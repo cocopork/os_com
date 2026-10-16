@@ -6,7 +6,11 @@ use aster_block::{BLOCK_SIZE, bio::BioStatus};
 
 use crate::{
     fs::{
-        fs_impls::ext4::{Ext4, fs::StatBlockAccounting, super_block::MAGIC_NUM},
+        fs_impls::ext4::{
+            Ext4,
+            fs::{StatBlockAccounting, dump_latency_stats_once},
+            super_block::MAGIC_NUM,
+        },
         utils::NAME_MAX,
         vfs::{
             file_system::{FileSystem, FsEventSubscriberStats, FsFlags, SuperBlock},
@@ -63,6 +67,8 @@ impl FileSystem for Ext4 {
         if self.block_device().sync()? != BioStatus::Complete {
             return_errno_with_message!(Errno::EIO, "failed to flush block device");
         }
+        dump_latency_stats_once();
+        super::super::fs::dump_nvpage_profile();
         Ok(())
     }
 
@@ -96,17 +102,19 @@ impl FileSystem for Ext4 {
         };
         // `bavail` excludes the root-reserved blocks (`s_r_blocks_count`), like
         // Linux `ext4_statfs`, so unprivileged `df` sees the space it can use.
-        let bavail = sb
-            .free_blocks_count()
-            .saturating_sub(u64::from(sb.reserved_blocks_count()));
+        // The live free counts come from the atomic authorities, not the (seed)
+        // superblock fields.
+        let free_blocks = self.free_blocks_count();
+        let free_inodes = self.free_inodes_count();
+        let bavail = free_blocks.saturating_sub(u64::from(sb.reserved_blocks_count()));
         SuperBlock {
             magic: MAGIC_NUM as u64,
             bsize: BLOCK_SIZE,
             blocks: usize::try_from(reported_blocks).unwrap(),
-            bfree: usize::try_from(sb.free_blocks_count()).unwrap(),
+            bfree: usize::try_from(free_blocks).unwrap(),
             bavail: usize::try_from(bavail).unwrap(),
             files: sb.total_inodes() as usize,
-            ffree: sb.free_inodes_count() as usize,
+            ffree: free_inodes as usize,
             // The volume UUID's low 64 bits, so mounts are distinguishable
             // (Linux folds the UUID into `f_fsid` too).
             fsid: u64::from_le_bytes(sb.uuid()[..8].try_into().unwrap()),

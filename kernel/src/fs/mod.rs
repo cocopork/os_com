@@ -3,6 +3,7 @@
 pub mod file;
 mod fs_impls;
 pub mod pipe;
+pub mod rnvpc;
 pub mod rootfs;
 pub mod thread_info;
 pub mod utils;
@@ -21,6 +22,10 @@ use crate::{
 };
 
 pub fn init() {
+    // rNVPC（Simulated NV memory pool）：内核 cmdline `rnvpc_size=` 给了尺寸才初始化，
+    // 否则 `init()` 直接返回（默认关闭，不影响任何既有路径）。旧名 `nv_pool_size=`
+    // 仍可读（告警一次），见 `rnvpc::config::select_param`。
+    rnvpc::init();
     vfs::init();
     fs_impls::init();
 }
