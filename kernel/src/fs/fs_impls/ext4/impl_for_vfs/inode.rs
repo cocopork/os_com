@@ -530,10 +530,18 @@ mod tests {
         process::{Gid, Uid},
     };
 
+    #[ktest]
+    fn ext4_vfs_inode_operations() {
+        crate::fs::fs_impls::ext4::test_utils::scenarios!(
+            mount_via_vfs_and_read,
+            attr_writes_persist,
+            read_at_routes_o_direct_flag,
+        );
+    }
+
     /// Drives a mounted ext4 filesystem entirely through the VFS traits:
     /// `FileSystem` for stat, and `Inode`/`FileOps` for type, lookup, metadata,
     /// and reads.
-    #[ktest]
     fn mount_via_vfs_and_read() {
         let f = Ext4FixtureBuilder::new(2048, 256, 2048).build().unwrap();
 
@@ -573,7 +581,6 @@ mod tests {
     /// chmod/chown/chgrp through the VFS `Inode` trait update the in-memory
     /// metadata and persist across a write-back + reload, preserving the inode
     /// type bits.
-    #[ktest]
     fn attr_writes_persist() {
         let f = Ext4FixtureBuilder::new(2048, 256, 2048)
             .with_block_bitmap_metadata_marked()
@@ -607,7 +614,6 @@ mod tests {
     /// direct path (block-aligned only) while a plain request stays on the
     /// buffered path: the direct path rejects an unaligned length that the
     /// buffered path serves without complaint.
-    #[ktest]
     fn read_at_routes_o_direct_flag() {
         let f = Ext4FixtureBuilder::new(2048, 256, 2048).build().unwrap();
         let content: Vec<u8> = (0..BLOCK_SIZE).map(|i| (i * 5 + 1) as u8).collect();

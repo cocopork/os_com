@@ -30,6 +30,7 @@ pub use inode::{FilePerm, Inode};
 use self::fs_type::Ext4Type;
 use crate::fs::vfs::registry;
 
+mod allocator;
 mod block_group;
 mod checksum;
 mod feature;
@@ -52,6 +53,7 @@ pub(super) fn init() {
 
 mod migration;
 mod stats;
+mod writeback;
 pub(crate) use stats::*;
 
 #[cfg(ktest)]

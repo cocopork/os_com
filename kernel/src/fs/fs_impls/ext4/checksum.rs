@@ -235,24 +235,34 @@ mod tests {
         }
     }
 
+    #[ktest]
+    fn ext4_crc32c_correctness() {
+        crate::fs::fs_impls::ext4::test_utils::scenarios!(
+            crc32c_canonical_check_vector,
+            crc32c_reference_is_canonical,
+            crc32c_empty_is_identity,
+            crc32c_segments_chain,
+            crc32c_detects_single_bit,
+            crc32c_sw_matches_reference,
+            crc32c_dispatch_matches_reference,
+        );
+    }
+
     /// The canonical CRC-32C check vector: `0xE3069283` over `b"123456789"`
     /// with the conventional `~0` init and `~0` xorout. Our raw function omits
     /// the xorout, so the caller applies the outer `!`.
-    #[ktest]
     fn crc32c_canonical_check_vector() {
         assert_eq!(!crc32c(!0u32, b"123456789"), 0xE306_9283);
     }
 
     /// Pins the oracle itself to the canonical check value, so the differential
     /// tests below diff against a trustworthy reference on every arch.
-    #[ktest]
     fn crc32c_reference_is_canonical() {
         assert_eq!(!crc32c_reference(!0u32, b"123456789"), 0xE306_9283);
     }
 
     /// The empty input leaves the running state untouched (the identity of the
     /// fold), so a `~0` seed over nothing xors back to zero.
-    #[ktest]
     fn crc32c_empty_is_identity() {
         assert_eq!(crc32c(0, &[]), 0);
         assert_eq!(!crc32c(!0u32, &[]), 0);
@@ -260,7 +270,6 @@ mod tests {
 
     /// Chaining two segments equals one pass over their concatenation — the
     /// property ext4 relies on to checksum a struct around its checksum field.
-    #[ktest]
     fn crc32c_segments_chain() {
         let whole = crc32c(!0u32, b"123456789");
         let split = crc32c(crc32c(!0u32, b"12345"), b"6789");
@@ -268,7 +277,6 @@ mod tests {
     }
 
     /// A single-byte change flips the result (guards against a stuck table).
-    #[ktest]
     fn crc32c_detects_single_bit() {
         let a = crc32c(!0u32, b"metadata_csum");
         let b = crc32c(!0u32, b"metadata_csun");
@@ -277,16 +285,20 @@ mod tests {
 
     /// The slice-by-8 software path must be byte-identical to the oracle across
     /// all lengths and alignments.
-    #[ktest]
     fn crc32c_sw_matches_reference() {
         diff_against_reference(crc32c_sw);
     }
 
     /// The public dispatcher (whichever back-end the running CPU selects) must
     /// match the oracle too.
-    #[ktest]
     fn crc32c_dispatch_matches_reference() {
         diff_against_reference(crc32c);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[ktest]
+    fn ext4_crc32c_hardware() {
+        crate::fs::fs_impls::ext4::test_utils::scenarios!(crc32c_hw_matches_reference,);
     }
 
     /// The SSE4.2 hardware path must be byte-identical to the oracle. The ktest
@@ -294,7 +306,6 @@ mod tests {
     /// gate actually admits the hardware arm here rather than silently testing
     /// the software fallback again.
     #[cfg(target_arch = "x86_64")]
-    #[ktest]
     fn crc32c_hw_matches_reference() {
         assert!(
             ostd::arch::cpu::crc32::crc32c(0, &[]).is_some(),
@@ -303,12 +314,17 @@ mod tests {
         diff_against_reference(|seed, data| ostd::arch::cpu::crc32::crc32c(seed, data).unwrap());
     }
 
+    #[cfg(target_arch = "x86_64")]
+    #[ktest]
+    fn ext4_crc32c_benchmark() {
+        crate::fs::fs_impls::ext4::test_utils::scenarios!(crc32c_microbench,);
+    }
+
     /// A coarse, non-asserting microbenchmark: it prints the raw cycle counts for
     /// the software and hardware paths over a 4088-byte span (an ext4 directory
     /// checksum tail) so the report has an order-of-magnitude figure. Real
     /// numbers come from the host bench harness.
     #[cfg(target_arch = "x86_64")]
-    #[ktest]
     fn crc32c_microbench() {
         const ROUNDS: u32 = 4096;
         let buf = [0xa5u8; 4088];

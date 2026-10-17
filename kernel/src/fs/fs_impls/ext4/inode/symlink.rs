@@ -280,9 +280,19 @@ mod tests {
         .unwrap()
     }
 
+    #[ktest]
+    fn ext4_symlink_lifecycle() {
+        crate::fs::fs_impls::ext4::test_utils::scenarios!(
+            fresh_symlink_decodes,
+            fast_symlink_round_trip,
+            slow_symlink_round_trip,
+            rejects_non_symlink,
+            rejects_overlong_target,
+        );
+    }
+
     /// A freshly created symlink (before `write_link`) decodes without panicking:
     /// it is extent-flagged, size 0, and not yet a fast symlink.
-    #[ktest]
     fn fresh_symlink_decodes() {
         let f = fixture_with_dir();
         let link = create_symlink(&f);
@@ -296,7 +306,6 @@ mod tests {
     /// A short target (< 60 bytes) is stored inline: `read_link` round-trips it,
     /// the inode is no longer extent-based, size equals the target length, and
     /// `is_fast_symlink` is true.
-    #[ktest]
     fn fast_symlink_round_trip() {
         let f = fixture_with_dir();
         let link = create_symlink(&f);
@@ -326,7 +335,6 @@ mod tests {
     /// A long target (> 60 bytes, < BLOCK_SIZE) is stored in a data block:
     /// `read_link` round-trips it, the payload stays `DataBacked`, exactly one
     /// data block is allocated, and the extent flag is kept.
-    #[ktest]
     fn slow_symlink_round_trip() {
         let f = fixture_with_dir();
         let link = create_symlink(&f);
@@ -355,7 +363,6 @@ mod tests {
     }
 
     /// `read_link`/`write_link` reject non-symlink inodes.
-    #[ktest]
     fn rejects_non_symlink() {
         let f = fixture_with_dir();
         let dir = f.ext4.read_inode(DIR_INO).unwrap();
@@ -364,7 +371,6 @@ mod tests {
     }
 
     /// A target at or past one block is rejected.
-    #[ktest]
     fn rejects_overlong_target() {
         let f = fixture_with_dir();
         let link = create_symlink(&f);

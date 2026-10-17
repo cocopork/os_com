@@ -162,6 +162,9 @@ struct NodeCacheInner {
     slots: [Option<Box<CachedNode>>; NODE_CACHE_SLOTS],
     /// Round-robin victim when every slot is full and none matches.
     victim: usize,
+    /// Authoritative nojournal after-images, independent of cache eviction.
+    pending: BTreeMap<Ext4Bid, Box<[u8; BLOCK_SIZE]>>,
+    batching: bool,
 }
 
 impl NodeCache {
@@ -171,6 +174,8 @@ impl NodeCache {
             inner: SpinLock::new(NodeCacheInner {
                 slots: [const { None }; NODE_CACHE_SLOTS],
                 victim: 0,
+                pending: BTreeMap::new(),
+                batching: false,
             }),
             hits: AtomicU64::new(0),
             misses: AtomicU64::new(0),
@@ -184,6 +189,9 @@ impl NodeCache {
     /// lock is dropped before the caller reconstructs the node, so it is never
     /// held across a device read.
     fn get(&self, bid: Ext4Bid) -> Option<Box<[u8; BLOCK_SIZE]>> {
+        if let Some(bytes) = self.inner.lock().pending.get(&bid) {
+            return Some(bytes.clone());
+        }
         if !node_cache_enabled() {
             self.bypasses.fetch_add(1, Ordering::Relaxed);
             record_node_cache_access(&NODE_CACHE_TOTAL_BYPASSES);
@@ -239,6 +247,44 @@ impl NodeCache {
         inner.victim = (victim + 1) % inner.slots.len();
     }
 
+    pub(super) fn defer_write(&self, bid: Ext4Bid, bytes: &[u8; BLOCK_SIZE]) -> bool {
+        let mut inner = self.inner.lock();
+        if !inner.batching {
+            return false;
+        }
+        inner.pending.insert(bid, boxed_block(bytes));
+        true
+    }
+
+    fn begin_batch(&self) {
+        let mut inner = self.inner.lock();
+        assert!(!inner.batching);
+        inner.batching = true;
+    }
+
+    fn finish_batch(&self, device: &dyn BlockDevice) -> Result<()> {
+        self.inner.lock().batching = false;
+        loop {
+            // The owning extent-tree write lock serializes edits across this
+            // I/O. No spin lock is held while accessing the device.
+            let next = self
+                .inner
+                .lock()
+                .pending
+                .first_key_value()
+                .map(|(&bid, bytes)| (bid, bytes.clone()));
+            let Some((bid, bytes)) = next else {
+                return Ok(());
+            };
+            device.write_val(Bid::new(bid).to_offset(), bytes.as_ref())?;
+            self.inner.lock().pending.remove(&bid);
+        }
+    }
+
+    fn is_pending(&self, bid: Ext4Bid) -> bool {
+        self.inner.lock().pending.contains_key(&bid)
+    }
+
     /// Drops every slot — the conservative invalidation any node free or
     /// whole-tree rebuild takes (clearing only loses a refill, never coherence).
     fn clear(&self) {
@@ -290,7 +336,9 @@ fn read_node_cached(fs: &Ext4, bid: Ext4Bid, cache: &NodeCache) -> Result<NodeBu
         // (the miss path would surface the same error as a plain `Err`), so an
         // unverifiable hit is skipped rather than escalated to a panic.
         #[cfg(debug_assertions)]
-        if let Ok(fresh) = NodeBuf::read(fs, bid) {
+        if !cache.is_pending(bid)
+            && let Ok(fresh) = NodeBuf::read(fs, bid)
+        {
             debug_assert_eq!(
                 bytes.as_ref(),
                 fresh.bytes(),
@@ -335,6 +383,7 @@ pub(in crate::fs::fs_impls::ext4::inode) struct ExtentTree {
     /// manager) can record its visited extents and probe its no-hole fast
     /// path (Q3) — via [`Self::es_cache`], the field itself stays private.
     es_cache: EsCache,
+    pub(super) delayed_owner: Option<u64>,
 }
 
 impl ExtentTree {
@@ -365,6 +414,7 @@ impl ExtentTree {
             dirty: false,
             node_cache: NodeCache::new(),
             es_cache: EsCache::new(),
+            delayed_owner: None,
         })
     }
 
@@ -383,6 +433,7 @@ impl ExtentTree {
             dirty: false,
             node_cache: NodeCache::new(),
             es_cache: EsCache::new(),
+            delayed_owner: None,
         }
     }
 
@@ -655,6 +706,18 @@ impl ExtentTree {
     /// — a fresh mapping is ordinary work that must not eat the reserve. The
     /// punch spans-both slow path re-enters through
     /// [`insert_with_intent`](Self::insert_with_intent) instead: a free-side
+    pub(super) fn begin_metadata_batch(&self) {
+        self.node_cache.begin_batch();
+    }
+
+    pub(super) fn finish_metadata_batch(&self, device: &dyn BlockDevice) -> Result<()> {
+        self.node_cache.finish_batch(device)
+    }
+
+    pub(super) fn allocation_intent(&self, fallback: AllocIntent) -> AllocIntent {
+        self.delayed_owner.map_or(fallback, AllocIntent::Delayed)
+    }
+
     /// op may draw the reserve (Linux `EXT4_EX_NOFAIL`).
     #[expect(clippy::too_many_arguments)]
     pub(super) fn insert(
@@ -697,6 +760,7 @@ impl ExtentTree {
         csum_seed: Option<InodeCsumSeed>,
         intent: AllocIntent,
     ) -> Result<()> {
+        let intent = self.allocation_intent(intent);
         // es: the new mapping's own span. A neighbour merge changes extent
         // boundaries but no block's mapping or kind, so per-block truth owes
         // it no wider span (see the `es` module docs).
@@ -1336,7 +1400,7 @@ impl ExtentTree {
                         e_start,
                         handle,
                         csum_seed,
-                        AllocIntent::MetadataReserve,
+                        self.allocation_intent(AllocIntent::MetadataReserve),
                     )?;
                     continue;
                 }
@@ -1496,7 +1560,7 @@ impl ExtentTree {
                 &[],
                 handle,
                 csum_seed,
-                AllocIntent::MetadataReserve,
+                self.allocation_intent(AllocIntent::MetadataReserve),
             )?;
             let net_meta = delta.meta_allocated as i64 - delta.meta_freed as i64;
             self.sector_count =
@@ -1610,7 +1674,7 @@ impl ExtentTree {
                                 e_start,
                                 handle,
                                 csum_seed,
-                                AllocIntent::MetadataReserve,
+                                self.allocation_intent(AllocIntent::MetadataReserve),
                             )?;
                             continue;
                         }
@@ -1660,7 +1724,7 @@ impl ExtentTree {
                         e_start,
                         handle,
                         csum_seed,
-                        AllocIntent::MetadataReserve,
+                        self.allocation_intent(AllocIntent::MetadataReserve),
                     )?;
                     continue;
                 }
@@ -1791,7 +1855,7 @@ impl ExtentTree {
                 &[],
                 handle,
                 csum_seed,
-                AllocIntent::MetadataReserve,
+                self.allocation_intent(AllocIntent::MetadataReserve),
             )?;
             let net_meta = delta.meta_allocated as i64 - delta.meta_freed as i64;
             self.sector_count =
@@ -2702,7 +2766,7 @@ impl ExtentTree {
                             e.kind(),
                             handle,
                             csum_seed,
-                            AllocIntent::MetadataReserve,
+                            self.allocation_intent(AllocIntent::MetadataReserve),
                         )?;
                         // `insert` accounted the tail as NEW data; its blocks
                         // were already counted before the split.
@@ -2887,7 +2951,7 @@ impl ExtentTree {
                 &[],
                 handle,
                 csum_seed,
-                AllocIntent::MetadataReserve,
+                self.allocation_intent(AllocIntent::MetadataReserve),
             )?;
             let net_meta = delta.meta_allocated as i64 - delta.meta_freed as i64;
             self.sector_count =
@@ -3729,6 +3793,7 @@ fn free_meta_block(
     // failed split's fresh nodes — so clearing here alone covers them all (the
     // cache's second coherence rule).
     cache.clear();
+    cache.inner.lock().pending.remove(&bid);
     fs.free_blocks(journal::forget(bid, 1), handle)
 }
 
@@ -3944,6 +4009,21 @@ mod tests {
     }
 
     #[ktest]
+    fn ext4_extent_tree_lookup() {
+        crate::fs::fs_impls::ext4::test_utils::scenarios!(
+            inline_single_extent_lookup,
+            inline_multiple_extents_lookup,
+            empty_root_is_all_holes,
+            rejects_bad_root_magic,
+            descends_into_external_leaf,
+            find_and_walk_match_linear_reference_across_shapes,
+            find_gap_reports_insertion_point_and_prev,
+            find_rejects_corrupt_children,
+            try_new_rejects_oversized_inline_root,
+            find_rejects_empty_interior_child,
+        );
+    }
+
     fn inline_single_extent_lookup() {
         let f = Ext4FixtureBuilder::new(2048, 256, 2048).build().unwrap();
         // One extent mapping logical 0..4 to physical 100..104.
@@ -3962,7 +4042,6 @@ mod tests {
         assert!(tree.lookup(&f.ext4, 4).unwrap().is_none());
     }
 
-    #[ktest]
     fn inline_multiple_extents_lookup() {
         let f = Ext4FixtureBuilder::new(2048, 256, 2048).build().unwrap();
         let tree = inline_tree(&[
@@ -3988,14 +4067,12 @@ mod tests {
         assert!(tree.lookup(&f.ext4, 3).unwrap().is_none());
     }
 
-    #[ktest]
     fn empty_root_is_all_holes() {
         let f = Ext4FixtureBuilder::new(2048, 256, 2048).build().unwrap();
         let tree = ExtentTree::empty();
         assert!(tree.lookup(&f.ext4, 0).unwrap().is_none());
     }
 
-    #[ktest]
     fn rejects_bad_root_magic() {
         let root = [0u32; RAW_BLOCK_PTRS_LEN];
         assert!(ExtentTree::try_new(root, 0).is_err());
@@ -4046,7 +4123,6 @@ mod tests {
     /// descended into. This exercises the interior-node read path that inline
     /// (depth-0) roots never reach — the real-image counterpart is a fragmented
     /// file whose extents overflow the inline root.
-    #[ktest]
     fn descends_into_external_leaf() {
         let f = Ext4FixtureBuilder::new(2048, 256, 2048).build().unwrap();
 
@@ -4090,6 +4166,27 @@ mod tests {
     }
 
     #[ktest]
+    fn ext4_extent_tree_insert_and_split() {
+        crate::fs::fs_impls::ext4::test_utils::scenarios!(
+            insert_into_inline_merges_contiguous,
+            insert_non_contiguous_stays_separate,
+            inline_overflow_grows_to_depth1,
+            insert_into_depth1_reuses_leaf,
+            overflow_past_depth1_grows_to_depth2,
+            merge_caps_unwritten_below_max_len,
+            insert_fast_path_edits_leaf_in_place,
+            insert_fast_path_appends_without_rebuild,
+            split_on_append_keeps_leaves_dense,
+            split_mid_leaf_and_position_zero,
+            grow_indepth_on_full_root,
+            journaled_split_reads_back_consistently,
+            before_first_split_keeps_old_leaf_nonempty,
+            merge_leaf_neighbors_coalesces_both_sides_and_respects_kind,
+            depth3_spine_reads_edits_converts_and_truncates,
+            grow_root_past_two_up_to_max_depth,
+        );
+    }
+
     fn insert_into_inline_merges_contiguous() {
         let f = Ext4FixtureBuilder::new(2048, 256, 2048)
             .with_block_bitmap_metadata_marked()
@@ -4113,7 +4210,6 @@ mod tests {
         assert_eq!(m.start() + (3 - m.block()) as u64, 103);
     }
 
-    #[ktest]
     fn insert_non_contiguous_stays_separate() {
         let f = Ext4FixtureBuilder::new(2048, 256, 2048)
             .with_block_bitmap_metadata_marked()
@@ -4132,7 +4228,6 @@ mod tests {
         assert!(tree.lookup(&f.ext4, 3).unwrap().is_none());
     }
 
-    #[ktest]
     fn inline_overflow_grows_to_depth1() {
         let f = Ext4FixtureBuilder::new(2048, 256, 2048)
             .with_block_bitmap_metadata_marked()
@@ -4179,7 +4274,6 @@ mod tests {
         );
     }
 
-    #[ktest]
     fn insert_into_depth1_reuses_leaf() {
         let f = Ext4FixtureBuilder::new(2048, 256, 2048)
             .with_block_bitmap_metadata_marked()
@@ -4216,7 +4310,6 @@ mod tests {
     /// levels. Stride-2 single-block extents never coalesce, so N inserts yield N
     /// distinct extents. 1400 extents need 5 leaves (> `INLINE_MAX`), overflowing
     /// the inline root into one interior node holding 5 leaf-index entries.
-    #[ktest]
     fn overflow_past_depth1_grows_to_depth2() {
         let f = Ext4FixtureBuilder::new(2048, 256, 2048)
             .with_block_bitmap_metadata_marked()
@@ -4267,7 +4360,6 @@ mod tests {
     /// 32768 overflows the bias encoding (`len + MAX_WRITTEN_LEN`), so an
     /// unwritten run caps at `EXT_UNWRITTEN_MAX_LEN = 32767`. Written runs of the
     /// same shape may still merge to 32768.
-    #[ktest]
     fn merge_caps_unwritten_below_max_len() {
         let half = MAX_WRITTEN_LEN / 2; // 16384
 
@@ -4299,11 +4391,18 @@ mod tests {
         assert_eq!(written[0].len(), MAX_WRITTEN_LEN);
     }
 
+    #[ktest]
+    fn ext4_extent_tree_checksums() {
+        crate::fs::fs_impls::ext4::test_utils::scenarios!(
+            stamp_extent_tail_matches_crc32c,
+            seeded_reserialize_stamps_leaf_tail,
+        );
+    }
+
     /// `stamp_extent_tail` writes crc32c of the node's first `EXTENT_TAIL_OFFSET`
     /// bytes into the 4-byte tail, and any change to the covered region changes
     /// the stamp — the `metadata_csum` extent-block invariant (Linux
     /// `ext4_extent_block_csum`).
-    #[ktest]
     fn stamp_extent_tail_matches_crc32c() {
         let seed = checksum::FsCsumSeed::new(0x1357_9bdf).derive_inode(1, 0);
         let mut block = [0u8; BLOCK_SIZE];
@@ -4338,7 +4437,6 @@ mod tests {
     /// End-to-end: a seeded depth-1 rebuild writes its external leaf to the
     /// device with a correct extent-block tail checksum; a `None` seed leaves the
     /// tail zeroed. Exercises the `write_leaf_node` compute-on-write hook.
-    #[ktest]
     fn seeded_reserialize_stamps_leaf_tail() {
         let f = Ext4FixtureBuilder::new(2048, 256, 2048)
             .with_block_bitmap_metadata_marked()
@@ -4392,7 +4490,6 @@ mod tests {
     /// and `walk_range` over the whole space must reproduce the flatten list,
     /// at every tree shape from inline through depth-2 — the path-based read
     /// side is only trusted through this equivalence.
-    #[ktest]
     fn find_and_walk_match_linear_reference_across_shapes() {
         let f = Ext4FixtureBuilder::new(8192, 256, 8192)
             .with_block_bitmap_metadata_marked()
@@ -4489,7 +4586,6 @@ mod tests {
     /// A gap's landing carries the insertion point and the in-leaf
     /// predecessor (the allocation-goal donor) — the rule-6 payload inserts
     /// consume without a second walk.
-    #[ktest]
     fn find_gap_reports_insertion_point_and_prev() {
         let f = Ext4FixtureBuilder::new(2048, 256, 2048).build().unwrap();
 
@@ -4565,7 +4661,6 @@ mod tests {
     /// The path walker rejects structurally corrupt children loud: a child
     /// whose depth does not step down by one, and a node whose entry count
     /// overruns the block.
-    #[ktest]
     fn find_rejects_corrupt_children() {
         let f = Ext4FixtureBuilder::new(2048, 256, 2048).build().unwrap();
 
@@ -4610,10 +4705,25 @@ mod tests {
         assert!(tree.find(&f.ext4, 0).is_err());
     }
 
+    #[ktest]
+    fn ext4_extent_tree_convert() {
+        crate::fs::fs_impls::ext4::test_utils::scenarios!(
+            convert_gate_bounded_probe_keeps_semantics,
+            convert_full_extent_flips_and_merges,
+            convert_middle_splits_three_ways,
+            convert_across_leaves_and_noop_gate,
+            journaled_convert_reads_back_consistently,
+            depth1_convert_middle_splits_in_leaf,
+            convert_in_full_leaf_reorganizes_then_splits,
+            convert_overflowing_inline_root_grows_depth1,
+            convert_in_full_leaf_enospc_is_clean,
+            convert_split_draws_metadata_reserve_when_full,
+        );
+    }
+
     /// The every-write convert gate must stay semantics-identical after the
     /// bounded-probe rewrite: a written-only range returns untouched (no
     /// dirtying, no rebuild), an unwritten overlap still converts.
-    #[ktest]
     fn convert_gate_bounded_probe_keeps_semantics() {
         let f = Ext4FixtureBuilder::new(2048, 256, 2048)
             .with_block_bitmap_metadata_marked()
@@ -4672,7 +4782,6 @@ mod tests {
     /// corrects the root index key — each leaving `i_blocks` with a pure-data
     /// delta (no metadata block churn, the fast-path signature) and the whole
     /// tree agreeing with the linear reference.
-    #[ktest]
     fn insert_fast_path_edits_leaf_in_place() {
         let f = Ext4FixtureBuilder::new(8192, 256, 8192)
             .with_block_bitmap_metadata_marked()
@@ -4739,7 +4848,6 @@ mod tests {
     /// The sequential-append pattern (fio seq write, SQLite growth): every
     /// extension left-merges onto the tail extent in place — extent count and
     /// metadata footprint stay constant while only data blocks accrue.
-    #[ktest]
     fn insert_fast_path_appends_without_rebuild() {
         let f = Ext4FixtureBuilder::new(8192, 256, 8192)
             .with_block_bitmap_metadata_marked()
@@ -4805,7 +4913,6 @@ mod tests {
     /// A full leaf split on the append boundary keeps the old leaf dense
     /// (Linux's split-at-insert-point policy): the new leaf starts with just
     /// the appended extent, and the root gains exactly one index entry.
-    #[ktest]
     fn split_on_append_keeps_leaves_dense() {
         let f = Ext4FixtureBuilder::new(8192, 256, 8192)
             .with_block_bitmap_metadata_marked()
@@ -4848,7 +4955,6 @@ mod tests {
     /// A mid-leaf split moves the tail entries to the new leaf and lands the
     /// extent in the old one; a below-first-key insert into a full leaf moves
     /// everything, lands in the emptied old leaf, and corrects the root key.
-    #[ktest]
     fn split_mid_leaf_and_position_zero() {
         let f = Ext4FixtureBuilder::new(8192, 256, 8192)
             .with_block_bitmap_metadata_marked()
@@ -4891,7 +4997,6 @@ mod tests {
     /// Filling four dense leaves fills the inline root; the next append grows
     /// the tree to depth 2 (the old root's content moves into a fresh interior
     /// node) and the split cascade lands in it.
-    #[ktest]
     fn grow_indepth_on_full_root() {
         let f = Ext4FixtureBuilder::new(16384, 256, 16384)
             .with_block_bitmap_metadata_marked()
@@ -4953,7 +5058,6 @@ mod tests {
     /// alive — 345 ops outgrow any fixture journal without its space reclaim,
     /// and reads must stay correct across whatever running / committing /
     /// checkpointed mix results.
-    #[ktest]
     fn journaled_split_reads_back_consistently() {
         crate::time::clocks::init_for_ktest();
         let f = Ext4FixtureBuilder::new(8192, 256, 8192)
@@ -4994,7 +5098,6 @@ mod tests {
     /// `i_block` capacity (INLINE_MAX). Without the bound the root scanners
     /// would index past the 60-byte `i_block` on a crafted image — a release
     /// slice panic, not the fail-loud EUCLEAN a corrupt mount owes.
-    #[ktest]
     fn try_new_rejects_oversized_inline_root() {
         let mut root = [0u32; RAW_BLOCK_PTRS_LEN];
         let header = RawExtentHeader {
@@ -5011,7 +5114,6 @@ mod tests {
     /// A depth-1 root pointing at an entries==0 interior node is rejected at
     /// the `NodeBuf::read` parse boundary (a childless interior is corruption);
     /// the walker never reads its phantom entry-0 bytes.
-    #[ktest]
     fn find_rejects_empty_interior_child() {
         let f = Ext4FixtureBuilder::new(2048, 256, 2048).build().unwrap();
         // A depth-2 root would descend through an interior node; craft that
@@ -5054,7 +5156,6 @@ mod tests {
     /// and the fresh node's parent key is strictly greater, so no duplicate
     /// index key is ever produced. The new extent lands in the old leaf and
     /// corrects the root key downward.
-    #[ktest]
     fn before_first_split_keeps_old_leaf_nonempty() {
         let f = Ext4FixtureBuilder::new(8192, 256, 8192)
             .with_block_bitmap_metadata_marked()
@@ -5119,10 +5220,19 @@ mod tests {
         (tree, pblocks)
     }
 
+    #[ktest]
+    fn ext4_extent_tree_truncate() {
+        crate::fs::fs_impls::ext4::test_utils::scenarios!(
+            truncate_prunes_depth2_cascade,
+            truncate_to_zero_resets_root,
+            truncate_chunk_frontier_and_consistency,
+            plan_shrink_reserves_for_deep_sparse_tree,
+        );
+    }
+
     /// Truncating a depth-2 tree frees the doomed tail extents in place and
     /// prunes the emptied leaves and interior nodes (Linux rm_leaf/rm_idx
     /// cascade), leaving the survivor prefix mapped and the tree still valid.
-    #[ktest]
     fn truncate_prunes_depth2_cascade() {
         let f = Ext4FixtureBuilder::new(16384, 256, 16384)
             .with_block_bitmap_metadata_marked()
@@ -5168,7 +5278,6 @@ mod tests {
 
     /// Truncating a depth-1 tree to zero frees every leaf and resets the root
     /// to an empty inline depth-0 node.
-    #[ktest]
     fn truncate_to_zero_resets_root() {
         let f = Ext4FixtureBuilder::new(8192, 256, 8192)
             .with_block_bitmap_metadata_marked()
@@ -5190,7 +5299,6 @@ mod tests {
     /// A chunked (credit-bounded) truncate frees a bounded batch per call and
     /// reports a frontier the outer spine drives down; the survivor after each
     /// chunk stays consistent with the linear reference.
-    #[ktest]
     fn truncate_chunk_frontier_and_consistency() {
         let f = Ext4FixtureBuilder::new(8192, 256, 8192)
             .with_block_bitmap_metadata_marked()
@@ -5232,9 +5340,22 @@ mod tests {
 
     // ---- P9a-T4b: in-place punch ----
 
+    #[ktest]
+    fn ext4_extent_tree_punch() {
+        crate::fs::fs_impls::ext4::test_utils::scenarios!(
+            punch_inline_middle_splits,
+            punch_inline_overflow_grows_tree,
+            punch_leaf_head_corrects_parent_key,
+            punch_empties_and_prunes_middle_leaf,
+            punch_full_leaf_spans_both_splits,
+            punch_full_leaf_draws_metadata_reserve_when_full,
+            punch_inline_overflow_draws_metadata_reserve_when_full,
+            punch_spans_slow_floor_reserves_insert_bound,
+        );
+    }
+
     /// Punching the middle of an inline (depth-0) extent splits it into head +
     /// tail in the root and frees exactly the covered run.
-    #[ktest]
     fn punch_inline_middle_splits() {
         let f = Ext4FixtureBuilder::new(8192, 256, 8192)
             .with_block_bitmap_metadata_marked()
@@ -5270,7 +5391,6 @@ mod tests {
     /// A depth-0 root already holding [`INLINE_MAX`] extents overflows when a
     /// punch splits one of them; the tail re-enters through insert and the
     /// tree grows to depth 1 with every mapping intact.
-    #[ktest]
     fn punch_inline_overflow_grows_tree() {
         let f = Ext4FixtureBuilder::new(8192, 256, 8192)
             .with_block_bitmap_metadata_marked()
@@ -5318,7 +5438,6 @@ mod tests {
     /// Punching the head of a non-first leaf removes its first entries; the
     /// leaf's risen first key must propagate into the parent index (Linux's
     /// exact-first-key invariant), and lookups stay correct.
-    #[ktest]
     fn punch_leaf_head_corrects_parent_key() {
         let f = Ext4FixtureBuilder::new(8192, 256, 8192)
             .with_block_bitmap_metadata_marked()
@@ -5349,7 +5468,6 @@ mod tests {
 
     /// A punch that covers a whole leaf's range empties and prunes it from the
     /// middle of the tree; the sibling leaves survive untouched.
-    #[ktest]
     fn punch_empties_and_prunes_middle_leaf() {
         let f = Ext4FixtureBuilder::new(8192, 256, 8192)
             .with_block_bitmap_metadata_marked()
@@ -5385,7 +5503,6 @@ mod tests {
     /// Punching inside one extent of a FULL leaf takes the slow spans-both
     /// path: trim to the head, re-insert the tail through the split machinery
     /// (the leaf splits), every mapping intact.
-    #[ktest]
     fn punch_full_leaf_spans_both_splits() {
         let f = Ext4FixtureBuilder::new(8192, 256, 8192)
             .with_block_bitmap_metadata_marked()
@@ -5445,7 +5562,6 @@ mod tests {
     /// splits a full leaf, needing a fresh tree node — which must come from
     /// the reserve, or "no space" would mean "no hole can be punched" (Linux
     /// `EXT4_EX_NOFAIL` on `ext4_ext_remove_space`'s split).
-    #[ktest]
     fn punch_full_leaf_draws_metadata_reserve_when_full() {
         let f = Ext4FixtureBuilder::new(8192, 256, 8192)
             .with_block_bitmap_metadata_marked()
@@ -5518,7 +5634,6 @@ mod tests {
     /// inline extent on a full volume pushes the survivors past the inline
     /// capacity, and the depth-1 rebuild's fresh leaf must come from the
     /// metadata reserve.
-    #[ktest]
     fn punch_inline_overflow_draws_metadata_reserve_when_full() {
         let f = Ext4FixtureBuilder::new(8192, 256, 8192)
             .with_block_bitmap_metadata_marked()
@@ -5584,7 +5699,6 @@ mod tests {
     /// bound, so a journal big enough only for the retired (under-counted)
     /// estimate refuses the step up front instead of admitting it and
     /// overrunning mid-punch.
-    #[ktest]
     fn punch_spans_slow_floor_reserves_insert_bound() {
         let f = Ext4FixtureBuilder::new(8192, 256, 8192)
             .with_block_bitmap_metadata_marked()
@@ -5654,7 +5768,6 @@ mod tests {
     /// Converting a whole unwritten extent flips its kind in place (no data
     /// move, no metadata delta) and coalesces with a contiguous written
     /// neighbour — the sequential-write pattern that must not fragment.
-    #[ktest]
     fn convert_full_extent_flips_and_merges() {
         let f = Ext4FixtureBuilder::new(2048, 256, 2048)
             .with_block_bitmap_metadata_marked()
@@ -5687,7 +5800,6 @@ mod tests {
 
     /// Converting the MIDDLE of an unwritten extent produces head-unwritten +
     /// written-middle + tail-unwritten, all mapping the same physical run.
-    #[ktest]
     fn convert_middle_splits_three_ways() {
         let f = Ext4FixtureBuilder::new(2048, 256, 2048)
             .with_block_bitmap_metadata_marked()
@@ -5719,7 +5831,6 @@ mod tests {
     /// Converting a range that spans a FULL leaf's worth of unwritten extents
     /// edits each covering leaf in place across a depth-1 tree, and the write
     /// path's every-write gate stays a no-op on an all-written range.
-    #[ktest]
     fn convert_across_leaves_and_noop_gate() {
         let f = Ext4FixtureBuilder::new(8192, 256, 8192)
             .with_block_bitmap_metadata_marked()
@@ -5775,7 +5886,6 @@ mod tests {
     /// edit EXTERNAL leaves whose newest bytes travel through the WAL funnel
     /// (the capture suppresses the direct write until checkpoint) — an
     /// inline-root tree would never exercise that path.
-    #[ktest]
     fn journaled_convert_reads_back_consistently() {
         crate::time::clocks::init_for_ktest();
         let f = Ext4FixtureBuilder::new(4096, 256, 4096)
@@ -5829,13 +5939,21 @@ mod tests {
 
     // ---- P9b b-ext: the external-node cache (1a) ----
 
+    #[ktest]
+    fn ext4_extent_tree_node_cache() {
+        crate::fs::fs_impls::ext4::test_utils::scenarios!(
+            node_cache_refreshes_on_writeback,
+            node_cache_holds_interior_and_leaf_across_depth2,
+            node_cache_invalidated_by_reserialize_reuse,
+        );
+    }
+
     /// The cache's first rule (refresh): priming a slot with a read, then
     /// editing that leaf (a `convert_unwritten` whose `write_back` refreshes the
     /// slot), then reading again must observe the WRITTEN bytes. A stale slot
     /// would replay the primed-unwritten node — a data-corruption-class bug this
     /// nails on observable content, independent of the debug coherence net that
     /// also cross-checks every hit.
-    #[ktest]
     fn node_cache_refreshes_on_writeback() {
         let f = Ext4FixtureBuilder::new(8192, 256, 8192)
             .with_block_bitmap_metadata_marked()
@@ -5873,7 +5991,6 @@ mod tests {
     /// = 8 the whole working set stays resident), and every verdict still
     /// matches the linear reference (the debug net cross-checks each hit for
     /// byte equality on top).
-    #[ktest]
     fn node_cache_holds_interior_and_leaf_across_depth2() {
         let f = Ext4FixtureBuilder::new(2048, 256, 2048)
             .with_block_bitmap_metadata_marked()
@@ -5917,7 +6034,6 @@ mod tests {
     /// the cache, or a later read would replay a reused leaf's pre-rebuild
     /// bytes. Prime a slot with the leaf, collapse, and confirm the shifted
     /// mapping is what the read returns.
-    #[ktest]
     fn node_cache_invalidated_by_reserialize_reuse() {
         let f = Ext4FixtureBuilder::new(8192, 256, 8192)
             .with_block_bitmap_metadata_marked()
@@ -5955,7 +6071,6 @@ mod tests {
     /// middle of an unwritten extent becomes head-U + mid-W + tail-U in
     /// staged single-leaf edits, preserving the physical mapping block for
     /// block and — with no leaf reorganization — leaving `i_blocks` untouched.
-    #[ktest]
     fn depth1_convert_middle_splits_in_leaf() {
         let f = Ext4FixtureBuilder::new(8192, 256, 8192)
             .with_block_bitmap_metadata_marked()
@@ -6004,7 +6119,6 @@ mod tests {
     /// A partial conversion inside a FULL leaf reorganizes first
     /// (`make_room_for` on a covered landing — the one new metadata block is
     /// the only `i_blocks` change), then splits the entry in place.
-    #[ktest]
     fn convert_in_full_leaf_reorganizes_then_splits() {
         let f = Ext4FixtureBuilder::new(8192, 256, 8192)
             .with_block_bitmap_metadata_marked()
@@ -6044,7 +6158,6 @@ mod tests {
     /// `merge_leaf_neighbors` coalesces the edited entry with contiguous
     /// same-kind neighbours on both sides and refuses a kind mismatch (the
     /// length caps live in `can_merge`, pinned separately).
-    #[ktest]
     fn merge_leaf_neighbors_coalesces_both_sides_and_respects_kind() {
         let es = es_token();
         let mut leaf = NodeBuf::fresh(999, 0);
@@ -6081,7 +6194,6 @@ mod tests {
     /// the inline capacity (4 entries + head + tail = 6): the tree rebuilds
     /// as depth-1 atomically (fresh leaf first, in-memory root flip last),
     /// keeping every mapping and counting exactly the one new leaf block.
-    #[ktest]
     fn convert_overflowing_inline_root_grows_depth1() {
         let f = Ext4FixtureBuilder::new(2048, 256, 2048)
             .with_block_bitmap_metadata_marked()
@@ -6113,7 +6225,6 @@ mod tests {
     /// A crafted depth-3 spine: with the growth cap lifted (T6) every
     /// consumer is path-based, so a tree deeper than the old flatten ceiling
     /// reads, edits, converts, and truncates through three index levels.
-    #[ktest]
     fn depth3_spine_reads_edits_converts_and_truncates() {
         let f = Ext4FixtureBuilder::new(4096, 256, 4096)
             .with_block_bitmap_metadata_marked()
@@ -6188,7 +6299,6 @@ mod tests {
     /// dense `external_node_count(2)` returned 0 for a `<= INLINE_MAX`-extent
     /// tree, so `plan_shrink` would under-reserve and misroute this whole
     /// truncate to the single-transaction fast path on a tiny journal.
-    #[ktest]
     fn plan_shrink_reserves_for_deep_sparse_tree() {
         let f = Ext4FixtureBuilder::new(4096, 256, 4096)
             .with_block_bitmap_metadata_marked()
@@ -6267,7 +6377,6 @@ mod tests {
     /// next allocation fails) is a CLEAN error — nothing edited, the tree
     /// still maps every block with the target still unwritten. The old
     /// trim-then-reinsert design aborted the whole volume here.
-    #[ktest]
     fn convert_in_full_leaf_enospc_is_clean() {
         let f = Ext4FixtureBuilder::new(8192, 256, 8192)
             .with_block_bitmap_metadata_marked()
@@ -6313,7 +6422,6 @@ mod tests {
     /// `ENOSPC` (xfstests generic/274). The metadata reserve makes that split
     /// succeed where an ordinary allocation — held back from the reserve — is
     /// already `ENOSPC`.
-    #[ktest]
     fn convert_split_draws_metadata_reserve_when_full() {
         let f = Ext4FixtureBuilder::new(8192, 256, 8192)
             .with_block_bitmap_metadata_marked()
@@ -6371,7 +6479,6 @@ mod tests {
     /// copies down under a one-entry depth-3 index, and only the on-disk
     /// format ceiling [`MAX_DEPTH`] refuses (grow never dereferences the
     /// children, so the crafted child ids stay untouched).
-    #[ktest]
     fn grow_root_past_two_up_to_max_depth() {
         let f = Ext4FixtureBuilder::new(2048, 256, 2048)
             .with_block_bitmap_metadata_marked()
@@ -6416,10 +6523,21 @@ mod tests {
 
     // ---- fallocate ZERO_RANGE (mark_range_unwritten) ----
 
+    #[ktest]
+    fn ext4_extent_tree_zero_range() {
+        crate::fs::fs_impls::ext4::test_utils::scenarios!(
+            zero_range_inline_flips_written_middle_to_unwritten,
+            zero_range_full_extent_coalesces_with_unwritten_neighbor,
+            zero_range_depth1_converts_written_run,
+            zero_range_noop_on_already_unwritten,
+            zero_range_full_max_written_extent_splits_inline,
+            zero_range_full_max_written_extent_splits_depth1,
+        );
+    }
+
     /// ZERO_RANGE over a written extent's middle flips the covered sub-range to
     /// unwritten (reads-as-zero) while keeping its physical mapping, splitting
     /// the written head and tail off around it.
-    #[ktest]
     fn zero_range_inline_flips_written_middle_to_unwritten() {
         let f = Ext4FixtureBuilder::new(2048, 256, 2048)
             .with_block_bitmap_metadata_marked()
@@ -6446,7 +6564,6 @@ mod tests {
 
     /// A ZERO_RANGE that fully covers a written extent flips it and coalesces
     /// with an adjacent unwritten run (they become one unwritten extent).
-    #[ktest]
     fn zero_range_full_extent_coalesces_with_unwritten_neighbor() {
         let f = Ext4FixtureBuilder::new(2048, 256, 2048)
             .with_block_bitmap_metadata_marked()
@@ -6470,7 +6587,6 @@ mod tests {
 
     /// ZERO_RANGE on a depth-1 tree flips the written extents in the range to
     /// unwritten in place, keeping their mappings; blocks outside stay written.
-    #[ktest]
     fn zero_range_depth1_converts_written_run() {
         let f = Ext4FixtureBuilder::new(16384, 256, 16384)
             .with_block_bitmap_metadata_marked()
@@ -6492,7 +6608,6 @@ mod tests {
 
     /// The every-op gate: a ZERO_RANGE over an already-unwritten range edits
     /// nothing and leaves the tree clean.
-    #[ktest]
     fn zero_range_noop_on_already_unwritten() {
         let f = Ext4FixtureBuilder::new(2048, 256, 2048)
             .with_block_bitmap_metadata_marked()
@@ -6512,7 +6627,6 @@ mod tests {
     /// (32768) written extent in the INLINE root must split the unwritten flip at
     /// `MAX_UNWRITTEN_LEN`. A single unwritten run of 32768 bias-encodes to a
     /// wrapped zero-length `ee_len` (`RawExtent::from` debug_asserts pre-fix).
-    #[ktest]
     fn zero_range_full_max_written_extent_splits_inline() {
         let f = Ext4FixtureBuilder::new(2048, 256, 2048)
             .with_block_bitmap_metadata_marked()
@@ -6574,7 +6688,6 @@ mod tests {
     /// `MAX_WRITTEN_LEN` run inside an EXTERNAL leaf must split the in-place kind
     /// flip at `MAX_UNWRITTEN_LEN` too, or the leaf write-back bias-encodes a
     /// wrapped zero-length `ee_len`.
-    #[ktest]
     fn zero_range_full_max_written_extent_splits_depth1() {
         let f = Ext4FixtureBuilder::new(16384, 256, 16384)
             .with_block_bitmap_metadata_marked()
@@ -6639,10 +6752,18 @@ mod tests {
 
     // ---- fallocate COLLAPSE_RANGE ----
 
+    #[ktest]
+    fn ext4_extent_tree_collapse() {
+        crate::fs::fs_impls::ext4::test_utils::scenarios!(
+            collapse_frees_window_and_shifts_tail_left_inline,
+            collapse_straddling_extent_splits_and_shifts,
+            collapse_depth1_rebuilds_and_shifts,
+        );
+    }
+
     /// COLLAPSE_RANGE frees the removed window's blocks and shifts the tail left,
     /// closing the logical gap; `i_blocks` and the free count drop by exactly the
     /// freed data blocks.
-    #[ktest]
     fn collapse_frees_window_and_shifts_tail_left_inline() {
         let f = Ext4FixtureBuilder::new(2048, 256, 2048)
             .with_block_bitmap_metadata_marked()
@@ -6683,7 +6804,6 @@ mod tests {
     /// COLLAPSE_RANGE inside one extent splits off the head, frees the covered
     /// middle, and shifts the tail left — the head and shifted tail stay separate
     /// (a physical gap remains where the middle was freed).
-    #[ktest]
     fn collapse_straddling_extent_splits_and_shifts() {
         let f = Ext4FixtureBuilder::new(2048, 256, 2048)
             .with_block_bitmap_metadata_marked()
@@ -6719,7 +6839,6 @@ mod tests {
 
     /// COLLAPSE_RANGE on a depth-1 tree rebuilds it (flatten + reserialize) with
     /// the tail shifted left; the survivor stays consistent with the reference.
-    #[ktest]
     fn collapse_depth1_rebuilds_and_shifts() {
         let f = Ext4FixtureBuilder::new(8192, 256, 8192)
             .with_block_bitmap_metadata_marked()
@@ -6756,9 +6875,17 @@ mod tests {
 
     // ---- fallocate INSERT_RANGE ----
 
+    #[ktest]
+    fn ext4_extent_tree_insert_range() {
+        crate::fs::fs_impls::ext4::test_utils::scenarios!(
+            insert_opens_hole_and_shifts_tail_right_inline,
+            insert_depth1_rebuilds_and_shifts,
+            insert_rejects_shift_past_logical_max,
+        );
+    }
+
     /// INSERT_RANGE opens a hole and shifts the tail right, splitting the extent
     /// straddling the insertion point; no data block moves.
-    #[ktest]
     fn insert_opens_hole_and_shifts_tail_right_inline() {
         let f = Ext4FixtureBuilder::new(2048, 256, 2048)
             .with_block_bitmap_metadata_marked()
@@ -6783,7 +6910,6 @@ mod tests {
 
     /// INSERT_RANGE on a depth-1 tree shifts every extent right; the leading
     /// range becomes a hole and the tail keeps its physical blocks.
-    #[ktest]
     fn insert_depth1_rebuilds_and_shifts() {
         let f = Ext4FixtureBuilder::new(8192, 256, 8192)
             .with_block_bitmap_metadata_marked()
@@ -6810,7 +6936,6 @@ mod tests {
     /// logical space is rejected `EINVAL` with the tree untouched (Linux
     /// `ext4_ext_shift_extents`'s SHIFT_RIGHT `EXT_MAX_BLOCKS` guard) — without
     /// it the shifted-key arithmetic would wrap and corrupt the tree.
-    #[ktest]
     fn insert_rejects_shift_past_logical_max() {
         let f = Ext4FixtureBuilder::new(2048, 256, 2048)
             .with_block_bitmap_metadata_marked()
@@ -6843,11 +6968,23 @@ mod tests {
     // ---- P10-T1b: es-cache population by the convert paths (the knife-2
     // written-hint nails, migrated per the T1 spec §7.2) ----
 
+    #[ktest]
+    fn ext4_extent_tree_status_cache() {
+        crate::fs::fs_impls::ext4::test_utils::scenarios!(
+            es_populated_by_noop_convert_inline,
+            es_populated_by_noop_convert_external,
+            es_never_claims_written_over_unwritten,
+            es_facts_survive_in_leaf_merge_with_per_block_truth,
+            es_invalidated_by_mutators,
+            es_r3_backfills_converted_range,
+            es_debug_net_accepts_true_verdicts,
+        );
+    }
+
     /// The no-conversion arm of `convert_unwritten` records every written
     /// extent its scan visited (R2), so the cache answers `AllWritten` over
     /// the covering extent's OWN bounds — and still `Unknown` one block past
     /// them — on the inline (depth-0) path.
-    #[ktest]
     fn es_populated_by_noop_convert_inline() {
         let f = Ext4FixtureBuilder::new(2048, 256, 2048)
             .with_block_bitmap_metadata_marked()
@@ -6873,7 +7010,6 @@ mod tests {
     /// walk records the visited written singleton, bounded to that extent —
     /// a probe spilling into the neighbouring hole stays `Unknown` (the
     /// false-positive guard).
-    #[ktest]
     fn es_populated_by_noop_convert_external() {
         let f = Ext4FixtureBuilder::new(8192, 256, 8192)
             .with_block_bitmap_metadata_marked()
@@ -6896,7 +7032,6 @@ mod tests {
     /// remainder's own unwritten fact recorded (an R1-style walk), the range
     /// answers the richer `AllMapped` tier instead — the three-state
     /// increment over the binary hint this cache replaced.
-    #[ktest]
     fn es_never_claims_written_over_unwritten() {
         let f = Ext4FixtureBuilder::new(8192, 256, 8192)
             .with_block_bitmap_metadata_marked()
@@ -6957,7 +7092,6 @@ mod tests {
     /// the merge's left side SURVIVES an adjacent insert (which invalidates
     /// only its own span) and still agrees with the tree block for block —
     /// the es-cache's core increment over the whole-clearing written hint.
-    #[ktest]
     fn es_facts_survive_in_leaf_merge_with_per_block_truth() {
         let f = Ext4FixtureBuilder::new(8192, 256, 8192)
             .with_block_bitmap_metadata_marked()
@@ -6997,7 +7131,6 @@ mod tests {
     /// clear the whole tail, and their applies rebuild the tree
     /// (`reserialize` → `clear_all`), so nothing survives them today —
     /// over-invalidation is always legal; the red line runs the other way.
-    #[ktest]
     fn es_invalidated_by_mutators() {
         // Prime written facts [0,8) and [20,24) via one no-op convert (the
         // inline scan R2-records every written entry it passes), run
@@ -7112,7 +7245,6 @@ mod tests {
     /// records only the flipped middle (the surviving unwritten tail stays
     /// unclaimed), and a staged head split records nothing until its
     /// remainder actually flips.
-    #[ktest]
     fn es_r3_backfills_converted_range() {
         let f = Ext4FixtureBuilder::new(8192, 256, 8192)
             .with_block_bitmap_metadata_marked()
@@ -7148,7 +7280,6 @@ mod tests {
     /// The debug double-read net accepts verdicts the tree supports (and
     /// `Unknown` vacuously) — the Q2/Q3-side assertion T1b's query points run
     /// behind every hit.
-    #[ktest]
     fn es_debug_net_accepts_true_verdicts() {
         let f = Ext4FixtureBuilder::new(2048, 256, 2048)
             .with_block_bitmap_metadata_marked()

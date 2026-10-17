@@ -4,12 +4,12 @@ mod balancing;
 
 use core::{
     alloc::Layout,
-    cell::RefCell,
     ops::DerefMut,
     sync::atomic::{AtomicUsize, Ordering},
 };
 
 use ostd::{
+    cpu::all_cpus,
     cpu_local,
     irq::DisabledLocalIrqGuard,
     mm::Paddr,
@@ -28,7 +28,8 @@ static GLOBAL_POOL_SIZE: AtomicUsize = AtomicUsize::new(0);
 
 // CPU-local free buddies.
 cpu_local! {
-    static LOCAL_POOL: RefCell<BuddySet<MAX_LOCAL_BUDDY_ORDER>> = RefCell::new(BuddySet::new_empty());
+    static LOCAL_POOL: SpinLock<BuddySet<MAX_LOCAL_BUDDY_ORDER>, LocalIrqDisabled> =
+        SpinLock::new(BuddySet::new_empty());
 }
 
 /// Maximum supported order of the buddy system.
@@ -52,8 +53,29 @@ const MAX_BUDDY_ORDER: BuddyOrder = 32;
 const MAX_LOCAL_BUDDY_ORDER: BuddyOrder = 18;
 
 pub(super) fn alloc(guard: &DisabledLocalIrqGuard, layout: Layout) -> Option<Paddr> {
+    if let Some(addr) = try_alloc(guard, layout) {
+        return Some(addr);
+    }
+
+    // Free buddies can be stranded in different CPU-local sets. Consolidate
+    // only after the ordinary allocation path fails. Never hold a global lock
+    // while acquiring a local lock, or hold two local locks at once: other CPUs
+    // follow the same local -> global order during allocation/deallocation.
+    for cpu in all_cpus() {
+        let mut local_pool = LOCAL_POOL.get_on_cpu(cpu).lock();
+        if local_pool.total_size() == 0 {
+            continue;
+        }
+        let mut global_pool = OnDemandGlobalLock::new();
+        balancing::drain_to(&mut *local_pool, &mut *global_pool.get());
+    }
+    // A bounded retry; genuine exhaustion/fragmentation still returns None.
+    try_alloc(guard, layout)
+}
+
+fn try_alloc(guard: &DisabledLocalIrqGuard, layout: Layout) -> Option<Paddr> {
     let local_pool_cell = LOCAL_POOL.get_with(guard);
-    let mut local_pool = local_pool_cell.borrow_mut();
+    let mut local_pool = local_pool_cell.lock();
     let mut global_pool = OnDemandGlobalLock::new();
 
     let size_order = greater_order_of(layout.size());
@@ -70,9 +92,18 @@ pub(super) fn alloc(guard: &DisabledLocalIrqGuard, layout: Layout) -> Option<Pad
     if chunk_addr.is_none() {
         chunk_addr = global_pool.get().alloc_chunk(order);
     }
-    // TODO: On memory pressure the global pool may be not enough. We may need
-    // to merge all buddy chunks from the local pools to the global pool and
-    // try again.
+    if chunk_addr.is_none() {
+        // Balancing itself can merge a suitable block into either set.
+        balancing::balance(local_pool.deref_mut(), &mut global_pool);
+        chunk_addr = if order < MAX_LOCAL_BUDDY_ORDER {
+            local_pool.alloc_chunk(order)
+        } else {
+            None
+        };
+        if chunk_addr.is_none() {
+            chunk_addr = global_pool.get().alloc_chunk(order);
+        }
+    }
 
     // If the alignment order is larger than the size order, we need to split
     // the chunk and return the rest part back to the free lists.
@@ -97,7 +128,7 @@ pub(super) fn dealloc(
     segments: impl Iterator<Item = (Paddr, usize)>,
 ) {
     let local_pool_cell = LOCAL_POOL.get_with(guard);
-    let mut local_pool = local_pool_cell.borrow_mut();
+    let mut local_pool = local_pool_cell.lock();
     let mut global_pool = OnDemandGlobalLock::new();
 
     do_dealloc(&mut local_pool, &mut global_pool, segments);

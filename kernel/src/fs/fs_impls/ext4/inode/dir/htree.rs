@@ -331,9 +331,24 @@ mod tests {
         blk
     }
 
+    #[ktest]
+    fn ext4_htree_lookup() {
+        crate::fs::fs_impls::ext4::test_utils::scenarios!(
+            known_hash_vectors,
+            descent_lands_on_catch_all,
+            descent_lands_on_middle_entry,
+            descent_lands_on_last_entry,
+            descent_two_levels,
+            unsupported_hash_falls_back,
+            descent_rejects_cycle,
+            descent_rejects_zero_count,
+            descent_rejects_oversize_limit,
+            parse_dx_root_validation,
+        );
+    }
+
     /// The reference hashes this test file pins really are what the hasher
     /// produces, so the entry layouts below bracket the right value.
-    #[ktest]
     fn known_hash_vectors() {
         assert_eq!(
             ext4fs_dirhash(b"file0", DX_HASH_HALF_MD4, &MD4_SEED)
@@ -350,7 +365,6 @@ mod tests {
     }
 
     /// A target below every real entry lands on `entries[0]`'s catch-all block.
-    #[ktest]
     fn descent_lands_on_catch_all() {
         // file0 hashes to 0x1c3d2670, below both real entries.
         let root = build_dx_root(
@@ -364,7 +378,6 @@ mod tests {
 
     /// A target sitting on a middle entry descends to that entry's block; the
     /// entry immediately above (strictly greater hash) is not taken.
-    #[ktest]
     fn descent_lands_on_middle_entry() {
         let root = build_dx_root(
             DX_HASH_HALF_MD4,
@@ -381,7 +394,6 @@ mod tests {
     }
 
     /// A target above every entry lands on the last one.
-    #[ktest]
     fn descent_lands_on_last_entry() {
         // file3 hashes to 0x4f0413ba, above all three real entries.
         let root = build_dx_root(
@@ -400,7 +412,6 @@ mod tests {
 
     /// A one-level tree: the root's single catch-all points at a `dx_node`, whose
     /// entries are searched for the leaf.
-    #[ktest]
     fn descent_two_levels() {
         let node = build_dx_node(&[
             (0, 100),
@@ -421,7 +432,6 @@ mod tests {
 
     /// An unsupported hash version (siphash, 6) yields `None` so the caller can
     /// fall back to a linear scan, rather than an error.
-    #[ktest]
     fn unsupported_hash_falls_back() {
         let root = build_dx_root(6 /* siphash */, 0, &[(0, 10), (0x2000_0000, 11)]);
         let leaf = dx_lookup_leaf(|b| single_block(b, &root), b"file0", &MD4_SEED, false).unwrap();
@@ -429,7 +439,6 @@ mod tests {
     }
 
     /// A catch-all block that points back at the root (block 0) is a cycle.
-    #[ktest]
     fn descent_rejects_cycle() {
         let root = build_dx_root(DX_HASH_HALF_MD4, 0, &[(0, 0)]);
         let err =
@@ -438,7 +447,6 @@ mod tests {
     }
 
     /// A zero entry count is rejected before any descent.
-    #[ktest]
     fn descent_rejects_zero_count() {
         let mut root = build_dx_root(DX_HASH_HALF_MD4, 0, &[(0, 10), (0x2000_0000, 11)]);
         // Overwrite count (le16 at entries_off + 2) with 0.
@@ -450,7 +458,6 @@ mod tests {
 
     /// A `limit` whose entry array cannot fit the block is rejected rather than
     /// read off the end — a crafted index must not panic the kernel.
-    #[ktest]
     fn descent_rejects_oversize_limit() {
         let mut root = build_dx_root(DX_HASH_HALF_MD4, 0, &[(0, 10), (0x2000_0000, 11)]);
         // Overwrite limit (le16 at entries_off) with a value far larger than the
@@ -464,7 +471,6 @@ mod tests {
 
     /// `parse_dx_root` rejects a bad `info_length`, an unimplemented hash flag,
     /// and an over-deep tree.
-    #[ktest]
     fn parse_dx_root_validation() {
         let mut root = build_dx_root(DX_HASH_HALF_MD4, 0, &[(0, 10)]);
         assert!(parse_dx_root(&root).is_ok());

@@ -718,3 +718,140 @@ fn flush_batched_all_clean_is_noop() {
         assert_eq!(backend.write_count(p), 1);
     }
 }
+
+/// Accounting follows frames, not array membership or dirtying calls.
+#[ktest]
+fn pressure_accounting_and_pinned_reclaim() {
+    use super::{PageCacheAccounting, VmoOptions};
+    let backend = MockPageCacheBackend::new(3);
+    let backend_dyn: Arc<dyn PageCacheBackend> = backend.clone();
+    let accounting = Arc::new(PageCacheAccounting::default());
+    let cache = PageCache::from(
+        VmoOptions::new_page_cache(3 * PAGE_SIZE, Arc::downgrade(&backend_dyn))
+            .accounting(accounting.clone())
+            .alloc()
+            .unwrap(),
+    );
+    cache.write_bytes(0, &vec![0x35; 3 * PAGE_SIZE]).unwrap();
+    cache.write_bytes(0, &[0x35; 16]).unwrap();
+    assert_eq!(accounting.resident_pages(), 3);
+    assert_eq!(accounting.dirty_pages(), 3);
+    assert_eq!(cache.reclaim_clean_pages(3), 0);
+    assert_eq!(cache.flush_some_pages(1).unwrap(), 1);
+    assert_eq!(accounting.dirty_pages(), 2);
+    let pinned = cache.as_vmo().commit_on(0).unwrap();
+    assert_eq!(cache.reclaim_clean_pages(3), 0);
+    drop(pinned);
+    assert_eq!(cache.reclaim_clean_pages(3), 1);
+    wait_for_resident(&accounting, 2);
+    cache.flush_range(0..3 * PAGE_SIZE).unwrap();
+    assert_eq!(cache.reclaim_clean_pages(1), 1);
+    wait_for_resident(&accounting, 1);
+    let mut bytes = vec![0; 3 * PAGE_SIZE];
+    cache.read_bytes(0, &mut bytes).unwrap();
+    assert!(bytes.iter().all(|byte| *byte == 0x35));
+    assert_eq!(accounting.resident_pages(), 3);
+    drop(cache);
+    wait_for_resident(&accounting, 0);
+    assert_eq!(accounting.dirty_pages(), 0);
+    assert_eq!(accounting.writeback_pages(), 0);
+}
+
+/// A clean-at-submission page stays charged until completion; errors redirty it.
+#[ktest]
+fn pressure_accounts_inflight_redirty_and_error() {
+    use super::{PageCacheAccounting, VmoOptions};
+    let backend = MockPageCacheBackend::new(1);
+    let backend_dyn: Arc<dyn PageCacheBackend> = backend.clone();
+    let accounting = Arc::new(PageCacheAccounting::default());
+    let cache = PageCache::from(
+        VmoOptions::new_page_cache(PAGE_SIZE, Arc::downgrade(&backend_dyn))
+            .accounting(accounting.clone())
+            .alloc()
+            .unwrap(),
+    );
+    cache.write_bytes(0, &vec![0x11; PAGE_SIZE]).unwrap();
+    backend.set_completion(IoKind::Write, IoCompletion::Deferred);
+    let result = Arc::new(Mutex::new(None));
+    let thread = {
+        let cache = cache.clone();
+        let result = result.clone();
+        ThreadOptions::new(move || {
+            *result.lock() = Some(cache.flush_some_pages(1));
+        })
+        .spawn()
+    };
+    backend.wait_for_deferred_bios(IoKind::Write, 1);
+    assert_eq!(accounting.dirty_pages(), 0);
+    assert_eq!(accounting.writeback_pages(), 1);
+    assert_eq!(cache.reclaim_clean_pages(1), 0);
+    cache.write_bytes(0, &[0x22]).unwrap();
+    assert_eq!(accounting.dirty_pages(), 1);
+    assert!(backend.complete_next_deferred_bio(IoKind::Write, false));
+    thread.join();
+    assert!(result.lock().take().unwrap().is_err());
+    assert_eq!(accounting.dirty_pages(), 1);
+    assert_eq!(accounting.writeback_pages(), 0);
+    backend.set_completion(IoKind::Write, IoCompletion::Immediate);
+    cache.flush_range(0..PAGE_SIZE).unwrap();
+    assert_eq!(accounting.dirty_pages(), 0);
+    assert_eq!(cache.reclaim_clean_pages(1), 1);
+    let mut byte = [0];
+    cache.read_bytes(0, &mut byte).unwrap();
+    assert_eq!(byte, [0x22]);
+    drop(cache);
+    wait_for_resident(&accounting, 0);
+}
+
+// Array removal defers destruction through RCU. The unit runner has no idle
+// task: explicitly switch to runnable peers to pass the required grace periods.
+fn wait_for_resident(accounting: &super::PageCacheAccounting, expected: usize) {
+    for _ in 0..32 {
+        if accounting.resident_pages() == expected {
+            return;
+        }
+        ThreadOptions::new(|| {}).spawn().join();
+    }
+    assert_eq!(accounting.resident_pages(), expected);
+}
+
+#[ktest]
+fn pressure_reclaim_preserves_anonymous_data() {
+    let cache = PageCache::new_anon(PAGE_SIZE).unwrap();
+    cache.write_bytes(0, &[0x67; PAGE_SIZE]).unwrap();
+    assert_eq!(cache.reclaim_clean_pages(1), 0);
+    let mut bytes = [0; PAGE_SIZE];
+    cache.read_bytes(0, &mut bytes).unwrap();
+    assert_eq!(bytes, [0x67; PAGE_SIZE]);
+}
+
+#[ktest]
+fn pressure_single_page_completion_failure_stays_dirty() {
+    use io_util::batch::IoBatch;
+
+    use super::{CachePageExt, PageCacheAccounting, VmoOptions};
+    let backend = MockPageCacheBackend::new(1);
+    let backend_dyn: Arc<dyn PageCacheBackend> = backend.clone();
+    let accounting = Arc::new(PageCacheAccounting::default());
+    let cache = PageCache::from(
+        VmoOptions::new_page_cache(PAGE_SIZE, Arc::downgrade(&backend_dyn))
+            .accounting(accounting.clone())
+            .alloc()
+            .unwrap(),
+    );
+    cache.write_bytes(0, &[0x44; PAGE_SIZE]).unwrap();
+    backend.set_completion(IoKind::Write, IoCompletion::Deferred);
+    let mut batch = IoBatch::new();
+    let page = cache.as_vmo().commit_on(0).unwrap();
+    backend
+        .write_page_async(0, page.lock(), &mut batch)
+        .unwrap();
+    assert_eq!(accounting.dirty_pages(), 0);
+    assert!(backend.complete_next_deferred_bio(IoKind::Write, false));
+    assert!(batch.wait_all().is_err());
+    assert_eq!(accounting.dirty_pages(), 1);
+    assert_eq!(cache.reclaim_clean_pages(1), 0);
+    backend.set_completion(IoKind::Write, IoCompletion::Immediate);
+    cache.flush_range(0..PAGE_SIZE).unwrap();
+    assert_eq!(backend.persisted_page_bytes(0), vec![0x44; PAGE_SIZE]);
+}

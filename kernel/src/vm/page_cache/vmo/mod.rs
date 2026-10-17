@@ -31,7 +31,7 @@ use xarray::{Cursor, LockedXArray, XArray};
 
 use crate::{
     prelude::*,
-    vm::page_cache::{CachePage, CachePageExt, PageCacheBackend},
+    vm::page_cache::{CachePage, CachePageExt, PageCacheAccounting, PageCacheBackend},
 };
 
 mod options;
@@ -108,6 +108,10 @@ pub use options::VmoOptions;
 /// handed off. Anonymous VMOs stay `UpToDate` in steady state once a page is
 /// committed.
 pub struct Vmo {
+    // Serializes cloning from lock-free XArray cursors against clean reclaim.
+    // Lock order: commit_lock -> pages. Never held across backend I/O.
+    pub(super) commit_lock: SpinLock<()>,
+    pub(super) accounting: Option<Arc<PageCacheAccounting>>,
     /// The backend that provides disk I/O operations, if any.
     //
     // TODO: Using `Weak` here is to avoid circular references in exfat file systems.
@@ -210,6 +214,54 @@ impl CommitMode {
 }
 
 impl Vmo {
+    /// Removes only clean frames owned exclusively by the array.
+    ///
+    /// Holding the array lock prevents new commits from obtaining references.
+    /// Existing references (including PTE ownership) exclude removal. Try-lock
+    /// rather than sleep under the array spinlock. Drop removed frames outside
+    /// the lock, since destruction can release accounting/allocator resources.
+    pub(super) fn reclaim_clean_pages(&self, limit: usize) -> usize {
+        // Anonymous clean pages are the authoritative data, not a cache.
+        if self.backend.is_none() {
+            return 0;
+        }
+        let mut reclaimed = 0;
+        let mut index = 0;
+        while reclaimed < limit {
+            let removed = {
+                let _commit = self.commit_lock.lock();
+                let mut pages = self.pages.lock();
+                let mut cursor = pages.cursor_mut(index);
+                let mut victim = None;
+                loop {
+                    if let Some(page) = cursor.load() {
+                        if page.reference_count() == 1 && page.is_up_to_date() {
+                            if let Some(guard) = page.try_lock_guard() {
+                                if !guard.is_writing_back() && guard.is_up_to_date() {
+                                    victim = Some(cursor.index());
+                                }
+                            }
+                        }
+                    }
+                    if victim.is_some() {
+                        break;
+                    }
+                    if cursor.next_present().is_none() {
+                        break;
+                    }
+                }
+                let Some(victim) = victim else {
+                    break;
+                };
+                index = victim + 1;
+                cursor.remove().map(|page| page.clone())
+            };
+            drop(removed);
+            reclaimed += 1;
+        }
+        reclaimed
+    }
+
     /// Commits the page at `page_idx`, blocking on backend I/O if required.
     ///
     /// For anonymous VMOs the page is zero-filled on first access.
@@ -266,6 +318,7 @@ impl Vmo {
         cursor: &mut Cursor<'_, CachePage>,
         commit_mode: CommitMode,
     ) -> Result<(usize, CachePage), VmoCommitError> {
+        let _commit = self.commit_lock.lock();
         if let Some(backed_vmo) = self.as_backed_vmo() {
             return backed_vmo.try_commit_with_cursor(cursor, commit_mode);
         } else if let Some(page) = cursor.load() {
@@ -717,10 +770,62 @@ impl<'a> BackedVmo<'a> {
             self.collect_pages_if(locked_pages, page_idx_range, |_, page| page.is_dirty());
 
         let mut io_batch = IoBatch::with_capacity(dirty_pages.len());
-        self.backend
-            .write_pages_async_batch(dirty_pages, &mut io_batch)?;
+        let submitted = self
+            .backend
+            .write_pages_async_batch(dirty_pages, &mut io_batch);
+        // Even a partial submission failure must drain the already queued BIOs.
+        let completed = io_batch.wait_all().map_err(Into::into);
+        submitted.and(completed)
+    }
 
-        io_batch.wait_all().map_err(Into::into)
+    /// Snapshot for filesystem-side mapping preparation; no page-list lock
+    /// remains held while allocation or journal admission runs.
+    pub(super) fn dirty_page_indices(&self, limit: usize) -> Vec<usize> {
+        let mut indices = Vec::new();
+        if limit == 0 {
+            return indices;
+        }
+        let locked = self.pages.lock();
+        let mut cursor = locked.cursor(0);
+        loop {
+            if let Some(page) = cursor.load() {
+                if page.is_dirty() {
+                    indices.push(cursor.index() as usize);
+                }
+            }
+            if indices.len() == limit || cursor.next_present().is_none() {
+                break;
+            }
+        }
+        indices
+    }
+
+    /// Flushes a memory-bounded batch, preserving dirty pages on failure.
+    pub(super) fn flush_some_dirty_pages(&self, limit: usize) -> Result<usize> {
+        if limit == 0 {
+            return Ok(0);
+        }
+        let mut pages = Vec::with_capacity(limit);
+        {
+            let locked = self.pages.lock();
+            let mut cursor = locked.cursor(0);
+            loop {
+                if let Some(page) = cursor.load() {
+                    if page.is_dirty() {
+                        pages.push((cursor.index() as usize, page.clone()));
+                    }
+                }
+                if pages.len() == limit || cursor.next_present().is_none() {
+                    break;
+                }
+            }
+        }
+        let count = pages.len();
+        let mut batch = IoBatch::with_capacity(count);
+        let submitted = self.backend.write_pages_async_batch(pages, &mut batch);
+        let completed = batch.wait_all().map_err(Into::into);
+        submitted.and(completed)?;
+        Ok(count)
     }
 
     /// Reads ahead the pages in the specified byte range from the backend into
@@ -779,7 +884,7 @@ impl<'a> BackedVmo<'a> {
                         pages_to_read.push((page_idx, page.clone()));
                     }
                 } else {
-                    let uninit_page = CachePage::alloc_uninit()?;
+                    let uninit_page = CachePage::alloc_uninit_accounted(self.accounting.clone())?;
                     cursor.store(uninit_page.clone());
                     pages_to_read.push((page_idx, uninit_page));
                 }
@@ -903,7 +1008,7 @@ impl<'a> BackedVmo<'a> {
         };
 
         // The page is within the file bounds - need to allocate a cache page.
-        let uninit_page = CachePage::alloc_uninit()?;
+        let uninit_page = CachePage::alloc_uninit_accounted(self.accounting.clone())?;
         cursor.store(uninit_page.clone());
         drop(locked_pages);
 

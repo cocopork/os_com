@@ -964,6 +964,19 @@ mod tests {
     }
 
     #[ktest]
+    fn ext4_superblock_admission() {
+        crate::fs::fs_impls::ext4::test_utils::scenarios!(
+            parse_minimal_superblock,
+            reject_bad_magic,
+            reject_non_4k_block,
+            reject_sub_256_inode_size,
+            reject_unsupported_incompat,
+            reject_unsupported_ro_compat_for_writable_mount,
+            reject_without_extents,
+            accept_flex_bg,
+        );
+    }
+
     fn parse_minimal_superblock() {
         let raw = minimal_raw(2048, 2048, 256);
         let sb = SuperBlock::try_from(raw).unwrap();
@@ -977,14 +990,12 @@ mod tests {
         assert!(!sb.needs_recovery());
     }
 
-    #[ktest]
     fn reject_bad_magic() {
         let mut raw = minimal_raw(2048, 2048, 256);
         raw.magic = 0x1234;
         assert!(SuperBlock::try_from(raw).is_err());
     }
 
-    #[ktest]
     fn reject_non_4k_block() {
         let mut raw = minimal_raw(2048, 2048, 256);
         raw.log_block_size = 0; // 1 KiB
@@ -997,14 +1008,12 @@ mod tests {
     /// writeback; this 256-centric port admits only slots at least
     /// `size_of::<RawInode>()` wide (rejecting the misread rather than panicking on
     /// it, as a bare 256-byte slice of the block would).
-    #[ktest]
     fn reject_sub_256_inode_size() {
         let mut raw = minimal_raw(2048, 2048, 256);
         raw.inode_size = 128;
         assert!(SuperBlock::try_from(raw).is_err());
     }
 
-    #[ktest]
     fn reject_unsupported_incompat() {
         // `MMP` is a genuine incompatible feature this implementation does not
         // support (it is not in `INCOMPAT_SUPP`), so it must refuse the mount.
@@ -1016,7 +1025,6 @@ mod tests {
     /// A ro_compat feature outside `RO_COMPAT_SUPP` must refuse the (writable)
     /// mount with `EROFS` — writing such a volume would corrupt the feature's
     /// invariants (Linux `ext4_setup_super` parity).
-    #[ktest]
     fn reject_unsupported_ro_compat_for_writable_mount() {
         let mut raw = minimal_raw(2048, 2048, 256);
         // `GDT_CSUM` (legacy crc16 group-descriptor checksums) is a known but
@@ -1034,10 +1042,17 @@ mod tests {
         assert!(SuperBlock::try_from(raw).is_err());
     }
 
+    #[ktest]
+    fn ext4_superblock_checksums() {
+        crate::fs::fs_impls::ext4::test_utils::scenarios!(
+            superblock_checksum_covers_body_not_field,
+            verify_superblock_checksum_round_trip,
+        );
+    }
+
     /// `superblock_checksum` covers exactly the first `S_CHECKSUM_OFFSET` bytes,
     /// so recomputing after only the `s_checksum` field changes is stable, and a
     /// change anywhere in the covered range flips it.
-    #[ktest]
     fn superblock_checksum_covers_body_not_field() {
         let mut raw = minimal_raw(2048, 2048, 256);
         let csum = SuperBlock::superblock_checksum(&raw);
@@ -1055,7 +1070,6 @@ mod tests {
 
     /// `verify_superblock_checksum` accepts a correctly stamped superblock and
     /// rejects a corrupted one or a non-crc32c checksum type with `EUCLEAN`.
-    #[ktest]
     fn verify_superblock_checksum_round_trip() {
         let mut raw = minimal_raw(2048, 2048, 256);
         // `s_checksum_type` (0x175) must name crc32c (== 1).
@@ -1085,7 +1099,6 @@ mod tests {
         );
     }
 
-    #[ktest]
     fn reject_without_extents() {
         let mut raw = minimal_raw(2048, 2048, 256);
         raw.feature_incompat = FeatureIncompatSet::FILETYPE.bits();
@@ -1093,6 +1106,17 @@ mod tests {
     }
 
     #[ktest]
+    fn ext4_superblock_geometry_and_overhead() {
+        crate::fs::fs_impls::ext4::test_utils::scenarios!(
+            multi_group_geometry,
+            is_power_of_matches_test_root,
+            metadata_overhead_sparse_super,
+            metadata_overhead_reserved_gdt,
+            metadata_overhead_dense_super,
+            metadata_overhead_multi_gdt_block,
+        );
+    }
+
     fn multi_group_geometry() {
         // 3 full groups of 2048 blocks: blocks_count = 3*2048.
         let raw = minimal_raw(3 * 2048, 2048, 256);
@@ -1102,7 +1126,6 @@ mod tests {
     }
 
     /// `test_root`/`is_power_of` picks out the sparse-super backup groups.
-    #[ktest]
     fn is_power_of_matches_test_root() {
         assert!(is_power_of(3, 3) && is_power_of(9, 3) && is_power_of(81, 3));
         assert!(is_power_of(5, 5) && is_power_of(125, 5));
@@ -1115,7 +1138,6 @@ mod tests {
     /// The `ext4_calculate_overhead` (non-bigalloc) geometry sum. `minimal_raw`
     /// sets `sparse_super`, `first_data_block == 0`, inode size 256 (16 inodes
     /// per 4 KiB block → 16 inode-table blocks per group), and no reserved GDT.
-    #[ktest]
     fn metadata_overhead_sparse_super() {
         // 10 groups of 2048 blocks. GDT fits in one block (10 <= 4096/32). The
         // groups carrying a superblock/GDT copy are 0, 1 and the odd powers of
@@ -1128,7 +1150,6 @@ mod tests {
     }
 
     /// Reserved GDT-growth blocks add to every superblock-bearing group.
-    #[ktest]
     fn metadata_overhead_reserved_gdt() {
         let mut raw = minimal_raw(10 * 2048, 2048, 256);
         raw.reserved_gdt_blocks = 100;
@@ -1138,7 +1159,6 @@ mod tests {
     }
 
     /// Without `sparse_super`, every group carries a superblock/GDT copy.
-    #[ktest]
     fn metadata_overhead_dense_super() {
         let mut raw = minimal_raw(10 * 2048, 2048, 256);
         raw.feature_ro_compat = 0; // clear SPARSE_SUPER
@@ -1148,7 +1168,6 @@ mod tests {
 
     /// A GDT spanning more than one block: with 130 groups the primary GDT needs
     /// `ceil(130 / (4096/32)) = 2` blocks, charged to each super-bearing group.
-    #[ktest]
     fn metadata_overhead_multi_gdt_block() {
         let raw = minimal_raw(130 * 2048, 2048, 256);
         let sb = SuperBlock::try_from(raw).unwrap();
@@ -1158,9 +1177,18 @@ mod tests {
         assert_eq!(sb.metadata_overhead(), 130 * (16 + 2) + 11 * (1 + 2));
     }
 
+    #[ktest]
+    fn ext4_superblock_descriptor_width() {
+        crate::fs::fs_impls::ext4::test_utils::scenarios!(
+            desc_size_defaults_to_classic,
+            desc_size_explicit_classic,
+            reject_out_of_range_desc_size,
+            parse_desc_size_gating,
+        );
+    }
+
     /// A `0` on-disk `s_desc_size` (the mkfs default for non-64bit images)
     /// resolves to the classic 32-byte descriptor.
-    #[ktest]
     fn desc_size_defaults_to_classic() {
         let raw = minimal_raw(2048, 2048, 256);
         assert_eq!(raw.desc_size, 0);
@@ -1169,7 +1197,6 @@ mod tests {
     }
 
     /// An explicit `s_desc_size == 32` resolves to 32.
-    #[ktest]
     fn desc_size_explicit_classic() {
         let mut raw = minimal_raw(2048, 2048, 256);
         raw.desc_size = MIN_DESC_SIZE;
@@ -1179,7 +1206,6 @@ mod tests {
 
     /// Without `64BIT`, any `s_desc_size` other than 0 or 32 is rejected rather
     /// than silently misread by the 32-byte decoder.
-    #[ktest]
     fn reject_out_of_range_desc_size() {
         for bad in [16u16, 33, 48, 64, 128] {
             let mut raw = minimal_raw(2048, 2048, 256);
@@ -1194,7 +1220,6 @@ mod tests {
     /// The `EXT4_DESC_SIZE = has_64bit ? s_desc_size : 32` gating, exercised at
     /// the parse boundary directly (the mount-level `IS_64BIT` gate rejects the
     /// feature earlier today, so the 64bit branch is only reachable here).
-    #[ktest]
     fn parse_desc_size_gating() {
         // Without 64BIT: 0 and 32 resolve to 32; anything else is rejected.
         assert_eq!(parse_desc_size(0, false).unwrap(), MIN_DESC_SIZE);
@@ -1216,7 +1241,6 @@ mod tests {
 
     /// A `flex_bg` image mounts now that `FLEX_BG` is in `INCOMPAT_SUPP` (the
     /// read side already locates bitmaps/tables through the descriptor getters).
-    #[ktest]
     fn accept_flex_bg() {
         let mut raw = minimal_raw(2048, 2048, 256);
         raw.feature_incompat |= FeatureIncompatSet::FLEX_BG.bits();
@@ -1224,12 +1248,20 @@ mod tests {
         assert!(sb.feature_incompat().contains(FeatureIncompatSet::FLEX_BG));
     }
 
+    #[ktest]
+    fn ext4_superblock_high_block_counts() {
+        crate::fs::fs_impls::ext4::test_utils::scenarios!(
+            splice_count_hi_gating,
+            reject_high_count_without_64bit,
+            accept_64bit_image,
+        );
+    }
+
     /// The `s_*_count_hi` splice boundary: the high half is honored only under
     /// `64BIT`, and a non-64bit high half is rejected rather than folded in. A
     /// genuine `> 2^32`-block image cannot be built here (the fixture's `u32`
     /// `inodes_count` cannot express that geometry), so the wide decode itself is
     /// verified at this boundary.
-    #[ktest]
     fn splice_count_hi_gating() {
         // Without 64BIT: the low half passes through; any high half is rejected.
         assert_eq!(splice_count_hi(0x1234, 0, false).unwrap(), 0x1234);
@@ -1247,7 +1279,6 @@ mod tests {
 
     /// A non-64bit image carrying a non-zero `s_blocks_count_hi` or
     /// `s_free_blocks_count_hi` is malformed and rejected at parse time.
-    #[ktest]
     fn reject_high_count_without_64bit() {
         let mut raw = minimal_raw(2048, 2048, 256);
         raw.blocks_count_hi = 1;
@@ -1267,7 +1298,6 @@ mod tests {
     /// A `64BIT` image (feature bit + `s_desc_size == 64`) mounts, records the
     /// wide descriptor size, and round-trips the (here `< 2^32`) free-block count
     /// through the u64 splice.
-    #[ktest]
     fn accept_64bit_image() {
         let mut raw = minimal_raw(2048, 2048, 256);
         raw.feature_incompat |= FeatureIncompatSet::IS_64BIT.bits();

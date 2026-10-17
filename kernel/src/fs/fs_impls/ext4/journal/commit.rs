@@ -862,6 +862,17 @@ mod tests {
         txn
     }
 
+    #[ktest]
+    fn ext4_journal_commit_descriptor_format() {
+        crate::fs::fs_impls::ext4::test_utils::scenarios!(
+            descriptor_block_v0_bytes_are_frozen,
+            descriptor_builder_64bit_round_trip,
+            descriptor_builder_csum_v3_round_trip,
+            descriptor_builder_rejects_wide_block_on_v0_layout,
+            descriptor_chain_splits_with_per_descriptor_flags,
+        );
+    }
+
     /// The v0 (feature-less) descriptor block is BIT-IDENTICAL to the
     /// pre-TagLayout writer's output — the byte freeze the whole 160×825
     /// crash-matrix baseline rides on. A transaction that fits one descriptor
@@ -869,7 +880,6 @@ mod tests {
     /// Expected bytes hardcoded from the pre-change code's layout: 12-byte
     /// header, 8-byte tag 0, 16 zero UUID bytes, 8-byte tag 1
     /// (SAME_UUID | LAST_TAG), zeros to the end.
-    #[ktest]
     fn descriptor_block_v0_bytes_are_frozen() {
         let c = [0u8; BLOCK_SIZE];
         let txn = make_txn(Tid::new(7), &[(0x123u64, c), (0x456u64, c)]);
@@ -899,7 +909,6 @@ mod tests {
 
     /// The builder emits 12-byte 64-bit tags (including a > 32-bit block
     /// number) that the shared recovery-side walker reads back verbatim.
-    #[ktest]
     fn descriptor_builder_64bit_round_trip() {
         let layout = TagLayout::from_features(INCOMPAT_64BIT).unwrap();
         let small: Ext4Bid = 0x321;
@@ -925,7 +934,6 @@ mod tests {
     /// with the escape flag surviving the round trip, every tag checksum
     /// stamped over the LOGGED (post-escape) form, and the descriptor tail
     /// sealed.
-    #[ktest]
     fn descriptor_builder_csum_v3_round_trip() {
         let layout = TagLayout::from_features(INCOMPAT_CSUM_V3 | INCOMPAT_64BIT).unwrap();
         let seed = JournalCsumSeed::for_test(b"p7a4-commit-uuid");
@@ -967,7 +975,6 @@ mod tests {
 
     /// Without 64-bit tags a > 32-bit destination block still refuses with
     /// `EFBIG` (the pre-TagLayout guard, now layout-conditional).
-    #[ktest]
     fn descriptor_builder_rejects_wide_block_on_v0_layout() {
         let c = [0u8; BLOCK_SIZE];
         let txn = make_txn(Tid::new(1), &[((1u64 << 32) | 5, c)]);
@@ -984,7 +991,6 @@ mod tests {
     /// `SAME_UUID`) and EACH descriptor's last tag sets `LAST_TAG`
     /// (fs/jbd2/commit.c:679-710 — `first_tag` resets per descriptor and the
     /// end-of-descriptor marker is written whenever one fills).
-    #[ktest]
     fn descriptor_chain_splits_with_per_descriptor_flags() {
         let layout = TagLayout::from_features(0).unwrap();
         let per_descriptor = layout.tags_per_descriptor();
@@ -1046,6 +1052,21 @@ mod tests {
     }
 
     #[ktest]
+    fn ext4_journal_commit() {
+        crate::fs::fs_impls::ext4::test_utils::scenarios!(
+            commit_single_transaction_layout,
+            commit_escapes_block_starting_with_magic,
+            commit_two_sequential_transactions,
+            commit_issues_both_barriers,
+            commit_flushes_ordered_data_to_disk,
+            commit_omits_forgotten_block_and_publishes_revoke,
+            commit_refuses_wide_revoke_on_v0_layout,
+            commit_without_ordered_data_skips_data_barrier,
+            commit_refuses_chain_crossing_uncheckpointed_tail,
+            commit_fills_wrapped_free_segment_exactly,
+        );
+    }
+
     fn commit_single_transaction_layout() {
         let f = journaled_fixture(16, 1, 1);
         let device = f.fixture.ext4.block_device();
@@ -1100,7 +1121,6 @@ mod tests {
         assert_eq!(sb.s_sequence.get(), tid.get());
     }
 
-    #[ktest]
     fn commit_escapes_block_starting_with_magic() {
         let f = journaled_fixture(16, 1, 1);
         let device = f.fixture.ext4.block_device();
@@ -1123,7 +1143,6 @@ mod tests {
         assert_eq!(&logged[4..8], b"REST");
     }
 
-    #[ktest]
     fn commit_two_sequential_transactions() {
         let f = journaled_fixture(24, 1, 1);
         let device = f.fixture.ext4.block_device();
@@ -1190,7 +1209,6 @@ mod tests {
         assert_eq!(sb.s_sequence.get(), 1);
     }
 
-    #[ktest]
     fn commit_issues_both_barriers() {
         let f = journaled_fixture(16, 1, 1);
         let device = f.fixture.ext4.block_device();
@@ -1212,7 +1230,6 @@ mod tests {
     /// The money test for ordered-data mode: a file's data reaches its final
     /// on-disk location during commit (not before), because it was registered as
     /// an ordered inode of the committed transaction.
-    #[ktest]
     fn commit_flushes_ordered_data_to_disk() {
         use super::super::super::test_utils::make_empty_file_inode;
         crate::time::clocks::init_for_ktest();
@@ -1294,7 +1311,6 @@ mod tests {
     /// chain with the freed block as its one be32 entry, the descriptor tags
     /// only the surviving capture, and the revoke is also published to the
     /// journal's committed-revoke memory at commit.
-    #[ktest]
     fn commit_omits_forgotten_block_and_publishes_revoke() {
         let f = journaled_fixture(16, 1, 1);
         let device = f.fixture.ext4.block_device();
@@ -1358,7 +1374,6 @@ mod tests {
     /// tag writer's) rather than truncating to revoke the wrong block. (The
     /// per-feature-set raw-bytes pin of the revoke serialization lives with
     /// the recovery round trips, `commit_writes_revoke_records_across_feature_sets`.)
-    #[ktest]
     fn commit_refuses_wide_revoke_on_v0_layout() {
         let f = journaled_fixture(16, 1, 1);
         let device = f.fixture.ext4.block_device();
@@ -1374,7 +1389,6 @@ mod tests {
     /// ordered inodes a commit issues the pre-commit + post-commit barriers
     /// (2), plus the superblock barrier on a clean-journal commit (3) — the
     /// ordered flush rides the pre-commit barrier instead of adding one.
-    #[ktest]
     fn commit_without_ordered_data_skips_data_barrier() {
         let f = journaled_fixture(16, 1, 1);
         let device = f.fixture.ext4.block_device();
@@ -1419,7 +1433,6 @@ mod tests {
     /// ([`CommitAttempt::NeedsLogSpace`]); after a checkpoint drains the
     /// tail, the SAME staged transaction commits (the commit thread's
     /// drain-and-retry flow, driven by hand).
-    #[ktest]
     fn commit_refuses_chain_crossing_uncheckpointed_tail() {
         crate::time::clocks::init_for_ktest();
         // maxlen 16, first 1: ring = 15.
@@ -1498,7 +1511,6 @@ mod tests {
     /// exactly fills the wrapped free segment `[head..ring end) + [first..tail)`
     /// commits — the head lands exactly ON the tail, a legally FULL ring —
     /// and the next commit is refused with zero free blocks, the tail intact.
-    #[ktest]
     fn commit_fills_wrapped_free_segment_exactly() {
         crate::time::clocks::init_for_ktest();
         // maxlen 16, first 1: ring = 15.

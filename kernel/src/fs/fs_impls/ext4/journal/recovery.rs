@@ -780,9 +780,24 @@ mod tests {
         b
     }
 
+    #[ktest]
+    fn ext4_journal_recovery_replay() {
+        crate::fs::fs_impls::ext4::test_utils::scenarios!(
+            recover_replays_committed_transaction,
+            recover_is_idempotent,
+            recover_replays_two_transactions_newest_wins,
+            recover_stops_at_interrupted_tail,
+            scan_transaction_finds_boundary,
+            recover_clean_journal_is_noop,
+            scan_transaction_rejects_wrong_sequence_commit,
+            recover_walks_past_commit_only_transaction,
+            commit_honors_log_capacity_bounds,
+            production_round_trip_replays_across_feature_sets,
+        );
+    }
+
     /// Test 1: recovery replays a single committed-but-un-checkpointed transaction
     /// to its final location and marks the journal clean.
-    #[ktest]
     fn recover_replays_committed_transaction() {
         crate::time::clocks::init_for_ktest();
         let f = journaled_fixture(16, 1, 1);
@@ -823,7 +838,6 @@ mod tests {
 
     /// Test 2: recovery is idempotent — a straight double-recover is a no-op, and
     /// re-running after a "clean-write lost" crash restores the same bytes.
-    #[ktest]
     fn recover_is_idempotent() {
         crate::time::clocks::init_for_ktest();
         let f = journaled_fixture(16, 1, 1);
@@ -864,7 +878,6 @@ mod tests {
 
     /// Test 3: two committed transactions both replay; on a shared block the newer
     /// (later-tid) one wins.
-    #[ktest]
     fn recover_replays_two_transactions_newest_wins() {
         crate::time::clocks::init_for_ktest();
         let f = journaled_fixture(24, 1, 1);
@@ -902,7 +915,6 @@ mod tests {
     /// replayed. SCAN stops at that boundary; only the fully committed prefix
     /// replays, and the clean superblock's `s_sequence` reflects "T1 committed, T2
     /// did not".
-    #[ktest]
     fn recover_stops_at_interrupted_tail() {
         crate::time::clocks::init_for_ktest();
         let f = journaled_fixture(24, 1, 1);
@@ -974,7 +986,6 @@ mod tests {
     /// A direct `scan_transaction` boundary check: a fully committed T1 scans to
     /// the next start, but the block after it (never a descriptor for tid 2) makes
     /// the following scan return `None`.
-    #[ktest]
     fn scan_transaction_finds_boundary() {
         crate::time::clocks::init_for_ktest();
         let f = journaled_fixture(24, 1, 1);
@@ -1002,7 +1013,6 @@ mod tests {
 
     /// Test 5: recovery on an already-clean journal (`s_start == 0`) is a no-op —
     /// it returns Ok and changes nothing on disk.
-    #[ktest]
     fn recover_clean_journal_is_noop() {
         crate::time::clocks::init_for_ktest();
         // A fresh fixture's journal has s_start == 0 (see `journaled_fixture`).
@@ -1027,7 +1037,6 @@ mod tests {
     /// A hand-built interrupted tail using a raw commit block corrupted in place,
     /// exercising the `scan_transaction` commit-mismatch path with a
     /// wrong-`h_sequence` commit rather than a zeroed one.
-    #[ktest]
     fn scan_transaction_rejects_wrong_sequence_commit() {
         crate::time::clocks::init_for_ktest();
         let f = journaled_fixture(24, 1, 1);
@@ -1066,7 +1075,6 @@ mod tests {
     /// block (jbd2 `do_one_pass` seals on any same-tid commit block), and
     /// treating it as a boundary would silently under-replay everything
     /// after it. Recovery walks past it to the following transaction.
-    #[ktest]
     fn recover_walks_past_commit_only_transaction() {
         crate::time::clocks::init_for_ktest();
         let f = journaled_fixture(24, 1, 1);
@@ -1120,12 +1128,25 @@ mod tests {
     // records PASS_REVOKE collects. The a5-era refusal of any valid-magic
     // revoke block is retired — nothing refuses anymore. ---
 
+    #[ktest]
+    fn ext4_journal_recovery_revoke() {
+        crate::fs::fs_impls::ext4::test_utils::scenarios!(
+            scan_treats_garbage_magic_revoke_bytes_as_boundary,
+            recover_stops_at_garbage_magic_revoke_bytes_mid_chain,
+            scan_walks_same_tid_revoke_and_bounds_at_stale_tid,
+            commit_writes_revoke_records_across_feature_sets,
+            recovery_suppresses_revoked_block_replay,
+            recovery_replays_image_newer_than_revoke,
+            scan_defers_torn_revoke_tail_to_the_seal,
+            recover_replays_wrap_spanning_chain_with_revoke_blocks,
+        );
+    }
+
     /// A boundary slot whose STALE bytes happen to read [`BLOCKTYPE_REVOKE`]
     /// — garbage magic, type word 5 — is the ordinary log boundary, never a
     /// revoke refusal: jbd2 breaks on bad magic before dispatching on the
     /// type (recovery.c:545-548). Refusing here would brick the mount on
     /// leftover noise after a ring wrap.
-    #[ktest]
     fn scan_treats_garbage_magic_revoke_bytes_as_boundary() {
         crate::time::clocks::init_for_ktest();
         let f = journaled_fixture(16, 1, 1);
@@ -1165,7 +1186,6 @@ mod tests {
     /// position — the slot where T2's commit block never landed — are the
     /// interrupted-commit boundary: the committed prefix replays and the
     /// mount survives, exactly as with a zeroed torn slot.
-    #[ktest]
     fn recover_stops_at_garbage_magic_revoke_bytes_mid_chain() {
         crate::time::clocks::init_for_ktest();
         let f = journaled_fixture(24, 1, 1);
@@ -1212,7 +1232,6 @@ mod tests {
     ///   sequence check precedes the type dispatch (recovery.c:555-558) — so
     ///   a foreign (Linux-written, previous-wrap) revoke leftover no longer
     ///   bricks the mount; recovery ends there and cleans up normally.
-    #[ktest]
     fn scan_walks_same_tid_revoke_and_bounds_at_stale_tid() {
         crate::time::clocks::init_for_ktest();
         let f = journaled_fixture(16, 1, 1);
@@ -1278,7 +1297,6 @@ mod tests {
     /// `r_count` counts bytes including the 16-byte header (revoke.c:655),
     /// the block bears the transaction's tid, and on a csum layout the tail
     /// checksum verifies under the journal's seed.
-    #[ktest]
     fn commit_writes_revoke_records_across_feature_sets() {
         crate::time::clocks::init_for_ktest();
         for features in [0, INCOMPAT_CSUM_V3, INCOMPAT_CSUM_V3 | INCOMPAT_64BIT] {
@@ -1345,7 +1363,6 @@ mod tests {
     /// NEW content across crash-recovery: PASS_REVOKE's record `(B, 2)`
     /// suppresses T1's stale image, while T1's un-revoked sibling and T2's
     /// own capture still replay. Run per admitted feature set.
-    #[ktest]
     fn recovery_suppresses_revoked_block_replay() {
         crate::time::clocks::init_for_ktest();
         for features in [0, INCOMPAT_CSUM_V3, INCOMPAT_CSUM_V3 | INCOMPAT_64BIT] {
@@ -1402,7 +1419,6 @@ mod tests {
     /// replayed"* (revoke.c; `jbd2_journal_test_revoke`, recovery.c:632-636).
     /// T1 journals B, T2 revokes it, T3 re-journals it: recovery lands T3's
     /// image (tid 3 > tid_r 2), never T1's.
-    #[ktest]
     fn recovery_replays_image_newer_than_revoke() {
         crate::time::clocks::init_for_ktest();
         let f = journaled_fixture(24, 1, 1);
@@ -1430,13 +1446,23 @@ mod tests {
         assert_eq!(sb.s_sequence.get(), 4);
     }
 
+    #[ktest]
+    fn ext4_journal_recovery_multi_descriptor() {
+        crate::fs::fs_impls::ext4::test_utils::scenarios!(
+            recovery_honors_multi_block_revoke_set,
+            production_round_trip_replays_multi_descriptor_chain,
+            recover_replays_wrap_spanning_multi_descriptor_chain,
+            scan_walks_real_linux_multi_descriptor_chain,
+            recover_replays_multi_descriptor_transaction,
+        );
+    }
+
     /// A revoke set larger than one block's entry capacity splits across
     /// revoke blocks (Linux flushes and starts a fresh descriptor at the
     /// space bound, revoke.c:602-607), pinned on the raw bytes — the first
     /// block completely full (v0: r_count = 16 + 1020·4 = 4096, the exact
     /// `j_blocksize` bound) — and PASS_REVOKE honors records from BOTH
     /// blocks: doomed blocks landing in either are suppressed.
-    #[ktest]
     fn recovery_honors_multi_block_revoke_set() {
         crate::time::clocks::init_for_ktest();
         let f = journaled_fixture(24, 1, 1);
@@ -1520,7 +1546,6 @@ mod tests {
     /// like a torn descriptor: bad tail checksum in a SEALED transaction →
     /// `EUCLEAN` (nothing applied, journal left dirty); with the commit torn
     /// away → the ordinary boundary.
-    #[ktest]
     fn scan_defers_torn_revoke_tail_to_the_seal() {
         crate::time::clocks::init_for_ktest();
         let f = csum_journaled_fixture(24, 1, 7);
@@ -1560,7 +1585,6 @@ mod tests {
     /// two revoke blocks (a split set), two descriptors, 256 after-images —
     /// wraps the ring end walks identically through SCAN, PASS_REVOKE, and
     /// REPLAY (same cursor arithmetic), and its revokes still suppress.
-    #[ktest]
     fn recover_replays_wrap_spanning_chain_with_revoke_blocks() {
         crate::time::clocks::init_for_ktest();
         let f = csum_journaled_fixture(300, 1, 1);
@@ -1696,7 +1720,6 @@ mod tests {
     /// and (on csum layouts) its own verifying tail checksum — then recovers
     /// and checks every after-image (escape restored) plus the clean
     /// superblock.
-    #[ktest]
     fn production_round_trip_replays_multi_descriptor_chain() {
         crate::time::clocks::init_for_ktest();
         for features in [0, INCOMPAT_CSUM_V3, INCOMPAT_CSUM_V3 | INCOMPAT_64BIT] {
@@ -1790,7 +1813,6 @@ mod tests {
     /// A multi-descriptor transaction whose chain WRAPS the log ring round
     /// trips: committed with the head near the end of the ring, recovered
     /// across the wrap.
-    #[ktest]
     fn recover_replays_wrap_spanning_multi_descriptor_chain() {
         crate::time::clocks::init_for_ktest();
         let f = csum_journaled_fixture(300, 1, 1);
@@ -1832,12 +1854,28 @@ mod tests {
         assert_eq!(sb.s_sequence.get(), 3);
     }
 
+    #[ktest]
+    fn ext4_journal_recovery_checksum_integrity() {
+        crate::fs::fs_impls::ext4::test_utils::scenarios!(
+            scan_refuses_bad_tail_csum_in_second_descriptor,
+            apply_skips_csum_bad_block_under_second_descriptor,
+            scan_seals_only_with_valid_commit_csum,
+            scan_defers_descriptor_csum_verdict_to_the_seal,
+            apply_rejects_descriptor_csum_mismatch,
+            apply_skips_csum_bad_block_and_fails,
+            recover_replays_own_stamped_csum_v3_log,
+            recover_applies_prefix_then_refuses_corrupt_second_transaction,
+            recover_refuses_corrupt_csum_log,
+            recovery_refuses_one_byte_corruption_per_csum_feature_set,
+            superblock_restamped_at_every_serialization_site,
+        );
+    }
+
     /// A bad tail checksum in descriptor #2 of a SEALED chain refuses the
     /// whole transaction (`EUCLEAN`) with NOTHING applied — transaction
     /// atomicity holds at the chain level, never per descriptor. With the
     /// commit torn away instead, the same corruption is the ordinary
     /// boundary (the a3 deferral, accumulated across the chain).
-    #[ktest]
     fn scan_refuses_bad_tail_csum_in_second_descriptor() {
         crate::time::clocks::init_for_ktest();
         let f = csum_journaled_fixture(300, 1, 7);
@@ -1881,7 +1919,6 @@ mod tests {
     /// skips the corrupt block, still applies every intact one — across BOTH
     /// descriptors — and the recovery fails (`EUCLEAN`), leaving the journal
     /// dirty.
-    #[ktest]
     fn apply_skips_csum_bad_block_under_second_descriptor() {
         crate::time::clocks::init_for_ktest();
         let f = csum_journaled_fixture(300, 1, 7);
@@ -1921,7 +1958,6 @@ mod tests {
     /// exact footprint fits the ring), and one whose footprint exceeds the
     /// ring is refused up front (`ENOSPC`) with nothing written — the
     /// commit-side fit guard behind `journal_start`'s conservative bound.
-    #[ktest]
     fn commit_honors_log_capacity_bounds() {
         crate::time::clocks::init_for_ktest();
 
@@ -1996,7 +2032,6 @@ mod tests {
     /// none); the REPLAY side of the chain walk is pinned by the synthetic
     /// production round trips above, and the full real-image replay proof is
     /// the P7a-6 guest interop gate.
-    #[ktest]
     fn scan_walks_real_linux_multi_descriptor_chain() {
         use super::super::interop_vectors::{
             GATE3_COMMIT, GATE3_COMMIT_LOG, GATE3_DESC_LOGS, GATE3_DESC_NTAGS, GATE3_DESC1,
@@ -2164,7 +2199,6 @@ mod tests {
     /// whose checksum does not REFUSES (`EUCLEAN` — jbd2's sync-commit
     /// `j_failed_commit` path, never a silent boundary); a zeroed commit slot
     /// stays the ordinary torn-tail boundary.
-    #[ktest]
     fn scan_seals_only_with_valid_commit_csum() {
         crate::time::clocks::init_for_ktest();
         let f = csum_journaled_fixture(24, 1, 7);
@@ -2200,7 +2234,6 @@ mod tests {
     /// (jbd2's `need_check_commit_time` deferral): sealed by a valid commit →
     /// real corruption, `EUCLEAN`; with the commit torn away → the ordinary
     /// boundary (the tear hit the descriptor itself).
-    #[ktest]
     fn scan_defers_descriptor_csum_verdict_to_the_seal() {
         crate::time::clocks::init_for_ktest();
         let f = csum_journaled_fixture(24, 1, 7);
@@ -2230,7 +2263,6 @@ mod tests {
     /// REPLAY rejects a descriptor whose tail checksum mismatches, before any
     /// tag is applied (jbd2 hard-errors with `-EFSBADCRC` in any pass but
     /// SCAN).
-    #[ktest]
     fn apply_rejects_descriptor_csum_mismatch() {
         crate::time::clocks::init_for_ktest();
         let f = csum_journaled_fixture(24, 1, 7);
@@ -2261,7 +2293,6 @@ mod tests {
     /// skip-and-record shape: the corrupt block is never applied, the intact
     /// sibling still lands, and the apply as a whole fails (`EUCLEAN` — the
     /// mount is refused, exactly as Linux's recovery error refuses it).
-    #[ktest]
     fn apply_skips_csum_bad_block_and_fails() {
         crate::time::clocks::init_for_ktest();
         let f = csum_journaled_fixture(24, 1, 7);
@@ -2298,7 +2329,6 @@ mod tests {
     /// tags, the descriptor tail, the commit block, and the dirty superblock
     /// — and `recover` verifies and replays it, leaving a clean superblock
     /// whose restamped checksum verifies.
-    #[ktest]
     fn recover_replays_own_stamped_csum_v3_log() {
         crate::time::clocks::init_for_ktest();
         let f = csum_journaled_fixture(24, 1, 7);
@@ -2335,7 +2365,6 @@ mod tests {
     /// for a repair tool, never a clean-marked under-replay. Re-running
     /// recovery is idempotent: the same prefix replays to the same bytes and
     /// the same refusal follows.
-    #[ktest]
     fn recover_applies_prefix_then_refuses_corrupt_second_transaction() {
         crate::time::clocks::init_for_ktest();
         let f = csum_journaled_fixture(24, 1, 7);
@@ -2378,7 +2407,6 @@ mod tests {
     /// the mount) — SCAN still seals the transaction (it does not read data
     /// blocks, matching Linux), REPLAY's tag verification catches it, and
     /// the journal is left dirty, never silently under-replayed.
-    #[ktest]
     fn recover_refuses_corrupt_csum_log() {
         crate::time::clocks::init_for_ktest();
         let f = csum_journaled_fixture(24, 1, 7);
@@ -2410,7 +2438,6 @@ mod tests {
     /// Each transaction includes an ESCAPED block, so the
     /// stamped-over-logged-form contract is exercised end to end, and the
     /// clean superblock's checksum matches its features.
-    #[ktest]
     fn production_round_trip_replays_across_feature_sets() {
         crate::time::clocks::init_for_ktest();
         for features in [
@@ -2473,7 +2500,6 @@ mod tests {
     /// (`EUCLEAN`, per the a3 politics), for every csum feature set the
     /// production writer stamps. The final location stays untouched and the
     /// journal stays dirty.
-    #[ktest]
     fn recovery_refuses_one_byte_corruption_per_csum_feature_set() {
         crate::time::clocks::init_for_ktest();
         // (log block to corrupt, byte offset within it): the logged data
@@ -2522,7 +2548,6 @@ mod tests {
     /// checkpoint clean rewrite, and the unmount flush (commit + checkpoint
     /// driven through `flush_on_unmount`). Recovery's clean rewrite is
     /// covered by `recover_replays_own_stamped_csum_v3_log`.
-    #[ktest]
     fn superblock_restamped_at_every_serialization_site() {
         crate::time::clocks::init_for_ktest();
         let f = csum_journaled_fixture(24, 1, 1);
@@ -2562,7 +2587,6 @@ mod tests {
     /// walks the whole chain as one tid and replays every block. This is
     /// the writer+recovery same-batch pairing the `multi-descriptor-replay`
     /// ledger row asks for.
-    #[ktest]
     fn recover_replays_multi_descriptor_transaction() {
         crate::time::clocks::init_for_ktest();
         // 1024 log blocks: the 603-block chain (desc + 508 data + desc +

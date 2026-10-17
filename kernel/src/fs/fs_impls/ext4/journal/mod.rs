@@ -1842,25 +1842,30 @@ impl Journal {
         Tid::new(self.committed_tid.load(Ordering::Acquire))
     }
 
-    /// Snapshots the pinned freed runs as `(first block, count)` pairs — the
-    /// allocator's skip set (see [`JournalState::pinned_frees`]).
-    ///
-    /// Taken once per allocation, under a transient state-lock hold. The
-    /// journal state lock is a leaf of the filesystem's lock order (the
-    /// capture funnels already take it under the superblock and group locks,
-    /// and nothing acquires a filesystem lock while holding it), so reading
-    /// here from `Ext4::alloc_blocks` — which holds the superblock write lock
-    /// — adds no edge. The snapshot cannot miss a pin: insertion
-    /// ([`pin_freed_run`]) runs inside `Ext4::free_blocks`, which needs the
-    /// same superblock write lock the allocator is holding. It can only be
-    /// conservatively stale the other way — a release (commit step 6) landing
-    /// mid-scan merely leaves a just-unpinned block skipped for this attempt.
+    /// Snapshots the allocator's skip set under the journal leaf lock.
+    /// The caller must hold the target group's allocation gate, also held
+    /// across free bitmap-clear + pin registration. A concurrent commit can
+    /// only make this snapshot conservative by retiring pins after it is read.
     pub(in crate::fs::fs_impls::ext4) fn pinned_frees_snapshot(&self) -> Vec<(Ext4Bid, u32)> {
         self.state_read()
             .pinned_frees
             .iter()
             .map(|(&start, run)| (start, run.count))
             .collect()
+    }
+
+    /// Counts the union, including conservatively overlapping double-free pins.
+    /// Called under the short capacity lock; journal remains a leaf lock.
+    pub(in crate::fs::fs_impls::ext4) fn pinned_free_blocks(&self) -> u64 {
+        let state = self.state_read();
+        let mut end = 0;
+        let mut count = 0;
+        for (&start, run) in &state.pinned_frees {
+            let next = start.saturating_add(run.count as u64);
+            count += next.saturating_sub(start.max(end));
+            end = end.max(next);
+        }
+        count
     }
 
     /// Whether any freed run is pinned awaiting its freeing transaction's
@@ -3387,9 +3392,9 @@ pub(super) fn reserve_capture_burst(handle: Option<&Handle>, extra: usize) -> Re
 /// [`JournalState::release_pinned_frees`] releases it at commit step 6).
 ///
 /// Called by `Ext4::free_blocks` for each contiguous per-group run it clears,
-/// right after that run's bitmap clear, under the same superblock write lock
-/// — which is what makes "clear the bits, then pin" atomic against the
-/// allocator (it needs that lock too). Applies to **both** [`BlockFreeAuth`]
+/// right after that run's bitmap clear, under the same group allocation gate
+/// — which makes "clear the bits, then pin" atomic against an allocator's
+/// fresh pin snapshot for that group. Applies to **both** [`BlockFreeAuth`]
 /// flavors: a revoke-duty free's old *journaled* image survives in the
 /// un-retired log, and even a plain-data free is not durable until the
 /// commit — reusing either early hands the block to a new owner whose bytes
@@ -3769,6 +3774,16 @@ mod tests {
     }
 
     #[ktest]
+    fn ext4_journal_geometry_admission() {
+        crate::fs::fs_impls::ext4::test_utils::scenarios!(
+            load_geometry_end_to_end,
+            load_geometry_admission_matches_supp_set,
+            load_geometry_refuses_journal_ro_compat_bits,
+            load_geometry_admits_v1_journal_regardless_of_feature_bits,
+            load_geometry_without_journal_is_none,
+        );
+    }
+
     fn load_geometry_end_to_end() {
         let f = Ext4FixtureBuilder::new(2048, 256, 2048)
             .with_block_bitmap_metadata_marked()
@@ -3812,7 +3827,6 @@ mod tests {
     /// stamped-and-verified feature combination (64bit, csum v2/v3, ±64bit,
     /// revoke) is admitted, while async commit, fast commit, and the
     /// contradictory csum_v2+csum_v3 pair stay refused with `EINVAL`.
-    #[ktest]
     fn load_geometry_admission_matches_supp_set() {
         use super::format::{
             INCOMPAT_ASYNC_COMMIT, INCOMPAT_CSUM_V2, INCOMPAT_FAST_COMMIT, INCOMPAT_REVOKE,
@@ -3877,7 +3891,6 @@ mod tests {
     /// unknown ro_compat bit at load (fs/jbd2/journal.c:1382-1388) and
     /// `JBD2_KNOWN_ROCOMPAT_FEATURES` is empty in 6.6 — there is no "mount
     /// read-only instead" fallback, and this port always mounts read-write.
-    #[ktest]
     fn load_geometry_refuses_journal_ro_compat_bits() {
         let f = Ext4FixtureBuilder::new(2048, 256, 2048)
             .with_block_bitmap_metadata_marked()
@@ -3906,7 +3919,6 @@ mod tests {
     /// test), so admission ignores them entirely: bits that refuse a V2
     /// journal two ways over — an unadmitted INCOMPAT (fast commit) and a
     /// set ro_compat word — load fine on a V1 and parse as featureless v0.
-    #[ktest]
     fn load_geometry_admits_v1_journal_regardless_of_feature_bits() {
         let f = Ext4FixtureBuilder::new(2048, 256, 2048)
             .with_block_bitmap_metadata_marked()
@@ -3932,7 +3944,6 @@ mod tests {
         assert!(geo.csum_seed().is_none());
     }
 
-    #[ktest]
     fn load_geometry_without_journal_is_none() {
         // Same fixture but without the HAS_JOURNAL compat bit.
         let f = Ext4FixtureBuilder::new(2048, 256, 2048)
@@ -4005,6 +4016,10 @@ mod tests {
     }
 
     #[ktest]
+    fn ext4_journal_transaction_ids() {
+        crate::fs::fs_impls::ext4::test_utils::scenarios!(tid_geq_wrapping, tid_next_prev_wrap,);
+    }
+
     fn tid_geq_wrapping() {
         // Simple ordering.
         assert!(Tid::new(1).geq(Tid::new(0)));
@@ -4017,7 +4032,6 @@ mod tests {
 
     /// The successor/predecessor helpers wrap at the `u32` boundary, matching
     /// the wrapping arithmetic the raw tids used.
-    #[ktest]
     fn tid_next_prev_wrap() {
         assert_eq!(Tid::new(1).next(), Tid::new(2));
         assert_eq!(Tid::new(2).prev(), Tid::new(1));
@@ -4028,9 +4042,17 @@ mod tests {
         assert!(Tid::new(u32::MAX).next().geq(Tid::new(u32::MAX)));
     }
 
+    #[ktest]
+    fn ext4_journal_thread_lifecycle() {
+        crate::fs::fs_impls::ext4::test_utils::scenarios!(
+            commit_thread_end_to_end,
+            revoke_or_pin_only_transaction_is_committable,
+            teardown_with_no_work_is_prompt,
+        );
+    }
+
     /// The money test: a full commit driven by the background thread, waited on
     /// via `log_wait_commit`, then a clean teardown.
-    #[ktest]
     fn commit_thread_end_to_end() {
         crate::time::clocks::init_for_ktest();
 
@@ -4075,6 +4097,18 @@ mod tests {
         f.journal.stop_commit_thread();
     }
 
+    #[ktest]
+    fn ext4_journal_admission_and_pipeline() {
+        crate::fs::fs_impls::ext4::test_utils::scenarios!(
+            nested_op_handle_on_one_task_is_rejected,
+            new_running_transaction_starts_while_committing_is_in_flight,
+            commit_phase_advance_guards_pipeline_order,
+            committer_waits_out_an_occupied_slot_instead_of_spinning,
+            due_transaction_with_open_handles_parks_drains_and_stages,
+            journal_start_blocks_at_the_locked_barrier,
+        );
+    }
+
     /// The nested-`begin_op` guard (c2 hardening): a task holding an operation
     /// handle that opens a second one gets an immediate `EDEADLK` instead of the
     /// self-deadlock (the nested `journal_start` would park on a barrier only
@@ -4084,7 +4118,6 @@ mod tests {
     /// [`journal_start`] primitive stays unguarded (this drives `OpHandle`, the
     /// operation boundary, deliberately), so the transaction-sharing tests keep
     /// working.
-    #[ktest]
     fn nested_op_handle_on_one_task_is_rejected() {
         let f = journaled_fixture(16, 1, 1);
 
@@ -4110,7 +4143,6 @@ mod tests {
     /// counts the obligation set structurally. Constructed synthetically because
     /// `Ext4::free_blocks` always captures the group bitmap, so no real path
     /// reaches zero captures with a live obligation.
-    #[ktest]
     fn revoke_or_pin_only_transaction_is_committable() {
         let f = journaled_fixture(64, 1, 1);
         let handle = journal_start(&f.journal, 4).unwrap();
@@ -4156,9 +4188,16 @@ mod tests {
         journal_stop(handle).unwrap();
     }
 
+    #[ktest]
+    fn ext4_journal_commit_wait() {
+        crate::fs::fs_impls::ext4::test_utils::scenarios!(
+            log_wait_commit_returns_when_already_committed,
+            log_wait_commit_returns_for_earlier_tid_while_successor_runs,
+        );
+    }
+
     /// `log_wait_commit` returns immediately for an already-committed tid, without
     /// requesting another commit or hanging.
-    #[ktest]
     fn log_wait_commit_returns_when_already_committed() {
         crate::time::clocks::init_for_ktest();
 
@@ -4188,7 +4227,6 @@ mod tests {
 
     /// Starting then immediately stopping the commit thread, with no work to do,
     /// returns promptly: the idle thread is woken by the stop and exits.
-    #[ktest]
     fn teardown_with_no_work_is_prompt() {
         let f = journaled_fixture(16, 1, 1);
         f.journal.start_commit_thread();
@@ -4203,10 +4241,24 @@ mod tests {
     /// A physical block used to exercise capture, clear of the log region.
     const CAPTURE_BLOCK: Ext4Bid = 300;
 
+    #[ktest]
+    fn ext4_journal_metadata_funnel() {
+        crate::fs::fs_impls::ext4::test_utils::scenarios!(
+            funnel_write_access_seeds_from_device_then_patches,
+            funnel_create_access_zeroes_and_accumulates,
+            funnel_without_handle_is_inert,
+            apply_patch_without_capture_errors_defensively,
+            capture_after_commit_seeds_from_uncheckpointed_image,
+            capture_after_checkpoint_seeds_from_device_again,
+            forget_evicts_uncheckpointed_image_and_recapture_cancels,
+            stale_write_access_across_recapture_fails,
+            capture_while_committing_seeds_from_its_stashed_image,
+        );
+    }
+
     /// `get_write_access` seeds the after-image from the device, then
     /// `dirty_metadata` patches it in place (the sub-block RMW pattern): the
     /// seeded device bytes survive everywhere the patch does not touch.
-    #[ktest]
     fn funnel_write_access_seeds_from_device_then_patches() {
         let f = journaled_fixture(16, 1, 1);
 
@@ -4248,7 +4300,6 @@ mod tests {
     /// `get_create_access` seeds a *zeroed* after-image (the device content is
     /// ignored), and repeated `dirty_metadata` patches on the same block
     /// accumulate onto that one buffer.
-    #[ktest]
     fn funnel_create_access_zeroes_and_accumulates() {
         let f = journaled_fixture(16, 1, 1);
 
@@ -4285,7 +4336,6 @@ mod tests {
 
     /// Without a handle the funnels are inert: no transaction is created and the
     /// `dirty_metadata` patch is never invoked (Phases 1–3 behaviour).
-    #[ktest]
     fn funnel_without_handle_is_inert() {
         let f = journaled_fixture(16, 1, 1);
 
@@ -4304,7 +4354,6 @@ mod tests {
     /// Patch-without-capture is unrepresentable through [`WriteAccess`] (the
     /// old free `dirty_metadata` could be called without a prior access); the
     /// transaction-level defensive check underneath still errors if reached.
-    #[ktest]
     fn apply_patch_without_capture_errors_defensively() {
         let f = journaled_fixture(16, 1, 1);
         let handle = journal_start(&f.journal, 4).unwrap();
@@ -4326,11 +4375,20 @@ mod tests {
 
     // --- Int-B B2.1: commit/checkpoint triggering (unmount flush). ---
 
+    #[ktest]
+    fn ext4_journal_flush_on_unmount() {
+        crate::fs::fs_impls::ext4::test_utils::scenarios!(
+            flush_on_unmount_commits_running_and_cleans_journal,
+            flush_on_unmount_with_no_work_is_noop,
+            flush_on_unmount_on_aborted_journal_writes_nothing,
+            flush_on_unmount_commits_the_parked_transaction,
+        );
+    }
+
     /// `flush_on_unmount` commits the running transaction and checkpoints it, so
     /// the after-image reaches its final location and the on-disk journal is left
     /// clean (`s_start == 0`). Driven synchronously here (no commit thread), the
     /// deterministic mirror of the unmount path.
-    #[ktest]
     fn flush_on_unmount_commits_running_and_cleans_journal() {
         crate::time::clocks::init_for_ktest();
         let f = journaled_fixture(16, 1, 1);
@@ -4372,7 +4430,6 @@ mod tests {
 
     /// `flush_on_unmount` on a journal that never ran a transaction is a clean
     /// no-op (nothing captured, tail already clean).
-    #[ktest]
     fn flush_on_unmount_with_no_work_is_noop() {
         crate::time::clocks::init_for_ktest();
         let f = journaled_fixture(16, 1, 1);
@@ -4386,7 +4443,6 @@ mod tests {
     /// publish a recoverable successor of the transaction the abort lost;
     /// the untouched dirty log is what the next mount safely replays
     /// (committed-before-abort transactions only).
-    #[ktest]
     fn flush_on_unmount_on_aborted_journal_writes_nothing() {
         crate::time::clocks::init_for_ktest();
         let f = journaled_fixture(16, 1, 1);
@@ -4426,11 +4482,15 @@ mod tests {
     // --- a5 review MAJOR 2: the free-segment fit bound and its abort
     // fallback. ---
 
+    #[ktest]
+    fn ext4_journal_ring_capacity() {
+        crate::fs::fs_impls::ext4::test_utils::scenarios!(free_log_blocks_ring_distance,);
+    }
+
     /// The free-segment ring distance ([`JournalGeometry::free_log_blocks`]):
     /// a clean ring frees the whole usable ring; a dirty ring frees the
     /// distance from the head forward to the tail, across the wrap; and
     /// `head == tail` on a dirty ring is FULL (0), never the ring size.
-    #[ktest]
     fn free_log_blocks_ring_distance() {
         // maxlen 16, first 1: ring = 15, positions in [1, 16).
         let f = journaled_fixture(16, 1, 1);
@@ -4453,6 +4513,14 @@ mod tests {
         assert_eq!(geo.free_log_blocks(7, Some(7)), 0);
     }
 
+    #[ktest]
+    fn ext4_journal_abort() {
+        crate::fs::fs_impls::ext4::test_utils::scenarios!(
+            commit_aborts_when_tail_cannot_drain,
+            abort_stops_age_timer_from_committing_poisoned_txn,
+        );
+    }
+
     /// The abort half of the fit bound: when a commit does not fit the free
     /// segment AND the inline tail drain fails, the commit thread ABORTS the
     /// journal rather than overwrite the un-checkpointed tail — those log
@@ -4461,7 +4529,6 @@ mod tests {
     /// injection exists for checkpoint writes; the drain failure is driven by
     /// corrupting the tail transaction's on-disk descriptor magic, which
     /// `apply_log_transaction` refuses with `EUCLEAN`.)
-    #[ktest]
     fn commit_aborts_when_tail_cannot_drain() {
         crate::time::clocks::init_for_ktest();
         // maxlen 16, first 1: ring = 15.
@@ -4576,7 +4643,6 @@ mod tests {
     /// `advance_pipeline` refuses. The coda then runs the REAL commit thread over
     /// the same aborted+expired journal to prove it parks (arms no age timeout)
     /// and tears down without committing or hanging.
-    #[ktest]
     fn abort_stops_age_timer_from_committing_poisoned_txn() {
         crate::time::clocks::init_for_ktest();
         let f = journaled_fixture(16, 1, 1);
@@ -4662,7 +4728,6 @@ mod tests {
     /// seed comes from the device (stale: txn 1 not applied yet), txn 2's
     /// after-image resurrects the pre-txn-1 bytes and — checkpoint applying in
     /// tid order, newest last — clobbers txn 1's write at the final location.
-    #[ktest]
     fn capture_after_commit_seeds_from_uncheckpointed_image() {
         crate::time::clocks::init_for_ktest();
         let f = journaled_fixture(16, 1, 1);
@@ -4722,7 +4787,6 @@ mod tests {
     /// now up to date — is the seed source again: a doctored device byte shows up
     /// in the next capture (proving the fallback), and the stash does not grow
     /// without bound.
-    #[ktest]
     fn capture_after_checkpoint_seeds_from_device_again() {
         crate::time::clocks::init_for_ktest();
         let f = journaled_fixture(16, 1, 1);
@@ -4790,7 +4854,6 @@ mod tests {
     /// through the production funnels: re-capturing the forgotten block in
     /// the same running transaction cancels its revoke record
     /// (`jbd2_journal_cancel_revoke`).
-    #[ktest]
     fn forget_evicts_uncheckpointed_image_and_recapture_cancels() {
         crate::time::clocks::init_for_ktest();
         let f = journaled_fixture(16, 1, 1);
@@ -4858,7 +4921,6 @@ mod tests {
     /// old credential's patch must fail `EIO` (capture-generation mismatch)
     /// instead of writing the old owner's bytes into the new owner's image.
     /// The fresh credential works.
-    #[ktest]
     fn stale_write_access_across_recapture_fails() {
         crate::time::clocks::init_for_ktest();
         let f = journaled_fixture(16, 1, 1);
@@ -4909,7 +4971,6 @@ mod tests {
     /// slot (mid-flight, `Locked`), `journal_start` opens a NEW running
     /// transaction with the next tid — without consulting or waiting on the
     /// slot — and it accepts captures; finishing T1 leaves T2 untouched.
-    #[ktest]
     fn new_running_transaction_starts_while_committing_is_in_flight() {
         crate::time::clocks::init_for_ktest();
         let f = journaled_fixture(16, 1, 1);
@@ -4961,7 +5022,6 @@ mod tests {
     /// in the new running T2 seeds from T1's stashed image, and the metadata
     /// read funnel serves it; the end-to-end result carries both writers'
     /// bytes.
-    #[ktest]
     fn capture_while_committing_seeds_from_its_stashed_image() {
         crate::time::clocks::init_for_ktest();
         let f = journaled_fixture(16, 1, 1);
@@ -5021,7 +5081,6 @@ mod tests {
     /// The phase machine's guards: a skipped station and a wrong tid are
     /// refused with `EIO` (phase intact), the legal single-step walk goes
     /// through, and `Finished` is terminal.
-    #[ktest]
     fn commit_phase_advance_guards_pipeline_order() {
         crate::time::clocks::init_for_ktest();
         let f = journaled_fixture(16, 1, 1);
@@ -5079,7 +5138,6 @@ mod tests {
     /// Commits stay strictly serial under the pipeline (one slot), so
     /// waiting on an already-committed tid returns immediately even while a
     /// successor transaction is running with live captures.
-    #[ktest]
     fn log_wait_commit_returns_for_earlier_tid_while_successor_runs() {
         crate::time::clocks::init_for_ktest();
         let f = journaled_fixture(16, 1, 1);
@@ -5105,6 +5163,16 @@ mod tests {
         journal_stop(h2).unwrap();
     }
 
+    #[ktest]
+    fn ext4_journal_sync_probe() {
+        crate::fs::fs_impls::ext4::test_utils::scenarios!(
+            sync_probe_targets_the_committing_slot,
+            sync_probe_on_empty_journal_is_trivially_durable,
+            sync_probe_targets_a_revoke_or_pin_only_running_transaction,
+            sync_probe_targets_the_locking_seat,
+        );
+    }
+
     /// `sync(2)`'s durability probe covers the committing slot,
     /// deterministically (the earlier threaded form let the finisher outrun
     /// the probe on SMP and degrade to the empty-journal path while still
@@ -5115,7 +5183,6 @@ mod tests {
     /// production probe returns without waiting. (The wait primitive itself
     /// — blocking until `committed_tid` reaches the target — is covered by
     /// `commit_thread_end_to_end`.)
-    #[ktest]
     fn sync_probe_targets_the_committing_slot() {
         crate::time::clocks::init_for_ktest();
         let f = journaled_fixture(16, 1, 1);
@@ -5147,7 +5214,6 @@ mod tests {
     /// The probe's empty path, split from the occupied-slot case: nothing
     /// running and nothing committing (and no abort) is trivially durable —
     /// `sync(2)` returns at once, with no tid to wait on.
-    #[ktest]
     fn sync_probe_on_empty_journal_is_trivially_durable() {
         crate::time::clocks::init_for_ktest();
         let f = journaled_fixture(16, 1, 1);
@@ -5167,7 +5233,6 @@ mod tests {
     /// case is latent-only today — `free_blocks` captures the group bitmap
     /// before it pins/revokes — so this uses a synthetic obligation, mirroring
     /// `revoke_or_pin_only_transaction_is_committable`.)
-    #[ktest]
     fn sync_probe_targets_a_revoke_or_pin_only_running_transaction() {
         crate::time::clocks::init_for_ktest();
         let f = journaled_fixture(16, 1, 1);
@@ -5218,7 +5283,6 @@ mod tests {
     /// is the only production stager while running and retires its own
     /// stage before re-polling — so this pins the defensive shape, not a
     /// reachable livelock.
-    #[ktest]
     fn committer_waits_out_an_occupied_slot_instead_of_spinning() {
         crate::time::clocks::init_for_ktest();
         let f = journaled_fixture(16, 1, 1);
@@ -5283,12 +5347,20 @@ mod tests {
             .unwrap();
     }
 
+    #[ktest]
+    fn ext4_journal_feature_upgrade() {
+        crate::fs::fs_impls::ext4::test_utils::scenarios!(
+            upgrade_stamps_csum_v3_on_featureless_journal,
+            upgrade_adds_64bit_iff_fs_is_64bit,
+            upgrade_honors_journal_per_policy_table,
+        );
+    }
+
     /// D-4 upgrade, the acting row: a metadata_csum fs over a featureless
     /// clean journal flips it to csum_v3 (+64bit iff the fs is 64bit), names
     /// crc32c, and stamps a valid `s_checksum` — and the rewritten superblock
     /// re-parses through the production `load_geometry` with the new tag
     /// layout and a seed, exactly the reload the mount performs.
-    #[ktest]
     fn upgrade_stamps_csum_v3_on_featureless_journal() {
         let f = journaled_fixture(16, 1, 1);
         assert_eq!(read_fixture_journal_super(&f).s_feature_incompat.get(), 0);
@@ -5321,7 +5393,6 @@ mod tests {
 
     /// D-4 upgrade on a 64bit fs adds `INCOMPAT_64BIT` alongside csum_v3
     /// (fs/ext4/super.c:4909-4912).
-    #[ktest]
     fn upgrade_adds_64bit_iff_fs_is_64bit() {
         let f = journaled_fixture(16, 1, 1);
         let rewritten = upgrade_journal_on_mount(
@@ -5354,7 +5425,6 @@ mod tests {
     /// carrying features (64bit-only or csum_v3, with or without fs
     /// metadata_csum), a dirty (`s_start != 0`) journal, and a V1-blocktype
     /// superblock that cannot carry features at all.
-    #[ktest]
     fn upgrade_honors_journal_per_policy_table() {
         let f = journaled_fixture(16, 1, 1);
         let device = f.fixture.ext4.block_device();
@@ -5438,7 +5508,6 @@ mod tests {
     /// next advance stages + commits; and — the §10.6 pin-window recipe
     /// extended — a successor capture then seeds the drained transaction's
     /// stashed image, never the lagging device.
-    #[ktest]
     fn due_transaction_with_open_handles_parks_drains_and_stages() {
         crate::time::clocks::init_for_ktest();
         let f = journaled_fixture(16, 1, 1);
@@ -5498,7 +5567,6 @@ mod tests {
     /// `journal_start` neither joins it nor creates a successor — it blocks
     /// (jbd2 `wait_transaction_locked`) and joins the successor only once
     /// the seat staged.
-    #[ktest]
     fn journal_start_blocks_at_the_locked_barrier() {
         crate::time::clocks::init_for_ktest();
         let f = journaled_fixture(16, 1, 1);
@@ -5546,7 +5614,6 @@ mod tests {
     /// empty and the transaction parked mid-drain, the probe's target IS
     /// its tid — returning early would claim durability for captures that
     /// are not even staged yet.
-    #[ktest]
     fn sync_probe_targets_the_locking_seat() {
         crate::time::clocks::init_for_ktest();
         let f = journaled_fixture(16, 1, 1);
@@ -5573,7 +5640,6 @@ mod tests {
     /// The unmount flush commits a transaction left parked in the locking
     /// seat (the committer joined mid-drain): staged oldest-first, committed,
     /// checkpointed — the on-disk log ends clean and the bytes land.
-    #[ktest]
     fn flush_on_unmount_commits_the_parked_transaction() {
         crate::time::clocks::init_for_ktest();
         let f = journaled_fixture(16, 1, 1);

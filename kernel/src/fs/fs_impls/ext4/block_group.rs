@@ -42,6 +42,7 @@
 use core::fmt;
 
 use super::{
+    allocator::free_space::FreeSpaceIndex,
     checksum::{self, FsCsumSeed},
     fs::Ext4,
     inode::{Inode, InodeDesc, RawInode},
@@ -340,6 +341,7 @@ pub(super) struct BlockGroupMetadata {
     pub block_bitmap: Dirty<IdBitmap>,
     /// Inode bitmap cached in memory.
     pub inode_bitmap: Dirty<IdBitmap>,
+    free_index: Option<FreeSpaceIndex>,
 }
 
 impl Debug for BlockGroupMetadata {
@@ -396,6 +398,8 @@ pub(super) struct BlockGroup {
     /// Group descriptor, block bitmap, and inode bitmap, protected by a single
     /// lock.
     metadata: RwMutex<BlockGroupMetadata>,
+    /// Serializes pin snapshots against free bitmap-clear + pin publication.
+    allocation_gate: Mutex<()>,
     /// Backing block device (shared with `Ext4` and other groups).
     block_device: Arc<dyn BlockDevice>,
     /// Cached geometry: first filesystem-wide block number of this group.
@@ -442,6 +446,10 @@ impl Debug for BlockGroup {
 }
 
 impl BlockGroup {
+    pub(super) fn lock_allocation(&self) -> ostd::sync::MutexGuard<'_, ()> {
+        self.allocation_gate.lock()
+    }
+
     /// Loads a block group from the descriptor table.
     ///
     /// Reads and decodes the group's descriptor at `gdt_base_offset + group_idx *
@@ -490,10 +498,12 @@ impl BlockGroup {
 
         Ok(Self {
             group_idx,
+            allocation_gate: Mutex::new(()),
             metadata: RwMutex::new(BlockGroupMetadata {
                 desc: Dirty::new(desc),
                 block_bitmap: Dirty::new(block_bitmap),
                 inode_bitmap: Dirty::new(inode_bitmap),
+                free_index: None,
             }),
             block_device: device,
             first_block,
@@ -572,6 +582,7 @@ impl BlockGroup {
         metadata.desc = Dirty::new(desc);
         metadata.block_bitmap = Dirty::new(block_bitmap);
         metadata.inode_bitmap = Dirty::new(inode_bitmap);
+        metadata.free_index = None;
         Ok(())
     }
 
@@ -883,68 +894,41 @@ impl BlockGroup {
             });
         }
 
-        // Hold (mark allocated) every pinned bit BEFORE the scan, so the
-        // policy scans below run exactly once over a bitmap where "free"
-        // means "allocatable" — Linux's "mark the pending frees used when
-        // generating the buddy" (mballoc.c `ext4_mb_generate_from_freelist`).
-        // Every hold is released below, before the bitmap is read or
-        // serialized. The retired shape — scan, test the candidate against
-        // the pin list, hold the overlap, rescan — restarted the scan from
-        // its hint after every hold: O(pinned²) per call under generic/371's
-        // rm churn (tens of thousands of pinned bits), which stretched even
-        // a single-block allocation to tens of milliseconds UNDER THE
-        // SUPERBLOCK WRITE LOCK and starved the pwrite side's
-        // pinned-`ENOSPC` retries into a surfaced `ENOSPC` (the freed-space
-        // windows its commit-and-retry protocol opened were always consumed
-        // by the concurrent fallocate loop first). Pre-holding is O(pinned)
-        // once, and each policy scan is one linear pass.
-        let mut pinned_held: Vec<Range<u16>> = Vec::new();
+        // The allocation gate was acquired BEFORE the caller's pin snapshot.
+        // A free cannot clear bitmap bits and publish a new pin in between.
+        let BlockGroupMetadata {
+            block_bitmap,
+            free_index,
+            ..
+        } = &mut *metadata;
+        let index = free_index.get_or_insert_with(|| FreeSpaceIndex::new(block_bitmap));
         for pin in &pinned_bits {
-            if let Some(held) = metadata
-                .block_bitmap
-                .alloc_exact_at(pin.start, pin.end - pin.start)
-            {
-                pinned_held.push(held);
-            } else {
-                // A pin names free bits (its free cleared them, and the
-                // allocator refuses pinned bits), but pin entries can
-                // overlap each other transiently; hold each still-free bit
-                // individually so coverage stays exact without double-holds.
-                for bit in pin.clone() {
-                    if let Some(held) = metadata.block_bitmap.alloc_exact_at(bit, 1) {
-                        pinned_held.push(held);
-                    }
-                }
-            }
+            index.exclude(pin.clone());
         }
         let allocated_range = match policy {
-            AllocPolicy::FullRunOnly { goal_offset } => {
-                // The whole (group-clamped) run or nothing: no halving, no
-                // silent shrink to the free count (the precheck above already
-                // excluded a group that cannot hold it). Goal-directed first
-                // (runs at or after the goal bit), then the group head — the
-                // head scan also covers the below-goal runs the first pass
-                // skipped.
-                let want = count.min(group_size) as u16;
-                let mut hints = goal_offset.into_iter().chain(core::iter::once(0));
-                hints.find_map(|hint| metadata.block_bitmap.alloc_consecutive_from(hint, want))
-            }
-            AllocPolicy::BestEffort => {
-                // The longest run available, early-stopping at the (fully
-                // clamped) request.
-                let cap = count
+            AllocPolicy::FullRunOnly { goal_offset } => index.find(
+                count.min(group_size) as u16,
+                goal_offset.unwrap_or(0),
+                false,
+            ),
+            AllocPolicy::BestEffort => index.find(
+                count
                     .min(group_size)
-                    .min(metadata.desc.free_blocks_count())
-                    .min(sb_free_blocks.min(u32::MAX as u64) as u32)
-                    as u16;
-                metadata.block_bitmap.alloc_longest_run(cap)
-            }
+                    .min(sb_free_blocks.min(u32::MAX as u64) as u32) as u16,
+                0,
+                true,
+            ),
         };
-        // The pinned bits must stay clear everywhere but inside this scan: the
-        // capture patch below serializes the whole bitmap, so a hold leaking
-        // past this point would journal freed blocks as allocated.
-        for held in pinned_held {
-            metadata.block_bitmap.free_consecutive(held);
+        // Exclusions are an overlay, never persistent bitmap allocations.
+        // Restore even on NoFit; newly committed frees become available on the
+        // next gate-stable snapshot, without journal -> group callbacks.
+        for pin in &pinned_bits {
+            index.refresh(block_bitmap, pin.clone());
+        }
+        let allocated_range = allocated_range
+            .and_then(|range| block_bitmap.alloc_exact_at(range.start, range.end - range.start));
+        if let Some(range) = &allocated_range {
+            index.refresh(block_bitmap, range.clone());
         }
 
         let Some(range) = allocated_range else {
@@ -976,7 +960,15 @@ impl BlockGroup {
         let bitmap_access = match journal::get_write_access(handle, block_bitmap_bid) {
             Ok(access) => access,
             Err(err) => {
-                metadata.block_bitmap.free_consecutive(range);
+                metadata.block_bitmap.free_consecutive(range.clone());
+                let BlockGroupMetadata {
+                    block_bitmap,
+                    free_index,
+                    ..
+                } = &mut *metadata;
+                if let Some(index) = free_index {
+                    index.refresh(block_bitmap, range);
+                }
                 return Err(err);
             }
         };
@@ -987,7 +979,15 @@ impl BlockGroup {
             || metadata.desc.free_blocks_count() < alloc_count
             || sb_free_blocks < alloc_count as u64
         {
-            metadata.block_bitmap.free_consecutive(range);
+            metadata.block_bitmap.free_consecutive(range.clone());
+            let BlockGroupMetadata {
+                block_bitmap,
+                free_index,
+                ..
+            } = &mut *metadata;
+            if let Some(index) = free_index {
+                index.refresh(block_bitmap, range);
+            }
             return_errno_with_message!(Errno::EIO, "block bitmap corruption detected");
         }
 
@@ -1079,6 +1079,15 @@ impl BlockGroup {
                 metadata.block_bitmap.free(block_bit);
                 actually_freed += 1;
             }
+        }
+
+        let BlockGroupMetadata {
+            block_bitmap,
+            free_index,
+            ..
+        } = &mut *metadata;
+        if let Some(index) = free_index {
+            index.refresh(block_bitmap, range_start..range_end);
         }
 
         let new_free = metadata
@@ -1479,12 +1488,19 @@ mod tests {
 
     use super::{super::test_utils::Ext4MemoryDisk, *};
 
+    #[ktest]
+    fn ext4_block_group_uninitialized_bitmap() {
+        crate::fs::fs_impls::ext4::test_utils::scenarios!(
+            block_uninit_reconstructs_prefix_bitmap,
+            block_uninit_rejects_metadata_past_prefix,
+        );
+    }
+
     /// A `BLOCK_UNINIT` group reconstructs its block bitmap from the layout — the
     /// leading `group_size - free_blocks_count` overhead blocks marked used, the
     /// rest free — and does NOT trust the (garbage) on-disk bitmap block. This is
     /// the fix for handing out a lazily-initialized group's backup metadata as
     /// "free" space.
-    #[ktest]
     fn block_uninit_reconstructs_prefix_bitmap() {
         const GROUP_SIZE: u32 = 100;
         const OVERHEAD: u32 = 10;
@@ -1524,7 +1540,6 @@ mod tests {
     /// A metadata block sitting beyond the reconstructed prefix breaks the
     /// prefix assumption, so reconstruction refuses (fail-closed) rather than
     /// risk handing that block out.
-    #[ktest]
     fn block_uninit_rejects_metadata_past_prefix() {
         let disk = Ext4MemoryDisk::new(2);
         let desc = BlockGroupDesc {
@@ -1540,10 +1555,23 @@ mod tests {
         assert!(BlockGroup::load_block_bitmap(&disk, 0, 99, &desc).is_err());
     }
 
+    #[ktest]
+    fn ext4_block_group_descriptor() {
+        crate::fs::fs_impls::ext4::test_utils::scenarios!(
+            decode_64byte_descriptor_high_halves,
+            read_desc_64byte_stride,
+            group_desc_checksum_round_trip,
+            group_desc_checksum_covers_high_tail,
+            stamp_checksums_round_trip_32,
+            stamp_desc_in_block_at_offset,
+            patch_into_preserves_high_tail,
+            descriptor_round_trip_64byte,
+        );
+    }
+
     /// A 64-byte descriptor whose block-number high halves are non-zero decodes
     /// to the correct `> 2^32` `Ext4Bid` — the red-line splice. The per-group
     /// counters come from the low half untouched.
-    #[ktest]
     fn decode_64byte_descriptor_high_halves() {
         let raw = RawBlockGroup64 {
             lo: RawBlockGroup {
@@ -1581,7 +1609,6 @@ mod tests {
     /// Two adjacent 64-byte descriptors in a GDT are read at their 64-byte-apart
     /// offsets and each decodes to its own distinct (wide) block numbers — the
     /// desc_size stride plus the wide read.
-    #[ktest]
     fn read_desc_64byte_stride() {
         let disk = Ext4MemoryDisk::new(4);
         let gdt_base = BLOCK_SIZE; // GDT at block 1, as the fixture lays it out.
@@ -1632,7 +1659,6 @@ mod tests {
     /// corrupted field, a wrong group number, or a wrong seed each fail with
     /// `EUCLEAN`. The checksum depends on the group number, so the same bytes at
     /// a different group index do not verify.
-    #[ktest]
     fn group_desc_checksum_round_trip() {
         let seed = FsCsumSeed::new(0x1234_5678);
         let mut lo = RawBlockGroup {
@@ -1667,7 +1693,6 @@ mod tests {
 
     /// The 64-byte descriptor folds its high-half tail (including the bitmap
     /// checksum high halves) into `bg_checksum`, so a change there is caught.
-    #[ktest]
     fn group_desc_checksum_covers_high_tail() {
         let seed = FsCsumSeed::new(0xABCD);
         let lo = RawBlockGroup {
@@ -1696,7 +1721,6 @@ mod tests {
     /// bg_checksum) round-trips through the read-side verify, and the stored
     /// bitmap checksum equals a fresh crc32c of the bitmap. A change to the
     /// bitmap after stamping is then detectable. 32-byte descriptor.
-    #[ktest]
     fn stamp_checksums_round_trip_32() {
         let seed = FsCsumSeed::new(0x0BAD_F00D);
         let group = 4;
@@ -1735,7 +1759,6 @@ mod tests {
     /// image, stamps it, and writes it back so a later read verifies. Exercises
     /// the journaled `patch_into` funnel's csum step at a non-zero descriptor
     /// offset within the block.
-    #[ktest]
     fn stamp_desc_in_block_at_offset() {
         let seed = FsCsumSeed::new(0x1357_9BDF);
         let block_device: Arc<dyn BlockDevice> = Arc::new(Ext4MemoryDisk::new(4));
@@ -1749,11 +1772,13 @@ mod tests {
             desc: Dirty::new(desc),
             block_bitmap: Dirty::new(block_bitmap),
             inode_bitmap: Dirty::new(inode_bitmap),
+            free_index: None,
         };
 
         let bg = BlockGroup {
             group_idx,
             metadata: RwMutex::new(metadata),
+            allocation_gate: Mutex::new(()),
             block_device,
             first_block: 0,
             last_block: 32767,
@@ -1785,7 +1810,6 @@ mod tests {
     /// `patch_into` on a 64-byte descriptor rewrites only the 32-byte low half:
     /// the counters take new values while the high tail (block-number high halves
     /// and the zero counter high halves) is byte-for-byte preserved.
-    #[ktest]
     fn patch_into_preserves_high_tail() {
         let raw = RawBlockGroup64 {
             lo: RawBlockGroup {
@@ -1835,7 +1859,6 @@ mod tests {
     /// Round-trip: decode a 64-byte descriptor, patch its (unchanged) counters
     /// back into the same block, re-decode, and assert every field survives — and
     /// the full 64-byte on-disk image is byte-for-byte identical.
-    #[ktest]
     fn descriptor_round_trip_64byte() {
         let raw = RawBlockGroup64 {
             lo: RawBlockGroup {

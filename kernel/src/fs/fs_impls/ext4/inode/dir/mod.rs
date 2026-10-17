@@ -1698,13 +1698,17 @@ mod tests {
         prelude::{Errno, Error, Result},
     };
 
+    #[ktest]
+    fn ext4_directory_checksum() {
+        crate::fs::fs_impls::ext4::test_utils::scenarios!(dir_tail_marker_and_checksum_formula,);
+    }
+
     /// The `metadata_csum` directory tail is a fake `EXT4_FT_DIR_CSUM` entry an
     /// old kernel skips as deleted, and the block checksum covers the block up to
     /// its last word (`det_checksum`). Integration (tail reservation on grow,
     /// skip in slot search, seal correctness) is validated by the guest e2fsck on
     /// a real metadata_csum image, since a checksummed volume mounts only after
     /// the admission task.
-    #[ktest]
     fn dir_tail_marker_and_checksum_formula() {
         use super::{DIR_TAIL_LEN, DirEntryHeader, EXT4_FT_DIR_CSUM, checksum};
 
@@ -1732,6 +1736,18 @@ mod tests {
     }
 
     #[ktest]
+    fn ext4_directory_entries() {
+        crate::fs::fs_impls::ext4::test_utils::scenarios!(
+            lookup_and_readdir,
+            readdir_resumes_across_getdents_calls,
+            add_new_entries_visible,
+            add_splits_predecessor_slack,
+            add_grows_directory_into_second_block,
+            delete_entry_merges_and_reclaims,
+            make_empty_then_empty_dir,
+        );
+    }
+
     fn lookup_and_readdir() {
         let f = Ext4FixtureBuilder::new(2048, 256, 2048).build().unwrap();
 
@@ -1788,7 +1804,6 @@ mod tests {
     /// the directory offset by the returned byte count across multiple calls.
     /// This exercises offset resumption that the single-call test above cannot,
     /// mirroring a real mke2fs root layout (`.`, `..`, `lost+found`, files).
-    #[ktest]
     fn readdir_resumes_across_getdents_calls() {
         let f = Ext4FixtureBuilder::new(2048, 256, 2048).build().unwrap();
         let dir_block = 101u32;
@@ -1870,7 +1885,6 @@ mod tests {
 
     /// `add_new_entry` then `find_entry_info`/`readdir_at` see the new name, and
     /// multiple adds in one block all become visible.
-    #[ktest]
     fn add_new_entries_visible() {
         let f = fixture_with_empty_dir();
         let dir = f.ext4.read_inode(DIR_INO).unwrap();
@@ -1914,7 +1928,6 @@ mod tests {
     }
 
     /// An add that splits a live predecessor's slack reuses the same block.
-    #[ktest]
     fn add_splits_predecessor_slack() {
         let f = fixture_with_empty_dir();
         let dir = f.ext4.read_inode(DIR_INO).unwrap();
@@ -1938,7 +1951,6 @@ mod tests {
     /// Filling a block forces the next add to grow the directory; entries in
     /// both blocks are then found by `readdir_at`, and `file_size` grew by
     /// exactly one block.
-    #[ktest]
     fn add_grows_directory_into_second_block() {
         let f = fixture_with_empty_dir();
         let dir = f.ext4.read_inode(DIR_INO).unwrap();
@@ -1996,7 +2008,6 @@ mod tests {
 
     /// `delete_entry` removes a name, merges its space into the predecessor, and
     /// the reclaimed slot can hold a same-or-smaller name again.
-    #[ktest]
     fn delete_entry_merges_and_reclaims() {
         let f = fixture_with_empty_dir();
         let dir = f.ext4.read_inode(DIR_INO).unwrap();
@@ -2044,7 +2055,6 @@ mod tests {
 
     /// `make_empty` lays down `.`/`..`, `empty_dir` reports true, and a later add
     /// flips it to false.
-    #[ktest]
     fn make_empty_then_empty_dir() {
         let f = fixture_with_empty_dir();
         let dir = f.ext4.read_inode(DIR_INO).unwrap();
@@ -2103,10 +2113,21 @@ mod tests {
         FilePerm::from_bits_truncate(0o644)
     }
 
+    #[ktest]
+    fn ext4_directory_create() {
+        crate::fs::fs_impls::ext4::test_utils::scenarios!(
+            create_regular_file,
+            create_subdirectory,
+            create_grows_parent_into_second_block,
+            create_routes_special_files,
+            create_with_device_encodes_rdev,
+            create_error_path_clears_link_count,
+        );
+    }
+
     /// `create` of a regular file: `lookup` finds it (type File, link count 1),
     /// the parent's mtime advances, and the child has a valid empty extent root
     /// with the `EXTENTS` flag (from the inode allocator).
-    #[ktest]
     fn create_regular_file() {
         let f = fixture_for_create();
         let dir = f.ext4.read_inode(DIR_INO).unwrap();
@@ -2132,11 +2153,19 @@ mod tests {
         assert_eq!(dir.link_count(), 2);
     }
 
+    #[ktest]
+    fn ext4_directory_journal_capture() {
+        crate::fs::fs_impls::ext4::test_utils::scenarios!(
+            create_captures_within_estimate,
+            dir_block_capture_failure_aborts_the_journal,
+            grow_dir_block_journals_new_block_immediately,
+        );
+    }
+
     /// P7d-1 safe-upper-bound gate: a real journaled `create` captures no more
     /// metadata than `Ext4::create_credits` reserves, and — being a bounded op —
     /// never grows its reservation. Uses the enforced-credit path (a journaled
     /// volume), so the captured count is the operation's true footprint.
-    #[ktest]
     fn create_captures_within_estimate() {
         clocks::init_for_ktest();
         let f = Ext4FixtureBuilder::new(2048, 256, 2048)
@@ -2179,6 +2208,15 @@ mod tests {
         drop(f);
     }
 
+    #[ktest]
+    fn ext4_directory_htree_mutation() {
+        crate::fs::fs_impls::ext4::test_utils::scenarios!(
+            degrade_htree_over_capacity_leaves_index_intact,
+            cross_dir_move_of_htree_dir_degrades_and_repoints,
+            cross_dir_move_efbig_degrade_leaves_both_dirs_intact,
+        );
+    }
+
     /// P7d-1 red-line regression: an htree degrade whose index-block rewrite
     /// cannot fit one journal transaction must fail BEFORE mutating the page
     /// cache, leaving the directory a valid htree — never a half-linearized,
@@ -2193,7 +2231,6 @@ mod tests {
     /// degrade under a handle whose reservation cannot cover the burst and
     /// asserts the atomic-or-fail-clean fix: `EFBIG` up front, block 0 still a
     /// dx_root, `INDEX` still set, and zero partial captures in the transaction.
-    #[ktest]
     fn degrade_htree_over_capacity_leaves_index_intact() {
         use super::{FileFlags, htree};
 
@@ -2376,7 +2413,6 @@ mod tests {
     /// after-image — a torn or lost name on crash — nor forking the live volume
     /// (which lookup already serves) from the log. Driven by the one-shot
     /// capture fault (the EIO/ENOMEM window has no natural ktest trigger).
-    #[ktest]
     fn dir_block_capture_failure_aborts_the_journal() {
         clocks::init_for_ktest();
         let f = Ext4FixtureBuilder::new(2048, 256, 2048)
@@ -2425,7 +2461,6 @@ mod tests {
     /// grows the directory but then orphans its half-built child commits the grown
     /// size + written extent WITHOUT the new block's after-image, and recovery
     /// replays a grown directory whose new block still holds stale on-disk bytes.
-    #[ktest]
     fn grow_dir_block_journals_new_block_immediately() {
         clocks::init_for_ktest();
         let f = Ext4FixtureBuilder::new(2048, 256, 2048)
@@ -2485,7 +2520,6 @@ mod tests {
     /// degrade-on-mutate) and repoints its `..`. Guards the regression risk of
     /// hoisting the degrade ahead of the entry mutations: the moved directory
     /// still linearizes, moves, and repoints correctly.
-    #[ktest]
     fn cross_dir_move_of_htree_dir_degrades_and_repoints() {
         use super::FileFlags;
 
@@ -2525,7 +2559,6 @@ mod tests {
     /// target gained it but `..` was never repointed (an e2fsck-fixable `..`
     /// mismatch). Hoisting the degrade ahead of the entry mutations makes the one
     /// `EFBIG`-capable step the first, so it leaves nothing behind.
-    #[ktest]
     fn cross_dir_move_efbig_degrade_leaves_both_dirs_intact() {
         use super::FileFlags;
 
@@ -2563,7 +2596,6 @@ mod tests {
 
     /// `create` of a subdirectory: it has `.`/`..` (empty_dir true, `..` -> the
     /// parent), child link count 2, and the parent's link count gains one.
-    #[ktest]
     fn create_subdirectory() {
         let f = fixture_for_create();
         let dir = f.ext4.read_inode(DIR_INO).unwrap();
@@ -2585,7 +2617,6 @@ mod tests {
 
     /// Creating many children forces the parent directory to grow a second
     /// block; every name remains resolvable afterwards.
-    #[ktest]
     fn create_grows_parent_into_second_block() {
         let f = fixture_for_create();
         let dir = f.ext4.read_inode(DIR_INO).unwrap();
@@ -2611,7 +2642,6 @@ mod tests {
     /// Devices cannot come through plain `create` (they need a device number,
     /// via `mknod` → `create_with_device`); FIFOs and sockets can — a Unix
     /// socket bind arrives here as a plain `create`.
-    #[ktest]
     fn create_routes_special_files() {
         let f = fixture_for_create();
         let dir = f.ext4.read_inode(DIR_INO).unwrap();
@@ -2644,7 +2674,6 @@ mod tests {
     /// `mknod` devices: the device number is encoded into `i_block` inside the
     /// creating transaction (no rdev-0 crash window) and survives the on-disk
     /// round-trip, in both the old (8-bit) and wide encodings.
-    #[ktest]
     fn create_with_device_encodes_rdev() {
         let f = fixture_for_create();
         let dir = f.ext4.read_inode(DIR_INO).unwrap();
@@ -2681,7 +2710,6 @@ mod tests {
     /// subdirectory whose `make_empty` cannot allocate its first block because
     /// free blocks are exhausted — `create` leaves the child link count at 0
     /// (ready for reclaim) and the name absent.
-    #[ktest]
     fn create_error_path_clears_link_count() {
         clocks::init_for_ktest();
         // Cap the image to exactly ONE ordinarily-allocatable free block —
@@ -2729,11 +2757,24 @@ mod tests {
         assert_eq!(readdir_names(&dir), [".", ".."]);
     }
 
+    #[ktest]
+    fn ext4_directory_unlink_and_reclaim() {
+        crate::fs::fs_impls::ext4::test_utils::scenarios!(
+            unlink_frees_inode_and_blocks,
+            unlink_of_open_defers_reclaim,
+            unlink_directory_rejected,
+            create_unlink_loop_reuses_resources,
+            orphan_machinery_inert_without_journal,
+            symlink_reclaim_forgets_target_block,
+            file_truncate_records_no_revoke,
+            unlink_of_open_chains_then_reclaims_drain,
+        );
+    }
+
     /// `unlink` of a regular file with no open handle: the name disappears, the
     /// parent's mtime advances, and the child inode *and* its data blocks are
     /// reclaimed — free-inode and free-block counts return to their pre-create
     /// values and the inode's bitmap bit is cleared.
-    #[ktest]
     fn unlink_frees_inode_and_blocks() {
         let f = fixture_for_create();
         let dir = f.ext4.read_inode(DIR_INO).unwrap();
@@ -2774,7 +2815,6 @@ mod tests {
     /// name but does NOT free the inode (it stays allocated). Dropping the held
     /// `Arc` then reclaims it via `Drop`, restoring the free counts. This is the
     /// key refcount/reclaim test.
-    #[ktest]
     fn unlink_of_open_defers_reclaim() {
         let f = fixture_for_create();
         let dir = f.ext4.read_inode(DIR_INO).unwrap();
@@ -2812,7 +2852,6 @@ mod tests {
     }
 
     /// `unlink` on a directory is rejected with `EISDIR`; the entry survives.
-    #[ktest]
     fn unlink_directory_rejected() {
         let f = fixture_for_create();
         let dir = f.ext4.read_inode(DIR_INO).unwrap();
@@ -2826,8 +2865,17 @@ mod tests {
         assert!(dir.lookup("subdir").is_ok());
     }
 
-    /// `rmdir` on a non-empty directory is rejected with `ENOTEMPTY`.
     #[ktest]
+    fn ext4_directory_rmdir() {
+        crate::fs::fs_impls::ext4::test_utils::scenarios!(
+            rmdir_non_empty_rejected,
+            rmdir_file_rejected,
+            rmdir_empty_directory,
+            rmdir_reclaim_forgets_dir_blocks,
+        );
+    }
+
+    /// `rmdir` on a non-empty directory is rejected with `ENOTEMPTY`.
     fn rmdir_non_empty_rejected() {
         let f = fixture_for_create();
         let dir = f.ext4.read_inode(DIR_INO).unwrap();
@@ -2843,7 +2891,6 @@ mod tests {
     }
 
     /// `rmdir` on a regular file is rejected with `ENOTDIR`.
-    #[ktest]
     fn rmdir_file_rejected() {
         let f = fixture_for_create();
         let dir = f.ext4.read_inode(DIR_INO).unwrap();
@@ -2860,7 +2907,6 @@ mod tests {
     /// `rmdir` of an empty directory: the name disappears, the parent loses one
     /// link (for the removed child's `..`), the child inode is freed, and its
     /// `.`/`..` data block is freed.
-    #[ktest]
     fn rmdir_empty_directory() {
         let f = fixture_for_create();
         let dir = f.ext4.read_inode(DIR_INO).unwrap();
@@ -2895,7 +2941,6 @@ mod tests {
 
     /// Creating and unlinking a file in a loop reuses inode and block numbers,
     /// proving reclaim returns resources to the allocator (no leak).
-    #[ktest]
     fn create_unlink_loop_reuses_resources() {
         let f = fixture_for_create();
         let dir = f.ext4.read_inode(DIR_INO).unwrap();
@@ -2933,7 +2978,6 @@ mod tests {
     /// On a non-journaled volume the orphan machinery is inert (journal-only,
     /// Linux parity): unlink + reclaim succeed, the inode is freed, and the
     /// superblock's orphan head never budges.
-    #[ktest]
     fn orphan_machinery_inert_without_journal() {
         let f = fixture_for_create();
         let dir = f.ext4.read_inode(DIR_INO).unwrap();
@@ -2977,7 +3021,6 @@ mod tests {
     /// dir-typed forget policy must land every freed dir block in the
     /// transaction's revoke set (Linux `S_ISDIR → METADATA | FORGET`,
     /// fs/ext4/extents.c:2415-2417).
-    #[ktest]
     fn rmdir_reclaim_forgets_dir_blocks() {
         let f = journaled_fixture_for_create();
         let journal = f.ext4.journal().unwrap();
@@ -3015,7 +3058,6 @@ mod tests {
     /// Revoke coverage, slow-symlink reclaim (audit row 3c): unlinking a
     /// symlink with an extent-mapped (slow) target forgets the freed target
     /// block, mirroring Linux's unconditional `S_ISLNK → METADATA | FORGET`.
-    #[ktest]
     fn symlink_reclaim_forgets_target_block() {
         let f = journaled_fixture_for_create();
         let journal = f.ext4.journal().unwrap();
@@ -3052,7 +3094,6 @@ mod tests {
     /// file data never enters the log (Linux frees it with `flags == 0`,
     /// fs/ext4/extents.c:2413-2420), so revoking it would only bloat the
     /// revoke table and, later, the on-disk revoke blocks.
-    #[ktest]
     fn file_truncate_records_no_revoke() {
         let f = journaled_fixture_for_create();
         let journal = f.ext4.journal().unwrap();
@@ -3079,7 +3120,6 @@ mod tests {
     /// (the predecessor's on-disk pointer skips it); reclaiming the head drains
     /// the list. Every intermediate on-disk state a crash could expose is a
     /// well-formed chain of exactly the still-allocated orphans.
-    #[ktest]
     fn unlink_of_open_chains_then_reclaims_drain() {
         let f = journaled_fixture_for_create();
         let journal = f.ext4.journal().unwrap();
@@ -3147,10 +3187,17 @@ mod tests {
 
     // ── link ────────────────────────────────────────────────────────────────
 
+    #[ktest]
+    fn ext4_directory_hardlink() {
+        crate::fs::fs_impls::ext4::test_utils::scenarios!(
+            link_hardlinks_a_file,
+            link_directory_guard_is_in_caller,
+        );
+    }
+
     /// A hard link makes a second name resolve to the same inode and bumps its
     /// link count; unlinking one name leaves the other live with the count back
     /// at 1.
-    #[ktest]
     fn link_hardlinks_a_file() {
         let f = fixture_for_create();
         let dir = f.ext4.read_inode(DIR_INO).unwrap();
@@ -3182,7 +3229,6 @@ mod tests {
     /// so — like ext2 — ext4's `link` performs no inode-level type check. This
     /// test documents that the primitive itself only governs the supported
     /// (non-directory) path; the directory guard lives in the caller.
-    #[ktest]
     fn link_directory_guard_is_in_caller() {
         let f = fixture_for_create();
         let dir = f.ext4.read_inode(DIR_INO).unwrap();
@@ -3194,9 +3240,24 @@ mod tests {
 
     // ── rename within one directory ──────────────────────────────────────────
 
+    #[ktest]
+    fn ext4_directory_rename() {
+        crate::fs::fs_impls::ext4::test_utils::scenarios!(
+            rename_same_dir_no_replace,
+            rename_same_name_is_noop,
+            rename_same_dir_replaces_file,
+            rename_replace_hardlinked_target_survives,
+            rename_moves_file_across_dirs,
+            rename_moves_dir_across_dirs_repoints_dotdot,
+            rename_dir_onto_nonempty_dir_enotempty,
+            rename_dir_onto_file_enotdir,
+            rename_file_onto_dir_eisdir,
+            rename_missing_source_enoent,
+        );
+    }
+
     /// Renaming `a` to a non-existent `b` in the same directory: `b` resolves to
     /// the old inode and `a` is gone.
-    #[ktest]
     fn rename_same_dir_no_replace() {
         let f = fixture_for_create();
         let dir = f.ext4.read_inode(DIR_INO).unwrap();
@@ -3213,7 +3274,6 @@ mod tests {
     }
 
     /// Renaming a no-op onto itself (`a` -> `a`) succeeds and changes nothing.
-    #[ktest]
     fn rename_same_name_is_noop() {
         let f = fixture_for_create();
         let dir = f.ext4.read_inode(DIR_INO).unwrap();
@@ -3227,7 +3287,6 @@ mod tests {
     /// Renaming `a` onto an existing `b` (file onto file) in the same directory:
     /// `b` now resolves to `a`'s inode, and `b`'s old inode (link count 1) is
     /// reclaimed, restoring the free counts.
-    #[ktest]
     fn rename_same_dir_replaces_file() {
         let f = fixture_for_create();
         let dir = f.ext4.read_inode(DIR_INO).unwrap();
@@ -3271,7 +3330,6 @@ mod tests {
 
     /// Renaming onto an existing name whose inode is also hard-linked elsewhere
     /// (link count 2): the replaced name's inode survives with link count 1.
-    #[ktest]
     fn rename_replace_hardlinked_target_survives() {
         let f = fixture_for_create();
         let dir = f.ext4.read_inode(DIR_INO).unwrap();
@@ -3306,7 +3364,6 @@ mod tests {
 
     /// Moving a file from `dir1` to `dir2`: gone from `dir1`, present in `dir2`,
     /// same inode.
-    #[ktest]
     fn rename_moves_file_across_dirs() {
         let f = fixture_for_create();
         let (dir1, dir2) = two_subdirs(&f);
@@ -3324,7 +3381,6 @@ mod tests {
 
     /// Moving a directory across directories: its `..` now points at the new
     /// parent, the old parent loses a link, and the new parent gains one.
-    #[ktest]
     fn rename_moves_dir_across_dirs_repoints_dotdot() {
         let f = fixture_for_create();
         let (dir1, dir2) = two_subdirs(&f);
@@ -3360,7 +3416,6 @@ mod tests {
 
     /// Renaming a directory onto a non-empty directory is rejected with
     /// `ENOTEMPTY`, leaving both names intact.
-    #[ktest]
     fn rename_dir_onto_nonempty_dir_enotempty() {
         let f = fixture_for_create();
         let dir = f.ext4.read_inode(DIR_INO).unwrap();
@@ -3379,7 +3434,6 @@ mod tests {
     }
 
     /// Renaming a directory onto a regular file is rejected with `ENOTDIR`.
-    #[ktest]
     fn rename_dir_onto_file_enotdir() {
         let f = fixture_for_create();
         let dir = f.ext4.read_inode(DIR_INO).unwrap();
@@ -3396,7 +3450,6 @@ mod tests {
     }
 
     /// Renaming a regular file onto a directory is rejected with `EISDIR`.
-    #[ktest]
     fn rename_file_onto_dir_eisdir() {
         let f = fixture_for_create();
         let dir = f.ext4.read_inode(DIR_INO).unwrap();
@@ -3413,7 +3466,6 @@ mod tests {
     }
 
     /// Renaming a missing source is `ENOENT`.
-    #[ktest]
     fn rename_missing_source_enoent() {
         let f = fixture_for_create();
         let dir = f.ext4.read_inode(DIR_INO).unwrap();

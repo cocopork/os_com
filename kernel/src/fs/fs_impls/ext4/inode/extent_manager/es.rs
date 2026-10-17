@@ -71,6 +71,9 @@ struct EsInner {
     /// Entries are pairwise disjoint — [`EsCache::record`] removes every
     /// overlapping entry before inserting — so a range scan is unambiguous.
     map: BTreeMap<Iblock, Extent>,
+    /// Authoritative delayed ownership; never evicted with mapping facts.
+    delayed: BTreeMap<Iblock, Iblock>,
+    delayed_count: u64,
 }
 
 /// The answer of a range-coverage query: the STRONGEST statement about
@@ -115,12 +118,94 @@ impl EsCache {
     /// wide scan over a heavily fragmented file ever trips it.
     const CAPACITY: usize = 512;
 
+    /// Counts blocks not already covered by delayed ownership.
+    pub(super) fn delayed_missing(&self, start: Iblock, end: Iblock) -> u64 {
+        let inner = self.inner.lock();
+        let predecessor = inner
+            .delayed
+            .range(..start)
+            .next_back()
+            .map_or(0, |(_, &hi)| hi.min(end).saturating_sub(start) as u64);
+        let covered: u64 = predecessor
+            + inner
+                .delayed
+                .range(start..end)
+                .map(|(&lo, &hi)| (hi.min(end) - lo) as u64)
+                .sum::<u64>();
+        (end - start) as u64 - covered
+    }
+
+    pub(super) fn record_delayed(&self, mut start: Iblock, mut end: Iblock) {
+        if start >= end {
+            return;
+        }
+        let mut inner = self.inner.lock();
+        if let Some((&lo, &hi)) = inner.delayed.range(..=start).next_back() {
+            if hi >= start {
+                start = lo;
+                end = end.max(hi);
+            }
+        }
+        let overlaps: Vec<_> = inner
+            .delayed
+            .range(start..=end)
+            .map(|(&lo, &hi)| (lo, hi))
+            .collect();
+        for (lo, hi) in overlaps {
+            inner.delayed.remove(&lo);
+            inner.delayed_count -= (hi - lo) as u64;
+            end = end.max(hi);
+        }
+        inner.delayed.insert(start, end);
+        inner.delayed_count += (end - start) as u64;
+    }
+
+    pub(super) fn remove_delayed(&self, start: Iblock, end: Iblock) {
+        let mut inner = self.inner.lock();
+        let mut overlaps: Vec<_> = inner
+            .delayed
+            .range(start..end)
+            .map(|(&lo, &hi)| (lo, hi))
+            .collect();
+        if let Some((&lo, &hi)) = inner.delayed.range(..start).next_back() {
+            if hi > start {
+                overlaps.push((lo, hi));
+            }
+        }
+        for (lo, hi) in overlaps {
+            inner.delayed.remove(&lo);
+            inner.delayed_count -= (hi - lo) as u64;
+            if lo < start {
+                inner.delayed.insert(lo, start);
+                inner.delayed_count += (start - lo) as u64;
+            }
+            if hi > end {
+                inner.delayed.insert(end, hi);
+                inner.delayed_count += (hi - end) as u64;
+            }
+        }
+    }
+
+    pub(super) fn first_delayed(&self) -> Option<(Iblock, Iblock)> {
+        self.inner
+            .lock()
+            .delayed
+            .first_key_value()
+            .map(|(&lo, &hi)| (lo, hi))
+    }
+
+    pub(super) fn delayed_blocks(&self) -> u64 {
+        self.inner.lock().delayed_count
+    }
+
     /// Creates an empty cache. `const` so
     /// [`ExtentTree::empty`](super::tree::ExtentTree) stays `const`.
     pub(super) const fn new() -> Self {
         Self {
             inner: SpinLock::new(EsInner {
                 map: BTreeMap::new(),
+                delayed: BTreeMap::new(),
+                delayed_count: 0,
             }),
         }
     }
@@ -260,10 +345,44 @@ mod tests {
         Extent::new(block, len, start, ExtentKind::Written)
     }
 
+    #[ktest]
+    fn ext4_extent_status_index() {
+        crate::fs::fs_impls::ext4::test_utils::scenarios!(
+            delayed_ownership_survives_fact_eviction_and_splits,
+            straddler_across_span_start_is_invalidated_whole,
+            record_on_full_cache_clears_then_seeds,
+            record_removes_overlapping_facts_first,
+            range_state_returns_strongest_true_tier,
+            tail_span_invalidation_clears_tail_and_spares_head,
+            clear_all_drops_every_fact,
+        );
+    }
+
+    fn delayed_ownership_survives_fact_eviction_and_splits() {
+        let es = EsCache::new();
+        es.record_delayed(4, 8);
+        es.record_delayed(12, 16);
+        es.record_delayed(7, 13);
+        assert_eq!(es.first_delayed(), Some((4, 16)));
+        assert_eq!(es.delayed_blocks(), 12);
+        assert_eq!(es.delayed_missing(2, 18), 4);
+        es.remove_delayed(7, 13);
+        assert_eq!(es.delayed_blocks(), 6);
+        assert_eq!(es.delayed_missing(2, 18), 10);
+        let _ = es.clear_all();
+        let _ = es.invalidate_range(0..u64::MAX);
+        for i in 0..EsCache::CAPACITY + 2 {
+            es.record(&written(i as Iblock, 1, 100 + i as u64));
+        }
+        assert_eq!(es.first_delayed(), Some((4, 7)));
+        assert_eq!(es.delayed_blocks(), 6);
+        es.remove_delayed(0, Iblock::MAX);
+        assert_eq!(es.delayed_blocks(), 0);
+    }
+
     /// An entry straddling `span.start` must be removed WHOLE (the classic
     /// missed invalidation case, probed via the predecessor), while disjoint
     /// facts survive; a span ending exactly at an entry's start spares it.
-    #[ktest]
     fn straddler_across_span_start_is_invalidated_whole() {
         let es = EsCache::new();
         es.record(&written(0, 8, 100));
@@ -283,7 +402,6 @@ mod tests {
 
     /// A record into a full cache clears it whole and seeds the new fact
     /// (the one-line eviction policy: old facts miss, correctness unharmed).
-    #[ktest]
     fn record_on_full_cache_clears_then_seeds() {
         let es = EsCache::new();
         for i in 0..u32::try_from(EsCache::CAPACITY).unwrap() {
@@ -298,7 +416,6 @@ mod tests {
 
     /// A new fact removes every overlapping older entry first (disjointness),
     /// and the answer layer reflects the recorded kind.
-    #[ktest]
     fn record_removes_overlapping_facts_first() {
         let es = EsCache::new();
         es.record(&written(0, 8, 100));
@@ -311,7 +428,6 @@ mod tests {
     /// `range_state` returns the strongest TRUE tier: `AllWritten` over pure
     /// written coverage, `AllMapped` once an unwritten fact joins, `Unknown`
     /// on any gap — including a straddler-covered start on either side.
-    #[ktest]
     fn range_state_returns_strongest_true_tier() {
         let es = EsCache::new();
         es.record(&written(0, 4, 100));
@@ -329,7 +445,6 @@ mod tests {
 
     /// The shift mutators (truncate / collapse / insert-range) drop the whole
     /// tail with one `[start, u64::MAX)` span; facts below the span survive.
-    #[ktest]
     fn tail_span_invalidation_clears_tail_and_spares_head() {
         let es = EsCache::new();
         es.record(&written(0, 4, 100));
@@ -342,7 +457,6 @@ mod tests {
     }
 
     /// `clear_all` (the whole-tree-rebuild invalidation) drops every fact.
-    #[ktest]
     fn clear_all_drops_every_fact() {
         let es = EsCache::new();
         es.record(&written(0, 4, 100));

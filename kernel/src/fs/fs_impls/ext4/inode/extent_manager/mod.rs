@@ -34,6 +34,8 @@ use crate::vm::page_cache::{
 
 mod es;
 mod node;
+
+pub(super) const DELALLOC_PROMISE_PER_BLOCK: u64 = 1 + 4 * (node::MAX_DEPTH as u64 + 1) + 2;
 mod path;
 mod tree;
 
@@ -323,6 +325,61 @@ impl ExtentManager {
     /// `mmap-hole-writeback`) must re-justify or remove this carve-out before
     /// letting that path allocate.** Distinct inodes never share an
     /// `ExtentManager`.
+    pub(super) fn delayed_missing(&self, start: Iblock, end: Iblock) -> u64 {
+        self.state.read().es_cache().delayed_missing(start, end)
+    }
+    pub(super) fn record_delayed(&self, start: Iblock, end: Iblock) {
+        self.state.read().es_cache().record_delayed(start, end);
+    }
+    pub(super) fn remove_delayed(&self, start: Iblock, end: Iblock) {
+        self.state.read().es_cache().remove_delayed(start, end);
+    }
+    pub(super) fn first_delayed(&self) -> Option<(Iblock, Iblock)> {
+        self.state.read().es_cache().first_delayed()
+    }
+    pub(super) fn delayed_blocks(&self) -> u64 {
+        self.state.read().es_cache().delayed_blocks()
+    }
+
+    /// Runs only under the owning inode's write lock; the tree lock is not
+    /// held across journal admission or completion waits.
+    pub(super) fn with_delayed_owner<T>(
+        &self,
+        owner: u64,
+        operation: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
+        let fs = self.fs()?;
+        let nojournal = fs.journal().is_none();
+        {
+            let mut tree = self.state.write();
+            if nojournal {
+                // Retry retained after-images before another tree edit.
+                tree.finish_metadata_batch(fs.block_device().as_ref())?;
+                tree.begin_metadata_batch();
+            }
+            assert!(tree.delayed_owner.replace(owner).is_none());
+        }
+        let result = operation();
+        let mut tree = self.state.write();
+        tree.delayed_owner = None;
+        let persisted = if nojournal {
+            tree.finish_metadata_batch(fs.block_device().as_ref())
+        } else {
+            Ok(())
+        };
+        match result {
+            Ok(value) => persisted.map(|()| value),
+            Err(error) => Err(error),
+        }
+    }
+
+    pub(super) fn flush_delayed_metadata(&self) -> Result<()> {
+        let fs = self.fs()?;
+        self.state
+            .write()
+            .finish_metadata_batch(fs.block_device().as_ref())
+    }
+
     pub(super) fn range_known_written(&self, start: Iblock, end: Iblock) -> bool {
         self.state.read().es_cache().range_state(start, end) == EsCoverage::AllWritten
     }
@@ -334,7 +391,6 @@ impl ExtentManager {
     /// should have dropped it turns a silent Unwritten-first violation into a
     /// loud ktest failure (ktest is a debug build) rather than latent
     /// corruption.
-    #[cfg(debug_assertions)]
     pub(super) fn debug_range_all_written(&self, start: Iblock, end: Iblock) -> Result<bool> {
         let fs = self.fs()?;
         let tree = self.state.read();
@@ -625,7 +681,8 @@ impl ExtentManager {
                 // silently drop the whole run on decode (Linux clamps identically
                 // in `ext4_ext_map_blocks`).
                 let want = (hole.run.end - ib).min(node::MAX_UNWRITTEN_LEN as u32);
-                let range = fs.alloc_blocks(want, goal, handle)?;
+                let intent = tree.allocation_intent(super::super::fs::AllocIntent::Normal);
+                let range = fs.alloc_blocks_with_intent(want, goal, handle, intent)?;
                 let got = (range.end - range.start) as u32;
                 debug_assert!(got > 0 && got <= want);
                 // If recording the extent fails, the just-allocated data blocks
@@ -1140,6 +1197,9 @@ impl BlockAsPageCacheBackend for ExtentManager {
         // not pre-allocate.
         let pblock = match self.map_blocks(iblock)? {
             Mapping::Mapped { pblock, .. } => pblock,
+            Mapping::Hole { .. } if fs.delalloc_enabled() || fs.journal().is_some() => {
+                return_errno_with_message!(Errno::EAGAIN, "mapping requires inode writeback");
+            }
             Mapping::Hole { .. } => self.allocate_one(iblock)?,
         };
         fs.write_blocks_async(pblock, bio_segment, Some(complete_fn), io_batch)
@@ -1289,6 +1349,19 @@ impl BlockAsPageCacheBackend for ExtentManager {
         let mut pages = pages.into_iter().peekable();
 
         while let Some((start_idx, first_page)) = pages.next() {
+            // Ordered commit can see delayed pages belonging to a later
+            // transaction. Leave holes/unwritten dirty: mapping preparation
+            // belongs to the inode writeback funnel, which owns a handle.
+            if (fs.delalloc_enabled() || fs.journal().is_some()) && start_idx < npages {
+                let block = Iblock::try_from(start_idx).map_err(|_| Error::new(Errno::EFBIG))?;
+                if !matches!(
+                    self.map_blocks(block)?,
+                    Mapping::Mapped { written: true, .. }
+                ) {
+                    continue;
+                }
+            }
+
             // Identify a physically contiguous *written* run starting here. Any
             // other outcome routes this one page through the single-page path.
             let run = (start_idx < npages)
@@ -1400,6 +1473,14 @@ mod tests {
     }
 
     #[ktest]
+    fn ext4_extent_manager_mapping_and_allocation() {
+        crate::fs::fs_impls::ext4::test_utils::scenarios!(
+            map_written_extent,
+            map_unwritten_extent_reads_as_zeros,
+            allocate_one_frees_block_when_insert_fails,
+        );
+    }
+
     fn map_written_extent() {
         let f = Ext4FixtureBuilder::new(2048, 256, 2048).build().unwrap();
         let root = inline_root(&[RawExtent {
@@ -1435,7 +1516,6 @@ mod tests {
         assert!(m4.reads_as_zeros());
     }
 
-    #[ktest]
     fn map_unwritten_extent_reads_as_zeros() {
         let f = Ext4FixtureBuilder::new(2048, 256, 2048).build().unwrap();
         let root = inline_root(&[RawExtent {
@@ -1463,7 +1543,6 @@ mod tests {
     /// Regression: when `allocate_one` allocates a data block but the following
     /// `insert_extent` fails (here the inline→depth-1 grow needs a leaf block and
     /// the disk is out of space), the data block must be freed, not leaked.
-    #[ktest]
     fn allocate_one_frees_block_when_insert_fails() {
         // Exactly one free block: enough for the data block, not the tree leaf.
         let f = Ext4FixtureBuilder::new(2048, 256, 2048)
@@ -1530,13 +1609,20 @@ mod tests {
         assert_eq!(em.root_depth(), 1, "tree grew an external leaf");
     }
 
+    #[ktest]
+    fn ext4_extent_manager_journal_visibility() {
+        crate::fs::fs_impls::ext4::test_utils::scenarios!(
+            journaled_tree_read_sees_uncheckpointed_leaf,
+            journaled_reserialize_captures_reused_leaf,
+        );
+    }
+
     /// A1-B0 regression (read side of the B-1 hazard): while a leaf's newest
     /// bytes sit only in the journal — the running transaction's capture, or the
     /// committed-but-un-checkpointed image — tree reads must be served from
     /// them. A bare device read returns the pre-op bytes (all zeros for a leaf
     /// grown this op, since WAL suppressed its direct write), so every lookup
     /// on the file failed `EUCLEAN` until checkpoint caught the device up.
-    #[ktest]
     fn journaled_tree_read_sees_uncheckpointed_leaf() {
         crate::time::clocks::init_for_ktest();
         let f = Ext4FixtureBuilder::new(2048, 256, 2048)
@@ -1581,7 +1667,6 @@ mod tests {
     /// reuse path's `dirty_metadata` failed dirty-without-access (`EIO`) on
     /// every journaled mutation of a depth-1 tree whose leaf survived from an
     /// earlier transaction.
-    #[ktest]
     fn journaled_reserialize_captures_reused_leaf() {
         crate::time::clocks::init_for_ktest();
         let f = Ext4FixtureBuilder::new(2048, 256, 2048)

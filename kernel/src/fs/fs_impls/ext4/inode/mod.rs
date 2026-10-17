@@ -45,6 +45,7 @@ use super::{
     stats::{LATENCY_STATS, read_ns},
 };
 
+mod delalloc;
 mod dir;
 mod extent_manager;
 mod symlink;
@@ -966,6 +967,7 @@ impl Inode {
         // The inode-affinity fallback goal (P9b-b2): hint-less allocations
         // land in the inode's own group instead of group 0.
         let inode_goal = fs.upgrade().map(|f| f.inode_goal_block(ino)).unwrap_or(0);
+        let mapped_size = desc.size() as usize;
         let payload = InodePayload::new(&desc, fs.clone(), csum_seed, inode_goal)?;
         let pipe = match type_ {
             InodeType::NamedPipe => Some(crate::fs::pipe::Pipe::new()),
@@ -974,7 +976,7 @@ impl Inode {
         // `new_cyclic` so the write paths can hand `self_weak` to the journal's
         // ordered-inode registration; the only fallible step (payload parsing)
         // runs before the closure, which just assembles.
-        Ok(Arc::new_cyclic(|self_weak| Self {
+        let inode = Arc::new_cyclic(|self_weak| Self {
             ino,
             type_,
             inner: RwMutex::new(InodeInner {
@@ -984,6 +986,8 @@ impl Inode {
                 datasync_tid: None,
                 csum_seed,
                 last_capture: None,
+                delayed_account: None,
+                mapped_size,
             }),
             block_group_idx,
             fs,
@@ -991,7 +995,15 @@ impl Inode {
             pipe,
             ra: SpinLock::new(RaState::cold()),
             extension: Extension::new(),
-        }))
+        });
+        if type_ == InodeType::File {
+            if let Ok(fs) = inode.fs() {
+                if fs.rnvpc_mode() == crate::fs::rnvpc::mode::RnvpcMode::Native {
+                    fs.cache_pressure.register(&inode, ino);
+                }
+            }
+        }
+        Ok(inode)
     }
 
     /// Builds a live inode for a crash-recovery orphan reclaim from its raw
@@ -1573,19 +1585,56 @@ impl Inode {
         {
             return self.read_rnvpc_at(&fs, offset, writer);
         }
-        let len = writer.avail();
-        if len > 0 {
-            // Take the detector lock only for `on_read`; the trailing `;` drops
-            // the guard before `page_cache()` (which briefly takes `inner`) and
-            // the prefetch I/O, so the leaf lock never nests.
-            let prefetch = self.ra.lock().on_read(offset, len);
-            if let Some(range) = prefetch
-                && let Some(page_cache) = self.page_cache()
-            {
-                let _ = page_cache.prefetch_range(range);
+        offset
+            .checked_add(writer.avail())
+            .ok_or_else(|| Error::new(Errno::EINVAL))?;
+        let mut done = 0;
+        while writer.avail() != 0 {
+            let amount = writer.avail().min(super::writeback::IO_CHUNK);
+            // Preserve the detector's existing window. Reserve prefetch capacity
+            // too, so sequential reads cannot bypass the resident budget.
+            let prefetch = self.ra.lock().on_read(offset + done, amount).map(|range| {
+                let end = range.end.min(
+                    range
+                        .start
+                        .saturating_add(fs.cache_pressure.prefetch_limit()),
+                );
+                range.start..end
+            });
+            let prefetch_pages = prefetch
+                .as_ref()
+                .map_or(0, |range| range.len().div_ceil(PAGE_SIZE));
+            let pages = ((offset + done) % PAGE_SIZE + amount).div_ceil(PAGE_SIZE) + prefetch_pages;
+            let _reservation = match fs.cache_pressure.reserve(&fs, pages) {
+                Ok(reservation) => reservation,
+                Err(error) => return if done != 0 { Ok(done) } else { Err(error) },
+            };
+            if let Some(range) = prefetch {
+                if let Some(cache) = self.page_cache() {
+                    let _ = cache.prefetch_range(range);
+                }
+            }
+            let result = {
+                let cursor_before = writer.cursor().addr();
+                let mut chunk = writer.clone_exclusive();
+                chunk.limit(amount);
+                let result = self.inner.read().read_at(offset + done, &mut chunk);
+                let copied = chunk.cursor().addr() - cursor_before;
+                drop(chunk);
+                writer.skip(copied);
+                result
+            };
+            match result {
+                Ok(read) => {
+                    done += read;
+                    if read < amount {
+                        break;
+                    }
+                }
+                Err(error) => return if done != 0 { Ok(done) } else { Err(error) },
             }
         }
-        self.inner.read().read_at(offset, writer)
+        Ok(done)
     }
 
     /// Reads file data at `offset` bypassing the page cache (`O_DIRECT`).
@@ -1626,23 +1675,15 @@ impl Inode {
         }
         let fs = self.fs()?;
 
-        // Size the flush from a preliminary EOF read; the authoritative clamp
-        // happens under the read lock below. An out-of-range flush portion is
-        // ignored, so a truncate racing between here and the lock is harmless.
-        let file_size = self.inner.read().file_size();
+        let mut inner = self.inner.write();
+        self.resolve_delalloc_locked(&fs, &mut inner, usize::MAX)?;
+        let file_size = inner.file_size();
         if offset >= file_size {
             return Ok(0);
         }
         let flush_end = offset + avail.min(file_size - offset);
-        if let Some(page_cache) = self.page_cache() {
-            page_cache.flush_range(offset..flush_end)?;
-        }
-
-        // The read lock spans map + DMA + copy so a concurrent write/truncate
-        // cannot re-map the run mid-read. Only the extent-tree lock (via
-        // `map_blocks`) and the device read funnel are touched under it — never
-        // the journal write funnel.
-        self.inner.read().read_direct_at(&fs, offset, writer)
+        inner.page_cache()?.flush_range(offset..flush_end)?;
+        inner.read_direct_at(&fs, offset, writer)
     }
 
     /// Writes file data at `offset` through the inode's page cache.
@@ -1824,6 +1865,39 @@ impl Inode {
         {
             return self.write_rnvpc_at(&fs, offset, reader);
         }
+        offset
+            .checked_add(reader.remain())
+            .ok_or_else(|| Error::new(Errno::EINVAL))?;
+        let mut done = 0;
+        while reader.remain() != 0 {
+            let amount = reader.remain().min(super::writeback::IO_CHUNK);
+            let pages = (offset + done)
+                .rem_euclid(PAGE_SIZE)
+                .saturating_add(amount)
+                .div_ceil(PAGE_SIZE);
+            let _reservation = match fs.cache_pressure.reserve(&fs, pages) {
+                Ok(reservation) => reservation,
+                Err(error) => return if done != 0 { Ok(done) } else { Err(error) },
+            };
+            let mut chunk = reader.clone();
+            chunk.limit(amount);
+            let result = self.write_native_chunk(&fs, offset + done, &mut chunk);
+            // Preserve reader consumption on a short/faulting copy, as before.
+            reader.skip(amount - chunk.remain());
+            match result {
+                Ok(written) => {
+                    done += written;
+                    if written < amount {
+                        break;
+                    }
+                }
+                Err(error) => return if done != 0 { Ok(done) } else { Err(error) },
+            }
+        }
+        Ok(done)
+    }
+
+    fn write_native_chunk(&self, fs: &Ext4, offset: usize, reader: &mut VmReader) -> Result<usize> {
         // `ext4_should_retry_alloc`: a write consuming the last unpinned blocks
         // can hit a transient `ENOSPC` while a just-freed run (a prior
         // `unlink`/`truncate`) is still pinned to its uncommitted transaction —
@@ -1840,7 +1914,12 @@ impl Inode {
         let mut retries = 0;
         loop {
             let remain_before = reader.remain();
-            match self.write_at_once(&fs, offset, reader) {
+            let result = if self.type_ == InodeType::File && fs.delalloc_enabled() {
+                self.write_delayed_chunk(fs, offset, reader)
+            } else {
+                self.write_at_once(fs, offset, reader)
+            };
+            match result {
                 Err(e)
                     if e.error() == Errno::ENOSPC
                         && reader.remain() == remain_before
@@ -2195,6 +2274,7 @@ impl Inode {
             .checked_add(write_len)
             .ok_or_else(|| Error::with_message(Errno::EINVAL, "write range overflow"))?;
         let mut inner = self.inner.write();
+        self.resolve_delalloc_locked(&fs, &mut inner, usize::MAX)?;
         let old_size = inner.file_size();
 
         // Coherency (direct-IO rule): flush overlapping dirty pages to the device
@@ -2366,6 +2446,9 @@ impl Inode {
         }
         let fs = self.fs()?;
         let mut inner = self.inner.write();
+        if new_size != 0 {
+            self.resolve_delalloc_locked(&fs, &mut inner, usize::MAX)?;
+        }
         let old_size = inner.file_size();
 
         // Fast/slow gate (DECISION §E, G-3): a shrink whose worst-case
@@ -2422,6 +2505,9 @@ impl Inode {
         // single-transaction shrink can grow its reservation in place; the
         // descriptor capture below reverts to the shared `get`.
         inner.resize(&fs, new_size, op.get_mut())?;
+        if new_size == 0 {
+            inner.cancel_delalloc()?;
+        }
         // Same per-handle descriptor capture as `write_at`: the new size and
         // truncated extent root must commit with the bitmap/GDT changes.
         if op.get().is_some() {
@@ -2715,6 +2801,7 @@ impl Inode {
             .ok_or_else(|| Error::with_message(Errno::EINVAL, "fallocate range overflow"))?;
         let fs = self.fs()?;
         let mut inner = self.inner.write();
+        self.resolve_delalloc_locked(&fs, &mut inner, usize::MAX)?;
         let old_size = inner.file_size();
         inner.ensure_size_within_limit(&fs, end)?;
 
@@ -2859,6 +2946,7 @@ impl Inode {
     fn punch_hole(&self, offset: usize, len: usize) -> Result<()> {
         let fs = self.fs()?;
         let mut inner = self.inner.write();
+        self.resolve_delalloc_locked(&fs, &mut inner, usize::MAX)?;
         let old_size = inner.file_size();
         // No hole beyond i_size (KEEP_SIZE never grows the file) — that range
         // already reads zero (Linux ext4_punch_hole).
@@ -3003,6 +3091,7 @@ impl Inode {
     fn zero_range(&self, offset: usize, len: usize, keep_size: bool) -> Result<()> {
         let fs = self.fs()?;
         let mut inner = self.inner.write();
+        self.resolve_delalloc_locked(&fs, &mut inner, usize::MAX)?;
         let old_size = inner.file_size();
         let end = offset
             .checked_add(len)
@@ -3139,6 +3228,7 @@ impl Inode {
         }
         let fs = self.fs()?;
         let mut inner = self.inner.write();
+        self.resolve_delalloc_locked(&fs, &mut inner, usize::MAX)?;
         let old_size = inner.file_size();
         let end = offset
             .checked_add(len)
@@ -3240,6 +3330,7 @@ impl Inode {
         }
         let fs = self.fs()?;
         let mut inner = self.inner.write();
+        self.resolve_delalloc_locked(&fs, &mut inner, usize::MAX)?;
         let old_size = inner.file_size();
         // An insert at/past EOF is a plain extend, not a shift (Linux EINVAL).
         if offset >= old_size {
@@ -3324,6 +3415,7 @@ impl Inode {
     pub(super) fn sync_metadata(&self) -> Result<()> {
         let fs = self.fs()?;
         let mut inner = self.inner.write();
+        self.resolve_delalloc_locked(&fs, &mut inner, usize::MAX)?;
         // Journaled: capture under a handle like every other metadata write (the
         // direct RMW below in `write_back_inode_desc` reads the on-disk slot,
         // which lags a suppressed-but-not-yet-checkpointed write — stale — and
@@ -3350,6 +3442,7 @@ impl Inode {
         let fs = self.fs()?;
         let wait_tid = {
             let mut inner = self.inner.write();
+            self.resolve_delalloc_locked(&fs, &mut inner, usize::MAX)?;
             inner.sync_data_pages(&fs)?;
             // Journaled: capture instead of direct-writing (see
             // `sync_metadata`). Wait below on whichever transaction carries
@@ -3384,6 +3477,9 @@ impl Inode {
         {
             journal.log_wait_commit(target)?;
         }
+        if fs.journal().is_none() {
+            fs.sync_metadata()?;
+        }
         if fs.block_device().sync()? != BioStatus::Complete {
             return_errno_with_message!(Errno::EIO, "failed to flush block device");
         }
@@ -3405,6 +3501,7 @@ impl Inode {
     pub(super) fn sync_data_and_meta_no_barrier(&self) -> Result<()> {
         let fs = self.fs()?;
         let mut inner = self.inner.write();
+        self.resolve_delalloc_locked(&fs, &mut inner, usize::MAX)?;
         inner.sync_data_pages(&fs)?;
         let op = fs.begin_op(Ext4::FSYNC_CREDITS)?;
         // Forced: a durability funnel never dedups (policy — see the wrapper).
@@ -3463,6 +3560,7 @@ impl Inode {
         }
 
         let mut inner = self.inner.write();
+        inner.cancel_delalloc()?;
         // Journal handle after the inner lock (inner ① → handle ②): captures the
         // block-bitmap / group-descriptor / inode-bitmap after-images freeing the
         // inode's blocks and the inode itself dirty. Per-chunk estimate at the
@@ -3657,6 +3755,34 @@ impl Inode {
         self.block_group_idx
     }
 
+    /// Writes a bounded regular-file batch without a journal commit wait.
+    pub(super) fn writeback_cache_pages(&self, limit: usize) -> Result<usize> {
+        if limit == 0 {
+            return Ok(0);
+        }
+        let fs = self.fs()?;
+        let mut inner = self.inner.write();
+        self.resolve_delalloc_locked(&fs, &mut inner, limit)?;
+        let written = inner.page_cache()?.flush_some_pages(limit)?;
+        if written != 0 || inner.is_dirty() {
+            if fs.journal().is_none() {
+                fs.sync_metadata()?;
+            }
+            let op = fs.begin_op(Ext4::FSYNC_CREDITS)?;
+            if let Some(handle) = op.get() {
+                handle.register_ordered_data(
+                    self.ino,
+                    self.self_weak.clone(),
+                    inner.page_cache()?.clone(),
+                    inner.file_size(),
+                )?;
+            }
+            inner.write_back_inode_desc(&fs, self.ino, op.get())?;
+            inner.stamp_datasync_tid(op.get());
+        }
+        Ok(written)
+    }
+
     /// Returns a clone of the inode's page cache, if it is data-backed.
     pub(super) fn page_cache(&self) -> Option<PageCache> {
         self.inner.read().page_cache().ok().cloned()
@@ -3845,6 +3971,8 @@ struct InodeInner {
     /// behind its own `Box` inside the record, so the inline `Option` costs
     /// the tid, the epoch and one pointer — no second indirection.
     last_capture: Option<InodeCaptureRecord>,
+    delayed_account: Option<super::allocator::DelayedAccount>,
+    mapped_size: usize,
 }
 
 impl InodeInner {
@@ -4795,6 +4923,11 @@ impl InodeInner {
         if !self.is_dirty() {
             return Ok(());
         }
+        if fs.journal().is_none() {
+            if let Ok(em) = self.extent_manager() {
+                em.flush_delayed_metadata()?;
+            }
+        }
         let (root, sector_count) = match self.extent_manager() {
             Ok(bm) => (bm.root_snapshot(), bm.sector_count()),
             Err(_) => (*self.desc.raw_block(), self.desc.sector_count()),
@@ -4802,12 +4935,13 @@ impl InodeInner {
         // Mirror the authoritative `i_blocks` into the descriptor before writing.
         self.desc.set_sector_count(sector_count);
 
+        let capture_desc = self.capturable_desc();
         if let Some(handle) = handle {
             let last = match policy {
                 CapturePolicy::Dedup => self.last_capture.as_ref(),
                 CapturePolicy::Forced => None,
             };
-            match fs.capture_inode_desc(ino, &self.desc, &root, handle, last) {
+            match fs.capture_inode_desc(ino, &capture_desc, &root, handle, last) {
                 Ok(InodeCaptureOutcome::Captured {
                     basis,
                     splice_epoch,
@@ -4842,12 +4976,28 @@ impl InodeInner {
             // the record's tid to equal this handle's, and that tid is exactly
             // what the record's full capture stamped here.
             self.sync_tid = Some(handle.tid());
+            self.mapped_size = capture_desc.size() as usize;
             self.clear_dirty();
+            if self
+                .extent_manager()
+                .is_ok_and(|em| em.first_delayed().is_some())
+            {
+                let size = self.file_size();
+                self.desc.set_size(size as u64);
+            }
             return Ok(());
         }
 
-        fs.write_back_inode_desc(ino, &self.desc, &root, None)?;
+        fs.write_back_inode_desc(ino, &capture_desc, &root, None)?;
+        self.mapped_size = capture_desc.size() as usize;
         self.clear_dirty();
+        if self
+            .extent_manager()
+            .is_ok_and(|em| em.first_delayed().is_some())
+        {
+            let size = self.file_size();
+            self.desc.set_size(size as u64);
+        }
         Ok(())
     }
 
@@ -5018,6 +5168,13 @@ impl InodePayload {
     ) -> Result<Self> {
         let page_cache_size = size.align_up(PAGE_SIZE);
         let page_count = page_cache_size / PAGE_SIZE;
+        let accounting = if matches!(data_forget_policy, journal::DataForgetPolicy::PlainData) {
+            fs.upgrade()
+                .filter(|fs| fs.rnvpc_mode() == crate::fs::rnvpc::mode::RnvpcMode::Native)
+                .map(|fs| fs.cache_pressure.accounting.clone())
+        } else {
+            None
+        };
         let extent_manager = Arc::new(ExtentManager::try_new(
             root,
             sector_count,
@@ -5028,8 +5185,12 @@ impl InodePayload {
             data_forget_policy,
         )?);
         let backend: Weak<dyn PageCacheBackend> = Arc::downgrade(&extent_manager) as _;
-        let page_cache = PageCache::new_with_backend(page_cache_size, backend)
-            .expect("ext4 inode page cache allocation failed");
+        let mut options =
+            crate::vm::page_cache::VmoOptions::new_page_cache(page_cache_size, backend);
+        if let Some(accounting) = accounting {
+            options = options.accounting(accounting);
+        }
+        let page_cache = PageCache::from(options.alloc()?);
         Ok(Self::DataBacked {
             page_cache,
             extent_manager,
@@ -5057,11 +5218,23 @@ mod tests {
         }
     }
 
+    #[ktest]
+    fn ext4_inode_encoding() {
+        crate::fs::fs_impls::ext4::test_utils::scenarios!(
+            inode_checksum_round_trip,
+            stamp_inode_checksum_round_trips_with_verify,
+            decode_root_dir_inode,
+            decode_combines_uid_gid_high,
+            decode_combines_size_high_for_file,
+            decode_nanosecond_time,
+            reject_unused_inode,
+        );
+    }
+
     /// An inode stamped with its crc32c `i_checksum_lo`/`i_checksum_hi` verifies;
     /// a body change, a wrong inode number, or a wrong generation each fail with
     /// `EUCLEAN`. The seed folds in the inode number and generation, so identical
     /// bytes at a different inode number do not verify.
-    #[ktest]
     fn inode_checksum_round_trip() {
         const INODE_SIZE: usize = 256;
         let fs_seed = 0xFEED_BEEF;
@@ -5103,7 +5276,6 @@ mod tests {
     /// The write-side `stamp_inode_checksum` produces exactly what the read-side
     /// `verify_inode_checksum` accepts — the compute/verify round-trip at the
     /// inode writeback funnel.
-    #[ktest]
     fn stamp_inode_checksum_round_trips_with_verify() {
         const INODE_SIZE: usize = 256;
         let fs_seed = 0x0102_0304;
@@ -5120,7 +5292,6 @@ mod tests {
         assert!(InodeDesc::verify_inode_checksum(&raw, iseed, INODE_SIZE).is_err());
     }
 
-    #[ktest]
     fn decode_root_dir_inode() {
         let raw = raw_root_dir();
         let desc = InodeDesc::try_from(&raw).unwrap();
@@ -5131,7 +5302,6 @@ mod tests {
         assert_eq!(desc.sector_count(), (BLOCK_SIZE / SECTOR_SIZE) as u64);
     }
 
-    #[ktest]
     fn decode_combines_uid_gid_high() {
         let mut raw = raw_root_dir();
         raw.uid = 0x1111;
@@ -5143,7 +5313,6 @@ mod tests {
         assert_eq!(desc.gid, 0x4444_3333);
     }
 
-    #[ktest]
     fn decode_combines_size_high_for_file() {
         let mut raw = raw_root_dir();
         raw.mode = 0o100644; // S_IFREG | 0644
@@ -5155,7 +5324,6 @@ mod tests {
         assert_eq!(desc.size(), (1u64 << 32) | 0x1000);
     }
 
-    #[ktest]
     fn decode_nanosecond_time() {
         let mut raw = raw_root_dir();
         raw.mtime = 1000;
@@ -5164,17 +5332,28 @@ mod tests {
         assert_eq!(desc.mtime, Duration::new(1000, 500));
     }
 
-    #[ktest]
     fn reject_unused_inode() {
         let mut raw = raw_root_dir();
         raw.link_count = 0;
         assert!(InodeDesc::try_from(&raw).is_err());
     }
 
+    #[ktest]
+    fn ext4_readahead_window() {
+        crate::fs::fs_impls::ext4::test_utils::scenarios!(
+            ra_state_cold_miss_opens_min_window,
+            ra_state_miss_does_not_amplify_random_reads,
+            ra_state_sequential_hits_double_window_to_max,
+            ra_state_seek_resets_window,
+            ra_state_plus_minus_one_page_tolerance,
+            ra_state_frontier_does_not_go_backwards,
+            ra_state_read_within_frontier_requests_nothing,
+        );
+    }
+
     /// A cold detector misses on its first read: the prefetch covers exactly
     /// the request (no look-ahead yet), the minimum window is armed for the
     /// next hit, and the next expected page is set.
-    #[ktest]
     fn ra_state_cold_miss_opens_min_window() {
         let mut ra = RaState::cold();
         let range = ra.on_read(0, PAGE_SIZE).unwrap();
@@ -5187,7 +5366,6 @@ mod tests {
 
     /// A miss never inflates the request: a random 4K read prefetches one
     /// page, not a whole window — only a sequential hit reads ahead.
-    #[ktest]
     fn ra_state_miss_does_not_amplify_random_reads() {
         let mut ra = RaState::cold();
         ra.on_read(0, PAGE_SIZE);
@@ -5204,7 +5382,6 @@ mod tests {
     /// A long sequential stream extends the frontier in window-sized chunks
     /// (doubling the window per extension up to the maximum), and between
     /// extensions it requests nothing — no per-read trickle.
-    #[ktest]
     fn ra_state_sequential_hits_double_window_to_max() {
         let mut ra = RaState::cold();
         ra.on_read(0, PAGE_SIZE); // miss -> window = RA_MIN, frontier = 1 page
@@ -5239,7 +5416,6 @@ mod tests {
 
     /// A non-sequential jump resets the window to the minimum and restarts the
     /// prefetch frontier at the seek target.
-    #[ktest]
     fn ra_state_seek_resets_window() {
         let mut ra = RaState::cold();
         ra.on_read(0, PAGE_SIZE);
@@ -5255,7 +5431,6 @@ mod tests {
 
     /// The one-page tolerance keeps a read that lands just before or just after
     /// the expected page counted as sequential.
-    #[ktest]
     fn ra_state_plus_minus_one_page_tolerance() {
         // Expected + 1 page still counts as sequential.
         let mut ra = RaState::cold();
@@ -5272,7 +5447,6 @@ mod tests {
 
     /// The prefetch frontier never walks backwards: a sequential read's new
     /// range starts exactly where the previous one ended.
-    #[ktest]
     fn ra_state_frontier_does_not_go_backwards() {
         let mut ra = RaState::cold();
         let first = ra.on_read(0, PAGE_SIZE).unwrap();
@@ -5283,7 +5457,6 @@ mod tests {
 
     /// A read that lands entirely behind an already-issued frontier asks for no
     /// new prefetch, and does not walk the frontier backwards.
-    #[ktest]
     fn ra_state_read_within_frontier_requests_nothing() {
         let mut ra = RaState {
             next_expected_page: Some(5),
@@ -5337,6 +5510,504 @@ mod write_tests {
     }
 
     #[ktest]
+    fn ext4_delalloc_foreground_defers_allocation() {
+        for journaled in [false, true] {
+            clocks::init_for_ktest();
+            let mut builder = Ext4FixtureBuilder::new(2048, 256, 2048)
+                .with_block_bitmap_metadata_marked()
+                .with_mount_options("delalloc");
+            if journaled {
+                builder = builder.with_journal_inode(64);
+            }
+            let f = builder.build().unwrap();
+            f.write_raw_inode(FILE_INO, &make_empty_file_inode());
+            let inode = f.ext4.read_inode(FILE_INO).unwrap();
+            let free_before = f.ext4.super_block().free_blocks_count();
+            let tid_before = inode.recorded_datasync_tid_for_test();
+            assert_eq!(write_all(&inode, 0, &[0x5a; BLOCK_SIZE]), BLOCK_SIZE);
+            assert_eq!(read_back(&inode, 0, BLOCK_SIZE), vec![0x5a; BLOCK_SIZE]);
+            assert_eq!(inode.size(), BLOCK_SIZE);
+            assert_eq!(inode.sector_count(), 0, "foreground allocated blocks");
+            assert_eq!(f.ext4.super_block().free_blocks_count(), free_before);
+            assert_eq!(inode.data_block_of(0), None);
+            assert_eq!(inode.recorded_datasync_tid_for_test(), tid_before);
+            inode.sync_data_and_meta(SyncScope::Full).unwrap();
+            assert!(inode.data_block_of(0).is_some());
+            assert_eq!(read_back(&inode, 0, BLOCK_SIZE), vec![0x5a; BLOCK_SIZE]);
+        }
+    }
+
+    fn delayed_fixture(journaled: bool) -> Ext4Fixture {
+        clocks::init_for_ktest();
+        let mut builder = Ext4FixtureBuilder::new(8192, 256, 8192)
+            .with_block_bitmap_metadata_marked()
+            .with_reserved_inode(FILE_INO)
+            .with_mount_options("delalloc");
+        if journaled {
+            builder = builder.with_journal_inode(64);
+        }
+        let f = builder.build().unwrap();
+        f.write_raw_inode(FILE_INO, &make_empty_file_inode());
+        f
+    }
+
+    #[ktest]
+    fn ext4_delalloc_lifecycle() {
+        for journaled in [false, true] {
+            let f = delayed_fixture(journaled);
+            let inode = f.ext4.read_inode(FILE_INO).unwrap();
+            write_all(&inode, 0, &[0x71; BLOCK_SIZE * 2]);
+            let promised = inode
+                .inner
+                .read()
+                .delayed_account
+                .as_ref()
+                .unwrap()
+                .remaining();
+            write_all(&inode, 7, &[0x32; 19]);
+            assert_eq!(
+                inode
+                    .inner
+                    .read()
+                    .delayed_account
+                    .as_ref()
+                    .unwrap()
+                    .remaining(),
+                promised
+            );
+            inode.resize(0).unwrap();
+            assert_eq!(
+                inode
+                    .inner
+                    .read()
+                    .extent_manager()
+                    .unwrap()
+                    .delayed_blocks(),
+                0
+            );
+            assert_eq!(
+                inode
+                    .inner
+                    .read()
+                    .delayed_account
+                    .as_ref()
+                    .unwrap()
+                    .remaining(),
+                0
+            );
+            inode.sync_data_and_meta(SyncScope::Full).unwrap();
+            assert_eq!(inode.sector_count(), 0);
+            write_all(&inode, BLOCK_SIZE * 3 + 3, &[0x45; 17]);
+            inode.punch_hole(BLOCK_SIZE * 3, BLOCK_SIZE).unwrap();
+            inode.sync_data_and_meta(SyncScope::Full).unwrap();
+            assert_eq!(read_back(&inode, 0, inode.size()), vec![0; inode.size()]);
+            write_all(&inode, 0, &[0x27; BLOCK_SIZE]);
+            let mut output = vec![0; BLOCK_SIZE];
+            let mut writer = VmWriter::from(output.as_mut_slice()).to_fallible();
+            assert_eq!(inode.read_direct_at(0, &mut writer).unwrap(), BLOCK_SIZE);
+            assert_eq!(output, vec![0x27; BLOCK_SIZE]);
+        }
+    }
+
+    #[ktest]
+    fn ext4_delalloc_bounded_writeback_and_remount() {
+        for journaled in [false, true] {
+            let f = delayed_fixture(journaled);
+            let inode = f.ext4.read_inode(FILE_INO).unwrap();
+            let data = vec![0x68; BLOCK_SIZE * 70];
+            write_all(&inode, 0, &data);
+            assert_eq!(inode.sector_count(), 0);
+            assert_eq!(inode.writeback_cache_pages(1).unwrap(), 1);
+            assert!(inode.data_block_of(0).is_some());
+            assert!(inode.data_block_of(1).is_none());
+            if let Some(journal) = f.ext4.journal() {
+                journal.commit_and_wait_running().unwrap();
+            }
+            assert_eq!(
+                inode
+                    .inner
+                    .read()
+                    .extent_manager()
+                    .unwrap()
+                    .delayed_blocks(),
+                69
+            );
+            inode.sync_data_and_meta(SyncScope::Full).unwrap();
+            if let Some(journal) = f.ext4.journal() {
+                journal.flush_on_unmount().unwrap();
+            }
+            let reopened =
+                Ext4::open(f.disk.clone() as Arc<dyn BlockDevice>, Some(c"delalloc")).unwrap();
+            let recovered = reopened.read_inode(FILE_INO).unwrap();
+            assert_eq!(read_back(&recovered, 0, data.len()), data);
+        }
+        // Controlled crash after only the first materialized page committed:
+        // replay must publish that prefix and discard the unallocated suffix.
+        let f = delayed_fixture(true);
+        let inode = f.ext4.read_inode(FILE_INO).unwrap();
+        write_all(&inode, 0, &vec![0x75; BLOCK_SIZE * 70]);
+        inode.writeback_cache_pages(1).unwrap();
+        let journal = f.ext4.journal().unwrap();
+        journal.commit_and_wait_running().unwrap();
+        assert!(!journal.uncheckpointed_blocks_for_test().is_empty());
+        f.ext4
+            .shutdown(crate::fs::fs_impls::ext4::fs::GoingDown::NoLogFlush)
+            .unwrap();
+        let reopened = Ext4::open(f.disk.clone() as Arc<dyn BlockDevice>, None).unwrap();
+        let recovered = reopened.read_inode(FILE_INO).unwrap();
+        assert_eq!(recovered.size(), BLOCK_SIZE);
+        assert_eq!(read_back(&recovered, 0, BLOCK_SIZE), vec![0x75; BLOCK_SIZE]);
+        assert!(recovered.data_block_of(1).is_none());
+    }
+
+    #[ktest]
+    fn ext4_delalloc_sparse_mmap_attributes_and_errors() {
+        for journaled in [false, true] {
+            let f = delayed_fixture(journaled);
+            let inode = f.ext4.read_inode(FILE_INO).unwrap();
+            write_all(&inode, 0, &[0x57; BLOCK_SIZE]);
+            inode
+                .set_mode(InodeMode::from_bits_truncate(0o600))
+                .unwrap();
+            if let Some(journal) = f.ext4.journal() {
+                journal.flush_on_unmount().unwrap();
+                assert_eq!(
+                    f.read_raw_inode(FILE_INO).size_lo,
+                    0,
+                    "attribute capture published pending size"
+                );
+                assert_eq!(inode.data_block_of(0), None);
+            }
+            inode.resize(BLOCK_SIZE * 30).unwrap();
+            let cache = inode.page_cache().unwrap();
+            let mmap_bytes = [0x39; BLOCK_SIZE];
+            let mut reader = VmReader::from(mmap_bytes.as_slice()).to_fallible();
+            cache.write(BLOCK_SIZE * 13, &mut reader).unwrap();
+            inode.sync_data_and_meta(SyncScope::Full).unwrap();
+            assert!(inode.data_block_of(13).is_some());
+            for block in [1, 12, 14, 29] {
+                assert!(inode.data_block_of(block).is_none());
+            }
+            assert_eq!(
+                read_back(&inode, BLOCK_SIZE * 13, BLOCK_SIZE),
+                vec![0x39; BLOCK_SIZE]
+            );
+            // Many disjoint writes force external extent nodes in both modes.
+            for block in (32..64).step_by(2) {
+                write_all(&inode, BLOCK_SIZE * block, &[block as u8; BLOCK_SIZE]);
+            }
+            inode.sync_data_and_meta(SyncScope::Full).unwrap();
+            if let Some(journal) = f.ext4.journal() {
+                journal.flush_on_unmount().unwrap();
+            }
+            let reopened = Ext4::open(f.disk.clone() as Arc<dyn BlockDevice>, None).unwrap();
+            let recovered = reopened.read_inode(FILE_INO).unwrap();
+            for block in (32..64).step_by(2) {
+                assert_eq!(
+                    read_back(&recovered, BLOCK_SIZE * block, BLOCK_SIZE),
+                    vec![block as u8; BLOCK_SIZE]
+                );
+                assert!(recovered.data_block_of((block + 1) as Iblock).is_none());
+            }
+        }
+        let f = delayed_fixture(false);
+        let inode = f.ext4.read_inode(FILE_INO).unwrap();
+        f.disk.set_fail_writes(true);
+        write_all(&inode, 0, &[0x59; BLOCK_SIZE]);
+        assert_eq!(
+            inode
+                .sync_data_and_meta(SyncScope::Full)
+                .unwrap_err()
+                .error(),
+            Errno::EIO
+        );
+        assert_eq!(read_back(&inode, 0, BLOCK_SIZE), vec![0x59; BLOCK_SIZE]);
+        f.disk.set_fail_writes(false);
+        inode.sync_data_and_meta(SyncScope::Full).unwrap();
+        let reopened = Ext4::open(f.disk.clone() as Arc<dyn BlockDevice>, None).unwrap();
+        assert_eq!(
+            read_back(&reopened.read_inode(FILE_INO).unwrap(), 0, BLOCK_SIZE),
+            vec![0x59; BLOCK_SIZE]
+        );
+    }
+
+    #[ktest]
+    fn ext4_delalloc_write_admission() {
+        for journaled in [false, true] {
+            let f = delayed_fixture(journaled);
+            let inode = f.ext4.read_inode(FILE_INO).unwrap();
+            f.ext4.set_read_only(true).unwrap();
+            let bytes = [0x19; 32];
+            let mut reader = VmReader::from(bytes.as_slice()).to_fallible();
+            assert_eq!(
+                inode.write_at(0, &mut reader).unwrap_err().error(),
+                Errno::EROFS
+            );
+            assert_eq!(reader.remain(), bytes.len());
+            assert_eq!(inode.size(), 0);
+            f.ext4.set_read_only(false).unwrap();
+            if let Some(journal) = f.ext4.journal() {
+                journal.abort_for_shutdown();
+                assert_eq!(
+                    inode.write_at(0, &mut reader).unwrap_err().error(),
+                    Errno::EROFS
+                );
+                assert_eq!(reader.remain(), bytes.len());
+            }
+        }
+    }
+
+    #[ktest]
+    fn ext4_delalloc_mapped_append_orders_size() {
+        for journaled in [false, true] {
+            let f = delayed_fixture(journaled);
+            let inode = f.ext4.read_inode(FILE_INO).unwrap();
+            write_all(&inode, 0, &[0x31; 100]);
+            inode.sync_data_and_meta(SyncScope::Full).unwrap();
+            write_all(&inode, 0, &[0x31; 100]);
+            inode.sync_data_and_meta(SyncScope::Full).unwrap();
+            assert!(
+                inode
+                    .inner
+                    .read()
+                    .extent_manager()
+                    .unwrap()
+                    .range_known_written(0, 1)
+            );
+            write_all(&inode, 100, &[0x42; 50]);
+            assert_eq!(inode.inner.read().capturable_desc().size(), 100);
+            inode
+                .set_mode(InodeMode::from_bits_truncate(0o600))
+                .unwrap();
+            if let Some(journal) = f.ext4.journal() {
+                journal.flush_on_unmount().unwrap();
+                assert_eq!(f.read_raw_inode(FILE_INO).size_lo, 100);
+            }
+            inode.sync_data_and_meta(SyncScope::Full).unwrap();
+            if !journaled {
+                assert_eq!(f.read_raw_inode(FILE_INO).size_lo, 150);
+            }
+            if let Some(journal) = f.ext4.journal() {
+                journal.flush_on_unmount().unwrap();
+            }
+            assert_eq!(f.read_raw_inode(FILE_INO).size_lo, 150);
+        }
+    }
+
+    #[ktest]
+    fn ext4_delalloc_credit_restart() {
+        let f = delayed_fixture(true);
+        let inode = f.ext4.read_inode(FILE_INO).unwrap();
+        let journal = f.ext4.journal().unwrap();
+        let small = f.ext4.write_credits(0);
+        let large = f.ext4.chunk_insert_credits(0);
+        assert!(large > small);
+        let occupied = journal.max_credits() - small;
+        let filler = f.ext4.begin_op(occupied).unwrap();
+        for i in 0..occupied {
+            let access = journal::get_create_access(filler.get(), 1000 + i as u64).unwrap();
+            access.patch(|bytes| bytes.fill(0)).unwrap();
+        }
+        drop(filler);
+        write_all(&inode, 0, &[0x37; BLOCK_SIZE]);
+        inode.sync_data_and_meta(SyncScope::Full).unwrap();
+        assert!(!journal.is_aborted());
+        assert!(journal.restart_count_for_test() > 0);
+        assert_eq!(read_back(&inode, 0, BLOCK_SIZE), vec![0x37; BLOCK_SIZE]);
+    }
+
+    #[ktest]
+    fn ext4_delalloc_nojournal_metadata_retry() {
+        let f = delayed_fixture(false);
+        let inode = f.ext4.read_inode(FILE_INO).unwrap();
+        write_all(&inode, 0, &[0x52; BLOCK_SIZE]);
+        // Inode 11 lives in table block 4 in this fixture. Data succeeds,
+        // only the final inode publication fails.
+        f.disk.set_fail_write_block(Some(4));
+        assert_eq!(
+            inode.writeback_cache_pages(64).unwrap_err().error(),
+            Errno::EIO
+        );
+        f.disk.set_fail_write_block(None);
+        assert_eq!(inode.writeback_cache_pages(64).unwrap(), 0);
+        assert_eq!(f.read_raw_inode(FILE_INO).size_lo, BLOCK_SIZE as u32);
+        for block in [2, 4, 6, 8] {
+            write_all(&inode, block * BLOCK_SIZE, &[0x63; BLOCK_SIZE]);
+        }
+        inode.sync_data_and_meta(SyncScope::Full).unwrap();
+        let leaf = inode.inner.read().extent_manager().unwrap().root_snapshot()[4] as usize;
+        f.disk.set_fail_write_block(Some(leaf));
+        write_all(&inode, 10 * BLOCK_SIZE, &[0x78; BLOCK_SIZE]);
+        assert_eq!(
+            inode
+                .sync_data_and_meta(SyncScope::Full)
+                .unwrap_err()
+                .error(),
+            Errno::EIO
+        );
+        f.disk.set_fail_write_block(None);
+        inode.sync_data_and_meta(SyncScope::Full).unwrap();
+        let reopened = Ext4::open(f.disk.clone() as Arc<dyn BlockDevice>, None).unwrap();
+        assert_eq!(
+            read_back(
+                &reopened.read_inode(FILE_INO).unwrap(),
+                10 * BLOCK_SIZE,
+                BLOCK_SIZE
+            ),
+            vec![0x78; BLOCK_SIZE]
+        );
+    }
+
+    #[ktest]
+    fn ext4_delalloc_full_capacity_overwrite_and_admission() {
+        let f = delayed_fixture(false);
+        let original = f.ext4.read_inode(FILE_INO).unwrap();
+        write_all(&original, 0, &[0x34; 100]);
+        original.sync_data_and_meta(SyncScope::Full).unwrap();
+        let fs = Ext4::open(f.disk.clone() as Arc<dyn BlockDevice>, None).unwrap();
+        let inode = fs.read_inode(FILE_INO).unwrap();
+        assert!(
+            !inode
+                .inner
+                .read()
+                .extent_manager()
+                .unwrap()
+                .range_known_written(0, 1)
+        );
+        let competing = fs.delayed_account();
+        while fs
+            .reserve_delayed(&competing, extent_manager::DELALLOC_PROMISE_PER_BLOCK)
+            .is_ok()
+        {}
+        let bytes = [0x26; BLOCK_SIZE];
+        let mut reader = VmReader::from(bytes.as_slice()).to_fallible();
+        assert_eq!(
+            inode.write_at(BLOCK_SIZE, &mut reader).unwrap_err().error(),
+            Errno::ENOSPC
+        );
+        assert_eq!(reader.remain(), BLOCK_SIZE);
+        assert_eq!(inode.size(), 100);
+        // A cold mapped overwrite and a mapped EOF append need no allocation.
+        write_all(&inode, 0, &[0x61; 100]);
+        write_all(&inode, 100, &[0x72; 50]);
+        assert_eq!(inode.inner.read().capturable_desc().size(), 100);
+        inode.sync_data_and_meta(SyncScope::Full).unwrap();
+        assert_eq!(inode.sector_count(), SECTORS_PER_BLOCK);
+        assert_eq!(read_back(&inode, 100, 50), vec![0x72; 50]);
+        drop(competing);
+        write_all(&inode, BLOCK_SIZE, &[0x33; BLOCK_SIZE]);
+        inode.sync_data_and_meta(SyncScope::Full).unwrap();
+    }
+
+    #[ktest]
+    fn ext4_delalloc_mapping_mutations() {
+        for journaled in [false, true] {
+            for operation in 0..7 {
+                let f = delayed_fixture(journaled);
+                let inode = f.ext4.read_inode(FILE_INO).unwrap();
+                for (block, byte) in [(0, 0x11), (1, 0x22), (2, 0x33)] {
+                    write_all(&inode, block * BLOCK_SIZE, &[byte; BLOCK_SIZE]);
+                }
+                assert_eq!(inode.sector_count(), 0);
+                match operation {
+                    0 => {
+                        inode.resize(100).unwrap();
+                        inode.resize(BLOCK_SIZE).unwrap();
+                        assert_eq!(
+                            read_back(&inode, 100, BLOCK_SIZE - 100),
+                            vec![0; BLOCK_SIZE - 100]
+                        );
+                    }
+                    1 => {
+                        inode
+                            .preallocate(4 * BLOCK_SIZE, BLOCK_SIZE, SizeMode::Keep)
+                            .unwrap();
+                        assert_eq!(inode.size(), 3 * BLOCK_SIZE);
+                        write_all(&inode, 4 * BLOCK_SIZE + 7, &[0x45; 19]);
+                        assert_eq!(read_back(&inode, 4 * BLOCK_SIZE, 7), vec![0; 7]);
+                    }
+                    2 => {
+                        inode.zero_range(BLOCK_SIZE, BLOCK_SIZE, true).unwrap();
+                        assert_eq!(
+                            read_back(&inode, BLOCK_SIZE, BLOCK_SIZE),
+                            vec![0; BLOCK_SIZE]
+                        );
+                    }
+                    3 => {
+                        inode.collapse_range(BLOCK_SIZE, BLOCK_SIZE).unwrap();
+                        assert_eq!(
+                            read_back(&inode, BLOCK_SIZE, BLOCK_SIZE),
+                            vec![0x33; BLOCK_SIZE]
+                        );
+                    }
+                    4 => {
+                        inode.insert_range(BLOCK_SIZE, BLOCK_SIZE).unwrap();
+                        assert_eq!(
+                            read_back(&inode, BLOCK_SIZE, BLOCK_SIZE),
+                            vec![0; BLOCK_SIZE]
+                        );
+                        assert_eq!(
+                            read_back(&inode, 2 * BLOCK_SIZE, BLOCK_SIZE),
+                            vec![0x22; BLOCK_SIZE]
+                        );
+                    }
+                    5 => {
+                        let bytes = [0x67; BLOCK_SIZE];
+                        let mut reader = VmReader::from(bytes.as_slice()).to_fallible();
+                        assert_eq!(inode.write_direct_at(0, &mut reader).unwrap(), BLOCK_SIZE);
+                        assert_eq!(read_back(&inode, 0, BLOCK_SIZE), bytes);
+                    }
+                    _ => {
+                        inode.inner.write().desc.set_link_count(0);
+                        assert!(inode.try_reclaim_deleted_inode().unwrap());
+                        assert_eq!(
+                            inode
+                                .inner
+                                .read()
+                                .extent_manager()
+                                .unwrap()
+                                .delayed_blocks(),
+                            0
+                        );
+                        assert_eq!(
+                            inode
+                                .inner
+                                .read()
+                                .delayed_account
+                                .as_ref()
+                                .unwrap()
+                                .remaining(),
+                            0
+                        );
+                        assert_eq!(inode.sector_count(), 0);
+                        continue;
+                    }
+                }
+                inode.sync_data_and_meta(SyncScope::Full).unwrap();
+                assert_eq!(
+                    inode
+                        .inner
+                        .read()
+                        .extent_manager()
+                        .unwrap()
+                        .delayed_blocks(),
+                    0
+                );
+            }
+        }
+    }
+
+    #[ktest]
+    fn ext4_inode_write_persistence() {
+        crate::fs::fs_impls::ext4::test_utils::scenarios!(
+            write_fresh_file_all_holes_round_trip,
+            scattered_writes_grow_tree_to_depth1,
+            write_back_inode_desc_is_lossless,
+            remount_persistence_round_trip,
+            write_into_unwritten_extent_converts_and_reads_back,
+        );
+    }
+
     fn write_fresh_file_all_holes_round_trip() {
         let f = fixture_with_empty_file();
         let inode = f.ext4.read_inode(FILE_INO).unwrap();
@@ -5357,6 +6028,17 @@ mod write_tests {
     }
 
     #[ktest]
+    fn ext4_sequential_append() {
+        crate::fs::fs_impls::ext4::test_utils::scenarios!(
+            append_past_eof_extends_file,
+            append_spanning_many_groups_forces_journal_restart,
+            contiguous_append_takes_the_no_restart_fast_path,
+            multi_block_append_maps_writes_and_converts_every_block,
+            appends_skip_checkerboard_fragments,
+            sequential_appends_stay_one_contiguous_extent,
+        );
+    }
+
     fn append_past_eof_extends_file() {
         let f = fixture_with_empty_file();
         let inode = f.ext4.read_inode(FILE_INO).unwrap();
@@ -5374,6 +6056,15 @@ mod write_tests {
     }
 
     #[ktest]
+    fn ext4_sparse_write() {
+        crate::fs::fs_impls::ext4::test_utils::scenarios!(
+            sparse_write_leaves_zero_gap,
+            partial_write_into_recycled_hole_reads_zeros_not_stale,
+            gap_write_past_unaligned_hole_eof_leaves_no_dirty_boundary_page,
+            covered_extend_write_across_unaligned_hole_eof_reads_zeros,
+        );
+    }
+
     fn sparse_write_leaves_zero_gap() {
         let f = fixture_with_empty_file();
         let inode = f.ext4.read_inode(FILE_INO).unwrap();
@@ -5393,6 +6084,17 @@ mod write_tests {
     }
 
     #[ktest]
+    fn ext4_overwrite_and_extent_status() {
+        crate::fs::fs_impls::ext4::test_utils::scenarios!(
+            overwrite_existing_data_no_new_allocation,
+            overwrite_fast_path_round_trips_es,
+            overwrite_fast_path_inline_primes_on_first_overwrite,
+            extending_write_bypasses_fast_path_es,
+            prealloc_write_skips_fill_and_convert_via_es,
+            overwrite_of_written_block_converts_nothing,
+        );
+    }
+
     fn overwrite_existing_data_no_new_allocation() {
         let f = fixture_with_empty_file();
         let inode = f.ext4.read_inode(FILE_INO).unwrap();
@@ -5425,7 +6127,6 @@ mod write_tests {
     /// written fact it produced (R3), so the FIRST plain overwrite already
     /// takes the fast path (the hint needed one slow overwrite to prime; the
     /// es-cache does not).
-    #[ktest]
     fn overwrite_fast_path_round_trips_es() {
         let f = fixture_with_empty_file();
         let inode = f.ext4.read_inode(FILE_INO).unwrap();
@@ -5463,7 +6164,6 @@ mod write_tests {
     /// (R1), the convert behind it already coasts on that fact (Q2), and the
     /// SECOND overwrite takes the Q1 fast path (the old hint cadence, kept
     /// as the pinned semantic of the depth-0 path).
-    #[ktest]
     fn overwrite_fast_path_inline_primes_on_first_overwrite() {
         let f = fixture_with_empty_file();
         let inode = f.ext4.read_inode(FILE_INO).unwrap();
@@ -5497,7 +6197,6 @@ mod write_tests {
     /// still rides Q1 (the hint died with every mutator; disjoint es facts
     /// outlive them). Depth ≥ 1 because a depth-0 insert rebuilds the root
     /// (`reserialize`), whose whole-cache clear legally drops everything.
-    #[ktest]
     fn extending_write_bypasses_fast_path_es() {
         let f = fixture_with_empty_file();
         let inode = f.ext4.read_inode(FILE_INO).unwrap();
@@ -5545,7 +6244,6 @@ mod write_tests {
     /// walk (Q3: the probed range is proven mapped) and the convert's scan
     /// (Q2: proven all written) — with identical data and accounting; the
     /// debug net re-walks behind each hit.
-    #[ktest]
     fn prealloc_write_skips_fill_and_convert_via_es() {
         let f = fixture_with_empty_file();
         let inode = f.ext4.read_inode(FILE_INO).unwrap();
@@ -5615,7 +6313,6 @@ mod write_tests {
         }
     }
 
-    #[ktest]
     fn scattered_writes_grow_tree_to_depth1() {
         let f = fixture_with_empty_file();
         let inode = f.ext4.read_inode(FILE_INO).unwrap();
@@ -5644,7 +6341,6 @@ mod write_tests {
         assert_eq!(depth, 1);
     }
 
-    #[ktest]
     fn write_back_inode_desc_is_lossless() {
         let f = fixture_with_empty_file();
 
@@ -5679,7 +6375,6 @@ mod write_tests {
         assert_eq!(after.crtime_extra, before.crtime_extra);
     }
 
-    #[ktest]
     fn remount_persistence_round_trip() {
         let f = fixture_with_empty_file();
         let content = b"survives a remount of the same disk image";
@@ -5713,6 +6408,21 @@ mod write_tests {
     }
 
     #[ktest]
+    fn ext4_truncate() {
+        crate::fs::fs_impls::ext4::test_utils::scenarios!(
+            shrink_frees_blocks_and_zeroes_partial_tail,
+            shrink_to_zero_frees_everything,
+            expand_is_sparse_and_reads_zeros,
+            resize_on_directory_is_eisdir,
+            truncate_spans_multiple_transactions_and_restarts,
+            chunked_truncate_keeps_unlinked_open_inode_on_orphan_list,
+            intermediate_truncate_chunk_serializes_sorted_ondisk_tree,
+            single_txn_truncate_takes_no_orphan,
+            shrink_into_hole_leaves_no_dirty_tail_page,
+            expand_from_unaligned_hole_eof_leaves_no_dirty_page,
+        );
+    }
+
     fn shrink_frees_blocks_and_zeroes_partial_tail() {
         let f = fixture_with_empty_file();
         let inode = f.ext4.read_inode(FILE_INO).unwrap();
@@ -5761,7 +6471,6 @@ mod write_tests {
         assert_eq!(read_back(&inode, BLOCK_SIZE, 100), vec![0xEE; 100]);
     }
 
-    #[ktest]
     fn shrink_to_zero_frees_everything() {
         let f = fixture_with_empty_file();
         let inode = f.ext4.read_inode(FILE_INO).unwrap();
@@ -5792,7 +6501,6 @@ mod write_tests {
         assert_eq!(bm.map_blocks(0).unwrap().state(), MapState::Hole);
     }
 
-    #[ktest]
     fn expand_is_sparse_and_reads_zeros() {
         let f = fixture_with_empty_file();
         let inode = f.ext4.read_inode(FILE_INO).unwrap();
@@ -5818,7 +6526,6 @@ mod write_tests {
         );
     }
 
-    #[ktest]
     fn write_into_unwritten_extent_converts_and_reads_back() {
         clocks::init_for_ktest();
         let f = Ext4FixtureBuilder::new(2048, 256, 2048)
@@ -5874,7 +6581,6 @@ mod write_tests {
         assert_eq!(f.ext4.super_block().free_blocks_count(), free_before);
     }
 
-    #[ktest]
     fn resize_on_directory_is_eisdir() {
         let f = fixture_with_empty_file();
         // ROOT_INO (2) is a directory in the fixture image.
@@ -5883,10 +6589,17 @@ mod write_tests {
         assert_eq!(dir.resize(0).unwrap_err().error(), Errno::EISDIR);
     }
 
+    #[ktest]
+    fn ext4_inode_time_and_device_encoding() {
+        crate::fs::fs_impls::ext4::test_utils::scenarios!(
+            decode_time_signed_epoch_semantics,
+            device_block_encoding_roundtrip,
+        );
+    }
+
     /// `decode_time` follows Linux's signed-base + epoch-extension layout:
     /// epoch 1 continues seamlessly at 2^31, and pre-1970 values (negative
     /// base, epoch 0) clamp to the epoch since `Duration` cannot express them.
-    #[ktest]
     fn decode_time_signed_epoch_semantics() {
         // 0x8000_0000 as i32 = -2^31; epoch 1 adds 2^32 → exactly 2^31.
         assert_eq!(decode_time(0x8000_0000, 0b01), Duration::new(1 << 31, 0));
@@ -5899,7 +6612,6 @@ mod write_tests {
     /// The special-file device encoding round-trips through `i_block` in both
     /// the old (8-bit major/minor, word 0) and wide (`new_encode_dev`, word 1)
     /// layouts.
-    #[ktest]
     fn device_block_encoding_roundtrip() {
         for (major, minor) in [(8, 1), (255, 255), (300, 7), (1, 70000), (4095, 1048575)] {
             let id = device_id::encode_device_numbers(major, minor);
@@ -5912,10 +6624,17 @@ mod write_tests {
         }
     }
 
+    #[ktest]
+    fn ext4_ordered_data() {
+        crate::fs::fs_impls::ext4::test_utils::scenarios!(
+            journaled_write_and_shrink_register_ordered_data,
+            ordered_data_enomem_aborts_the_transaction,
+        );
+    }
+
     /// P5-T0: allocating writes and shrinking truncates must register the
     /// inode as ordered data of the running transaction (jbd2 `data=ordered`),
     /// so the commit pipeline flushes its pages before the commit block.
-    #[ktest]
     fn journaled_write_and_shrink_register_ordered_data() {
         // The stopped commit thread keeps the running transaction inspectable:
         // nothing consumes it between the operation and the assertion.
@@ -5945,7 +6664,6 @@ mod write_tests {
     /// post-commit crash. The failure aborts the journal, discarding the
     /// running transaction's captures (nothing can ever commit), and the write
     /// fails; the filesystem is left read-only.
-    #[ktest]
     fn ordered_data_enomem_aborts_the_transaction() {
         let f = journaled_fixture_with_empty_file();
         let journal = f.ext4.journal().unwrap();
@@ -6023,7 +6741,6 @@ mod write_tests {
     /// spuriously failing. The commit thread is live so the restart's
     /// re-admission drains; the file must read back byte-exact with every block
     /// mapped written and `i_blocks`/size consistent.
-    #[ktest]
     fn append_spanning_many_groups_forces_journal_restart() {
         // `max_credits` = 20 here: one depth-1 chunk reserves 12
         // (`write_credits(1)`) and the per-insert stop bound is 15
@@ -6084,7 +6801,6 @@ mod write_tests {
     /// boundary), and unlists in the last chunk. The commit thread is live so the
     /// restarts' re-admissions drain. Asserts a genuine truncate restart, a
     /// drained orphan list, and a consistent tree / `i_blocks` / `i_size`.
-    #[ktest]
     fn truncate_spans_multiple_transactions_and_restarts() {
         // `max_credits` = 16: above the T6 per-insert stop bound (15, so the
         // 120-block write lands), below the ~19-credit whole-truncate estimate
@@ -6182,7 +6898,6 @@ mod write_tests {
     /// on the mirror AND the superblock head with its `OrphanNext` descriptor
     /// dtime intact (the recovery-consumable shape: head -> ino, link 0), and
     /// the tail's `debug_assert` tolerates the still-listed state.
-    #[ktest]
     fn chunked_truncate_keeps_unlinked_open_inode_on_orphan_list() {
         // Same geometry as the multi-transaction truncate test: the shrink
         // estimate must overrun one transaction to take the chunked spine.
@@ -6276,7 +6991,6 @@ mod write_tests {
     /// survivor still references must map (an unsorted survivor makes
     /// `search_entries` break early and report a covered block as a false
     /// hole).
-    #[ktest]
     fn intermediate_truncate_chunk_serializes_sorted_ondisk_tree() {
         // `max_credits` = 16: the 120-block write lands (per-insert bound 15),
         // but the ~10-extent free's accumulated captures overrun one
@@ -6352,7 +7066,6 @@ mod write_tests {
     /// truncate fits one transaction takes the atomic path: NO orphan_add/del, NO
     /// restart, byte-identical to before P7. The regression guard for the common
     /// case.
-    #[ktest]
     fn single_txn_truncate_takes_no_orphan() {
         let f = journaled_fixture_with_empty_file();
         let journal = f.ext4.journal().unwrap();
@@ -6408,11 +7121,20 @@ mod write_tests {
         (0..len).map(|k| (k % 250 + 1) as u8).collect()
     }
 
+    #[ktest]
+    fn ext4_fallocate_allocate() {
+        crate::fs::fs_impls::ext4::test_utils::scenarios!(
+            fallocate_allocate_reserves_unwritten_and_extends_size,
+            fallocate_allocate_keep_size_reserves_without_growing,
+            failed_cross_eof_write_keeps_keepsize_preallocation,
+            fallocate_allocate_failure_leaves_size_unchanged,
+        );
+    }
+
     /// P7e-3 — `fallocate(Allocate)` reserves UNWRITTEN blocks and extends
     /// `i_size`: the range reads zero (nothing written yet), and a later write
     /// converts just the written block to written while its neighbours stay
     /// reserved.
-    #[ktest]
     fn fallocate_allocate_reserves_unwritten_and_extends_size() {
         let f = fixture_with_empty_file();
         let inode = f.ext4.read_inode(FILE_INO).unwrap();
@@ -6455,7 +7177,6 @@ mod write_tests {
 
     /// P7e-3 — `fallocate(AllocateKeepSize)` reserves UNWRITTEN blocks WITHOUT
     /// changing `i_size` (the KEEP_SIZE flag): the blocks are reserved past EOF.
-    #[ktest]
     fn fallocate_allocate_keep_size_reserves_without_growing() {
         let f = fixture_with_empty_file();
         let inode = f.ext4.read_inode(FILE_INO).unwrap();
@@ -6485,7 +7206,6 @@ mod write_tests {
     /// size, swallowing the reservation; now it frees only the run the write
     /// itself allocated, so the untouched preallocation (and the old data)
     /// survive.
-    #[ktest]
     fn failed_cross_eof_write_keeps_keepsize_preallocation() {
         // Non-journaled: the rollback frees blocks synchronously, so the assertion
         // is deterministic (no pinned-free retry loop to reason about).
@@ -6545,12 +7265,23 @@ mod write_tests {
         assert_eq!(read_back(&inode, 0, BLOCK_SIZE), block0);
     }
 
+    #[ktest]
+    fn ext4_fallocate_punch() {
+        crate::fs::fs_impls::ext4::test_utils::scenarios!(
+            fallocate_punch_hole_middle_reads_zero_surrounding_intact,
+            fallocate_punch_partial_edges_zero_not_free,
+            fallocate_punch_two_adjacent_partials_both_mapped,
+            fallocate_punch_two_adjacent_partials_head_hole,
+            fallocate_punch_two_adjacent_partials_tail_hole,
+            fallocate_large_punch_spans_transactions,
+        );
+    }
+
     /// P7e-3 — `fallocate(PunchHoleKeepSize)` over a BLOCK-ALIGNED middle range
     /// frees the mapped blocks (leaving a hole that reads zero), keeps the
     /// surrounding data, and does not change `i_size`. The freed blocks travel the
     /// same forget/revoke + pin free funnel as truncate (data via `PlainData`,
     /// tree nodes via `free_meta_block`).
-    #[ktest]
     fn fallocate_punch_hole_middle_reads_zero_surrounding_intact() {
         let f = fixture_with_empty_file();
         let inode = f.ext4.read_inode(FILE_INO).unwrap();
@@ -6591,7 +7322,6 @@ mod write_tests {
     /// blocks (they are kept, their uncovered bytes survive) and FREES only the
     /// fully-covered block in between (Linux `ext4_zero_partial_blocks` +
     /// `ext4_ext_remove_space`).
-    #[ktest]
     fn fallocate_punch_partial_edges_zero_not_free() {
         let f = fixture_with_empty_file();
         let inode = f.ext4.read_inode(FILE_INO).unwrap();
@@ -6643,11 +7373,21 @@ mod write_tests {
         );
     }
 
+    #[ktest]
+    fn ext4_fallocate_zero_range() {
+        crate::fs::fs_impls::ext4::test_utils::scenarios!(
+            fallocate_zero_range_aligned_reads_zero_keeps_blocks,
+            fallocate_zero_range_partial_edges_zero_in_place,
+            fallocate_zero_range_grow_vs_keep_size,
+            fallocate_zero_range_then_rewrite_round_trips,
+            fallocate_zero_range_enospc_is_clean,
+        );
+    }
+
     /// P9 debt (`fallocate-zero-range-collapse-insert`) — `fallocate(ZeroRange)`
     /// over a block-aligned middle converts it to UNWRITTEN (reads zero, blocks
     /// KEPT — unlike a punch, `i_blocks` is unchanged) while the neighbours keep
     /// their data (Linux `ext4_zero_range`).
-    #[ktest]
     fn fallocate_zero_range_aligned_reads_zero_keeps_blocks() {
         let f = fixture_with_empty_file();
         let inode = f.ext4.read_inode(FILE_INO).unwrap();
@@ -6688,7 +7428,6 @@ mod write_tests {
     /// in place (the edge blocks stay written, their uncovered bytes survive)
     /// and converts only the fully-covered block between (Linux
     /// `ext4_zero_partial_blocks` over the edges).
-    #[ktest]
     fn fallocate_zero_range_partial_edges_zero_in_place() {
         let f = fixture_with_empty_file();
         let inode = f.ext4.read_inode(FILE_INO).unwrap();
@@ -6732,7 +7471,6 @@ mod write_tests {
     /// P9 debt — ZERO_RANGE past EOF grows `i_size` to the range end;
     /// ZeroRangeKeepSize reserves the blocks but leaves `i_size` alone (the
     /// KEEP_SIZE split, same as prealloc).
-    #[ktest]
     fn fallocate_zero_range_grow_vs_keep_size() {
         let f = fixture_with_empty_file();
         let inode = f.ext4.read_inode(FILE_INO).unwrap();
@@ -6766,7 +7504,6 @@ mod write_tests {
     /// P9 debt — ZERO_RANGE over already-written data that later gets REWRITTEN:
     /// the write converts the zeroed (unwritten) blocks back to written and the
     /// new data reads back — the Unwritten-first round trip.
-    #[ktest]
     fn fallocate_zero_range_then_rewrite_round_trips() {
         let f = fixture_with_empty_file();
         let inode = f.ext4.read_inode(FILE_INO).unwrap();
@@ -6796,7 +7533,6 @@ mod write_tests {
     /// P9 debt — a ZERO_RANGE whose allocation hits ENOSPC fails clean: `i_size`
     /// and the mappings are unchanged (the H-4 seal posture shared with
     /// `preallocate`).
-    #[ktest]
     fn fallocate_zero_range_enospc_is_clean() {
         let f = fixture_with_empty_file();
         let inode = f.ext4.read_inode(FILE_INO).unwrap();
@@ -6821,10 +7557,18 @@ mod write_tests {
         }
     }
 
+    #[ktest]
+    fn ext4_fallocate_collapse() {
+        crate::fs::fs_impls::ext4::test_utils::scenarios!(
+            fallocate_collapse_shifts_data_left_byte_exact,
+            fallocate_collapse_window_with_hole,
+            fallocate_collapse_rejects_unaligned_and_eof,
+        );
+    }
+
     /// P9 debt — `fallocate(CollapseRange)` removes the window and shifts the
     /// tail left: the data after the window moves down by `len`, byte-for-byte,
     /// and `i_size` shrinks (Linux `ext4_collapse_range`).
-    #[ktest]
     fn fallocate_collapse_shifts_data_left_byte_exact() {
         let f = fixture_with_empty_file();
         let inode = f.ext4.read_inode(FILE_INO).unwrap();
@@ -6847,7 +7591,6 @@ mod write_tests {
 
     /// P9 debt — a collapse window containing a HOLE: the hole is simply removed
     /// with the window (nothing to free there) and the tail still shifts left.
-    #[ktest]
     fn fallocate_collapse_window_with_hole() {
         let f = fixture_with_empty_file();
         let inode = f.ext4.read_inode(FILE_INO).unwrap();
@@ -6872,7 +7615,6 @@ mod write_tests {
     /// P9 debt — collapse argument validation (Linux `ext4_collapse_range`):
     /// unaligned offset or length is `EINVAL`; a window reaching EOF is `EINVAL`
     /// (that would be a truncate); nothing changes on rejection.
-    #[ktest]
     fn fallocate_collapse_rejects_unaligned_and_eof() {
         let f = fixture_with_empty_file();
         let inode = f.ext4.read_inode(FILE_INO).unwrap();
@@ -6896,11 +7638,20 @@ mod write_tests {
         assert_eq!(read_back(&inode, 0, 3 * BLOCK_SIZE), payload);
     }
 
+    #[ktest]
+    fn ext4_fallocate_insert() {
+        crate::fs::fs_impls::ext4::test_utils::scenarios!(
+            fallocate_insert_opens_hole_preserves_content,
+            fallocate_insert_rejects_unaligned_and_past_eof,
+            fallocate_insert_shifts_keepsize_preallocation,
+            fallocate_insert_overflow_rejection_does_not_abort_journal,
+        );
+    }
+
     /// P9 debt — `fallocate(InsertRange)` opens a hole at the offset and shifts
     /// the rest right: the shifted data reads back byte-for-byte at its new
     /// offset, the hole reads zero, and `i_size` grows (Linux
     /// `ext4_insert_range`).
-    #[ktest]
     fn fallocate_insert_opens_hole_preserves_content() {
         let f = fixture_with_empty_file();
         let inode = f.ext4.read_inode(FILE_INO).unwrap();
@@ -6946,7 +7697,6 @@ mod write_tests {
     /// P9 debt — insert argument validation (Linux `ext4_insert_range`):
     /// unaligned offset or length is `EINVAL`, an offset at/past EOF is `EINVAL`
     /// (a plain extend, not a shift); nothing changes on rejection.
-    #[ktest]
     fn fallocate_insert_rejects_unaligned_and_past_eof() {
         let f = fixture_with_empty_file();
         let inode = f.ext4.read_inode(FILE_INO).unwrap();
@@ -6974,7 +7724,6 @@ mod write_tests {
     /// everything else (it stays reserved), and Linux's SHIFT_RIGHT overflow
     /// guard (tree-level `insert_range` EINVAL) keeps the shifted keys inside
     /// the 32-bit logical space.
-    #[ktest]
     fn fallocate_insert_shifts_keepsize_preallocation() {
         let f = fixture_with_empty_file();
         let inode = f.ext4.read_inode(FILE_INO).unwrap();
@@ -7009,7 +7758,6 @@ mod write_tests {
     /// read-only plan BEFORE `begin_op`, the filesystem stays writable. Pre-fix
     /// the check fired under the handle and the caller escalated it to a whole-FS
     /// journal abort.
-    #[ktest]
     fn fallocate_insert_overflow_rejection_does_not_abort_journal() {
         let f = journaled_fixture_with_empty_file();
         let inode = f.ext4.read_inode(FILE_INO).unwrap();
@@ -7048,7 +7796,6 @@ mod write_tests {
     /// both covered sub-ranges are zeroed and NOTHING is freed (no full block).
     /// The single-block fast path must be keyed on same-block, not `aligned_start
     /// >= aligned_end` (which also holds for this adjacent-partial geometry).
-    #[ktest]
     fn fallocate_punch_two_adjacent_partials_both_mapped() {
         let f = fixture_with_empty_file();
         let inode = f.ext4.read_inode(FILE_INO).unwrap();
@@ -7094,7 +7841,6 @@ mod write_tests {
     /// zeroed against ITS OWN mapping. The pre-fix merged call checked only the
     /// head block (a hole) and returned WITHOUT zeroing, leaving the tail block's
     /// covered head holding stale bytes (a read of a punched range returns data).
-    #[ktest]
     fn fallocate_punch_two_adjacent_partials_head_hole() {
         let f = fixture_with_empty_file();
         let inode = f.ext4.read_inode(FILE_INO).unwrap();
@@ -7134,7 +7880,6 @@ mod write_tests {
     /// then hit that backing-block-less page — aborting the journal (fs read-only)
     /// or spuriously allocating the tail block — all triggered by a punch that
     /// already returned success. Drives a real commit to exercise the flush.
-    #[ktest]
     fn fallocate_punch_two_adjacent_partials_tail_hole() {
         let f = journaled_multigroup_fixture(64);
         let journal = f.ext4.journal().unwrap();
@@ -7192,7 +7937,6 @@ mod write_tests {
     /// success. Here the allocator runs out of space partway; `i_size` must stay
     /// at its original value. The pre-fix code grew `i_size` up front and left it
     /// at the range end after the failed allocation.
-    #[ktest]
     fn fallocate_allocate_failure_leaves_size_unchanged() {
         clocks::init_for_ktest();
         // A single-group fixture capped to a few free blocks: an `Allocate` over
@@ -7220,7 +7964,6 @@ mod write_tests {
     /// a real mid-punch `journal_restart` fires. A crash between chunks leaves a
     /// valid partial hole, so — unlike truncate — the punch NEVER touches the
     /// orphan list.
-    #[ktest]
     fn fallocate_large_punch_spans_transactions() {
         let f = journaled_multigroup_fixture(24);
         let journal = f.ext4.journal().unwrap();
@@ -7311,6 +8054,14 @@ mod write_tests {
         block
     }
 
+    #[ktest]
+    fn ext4_allocation_pressure() {
+        crate::fs::fs_impls::ext4::test_utils::scenarios!(
+            append_insert_exceeding_one_transaction_is_efbig_with_no_leak,
+            fallocate_enospc_midway_seals_the_transaction,
+        );
+    }
+
     /// P7d-2b (Fix C) — the EFBIG floor. When one bounded extent insert needs
     /// more credits than a whole transaction holds, no restart can ever fit
     /// it, so the append fails `EFBIG` — but WITHOUT leaking blocks, because
@@ -7322,7 +8073,6 @@ mod write_tests {
     /// the tree's own `write_credits` (8) still admits the handle — the exact
     /// window the floor guards. The depth-1 tree (4 full leaves, 1360 extents)
     /// is laid down directly on disk as a compact way to hold that depth.
-    #[ktest]
     fn append_insert_exceeding_one_transaction_is_efbig_with_no_leak() {
         clocks::init_for_ktest();
         // Single group, journal maxlen 13 → max_credits 9 (usable 12: 508*10/509).
@@ -7388,7 +8138,6 @@ mod write_tests {
     /// append spine takes the fast path (`remaining >= need`) with ZERO
     /// restarts, identical behavior to before d2-b. The regression guard for the
     /// zero-overhead common case.
-    #[ktest]
     fn contiguous_append_takes_the_no_restart_fast_path() {
         let f = journaled_fixture_with_empty_file();
         let journal = f.ext4.journal().unwrap();
@@ -7420,7 +8169,6 @@ mod write_tests {
     /// `append_spanning_many_groups_forces_journal_restart` (a many-small-group
     /// image) and at the primitive level by
     /// `journal_restart_from_locking_seat_readmits_after_staging`.
-    #[ktest]
     fn multi_block_append_maps_writes_and_converts_every_block() {
         let f = journaled_fixture_with_empty_file();
         let inode = f.ext4.read_inode(FILE_INO).unwrap();
@@ -7453,7 +8201,6 @@ mod write_tests {
     /// inserted as written) the sub-page commit read the recycled block's bytes
     /// into the uncovered range — a silent cross-file leak. Reproduces the fsx
     /// (generic/127) and posix_fallocate (generic/345) failures.
-    #[ktest]
     fn partial_write_into_recycled_hole_reads_zeros_not_stale() {
         let f = journaled_fixture_with_empty_file();
         let inode = f.ext4.read_inode(FILE_INO).unwrap();
@@ -7521,7 +8268,6 @@ mod write_tests {
     /// 045 verdict's length-1/2 extents); the two-pass ring's first pass
     /// takes whole runs only. (The fresh-disk sequential witness below stays
     /// as the outcome pin; the baseline passed it too — this one it fails.)
-    #[ktest]
     fn appends_skip_checkerboard_fragments() {
         let f = journaled_fixture_with_empty_file();
         let journal = f.ext4.journal().unwrap();
@@ -7572,7 +8318,6 @@ mod write_tests {
     /// contiguous extent — the goal now advances with each allocation and a
     /// nearly-full goal group answers NoFit instead of handing back halved
     /// fragments (the old allocator produced length-1 extents at stride 16).
-    #[ktest]
     fn sequential_appends_stay_one_contiguous_extent() {
         let f = journaled_fixture_with_empty_file();
         let inode = f.ext4.read_inode(FILE_INO).unwrap();
@@ -7599,7 +8344,6 @@ mod write_tests {
     /// depend on it, so the on-disk tree stays coherent across a crash right
     /// after that commit. Before the seal, the captures committed while the
     /// root stayed stale (torn on ENOSPC — a plain nearly-full-disk trigger).
-    #[ktest]
     fn fallocate_enospc_midway_seals_the_transaction() {
         let f = journaled_fixture_with_empty_file();
         let journal = f.ext4.journal().unwrap();
@@ -7651,6 +8395,13 @@ mod write_tests {
         drop(ext4);
     }
 
+    #[ktest]
+    fn ext4_inode_link_count() {
+        crate::fs::fs_impls::ext4::test_utils::scenarios!(
+            dir_nlink_saturates_and_foreign_pin_holds,
+        );
+    }
+
     /// `dir_nlink` semantics (Linux `ext4_inc_count`/`ext4_dec_count`,
     /// namei.c, adapted to linear directories): a directory's link count
     /// saturates at [`DIR_NLINK_MAX`] (never wraps the on-disk u16 — ext4/045
@@ -7658,7 +8409,6 @@ mod write_tests {
     /// deleted inode with live entries), and a FOREIGN pinned directory
     /// (count 1, written by a Linux htree mount) neither increments nor
     /// decrements (P9a-a5).
-    #[ktest]
     fn dir_nlink_saturates_and_foreign_pin_holds() {
         let f = journaled_fixture_with_empty_file();
         let root = f
@@ -7699,7 +8449,6 @@ mod write_tests {
     /// case must stay a bounded read-only probe (P9a-T5) that touches and
     /// journals no node. Here we pin the invariant on a small file — the
     /// mapping stays written and `i_blocks` is unchanged.
-    #[ktest]
     fn overwrite_of_written_block_converts_nothing() {
         let f = journaled_fixture_with_empty_file();
         let inode = f.ext4.read_inode(FILE_INO).unwrap();
@@ -7730,7 +8479,6 @@ mod write_tests {
     /// (the loud "writeback hit an unallocated block" EIO — as an ordered
     /// flush it aborts the journal). Reproduces xfstests generic/014
     /// (truncfile) and the generic/127 fsx poisoning.
-    #[ktest]
     fn shrink_into_hole_leaves_no_dirty_tail_page() {
         let f = journaled_fixture_with_empty_file();
         let inode = f.ext4.read_inode(FILE_INO).unwrap();
@@ -7769,7 +8517,6 @@ mod write_tests {
     /// old-EOF boundary page: the write never allocates that block, so the
     /// grow-fill would plant a dirty page over a hole (the generic/014
     /// truncfile journal abort came through this flow).
-    #[ktest]
     fn gap_write_past_unaligned_hole_eof_leaves_no_dirty_boundary_page() {
         let f = journaled_fixture_with_empty_file();
         let inode = f.ext4.read_inode(FILE_INO).unwrap();
@@ -7800,7 +8547,6 @@ mod write_tests {
     /// boundary block* must keep the pre-allocation zero materialization: the
     /// bytes between the old EOF and the write start must read as zeros, and
     /// writeback of the now-backed page must succeed.
-    #[ktest]
     fn covered_extend_write_across_unaligned_hole_eof_reads_zeros() {
         let f = journaled_fixture_with_empty_file();
         let inode = f.ext4.read_inode(FILE_INO).unwrap();
@@ -7826,7 +8572,6 @@ mod write_tests {
     /// Growing a file whose EOF sits unaligned inside a hole must not dirty
     /// the old tail page either — the grow-direction twin of the shrink fill
     /// (both directions of `PageCache::resize` zero-fill the boundary page).
-    #[ktest]
     fn expand_from_unaligned_hole_eof_leaves_no_dirty_page() {
         let f = journaled_fixture_with_empty_file();
         let inode = f.ext4.read_inode(FILE_INO).unwrap();
@@ -7857,13 +8602,22 @@ mod write_tests {
     // `INODE_TABLE_BID` (4) + (11 - 1) / (BLOCK_SIZE / INODE_SIZE = 16) = 4.
     const FILE_INODE_TABLE_BID: Ext4Bid = 4;
 
+    #[ktest]
+    fn ext4_inode_attributes_and_fdatasync() {
+        crate::fs::fs_impls::ext4::test_utils::scenarios!(
+            setattr_journals_inode_desc_and_survives_commit,
+            setattr_on_non_journaled_volume_stays_buffered,
+            fdatasync_narrows_to_datasync_tid_excluding_chmod,
+            fdatasync_follows_size_changing_truncate,
+        );
+    }
+
     /// P7d-4 Task 2: chmod/chown/utimens on a journaled volume open a handle and
     /// capture the inode-table block, so the change survives a crash before the
     /// deferred writeback. Every attribute folds into the one inode-table block,
     /// bumping `sync_tid` (fsync waits) but not `datasync_tid` (fdatasync does
     /// not force non-data metadata). Once committed, the after-image is durable
     /// in the journal (recovery replays it).
-    #[ktest]
     fn setattr_journals_inode_desc_and_survives_commit() {
         let f = journaled_fixture_with_empty_file();
         let journal = f.ext4.journal().unwrap();
@@ -7915,7 +8669,6 @@ mod write_tests {
     /// P7d-4 Task 2: a non-journaled volume keeps the pre-P7 behavior — the
     /// attribute change lives only in the dirty in-memory descriptor (no handle,
     /// no recorded tid) and persists via the buffered metadata writeback.
-    #[ktest]
     fn setattr_on_non_journaled_volume_stays_buffered() {
         let f = fixture_with_empty_file();
         assert!(f.ext4.journal().is_none());
@@ -7945,7 +8698,6 @@ mod write_tests {
     /// transaction) bumps only `sync_tid`. `fdatasync`'s target stays the
     /// write's already-committed tid — it must NOT be dragged forward to force
     /// the chmod's commit, which `fsync` would still wait for.
-    #[ktest]
     fn fdatasync_narrows_to_datasync_tid_excluding_chmod() {
         let f = journaled_fixture_with_empty_file();
         let journal = f.ext4.journal().unwrap();
@@ -7983,7 +8735,6 @@ mod write_tests {
     /// is needed to read the data), so it advances `datasync_tid` together with
     /// `sync_tid` — unlike a chmod. `fdatasync` after such a truncate waits for
     /// it.
-    #[ktest]
     fn fdatasync_follows_size_changing_truncate() {
         let f = journaled_fixture_with_empty_file();
         let journal = f.ext4.journal().unwrap();
@@ -8031,11 +8782,26 @@ mod write_tests {
         assert!(inner.is_dirty());
     }
 
+    #[ktest]
+    fn ext4_inode_capture_dedup() {
+        crate::fs::fs_impls::ext4::test_utils::scenarios!(
+            inode_capture_dedups_identical_writeback_within_transaction,
+            inode_capture_does_not_dedup_changed_bytes,
+            inode_capture_does_not_dedup_size_change,
+            fsync_writeback_is_forced_never_deduped,
+            inode_capture_record_rolls_over_at_transaction_boundary,
+            inode_capture_record_rolls_over_across_journal_restart,
+            orphan_del_writeback_is_not_deduped_against_on_chain_basis,
+            orphan_add_writeback_lands_successor_despite_prior_capture,
+            splice_epoch_forces_recapture_after_orphan_del_and_readd,
+            fsync_after_deduped_writeback_persists_both_writes,
+        );
+    }
+
     /// P10-T2.2 pin 1 (same-tick hit): two byte-identical journaled writebacks
     /// in one transaction — same coarse-clock tick, same size, same extent
     /// root — dedup the second capture, and the flushed on-disk inode is
     /// correct.
-    #[ktest]
     fn inode_capture_dedups_identical_writeback_within_transaction() {
         let f = journaled_fixture_with_empty_file();
         let journal = f.ext4.journal().unwrap();
@@ -8064,7 +8830,6 @@ mod write_tests {
     /// P10-T2.2 pin 2 (byte change misses): after a hit-able record exists, a
     /// same-transaction writeback whose serialized bytes changed (the mode
     /// bits here) must capture in full, and the change reaches the disk.
-    #[ktest]
     fn inode_capture_does_not_dedup_changed_bytes() {
         let f = journaled_fixture_with_empty_file();
         let journal = f.ext4.journal().unwrap();
@@ -8095,7 +8860,6 @@ mod write_tests {
     /// P10-T2.2 pin 3 (size change misses): pinned separately from pin 2 so a
     /// future "compare all but the size" regression cannot slip past — an
     /// `i_size` change alone must break coverage and land on disk.
-    #[ktest]
     fn inode_capture_does_not_dedup_size_change() {
         let f = journaled_fixture_with_empty_file();
         let journal = f.ext4.journal().unwrap();
@@ -8126,7 +8890,6 @@ mod write_tests {
     /// byte-identical dirty descriptor, `sync_data_and_meta(Full)` — the
     /// fsync funnel — must NOT dedup (the durability path is policy-forced),
     /// and the flushed state is correct.
-    #[ktest]
     fn fsync_writeback_is_forced_never_deduped() {
         let f = journaled_fixture_with_empty_file();
         let journal = f.ext4.journal().unwrap();
@@ -8158,7 +8921,6 @@ mod write_tests {
     /// transaction boundary — the old transaction's image is out of reach —
     /// and the record rolls over to the new transaction (a subsequent
     /// identical writeback inside it dedups again).
-    #[ktest]
     fn inode_capture_record_rolls_over_at_transaction_boundary() {
         let f = journaled_fixture_with_empty_file();
         let journal = f.ext4.journal().unwrap();
@@ -8205,7 +8967,6 @@ mod write_tests {
     /// onto a successor: an identical writeback through the restarted handle
     /// must then recapture — chunk N+1's image belongs to chunk N+1's
     /// transaction — and the record rolls over to the new transaction.
-    #[ktest]
     fn inode_capture_record_rolls_over_across_journal_restart() {
         let f = journaled_fixture_with_empty_file();
         let journal = f.ext4.journal().unwrap();
@@ -8285,7 +9046,6 @@ mod write_tests {
     /// on the pre-override bytes would compare 0 against 0, skip, and leave
     /// the stale chain pointer on disk — e2fsck's "inode in use but has dtime
     /// set".
-    #[ktest]
     fn orphan_del_writeback_is_not_deduped_against_on_chain_basis() {
         const NEIGHBOR_INO: u32 = 12;
         let f = journaled_fixture_with_empty_file();
@@ -8343,7 +9103,6 @@ mod write_tests {
     /// unchanged must MISS (the override now yields the successor) and land
     /// `i_dtime` = successor in the SAME transaction — the shrink first-txn
     /// contract that makes a crashed truncate's chain walkable.
-    #[ktest]
     fn orphan_add_writeback_lands_successor_despite_prior_capture() {
         const NEIGHBOR_INO: u32 = 12;
         let f = journaled_fixture_with_empty_file();
@@ -8399,7 +9158,6 @@ mod write_tests {
     /// writeback matches tid AND bytes; only the splice epoch knows the slot
     /// moved — it must MISS and recapture dtime = Y (a skip would commit the
     /// spliced 0, cutting Y off the on-disk chain).
-    #[ktest]
     fn splice_epoch_forces_recapture_after_orphan_del_and_readd() {
         const NEIGHBOR_INO: u32 = 12;
         let f = journaled_fixture_with_empty_file();
@@ -8473,7 +9231,6 @@ mod write_tests {
     /// DATA differs), then a real fsync — the commit the fsync forces must
     /// leave the final on-disk state carrying both writes' effect: the inode
     /// from the first capture, the data from the second write.
-    #[ktest]
     fn fsync_after_deduped_writeback_persists_both_writes() {
         let f = journaled_fixture_with_empty_file();
         let journal = f.ext4.journal().unwrap();
@@ -8513,10 +9270,21 @@ mod write_tests {
         );
     }
 
+    #[ktest]
+    fn ext4_read_ahead_io() {
+        crate::fs::fs_impls::ext4::test_utils::scenarios!(
+            sequential_read_through_readahead_is_byte_correct,
+            prefetch_then_shrink_reads_correctly,
+            prefetch_fragmented_extents_is_byte_correct,
+            prefetch_with_cached_gap_is_byte_correct,
+            prefetch_run_exceeding_bio_segment_cap_splits,
+            prefetch_sparse_file_zeros_holes_and_fills_data,
+        );
+    }
+
     /// End to end: a sequential scan of a multi-page file drives the read-ahead
     /// detector and prefetch path, and every byte reads back correctly even
     /// after the cache is dropped so each read must refault through the backend.
-    #[ktest]
     fn sequential_read_through_readahead_is_byte_correct() {
         let f = fixture_with_empty_file();
         let inode = f.ext4.read_inode(FILE_INO).unwrap();
@@ -8555,7 +9323,6 @@ mod write_tests {
     /// A large prefetch followed by a shrink must not panic and must read back
     /// correct bytes within the new size; prefetching the stale (now
     /// out-of-bounds) range on the shrunk file is a silent no-op.
-    #[ktest]
     fn prefetch_then_shrink_reads_correctly() {
         let f = fixture_with_empty_file();
         let inode = f.ext4.read_inode(FILE_INO).unwrap();
@@ -8594,7 +9361,6 @@ mod write_tests {
     /// dense file (two disjoint extents) prefetches byte-correctly. The prefetch
     /// must split the logically contiguous request at the physical discontinuity
     /// into two separate multi-segment BIOs.
-    #[ktest]
     fn prefetch_fragmented_extents_is_byte_correct() {
         let f = fixture_with_empty_file();
         let inode = f.ext4.read_inode(FILE_INO).unwrap();
@@ -8664,7 +9430,6 @@ mod write_tests {
     /// v2 run merging — a gap in the collected batch: warming one page in the
     /// middle makes the prefetch batch skip it, so the surrounding pages read as
     /// two runs split at the cached gap. Every page still reads back correctly.
-    #[ktest]
     fn prefetch_with_cached_gap_is_byte_correct() {
         let f = fixture_with_empty_file();
         let inode = f.ext4.read_inode(FILE_INO).unwrap();
@@ -8697,7 +9462,6 @@ mod write_tests {
     /// extent exceeds the per-BIO segment cap, so the override splits it into
     /// back-to-back multi-segment BIOs. A sequential scan reads every byte back
     /// correctly.
-    #[ktest]
     fn prefetch_run_exceeding_bio_segment_cap_splits() {
         let f = fixture_with_empty_file();
         let inode = f.ext4.read_inode(FILE_INO).unwrap();
@@ -8745,7 +9509,6 @@ mod write_tests {
     /// v2 run merging — a sparse file: holes and data interleaved. After a
     /// whole-file prefetch, the hole pages read back all-zeros (filled in process
     /// context, no device I/O) and the data pages read back correctly.
-    #[ktest]
     fn prefetch_sparse_file_zeros_holes_and_fills_data() {
         let f = fixture_with_empty_file();
         let inode = f.ext4.read_inode(FILE_INO).unwrap();
@@ -8778,12 +9541,19 @@ mod write_tests {
         assert_eq!(read_back(&inode, 0, expected.len()), expected);
     }
 
+    #[ktest]
+    fn ext4_batched_writeback() {
+        crate::fs::fs_impls::ext4::test_utils::scenarios!(
+            flush_batched_run_exceeding_bio_segment_cap_round_trips,
+            flush_batched_sparse_file_round_trips,
+        );
+    }
+
     /// Write-side run merging — a run longer than one BIO can hold: an 80-page
     /// contiguous extent exceeds the per-BIO segment cap, so the batched flush
     /// splits it into back-to-back multi-segment write BIOs. Flushing through the
     /// batched path, dropping the now-clean pages, and reading straight from disk
     /// returns every byte correctly.
-    #[ktest]
     fn flush_batched_run_exceeding_bio_segment_cap_round_trips() {
         let f = fixture_with_empty_file();
         let inode = f.ext4.read_inode(FILE_INO).unwrap();
@@ -8825,7 +9595,6 @@ mod write_tests {
     /// batched flush collects two disjoint runs (a gap breaks a run) and skips the
     /// hole pages entirely. After a batched flush + evict, the data pages read
     /// back from disk correctly and the holes read back as zeros.
-    #[ktest]
     fn flush_batched_sparse_file_round_trips() {
         let f = fixture_with_empty_file();
         let inode = f.ext4.read_inode(FILE_INO).unwrap();
@@ -8880,10 +9649,30 @@ mod write_tests {
             .error()
     }
 
+    #[ktest]
+    fn ext4_direct_io() {
+        crate::fs::fs_impls::ext4::test_utils::scenarios!(
+            direct_read_rejects_dir_and_unaligned,
+            direct_read_matches_buffered_across_fragmented_extents,
+            direct_read_holes_read_zeros_data_reads_bytes,
+            direct_read_unwritten_extent_reads_zeros,
+            direct_read_clamps_to_eof,
+            direct_read_sees_unflushed_buffered_write,
+            direct_read_splits_large_contiguous_run,
+            direct_write_rejects_dir_and_unaligned,
+            direct_write_invalidates_stale_cached_page,
+            direct_write_read_round_trips,
+            direct_and_buffered_interleaved_round_trip,
+            direct_write_fills_hole,
+            direct_write_converts_unwritten_extent,
+            direct_write_append_extends_size,
+            direct_write_spanning_many_groups_forces_restart,
+        );
+    }
+
     /// (1) A directory rejects the direct read with `EISDIR` (the type check
     /// wins even when the request is also unaligned), and a non-block-aligned
     /// offset or buffer length on a regular file rejects with `EINVAL`.
-    #[ktest]
     fn direct_read_rejects_dir_and_unaligned() {
         let f = fixture_with_empty_file();
         let inode = f.ext4.read_inode(FILE_INO).unwrap();
@@ -8905,7 +9694,6 @@ mod write_tests {
     /// image fragments a contiguous append into one physically discontiguous
     /// extent per group (the b3 fragmentation shape), so the direct path must
     /// stitch several `map_blocks` runs back into one logical stream.
-    #[ktest]
     fn direct_read_matches_buffered_across_fragmented_extents() {
         let f = journaled_multigroup_fixture(24);
         let inode = f.ext4.read_inode(FILE_INO).unwrap();
@@ -8933,7 +9721,6 @@ mod write_tests {
 
     /// (3) A sparse file read directly: the hole region reads all zeros and the
     /// data regions read the real bytes, matching the buffered view.
-    #[ktest]
     fn direct_read_holes_read_zeros_data_reads_bytes() {
         let f = fixture_with_empty_file();
         let inode = f.ext4.read_inode(FILE_INO).unwrap();
@@ -8956,7 +9743,6 @@ mod write_tests {
     /// device read of its blocks: the backing blocks are poisoned on the device
     /// yet the read still returns zeros. After a write converts the middle
     /// block, only that block reads real bytes.
-    #[ktest]
     fn direct_read_unwritten_extent_reads_zeros() {
         clocks::init_for_ktest();
         let f = Ext4FixtureBuilder::new(2048, 256, 2048)
@@ -8991,7 +9777,6 @@ mod write_tests {
     /// (4) EOF clamping: an aligned request straddling `i_size` returns only up
     /// to EOF (with a partial tail block), matching the buffered read; an
     /// aligned request at or past EOF returns 0.
-    #[ktest]
     fn direct_read_clamps_to_eof() {
         let f = fixture_with_empty_file();
         let inode = f.ext4.read_inode(FILE_INO).unwrap();
@@ -9017,7 +9802,6 @@ mod write_tests {
     /// (5) A buffered write that has NOT been fsync'd is visible to a subsequent
     /// direct read: `read_direct_at` flushes the overlapping dirty pages to the
     /// device before bypassing the cache.
-    #[ktest]
     fn direct_read_sees_unflushed_buffered_write() {
         let f = fixture_with_empty_file();
         let inode = f.ext4.read_inode(FILE_INO).unwrap();
@@ -9033,7 +9817,6 @@ mod write_tests {
 
     /// (6) A physically contiguous run longer than `DIRECT_MAX_RUN_BLOCKS` reads
     /// back correctly across the multi-BIO split.
-    #[ktest]
     fn direct_read_splits_large_contiguous_run() {
         let f = fixture_with_empty_file();
         let inode = f.ext4.read_inode(FILE_INO).unwrap();
@@ -9078,7 +9861,6 @@ mod write_tests {
     /// (7) A directory rejects the direct write with `EISDIR` (the type check
     /// wins even when the request is also unaligned), and a non-block-aligned
     /// offset or buffer length on a regular file rejects with `EINVAL`.
-    #[ktest]
     fn direct_write_rejects_dir_and_unaligned() {
         let f = fixture_with_empty_file();
         let inode = f.ext4.read_inode(FILE_INO).unwrap();
@@ -9098,7 +9880,6 @@ mod write_tests {
     /// clean) cached page; a direct overwrite of the same block must invalidate
     /// that page, so a subsequent BUFFERED read re-reads the device and returns
     /// the direct bytes, not the stale cached ones.
-    #[ktest]
     fn direct_write_invalidates_stale_cached_page() {
         let f = fixture_with_empty_file();
         let inode = f.ext4.read_inode(FILE_INO).unwrap();
@@ -9116,7 +9897,6 @@ mod write_tests {
 
     /// (3) A multi-block direct write round-trips through both the direct and the
     /// buffered read paths byte-for-byte, and publishes the block-aligned size.
-    #[ktest]
     fn direct_write_read_round_trips() {
         let f = fixture_with_empty_file();
         let inode = f.ext4.read_inode(FILE_INO).unwrap();
@@ -9131,7 +9911,6 @@ mod write_tests {
     /// (4) Buffered and direct writes interleaved across a file — including each
     /// mode overwriting a block the other mode wrote — read back identical
     /// through both read paths, proving the two stay coherent block by block.
-    #[ktest]
     fn direct_and_buffered_interleaved_round_trip() {
         let f = fixture_with_empty_file();
         let inode = f.ext4.read_inode(FILE_INO).unwrap();
@@ -9162,7 +9941,6 @@ mod write_tests {
     /// blocks (a hole in the direct-write range is not a bug — the write path
     /// allocates it, unlike ext2's pre-allocated direct write): afterwards the
     /// filled blocks are `Written` and the file reads back correct.
-    #[ktest]
     fn direct_write_fills_hole() {
         let f = fixture_with_empty_file();
         let inode = f.ext4.read_inode(FILE_INO).unwrap();
@@ -9199,7 +9977,6 @@ mod write_tests {
     /// converts only the written block: the poisoned backing blocks of the
     /// still-unwritten edges keep reading as zeros, so the write crossed the
     /// unwritten boundary without touching its neighbours' device contents.
-    #[ktest]
     fn direct_write_converts_unwritten_extent() {
         clocks::init_for_ktest();
         let f = Ext4FixtureBuilder::new(2048, 256, 2048)
@@ -9240,7 +10017,6 @@ mod write_tests {
     /// success every block is converted, so the readable prefix equals the
     /// converted prefix (the crash-window analogue is exercised by the crash
     /// matrix, not this static test).
-    #[ktest]
     fn direct_write_append_extends_size() {
         let f = fixture_with_empty_file();
         let inode = f.ext4.read_inode(FILE_INO).unwrap();
@@ -9266,7 +10042,6 @@ mod write_tests {
     /// completes byte-exact with EVERY block converted to written — the
     /// converted-prefix-equals-readable-prefix invariant, fully met on success —
     /// and `i_size`/`i_blocks` consistent.
-    #[ktest]
     fn direct_write_spanning_many_groups_forces_restart() {
         let f = journaled_multigroup_fixture(24);
         let journal = f.ext4.journal().unwrap();

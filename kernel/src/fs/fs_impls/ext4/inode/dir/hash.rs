@@ -250,6 +250,16 @@ mod tests {
     const MD4_SEED: [u32; 4] = [0xaec4_c740, 0x834c_e862, 0x09b5_3288, 0x34dc_d3db];
 
     #[ktest]
+    fn ext4_directory_hash_algorithms() {
+        crate::fs::fs_impls::ext4::test_utils::scenarios!(
+            half_md4_matches_e2fsprogs,
+            half_md4_signed_high_byte,
+            tea_matches_e2fsprogs,
+            legacy_matches_e2fsprogs,
+            unsupported_version_is_none,
+        );
+    }
+
     fn half_md4_matches_e2fsprogs() {
         let h = ext4fs_dirhash(b"file0", DX_HASH_HALF_MD4, &MD4_SEED).unwrap();
         assert_eq!(h.hash, 0x1c3d_2670);
@@ -266,7 +276,6 @@ mod tests {
 
     /// A name with a high byte (0xE9) distinguishes the signed variant, which
     /// this image uses, from the unsigned one.
-    #[ktest]
     fn half_md4_signed_high_byte() {
         let h = ext4fs_dirhash(b"x\xe9y", DX_HASH_HALF_MD4, &MD4_SEED).unwrap();
         assert_eq!(h.hash, 0xb8a7_e90a);
@@ -284,7 +293,6 @@ mod tests {
         );
     }
 
-    #[ktest]
     fn tea_matches_e2fsprogs() {
         let seed = [0x79e2_f44a, 0x9449_4804, 0xd0aa_bea6, 0x8275_3d4e];
         let h = ext4fs_dirhash(b"file0", DX_HASH_TEA, &seed).unwrap();
@@ -292,7 +300,6 @@ mod tests {
         assert_eq!(h.minor_hash, 0x2166_1f2d);
     }
 
-    #[ktest]
     fn legacy_matches_e2fsprogs() {
         let seed = [0x5001_7978, 0xb84a_f9d1, 0x3638_94a3, 0xe9cc_f611];
         let h = ext4fs_dirhash(b"file0", DX_HASH_LEGACY, &seed).unwrap();
@@ -300,7 +307,6 @@ mod tests {
         assert_eq!(h.minor_hash, 0); // 32-bit legacy hash carries no minor hash
     }
 
-    #[ktest]
     fn unsupported_version_is_none() {
         assert!(ext4fs_dirhash(b"file0", 6 /* siphash */, &MD4_SEED).is_none());
     }

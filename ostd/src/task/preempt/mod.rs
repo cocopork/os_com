@@ -23,6 +23,18 @@ pub use self::guard::{DisabledPreemptGuard, disable_preempt};
 pub fn halt_cpu() {
     crate::task::atomic_mode::might_sleep();
 
+    // Idle CPUs may run no other task for many grace periods. Reporting only
+    // on a context switch would retain every RCU-retired cache page until each
+    // idle CPU happened to schedule work, defeating bounded page-cache reclaim.
+    // Bootstrap bypasses `might_sleep`'s atomic-mode checks.
+    if !crate::IN_BOOTSTRAP_CONTEXT.load(core::sync::atomic::Ordering::Relaxed) {
+        // Recheck after observing the one-way transition out of bootstrap.
+        crate::task::atomic_mode::might_sleep();
+        // SAFETY: Outside bootstrap, `might_sleep` checked that no
+        // atomic-mode/RCU read guard is held.
+        unsafe { crate::sync::finish_grace_period() };
+    }
+
     let irq_guard = crate::irq::disable_local();
 
     if cpu_local::need_preempt() {

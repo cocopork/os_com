@@ -16,6 +16,7 @@ use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering
 use device_id::DeviceId;
 
 use super::{
+    allocator::{Capacity, metrics as allocation_metrics},
     block_group::{AllocPolicy, BlockGroup, GroupBlockAlloc},
     checksum::FsCsumSeed,
     feature::FeatureIncompatSet,
@@ -92,6 +93,8 @@ pub(super) enum AllocIntent {
     /// reserve intact: it fails `ENOSPC` once only the reserve remains, so the
     /// reserve is never eaten by ordinary work.
     Normal,
+    /// Uses only this delayed owner's already-authorized data/metadata budget.
+    Delayed(u64),
     /// A must-succeed metadata allocation for an operation over already-reserved
     /// space: the extent-tree split or growth an unwritten→written conversion
     /// (or its `ZERO_RANGE` mirror) forces. May draw the reserve down to empty
@@ -126,6 +129,7 @@ struct Ext4MountOptions {
     rnvpc: Option<bool>,
     rnvpc_extend: Option<bool>,
     rtio: Option<bool>,
+    nodelalloc: bool,
 }
 
 impl Ext4MountOptions {
@@ -156,6 +160,8 @@ impl Ext4MountOptions {
         let data = data.to_string_lossy();
         for token in data.split(',') {
             match token.trim() {
+                "delalloc" => options.nodelalloc = false,
+                "nodelalloc" => options.nodelalloc = true,
                 "rnvpc" => options.rnvpc = Some(true),
                 "rnvpc_extend" | "rnvpce" => options.rnvpc_extend = Some(true),
                 "rtio" => options.rtio = Some(true),
@@ -230,6 +236,7 @@ pub struct Ext4 {
     /// Runtime mount options that affect block-count reporting.
     mount_options: Ext4MountOptions,
     rnvpc_mode: RnvpcModeConfig,
+    pub(super) cache_pressure: Arc<super::writeback::CachePressure>,
     pub(super) nv_migration_lock: Mutex<()>,
     pub(super) nv_completion_lock: Mutex<()>,
     pub(super) nv_completion_queue: super::migration::CompletionQueue,
@@ -238,7 +245,9 @@ pub struct Ext4 {
     pub(super) nv_migration_failed: AtomicBool,
     pub(super) nv_inodes: Mutex<BTreeSet<Ext4Ino>>,
     rnvpc_fs_id: u64,
-    rnvpce_reserved_blocks: AtomicU64,
+    block_capacity: Arc<Capacity>,
+    /// Immutable geometry avoids even a superblock read on allocation.
+    allocation_geometry: (Ext4Bid, u32, u64),
     /// The JBD2 journal, present iff the volume carries the `HAS_JOURNAL` compat
     /// feature (jbd2 `journal_t`).
     ///
@@ -289,33 +298,23 @@ impl Ext4 {
         self.rnvpc_fs_id
     }
     pub(super) fn reserve_rnvpce_blocks(&self, blocks: u64) -> Result<()> {
-        let sb = self.super_block.write();
-        let available = sb
-            .free_blocks_count()
-            .saturating_sub(Self::metadata_reserve_floor(sb.total_blocks()));
-        self.rnvpce_reserved_blocks
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-                current
-                    .checked_add(blocks)
-                    .filter(|next| *next <= available)
-            })
-            .map_err(|_| Error::new(Errno::ENOSPC))?;
-        Ok(())
+        self.block_capacity.reserve_rnvpce(
+            blocks,
+            Self::metadata_reserve_floor(self.allocation_geometry.2),
+            || {
+                self.journal()
+                    .map_or(0, |journal| journal.pinned_free_blocks())
+            },
+        )
     }
     pub(super) fn release_rnvpce_blocks(&self, blocks: u64) -> Result<()> {
-        self.rnvpce_reserved_blocks
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-                current.checked_sub(blocks)
-            })
-            .map_err(|_| Error::new(Errno::EUCLEAN))?;
-        Ok(())
+        self.block_capacity.release_rnvpce(blocks)
     }
     pub(super) fn reconcile_rnvpce_reservations(&self) -> Result<()> {
         let pool = crate::fs::rnvpc::pool().ok_or_else(|| Error::new(Errno::EINVAL))?;
         let outstanding =
             crate::fs::rnvpc::write_transaction::outstanding_ssd_capacity(pool, self.rnvpc_fs_id)?;
-        self.rnvpce_reserved_blocks
-            .store(outstanding, Ordering::Release);
+        self.block_capacity.reconcile_rnvpce(outstanding);
         Ok(())
     }
     /// Mounts an ext4 volume from a block device.
@@ -346,6 +345,12 @@ impl Ext4 {
 
         let block_groups = Self::load_block_groups(device.clone(), &super_block)?;
 
+        let initial_free_blocks = super_block.free_blocks_count();
+        let allocation_geometry = (
+            super_block.first_data_block(),
+            super_block.nr_blocks_per_group(),
+            super_block.total_blocks(),
+        );
         let ext4 = Arc::new_cyclic(|weak| Ext4 {
             block_device: device,
             super_block: RwMutex::new(Dirty::new(super_block)),
@@ -358,6 +363,7 @@ impl Ext4 {
             s_orphan_lock: Mutex::new(OrphanChain::new()),
             mount_options,
             rnvpc_mode,
+            cache_pressure: super::writeback::CachePressure::new(),
             nv_migration_lock: Mutex::new(()),
             nv_completion_lock: Mutex::new(()),
             nv_completion_queue: Arc::new(SpinLock::new(VecDeque::with_capacity(
@@ -368,7 +374,8 @@ impl Ext4 {
             nv_migration_failed: AtomicBool::new(false),
             nv_inodes: Mutex::new(BTreeSet::new()),
             rnvpc_fs_id,
-            rnvpce_reserved_blocks: AtomicU64::new(0),
+            block_capacity: Arc::new(Capacity::new(initial_free_blocks)),
+            allocation_geometry,
             journal: RwMutex::new(None),
             fs_event_subscriber_stats: FsEventSubscriberStats::new(),
             #[cfg(ktest)]
@@ -481,6 +488,9 @@ impl Ext4 {
             ext4.reconcile_rnvpce_reservations()?;
         }
         ext4.start_nv_migration();
+        // Kernel fixtures opt in explicitly; avoid spawning a worker per fixture.
+        #[cfg(not(ktest))]
+        ext4.start_cache_writeback();
         Ok(ext4)
     }
 
@@ -498,6 +508,7 @@ impl Ext4 {
         for group in &self.block_groups {
             group.reload_metadata(self.block_device.as_ref())?;
         }
+        self.block_capacity.reset(super_block.free_blocks_count());
         *self.super_block.write() = Dirty::new(super_block);
         Ok(())
     }
@@ -1196,6 +1207,30 @@ impl Ext4 {
     /// the first block of the inode's own block group (Linux
     /// `ext4_inode_to_goal_block`) — keeping a file's data near its inode
     /// instead of piling every hint-less allocation into group 0.
+    pub(super) fn delalloc_enabled(&self) -> bool {
+        !self.mount_options.nodelalloc
+            && self.rnvpc_mode() == crate::fs::rnvpc::mode::RnvpcMode::Native
+    }
+
+    pub(super) fn delayed_account(&self) -> super::allocator::DelayedAccount {
+        self.block_capacity.delayed_account()
+    }
+
+    pub(super) fn reserve_delayed(
+        &self,
+        account: &super::allocator::DelayedAccount,
+        count: u64,
+    ) -> Result<()> {
+        let pinned = self
+            .journal()
+            .map_or(0, |journal| journal.pinned_free_blocks());
+        account.reserve(
+            count,
+            Self::metadata_reserve_floor(self.allocation_geometry.2),
+            pinned,
+        )
+    }
+
     pub(super) fn inode_goal_block(&self, ino: Ext4Ino) -> Ext4Bid {
         let sb = self.super_block.read();
         let group = ((ino - 1) / self.nr_inodes_per_group) as Ext4Bid;
@@ -1238,7 +1273,7 @@ impl Ext4 {
     /// Returns `Err(ENOSPC)` if no group can satisfy the request — the pinned
     /// flavor (free blocks exist but all await a commit) is transient: it
     /// nudges the committer asynchronously and clears once the freeing
-    /// transaction commits. Never waits: the caller holds inode/group locks
+    /// transaction commits. Never waits for a journal commit: the caller holds inode/group locks
     /// and — the deeper deadlock — the pinning transaction is typically the
     /// caller's own, uncommittable until the caller's handle closes (Linux
     /// retries around `jbd2_journal_force_commit_nested` from
@@ -1294,44 +1329,37 @@ impl Ext4 {
             }
         }
 
-        let mut sb = self.super_block.write();
-        let nr_block_groups = sb.nr_block_groups() as usize;
-        let sb_free_blocks = sb.free_blocks_count();
-        let first_data_block = sb.first_data_block();
-        let nr_blocks_per_group = sb.nr_blocks_per_group() as Ext4Bid;
-
-        // Reserve gate (Linux `ext4_has_free_clusters` + the `ar->len` halving
-        // in `ext4_mb_new_blocks`): a `Normal` request may consume only the
-        // free blocks *above* the reserve floor, and — like Linux clamping the
-        // request down until the claim passes — the count is trimmed to fit
-        // rather than failing outright, preserving the partial-run behavior a
-        // near-full data write already relies on. A `MetadataReserve` request
-        // ignores the floor entirely. Nothing left to hand out (only the
-        // reserve remains, for `Normal`; genuinely empty, for either) is
-        // `ENOSPC`.
-        let allocatable = match intent {
-            AllocIntent::Normal => sb_free_blocks
-                .saturating_sub(Self::metadata_reserve_floor(sb.total_blocks()))
-                .saturating_sub(self.rnvpce_reserved_blocks.load(Ordering::Acquire)),
-            AllocIntent::MetadataReserve | AllocIntent::RnvpceReserved => sb_free_blocks,
+        let (first_data_block, blocks_per_group, total_blocks) = self.allocation_geometry;
+        let nr_block_groups = self.block_groups.len();
+        let nr_blocks_per_group = blocks_per_group as Ext4Bid;
+        let journal = self.journal();
+        let admission = if let AllocIntent::Delayed(owner) = intent {
+            self.block_capacity.claim_delayed(count, owner)
+        } else {
+            self.block_capacity.claim(
+                count,
+                Self::metadata_reserve_floor(total_blocks),
+                intent == AllocIntent::Normal,
+                || {
+                    journal
+                        .as_ref()
+                        .map_or(0, |journal| journal.pinned_free_blocks())
+                },
+            )
         };
-        if allocatable == 0 {
-            return_errno_with_message!(Errno::ENOSPC, "no free blocks available above the reserve");
-        }
-        // Trim the request to what the reserve leaves. Widen to u64 for the min
-        // so a huge `allocatable` never truncates; the result is `≤ count`, a
-        // u32, so the narrowing back is lossless.
-        let count = (count as u64).min(allocatable) as u32;
-
-        // The pinned freed runs, snapshotted once per allocation. A transient
-        // journal-state read under the superblock write lock — a leaf edge
-        // the capture funnels already establish; the same superblock lock
-        // serializes this snapshot against `free_blocks`' pin insertions, so
-        // it cannot miss a pin (see `Journal::pinned_frees_snapshot`).
-        let pinned_frees = match self.journal() {
-            Some(journal) => journal.pinned_frees_snapshot(),
-            None => Vec::new(),
+        let reservation = match admission {
+            Ok(reservation) => reservation,
+            Err(error) => {
+                if let Some(journal) = &journal {
+                    if journal.has_pinned_frees() {
+                        allocation_metrics::PINNED_DENIALS.record(1);
+                        journal.request_commit_of_running();
+                    }
+                }
+                return Err(error);
+            }
         };
+        let count = reservation.count();
 
         let goal_group = if goal > first_data_block {
             ((goal - first_data_block) / nr_blocks_per_group) as usize
@@ -1369,11 +1397,52 @@ impl Ext4 {
                     AllocPolicy::BestEffort
                 };
 
-                match group.alloc_blocks(count, sb_free_blocks, &pinned_frees, policy, handle)? {
+                allocation_metrics::GROUP_VISITS.record(1);
+                let waiting = allocation_metrics::Span::new(&allocation_metrics::GROUP_WAIT);
+                let gate = group.lock_allocation();
+                drop(waiting);
+                let holding = allocation_metrics::Span::new(&allocation_metrics::GROUP_HOLD);
+                let pinned_frees = journal
+                    .as_ref()
+                    .map_or_else(Vec::new, |journal| journal.pinned_frees_snapshot());
+                let allocated =
+                    group.alloc_blocks(count, count as u64, &pinned_frees, policy, handle);
+                drop(gate);
+                drop(holding);
+                let allocated = match allocated {
+                    Ok(allocated) => allocated,
+                    Err(error) => {
+                        if let Some(handle) = handle {
+                            handle.abort_journal_on_fs_error();
+                        }
+                        reservation.poison();
+                        return Err(error);
+                    }
+                };
+                match allocated {
                     GroupBlockAlloc::Allocated(range) => {
                         let allocated_count = range.end - range.start;
-                        sb.dec_free_blocks(allocated_count)?;
-                        sb.journal_capture(handle, sb.last_orphan())?;
+                        // No group lock is held across superblock publication.
+                        // Model A admission keeps this handle's typed updates in
+                        // one transaction until both group and count are captured.
+                        let publish = (|| -> Result<()> {
+                            let waiting =
+                                allocation_metrics::Span::new(&allocation_metrics::PUBLISH_WAIT);
+                            let mut sb = self.super_block.write();
+                            drop(waiting);
+                            let _holding =
+                                allocation_metrics::Span::new(&allocation_metrics::PUBLISH_HOLD);
+                            sb.dec_free_blocks(allocated_count)?;
+                            sb.journal_capture(handle, sb.last_orphan())
+                        })();
+                        if let Err(error) = publish {
+                            if let Some(handle) = handle {
+                                handle.abort_journal_on_fs_error();
+                            }
+                            reservation.poison();
+                            return Err(error);
+                        }
+                        reservation.consume(allocated_count)?;
                         return Ok(range);
                     }
                     GroupBlockAlloc::NoFit { pinned_in_group } => pinned_blocked |= pinned_in_group,
@@ -1384,7 +1453,7 @@ impl Ext4 {
         if pinned_blocked {
             // Everything left is pinned. Force-request a commit of the
             // running transaction (asynchronous — waiting here, under the
-            // superblock lock and the caller's inode locks and open handle,
+            // caller's inode locks and open handle,
             // is banned; see the function docs) and fail the attempt: the
             // state ends with the pinning transaction's commit, so a retry
             // then succeeds. Under group commit a bare wake would no longer
@@ -1485,8 +1554,8 @@ impl Ext4 {
     /// clear ([`journal::pin_freed_run`]): the freed blocks stay out of the
     /// allocator until this transaction commits — both credential flavors,
     /// data and metadata alike (Linux pins exactly this set in ordered mode,
-    /// fs/ext4/mballoc.c:6536-6560). The superblock write lock held across
-    /// the whole function makes clear-then-pin atomic against the allocator.
+    /// fs/ext4/mballoc.c:6536-6560). The per-group allocation gate makes
+    /// clear-then-pin atomic against that group's fresh allocation snapshots.
     pub(super) fn free_blocks(
         &self,
         auth: journal::BlockFreeAuth,
@@ -1497,9 +1566,8 @@ impl Ext4 {
             return Ok(());
         }
 
-        let mut sb = self.super_block.write();
-        let nr_blocks_per_group = sb.nr_blocks_per_group() as Ext4Bid;
-        let first_data_block = sb.first_data_block();
+        let (first_data_block, blocks_per_group, _) = self.allocation_geometry;
+        let nr_blocks_per_group = blocks_per_group as Ext4Bid;
 
         let mut current_block = start;
         let mut remaining_blocks = count;
@@ -1520,6 +1588,7 @@ impl Ext4 {
             // non-journaled volume. A discharge `Err` still propagates
             // plainly: `discharge` can only fail before any of its effects
             // run, so nothing needs unwinding.
+            let gate = group.lock_allocation();
             if let (Some(handle), Some(duty)) = (handle, duty.as_ref()) {
                 duty.discharge(handle, current_block, blocks_in_group)?;
             }
@@ -1538,20 +1607,27 @@ impl Ext4 {
             // accepts no further work, so the poison can never act. Without
             // a handle nothing was discharged or pinned and there is no
             // journal to poison; the error propagates plainly.
-            let run_result = (|| -> Result<()> {
+            let run_result = (|| -> Result<u32> {
                 let freed_count = group
                     .free_blocks(group_start_bit..(group_start_bit + blocks_in_group), handle)?;
                 // Pin the freed run until this transaction commits (released
                 // at commit step 6). The bits are already clear, but no
-                // allocator can observe the gap: it needs the superblock
-                // write lock this function holds.
+                // allocator can observe the gap: it needs the same group's
+                // allocation gate before taking its journal pin snapshot.
                 journal::pin_freed_run(handle, current_block, blocks_in_group)?;
-                if freed_count > 0 {
+                Ok(freed_count)
+            })();
+            drop(gate);
+            let run_result = run_result.and_then(|freed_count| {
+                if freed_count != 0 {
+                    let mut sb = self.super_block.write();
                     sb.inc_free_blocks(freed_count as u64)?;
                     sb.journal_capture(handle, sb.last_orphan())?;
+                    drop(sb);
+                    self.block_capacity.credit(freed_count as u64)?;
                 }
                 Ok(())
-            })();
+            });
             if let Err(e) = run_result {
                 if let Some(handle) = handle {
                     handle.abort_journal_on_fs_error();
@@ -2568,16 +2644,17 @@ impl Ext4 {
 /// Stops the journal's commit thread on unmount (jbd2 journal teardown, the
 /// `jbd2_journal_destroy` step that halts `kjournald`).
 ///
-/// This MUST run here, on the unmounting thread — never on the commit thread
-/// itself, or [`Journal::stop_commit_thread`](journal::Journal::stop_commit_thread)
+/// This must never run on the journal commit thread itself, or [`Journal::stop_commit_thread`](journal::Journal::stop_commit_thread)
 /// would join on itself and spin forever. It is structurally impossible for the
 /// commit thread to reach this: that thread holds only a `Weak<Journal>` (see the
 /// commit-thread model in [`journal`]), so it never contributes to the `Ext4`
-/// strong count and can never be the last owner whose drop runs this. `Ext4::drop`
-/// therefore always runs on a real owner's thread. For a non-journaled volume the
-/// cell is `None` and this is a no-op.
+/// strong count and can never be the last owner whose drop runs this. A cache
+/// writeback worker may release the last upgraded filesystem reference after a
+/// completed round; it does not join itself or retain filesystem locks here.
+/// For a non-journaled volume the cell is `None` and this is a no-op.
 impl Drop for Ext4 {
     fn drop(&mut self) {
+        allocation_metrics::dump();
         // Callback queue ownership must outlive every submitted BIO. Drain in
         // process context before field destruction, even after shutdown.
         if let Err(error) = self.drain_nv_in_flight() {
@@ -2918,6 +2995,107 @@ impl InodeSlot {
 
 #[cfg(ktest)]
 mod tests {
+    #[ktest]
+    fn ext4_allocator_concurrency() {
+        crate::fs::fs_impls::ext4::test_utils::scenarios!(
+            group_allocator_concurrent_ownership_and_shared_gdt,
+            group_allocation_does_not_hold_superblock_during_search,
+        );
+    }
+
+    fn group_allocator_concurrent_ownership_and_shared_gdt() {
+        crate::time::clocks::init_for_ktest();
+        let fixture = Ext4FixtureBuilder::new(2048, 128, 8192)
+            .with_block_bitmap_metadata_marked()
+            .with_journal_inode(128)
+            .build()
+            .unwrap();
+        let fs = fixture.ext4.clone();
+        let before = fs.free_blocks_count();
+        let ranges = Arc::new(Mutex::new(Vec::new()));
+        let mut workers = Vec::new();
+        for cpu in 0..4 {
+            let fs = fs.clone();
+            let ranges = ranges.clone();
+            workers.push(
+                crate::thread::kernel_thread::ThreadOptions::new(move || {
+                    let op = fs.begin_op(8).unwrap();
+                    for step in 0..32 {
+                        let goal = (cpu % 2) * 2048 + 100;
+                        let range = fs.alloc_blocks(3, goal, op.get()).unwrap();
+                        ranges.lock().push(range);
+                        if step % 4 == 0 {
+                            crate::thread::Thread::yield_now();
+                        }
+                    }
+                })
+                .spawn(),
+            );
+        }
+        for worker in workers {
+            worker.join();
+        }
+        let mut ranges = ranges.lock();
+        ranges.sort_by_key(|range| range.start);
+        assert_eq!(ranges.len(), 128);
+        for pair in ranges.windows(2) {
+            assert!(pair[0].end <= pair[1].start);
+        }
+        assert_eq!(fs.free_blocks_count(), before - 384);
+        let journal = fs.journal().unwrap();
+        journal.stop_commit_thread();
+        journal.commit_now_for_test();
+        journal.flush_on_unmount().unwrap();
+        let raw = fixture
+            .disk
+            .segment()
+            .read_val::<RawSuperBlock>(SUPER_BLOCK_OFFSET)
+            .unwrap();
+        assert_eq!(raw.free_blocks_count as u64, before - 384);
+        for group_idx in 0..2 {
+            let offset = BLOCK_SIZE + group_idx * core::mem::size_of::<RawBlockGroup>();
+            let desc = fixture
+                .disk
+                .segment()
+                .read_val::<RawBlockGroup>(offset)
+                .unwrap();
+            assert_eq!(
+                desc.free_blocks_count_lo as u32,
+                fs.block_group(group_idx).free_blocks_count()
+            );
+        }
+    }
+
+    fn group_allocation_does_not_hold_superblock_during_search() {
+        crate::time::clocks::init_for_ktest();
+        let fixture = Ext4FixtureBuilder::new(2048, 128, 4096)
+            .with_block_bitmap_metadata_marked()
+            .build()
+            .unwrap();
+        let fs = fixture.ext4.clone();
+        let before = fs.block_group(0).free_blocks_count();
+        let sb = fs.super_block.write();
+        let worker_fs = fs.clone();
+        let worker = crate::thread::kernel_thread::ThreadOptions::new(move || {
+            worker_fs.alloc_blocks(8, 0, None).unwrap();
+        })
+        .spawn();
+        let mut progressed = false;
+        for _ in 0..128 {
+            crate::thread::Thread::yield_now();
+            if fs.block_group(0).free_blocks_count() < before {
+                progressed = true;
+                break;
+            }
+        }
+        drop(sb);
+        worker.join();
+        assert!(
+            progressed,
+            "group allocation was serialized behind superblock publication lock"
+        );
+    }
+
     use ostd::prelude::*;
 
     use super::{
@@ -2934,6 +3112,16 @@ mod tests {
     };
 
     #[ktest]
+    fn ext4_mount_and_inode_lookup() {
+        crate::fs::fs_impls::ext4::test_utils::scenarios!(
+            mount_and_read_root,
+            read_inode_zero_fails,
+            read_small_file_end_to_end,
+            read_inode_returns_same_arc_identity,
+            read_inode_rejects_out_of_range_ino,
+        );
+    }
+
     fn mount_and_read_root() {
         let f = Ext4FixtureBuilder::new(2048, 256, 2048).build().unwrap();
         let root = f.ext4.root_inode_desc().unwrap();
@@ -2943,15 +3131,22 @@ mod tests {
         assert_eq!(f.ext4.super_block().nr_block_groups(), 1);
     }
 
-    #[ktest]
     fn read_inode_zero_fails() {
         let f = Ext4FixtureBuilder::new(2048, 256, 2048).build().unwrap();
         assert!(f.ext4.read_inode_desc(0).is_err());
     }
 
+    #[ktest]
+    fn ext4_statfs() {
+        crate::fs::fs_impls::ext4::test_utils::scenarios!(
+            statfs_reports_usable_space,
+            mount_options_parse_bsddf_minixdf,
+            statfs_minixdf_reports_raw_total,
+        );
+    }
+
     /// `statfs` reports usable capacity (raw blocks minus metadata + journal
     /// overhead), reserved-block-adjusted `bavail`, and a UUID-derived `fsid`.
-    #[ktest]
     fn statfs_reports_usable_space() {
         use crate::fs::vfs::file_system::FileSystem;
 
@@ -2986,7 +3181,6 @@ mod tests {
     /// tokens (e.g. `noacl`) are ignored rather than failing the mount, and
     /// on a `bsddf`/`minixdf` conflict the last one wins (Linux
     /// `MOPT_SET`/`MOPT_CLEAR` parity).
-    #[ktest]
     fn mount_options_parse_bsddf_minixdf() {
         assert_eq!(
             Ext4MountOptions::parse(None).stat_block_accounting,
@@ -3010,7 +3204,6 @@ mod tests {
     /// — no metadata/journal overhead subtraction — while an explicit `bsddf`
     /// keeps the default usable-capacity accounting
     /// (`statfs_reports_usable_space`). Free counts are unaffected.
-    #[ktest]
     fn statfs_minixdf_reports_raw_total() {
         use crate::fs::vfs::file_system::FileSystem;
 
@@ -3041,11 +3234,19 @@ mod tests {
         assert_eq!(ext4.sb().blocks, default_stat.blocks);
     }
 
+    #[ktest]
+    fn ext4_read_only_remount() {
+        crate::fs::fs_impls::ext4::test_utils::scenarios!(
+            remount_read_only_blocks_writes_reads_stay_allowed,
+            remount_read_only_flushes_dirty_data_to_disk,
+            remount_read_write_refused_after_journal_abort,
+        );
+    }
+
     /// `mount -o remount,ro` takes the filesystem read-only for real: every
     /// write (data and metadata) is refused `EROFS` while reads stay allowed,
     /// and `remount,rw` restores writing. Idempotent in both directions.
     /// (generic/452 exercises this whole switch.)
-    #[ktest]
     fn remount_read_only_blocks_writes_reads_stay_allowed() {
         const DIR_INO: u32 = 12;
 
@@ -3113,7 +3314,6 @@ mod tests {
     /// The rw->ro switch flushes dirty file data to the device before raising
     /// the read-only gate (it reuses `FileSystem::sync`): an overwrite still in
     /// the page cache is on the platter once `remount,ro` returns.
-    #[ktest]
     fn remount_read_only_flushes_dirty_data_to_disk() {
         const FILE_INO: u32 = 11;
         // A block outside the fixture metadata, pre-mapped by the file's extent
@@ -3149,7 +3349,6 @@ mod tests {
     /// aborted: a failed commit already took the fs read-only for real, and
     /// letting writes resume would build on a log that can never commit (Linux
     /// `ext4_clear_journal_err`).
-    #[ktest]
     fn remount_read_write_refused_after_journal_abort() {
         crate::time::clocks::init_for_ktest();
         let f = Ext4FixtureBuilder::new(2048, 256, 2048)
@@ -3165,7 +3364,6 @@ mod tests {
         );
     }
 
-    #[ktest]
     fn read_small_file_end_to_end() {
         let f = Ext4FixtureBuilder::new(2048, 256, 2048).build().unwrap();
         let data_block = 100u32;
@@ -3185,6 +3383,15 @@ mod tests {
     }
 
     #[ktest]
+    fn ext4_block_allocation() {
+        crate::fs::fs_impls::ext4::test_utils::scenarios!(
+            alloc_and_free_single_group_ok,
+            alloc_goal_lands_in_later_group,
+            alloc_enospc_and_einval,
+            metadata_reserve_gates_normal_but_not_reserved,
+        );
+    }
+
     fn alloc_and_free_single_group_ok() {
         let f = Ext4FixtureBuilder::new(2048, 256, 2048)
             .with_block_bitmap_metadata_marked()
@@ -3223,6 +3430,18 @@ mod tests {
         assert_eq!(f.ext4.super_block().free_blocks_count(), before_sb_free);
     }
 
+    #[ktest]
+    fn ext4_free_block_reuse() {
+        crate::fs::fs_impls::ext4::test_utils::scenarios!(
+            forget_effects_run_at_free_not_at_mint,
+            system_zone_free_aborts_journal,
+            post_discharge_free_failure_aborts_journal,
+            freed_blocks_pinned_until_commit,
+            pinned_exhaustion_is_transient_enospc,
+            non_journaled_free_is_immediately_reusable,
+        );
+    }
+
     /// MAJOR-B red→green: the forget effects (capture cancel, revoke record,
     /// retained-image eviction) run at the authorization's CONSUMPTION —
     /// inside `free_blocks`, with the bitmap clear — never at mint. An
@@ -3233,7 +3452,6 @@ mod tests {
     /// at checkpoint (silent content rollback), and the cancelled capture's
     /// update would be lost. Reverting to effects-at-mint fails every `b2`
     /// assertion below.
-    #[ktest]
     fn forget_effects_run_at_free_not_at_mint() {
         crate::time::clocks::init_for_ktest();
         let f = Ext4FixtureBuilder::new(2048, 256, 2048)
@@ -3304,7 +3522,6 @@ mod tests {
     /// every later checkpoint/replay. The effects cannot be unwound, so the
     /// path must abort the journal (the Linux `ext4_error` shape), not
     /// error-return into continued operation with the poison standing.
-    #[ktest]
     fn system_zone_free_aborts_journal() {
         crate::time::clocks::init_for_ktest();
         let f = Ext4FixtureBuilder::new(2048, 256, 2048)
@@ -3341,7 +3558,6 @@ mod tests {
     /// what makes the run's missing pin moot: no new operation can reach the
     /// visible-free blocks (`begin_op` refuses), and the in-flight
     /// transaction that could is never committed.
-    #[ktest]
     fn post_discharge_free_failure_aborts_journal() {
         crate::time::clocks::init_for_ktest();
         let f = Ext4FixtureBuilder::new(2048, 256, 2048)
@@ -3383,7 +3599,6 @@ mod tests {
     /// block right back, so reverting the allocator's pin skip fails the
     /// mid-transaction assert; the commit (step 6) releases the pin and the
     /// block is allocatable again.
-    #[ktest]
     fn freed_blocks_pinned_until_commit() {
         crate::time::clocks::init_for_ktest();
         let f = Ext4FixtureBuilder::new(2048, 256, 2048)
@@ -3429,7 +3644,6 @@ mod tests {
     /// under the caller's locks is banned, and the pinning transaction is
     /// the caller's own) and never a pinned block — and succeeds again once
     /// the freeing transaction commits.
-    #[ktest]
     fn pinned_exhaustion_is_transient_enospc() {
         crate::time::clocks::init_for_ktest();
         let f = Ext4FixtureBuilder::new(2048, 256, 2048)
@@ -3502,7 +3716,6 @@ mod tests {
     /// A non-journaled volume keeps the pre-pinning behavior: no log means no
     /// commit boundary for a free to wait on, so a freed block is immediately
     /// allocatable (first-fit returns it right back).
-    #[ktest]
     fn non_journaled_free_is_immediately_reusable() {
         let f = Ext4FixtureBuilder::new(2048, 256, 2048)
             .with_block_bitmap_metadata_marked()
@@ -3516,7 +3729,6 @@ mod tests {
         assert_eq!(reused.start, freed);
     }
 
-    #[ktest]
     fn alloc_goal_lands_in_later_group() {
         // Two groups; goal points into group 1.
         let f = Ext4FixtureBuilder::new(2048, 256, 2 * 2048)
@@ -3531,7 +3743,6 @@ mod tests {
         assert!(range.start >= group1_first);
     }
 
-    #[ktest]
     fn alloc_enospc_and_einval() {
         // free == 0 -> ENOSPC.
         let f_full = Ext4FixtureBuilder::new(2048, 256, 2048)
@@ -3566,7 +3777,6 @@ mod tests {
     /// reserve is left, a `Normal` allocation is `ENOSPC` while a
     /// `MetadataReserve` one still succeeds — and the reserve, once exhausted by
     /// reserved allocations, is `ENOSPC` for both.
-    #[ktest]
     fn metadata_reserve_gates_normal_but_not_reserved() {
         let f = Ext4FixtureBuilder::new(8192, 256, 8192)
             .with_block_bitmap_metadata_marked()
@@ -3623,6 +3833,17 @@ mod tests {
     }
 
     #[ktest]
+    fn ext4_filesystem_sync() {
+        crate::fs::fs_impls::ext4::test_utils::scenarios!(
+            sync_metadata_round_trip_lossless,
+            sync_all_flushes_dirty_inode,
+            cross_inode_truncate_consistent_after_sync_all,
+            sync_metadata_persists_inode_counts,
+            free_count_words_journaled_with_bitmap,
+            sync_metadata_defers_counts_to_journal_while_live,
+        );
+    }
+
     fn sync_metadata_round_trip_lossless() {
         let f = Ext4FixtureBuilder::new(2048, 256, 2048)
             .with_block_bitmap_metadata_marked()
@@ -3730,7 +3951,6 @@ mod tests {
 
     /// `read_inode` returns the same `Arc<Inode>` for repeated reads of one ino:
     /// the per-group inode cache gives the inode a stable identity.
-    #[ktest]
     fn read_inode_returns_same_arc_identity() {
         let f = Ext4FixtureBuilder::new(2048, 256, 2048)
             .with_block_bitmap_metadata_marked()
@@ -3751,7 +3971,6 @@ mod tests {
     /// `fs.sync_all()` flushes a dirty inode's metadata to the on-disk inode
     /// table: after a write + `sync_all`, the raw inode read straight from the
     /// device segment carries the new size and `i_blocks`.
-    #[ktest]
     fn sync_all_flushes_dirty_inode() {
         crate::time::clocks::init_for_ktest();
         let f = Ext4FixtureBuilder::new(2048, 256, 2048)
@@ -3781,7 +4000,6 @@ mod tests {
     /// clean-unmount path) must flush B's trimmed inode together with the bitmap:
     /// on disk, B's size reflects the truncate, every block B's extents still
     /// reference is allocated, and the freed trailing block is marked free.
-    #[ktest]
     fn cross_inode_truncate_consistent_after_sync_all() {
         crate::time::clocks::init_for_ktest();
         let f = Ext4FixtureBuilder::new(2048, 256, 2048)
@@ -3836,9 +4054,24 @@ mod tests {
         (magic, entries)
     }
 
+    #[ktest]
+    fn ext4_inode_allocation() {
+        crate::fs::fs_impls::ext4::test_utils::scenarios!(
+            alloc_ino_free_inode_round_trip,
+            alloc_ino_rings_to_next_group,
+            alloc_dir_tracks_used_dirs_count,
+            alloc_file_does_not_touch_used_dirs_count,
+            alloc_ino_enospc,
+            create_file_inode_has_empty_extent_root,
+            create_dir_inode_has_link_count_two,
+            create_inode_generation_increments,
+            featureless_volume_keeps_itable_unused_zero,
+            create_inode_rolls_back_on_write_failure,
+        );
+    }
+
     /// alloc_ino then free_inode restores the group and superblock free-inode
     /// counters exactly.
-    #[ktest]
     fn alloc_ino_free_inode_round_trip() {
         let f = Ext4FixtureBuilder::new(2048, 256, 2048)
             .with_inode_bitmap_metadata_marked()
@@ -3859,7 +4092,6 @@ mod tests {
     }
 
     /// A full first group rings the allocation into the next group.
-    #[ktest]
     fn alloc_ino_rings_to_next_group() {
         // A 2-group image with the normal reserved layout. Group 0 has 32 inodes
         // (10 reserved -> 22 free); exhaust them so the next allocation, with its
@@ -3884,7 +4116,6 @@ mod tests {
     }
 
     /// A directory allocation bumps `used_dirs_count`; freeing it drops it back.
-    #[ktest]
     fn alloc_dir_tracks_used_dirs_count() {
         let f = Ext4FixtureBuilder::new(2048, 256, 2048)
             .with_inode_bitmap_metadata_marked()
@@ -3900,7 +4131,6 @@ mod tests {
     }
 
     /// A non-directory allocation leaves `used_dirs_count` untouched.
-    #[ktest]
     fn alloc_file_does_not_touch_used_dirs_count() {
         let f = Ext4FixtureBuilder::new(2048, 256, 2048)
             .with_inode_bitmap_metadata_marked()
@@ -3915,7 +4145,6 @@ mod tests {
     }
 
     /// alloc_ino with no free inodes returns ENOSPC.
-    #[ktest]
     fn alloc_ino_enospc() {
         let f = Ext4FixtureBuilder::new(2048, 256, 2048)
             .with_no_free_inodes()
@@ -3932,7 +4161,6 @@ mod tests {
 
     /// create_inode of a regular file produces a valid empty extent root with the
     /// EXTENTS flag, size 0, blocks 0, and link count 1.
-    #[ktest]
     fn create_file_inode_has_empty_extent_root() {
         crate::time::clocks::init_for_ktest();
         let f = Ext4FixtureBuilder::new(2048, 256, 2048)
@@ -3966,7 +4194,6 @@ mod tests {
 
     /// create_inode of a directory sets link count 2 (for the `.` self-link) and
     /// the directory type bits.
-    #[ktest]
     fn create_dir_inode_has_link_count_two() {
         crate::time::clocks::init_for_ktest();
         let f = Ext4FixtureBuilder::new(2048, 256, 2048)
@@ -3991,7 +4218,6 @@ mod tests {
     }
 
     /// The generation stamped onto a created inode increments across calls.
-    #[ktest]
     fn create_inode_generation_increments() {
         crate::time::clocks::init_for_ktest();
         let f = Ext4FixtureBuilder::new(2048, 256, 2048)
@@ -4019,7 +4245,6 @@ mod tests {
     /// unused count on a featureless volume as "group descriptor marked
     /// uninitialized without feature set" — ext4/045's guest-mkfs scratch
     /// caught exactly this (P9a-a5).
-    #[ktest]
     fn featureless_volume_keeps_itable_unused_zero() {
         crate::time::clocks::init_for_ktest();
         let f = Ext4FixtureBuilder::new(2048, 256, 2048)
@@ -4049,7 +4274,6 @@ mod tests {
 
     /// create_inode rolls back the inode allocation when the on-disk writeback
     /// fails: the bitmap bit is cleared and the superblock counter restored.
-    #[ktest]
     fn create_inode_rolls_back_on_write_failure() {
         crate::time::clocks::init_for_ktest();
         let f = Ext4FixtureBuilder::new(2048, 256, 2048)
@@ -4086,7 +4310,6 @@ mod tests {
     /// sync_metadata writes the inode bitmap and the inode-count descriptor
     /// fields back losslessly: after an inode alloc + sync, the on-disk group
     /// descriptor reflects the new free-inode and used-dirs counts.
-    #[ktest]
     fn sync_metadata_persists_inode_counts() {
         crate::time::clocks::init_for_ktest();
         let f = Ext4FixtureBuilder::new(2048, 256, 2048)
@@ -4152,7 +4375,6 @@ mod tests {
     /// `fs-sync-counts-direct-write` debt — there is no live-journal direct
     /// write left to invert (see
     /// [`sync_metadata_defers_counts_to_journal_while_live`]).
-    #[ktest]
     fn free_count_words_journaled_with_bitmap() {
         crate::time::clocks::init_for_ktest();
         let f = Ext4FixtureBuilder::new(2048, 256, 2048)
@@ -4217,7 +4439,6 @@ mod tests {
     /// is the unmount quiesce point (log already flushed empty — nothing to
     /// invert). Regression guard for the closed `fs-sync-counts-direct-write`
     /// WAL-inversion window.
-    #[ktest]
     fn sync_metadata_defers_counts_to_journal_while_live() {
         let f = Ext4FixtureBuilder::new(2048, 256, 2048)
             .with_block_bitmap_metadata_marked()
@@ -4275,9 +4496,18 @@ mod tests {
     /// The on-disk `RECOVER` incompatible feature bit.
     const RECOVER_BIT: u32 = FeatureIncompatSet::RECOVER.bits();
 
+    #[ktest]
+    fn ext4_journal_mount() {
+        crate::fs::fs_impls::ext4::test_utils::scenarios!(
+            journaled_mount_loads_journal_and_drops_cleanly,
+            non_journaled_mount_has_no_journal,
+            mount_rejects_nonstandard_journal_inum,
+            mount_rejects_external_journal_device,
+        );
+    }
+
     /// A journaled volume (clean journal) loads the journal at mount time and the
     /// commit thread starts; dropping the `Ext4` stops it cleanly (no panic/hang).
-    #[ktest]
     fn journaled_mount_loads_journal_and_drops_cleanly() {
         crate::time::clocks::init_for_ktest();
         let f = Ext4FixtureBuilder::new(2048, 256, 2048)
@@ -4294,10 +4524,23 @@ mod tests {
         drop(f);
     }
 
+    #[ktest]
+    fn ext4_metadata_capture() {
+        crate::fs::fs_impls::ext4::test_utils::scenarios!(
+            journaled_op_captures_allocation_metadata,
+            journaled_inode_writeback_is_suppressed_until_checkpoint,
+            journaled_inode_writeback_rebuilds_from_desc_not_stale_disk,
+            capture_inode_desc_dedups_only_identical_bytes_within_transaction,
+            journaled_neighbor_inode_survives_cross_transaction_capture,
+            journaled_superblock_capture_patches_all_mutable_fields,
+            read_inode_desc_funnels_committed_but_uncheckpointed_slot,
+            gdt_neighbor_descriptor_survives_cross_transaction_capture,
+        );
+    }
+
     /// Int-B B2.3: an operation on a journaled volume opens a handle and captures
     /// the metadata it dirties. Allocating a block captures the block-bitmap and
     /// group-descriptor after-images into the running transaction.
-    #[ktest]
     fn journaled_op_captures_allocation_metadata() {
         crate::time::clocks::init_for_ktest();
         let f = Ext4FixtureBuilder::new(2048, 256, 2048)
@@ -4336,7 +4579,6 @@ mod tests {
     /// and only checkpoint writes it to the final location — write-ahead logging.
     /// This is the correctness B2's clean-unmount could not show, since B2's
     /// direct writes masked whether the captured bytes were right.
-    #[ktest]
     fn journaled_inode_writeback_is_suppressed_until_checkpoint() {
         crate::time::clocks::init_for_ktest();
         let f = Ext4FixtureBuilder::new(2048, 256, 2048)
@@ -4389,7 +4631,6 @@ mod tests {
     /// write suppressed, not yet checkpointed). Here the on-disk slot is zeroed to
     /// stand in for that stale block; the writeback must still preserve the type
     /// bits, `extra_isize`, and generation from the descriptor.
-    #[ktest]
     fn journaled_inode_writeback_rebuilds_from_desc_not_stale_disk() {
         crate::time::clocks::init_for_ktest();
         let f = Ext4FixtureBuilder::new(2048, 256, 2048)
@@ -4438,7 +4679,6 @@ mod tests {
     /// byte-identical same-transaction recapture (`Deduped` — nothing new
     /// enters the transaction); any byte change (the link count here) breaks
     /// coverage and lands a full capture whose bytes reach the disk.
-    #[ktest]
     fn capture_inode_desc_dedups_only_identical_bytes_within_transaction() {
         crate::time::clocks::init_for_ktest();
         let f = Ext4FixtureBuilder::new(2048, 256, 2048)
@@ -4512,7 +4752,6 @@ mod tests {
     /// checkpoint) resurrects inode 2's old bytes, and checkpoint (tid order,
     /// newest wins) clobbers txn 1's write: exactly how the guest's `rm f2`
     /// emptied the unrelated f1.
-    #[ktest]
     fn journaled_neighbor_inode_survives_cross_transaction_capture() {
         crate::time::clocks::init_for_ktest();
         let f = Ext4FixtureBuilder::new(2048, 256, 2048)
@@ -4582,7 +4821,6 @@ mod tests {
     /// `last_orphan` here stands in for any stale seed byte: after a journaled
     /// op captures the superblock and checkpoint applies it, the field must hold
     /// the in-memory value, not the doctored device value.
-    #[ktest]
     fn journaled_superblock_capture_patches_all_mutable_fields() {
         crate::time::clocks::init_for_ktest();
         let f = Ext4FixtureBuilder::new(2048, 256, 2048)
@@ -4638,7 +4876,6 @@ mod tests {
     /// routes the inode-table read through the WAL funnel; before this hardening
     /// it bare-read the device and, under concurrency (a neighbor operation's
     /// commit leaving this block un-checkpointed), would resurrect the stale slot.
-    #[ktest]
     fn read_inode_desc_funnels_committed_but_uncheckpointed_slot() {
         crate::time::clocks::init_for_ktest();
         let f = Ext4FixtureBuilder::new(2048, 256, 2048)
@@ -4711,7 +4948,6 @@ mod tests {
     /// descriptor a concurrent operation had committed. The frozen after-image —
     /// already the B-1 seed source for every `get_write_access` — carries the
     /// neighbor slot through unchanged; this test pins that window.
-    #[ktest]
     fn gdt_neighbor_descriptor_survives_cross_transaction_capture() {
         crate::time::clocks::init_for_ktest();
         let f = Ext4FixtureBuilder::new(2048, 256, 2048)
@@ -4779,12 +5015,20 @@ mod tests {
         );
     }
 
+    #[ktest]
+    fn ext4_fsync_durability() {
+        crate::fs::fs_impls::ext4::test_utils::scenarios!(
+            fsync_on_journaled_volume_commits_before_returning,
+            fdatasync_of_new_file_survives_crash,
+            create_stamp_keeps_fdatasync_narrowing,
+        );
+    }
+
     /// T2 (fsync WAL): on a journaled volume, `fsync` journals the inode
     /// writeback (no direct stale-RMW of the on-disk slot) and does not return
     /// until the transaction is committed to the log — and an `fsync` of a
     /// clean inode returns immediately instead of waiting on a transaction
     /// that will never become committable.
-    #[ktest]
     fn fsync_on_journaled_volume_commits_before_returning() {
         crate::time::clocks::init_for_ktest();
         let f = Ext4FixtureBuilder::new(2048, 256, 2048)
@@ -4823,7 +5067,6 @@ mod tests {
 
     /// A non-journaled volume has no journal — the Phase 1–3 mount path is
     /// unchanged (the `load_geometry -> None` no-op branch).
-    #[ktest]
     fn non_journaled_mount_has_no_journal() {
         let f = Ext4FixtureBuilder::new(2048, 256, 2048)
             .with_block_bitmap_metadata_marked()
@@ -4832,11 +5075,18 @@ mod tests {
         assert!(f.ext4.journal().is_none());
     }
 
+    #[ktest]
+    fn ext4_mount_replay() {
+        crate::fs::fs_impls::ext4::test_utils::scenarios!(
+            dirty_journaled_mount_recovers_and_clears_recover_bit,
+            crash_of_our_own_mount_replays_committed_log_on_next_mount,
+        );
+    }
+
     /// The mount-recovery path in miniature: a fixture whose on-disk journal holds
     /// a committed-but-un-checkpointed transaction (and whose ext4 superblock has
     /// the `RECOVER` bit set) is *recovered by `Ext4::open`* — the after-image
     /// reaches its final location and the on-disk `RECOVER` bit is cleared.
-    #[ktest]
     fn dirty_journaled_mount_recovers_and_clears_recover_bit() {
         crate::time::clocks::init_for_ktest();
 
@@ -4930,7 +5180,6 @@ mod tests {
     /// device superblock shows no recovery need (`last_orphan == 0`) and the
     /// committed transaction would be silently discarded (the fsync-durability
     /// hole the adversarial review confirmed).
-    #[ktest]
     fn crash_of_our_own_mount_replays_committed_log_on_next_mount() {
         crate::time::clocks::init_for_ktest();
         let f = Ext4FixtureBuilder::new(2048, 256, 2048)
@@ -4982,7 +5231,6 @@ mod tests {
     /// acknowledged file. Linux stamps BOTH tids under the creating handle
     /// (`__ext4_new_inode`, v6.6 `fs/ext4/ialloc.c:1339-1342`): a create is
     /// data-relevant, losing it loses the data wholesale.
-    #[ktest]
     fn fdatasync_of_new_file_survives_crash() {
         // A pre-placed empty directory to create in (the fixture root inode
         // claims one block of dir data but maps none, so it cannot host a
@@ -5033,6 +5281,21 @@ mod tests {
         drop(ext4);
     }
 
+    #[ktest]
+    fn ext4_orphan_recovery() {
+        crate::fs::fs_impls::ext4::test_utils::scenarios!(
+            failed_create_orphans_child_so_recovery_reclaims_it,
+            mount_scan_retruncates_live_orphan,
+            crash_mid_truncate_recovers_by_retruncate,
+            retruncate_is_idempotent,
+            mount_scan_frees_crashed_orphan_with_blocks,
+            orphan_chain_journaled_add_del_and_disk_splice,
+            journaled_writeback_pulls_orphan_next_from_chain,
+            mount_scan_frees_crashed_orphan,
+            mount_scan_clears_garbage_orphan_head,
+        );
+    }
+
     /// H-6a (`dir-block-capture-failure-family`, child side): a `create` that
     /// fails after allocating its child inode must ORPHAN-LIST the half-built
     /// inode in the SAME transaction, so a crash between that transaction's
@@ -5042,7 +5305,6 @@ mod tests {
     /// clear_nlink + ext4_orphan_add). The reclaim-skip fault freezes exactly
     /// that crash window; before the fix the child was left off the orphan list
     /// and recovery could not reclaim it.
-    #[ktest]
     fn failed_create_orphans_child_so_recovery_reclaims_it() {
         const DIR_INO: u32 = 12;
 
@@ -5124,7 +5386,6 @@ mod tests {
     /// `fdatasync` returns without forcing the attribute change's transaction
     /// — on this stopped committer, a wait wrongly dragged to that
     /// uncommitted transaction would hang the test rather than pass it.
-    #[ktest]
     fn create_stamp_keeps_fdatasync_narrowing() {
         const DIR_INO: u32 = 12;
 
@@ -5196,7 +5457,6 @@ mod tests {
     /// Mount contract (report §4.5): a superblock whose `s_journal_inum` names
     /// anything but the reserved ino 8 must fail the mount — silently parsing
     /// some other inode as the journal would "replay" unrelated file content.
-    #[ktest]
     fn read_inode_rejects_out_of_range_ino() {
         crate::time::clocks::init_for_ktest();
         let f = Ext4FixtureBuilder::new(2048, 256, 2048).build().unwrap();
@@ -5211,6 +5471,14 @@ mod tests {
     }
 
     #[ktest]
+    fn ext4_shutdown() {
+        crate::fs::fs_impls::ext4::test_utils::scenarios!(
+            shutdown_freezes_the_filesystem,
+            journal_abort_takes_filesystem_read_only,
+            shutdown_is_single_winner_across_modes,
+        );
+    }
+
     fn shutdown_freezes_the_filesystem() {
         crate::time::clocks::init_for_ktest();
         let f = Ext4FixtureBuilder::new(2048, 256, 2048)
@@ -5244,7 +5512,6 @@ mod tests {
     /// `is_journal_aborted`), reads still work, and the error is recorded so a
     /// later mount / e2fsck knows a check is needed. Distinct from the shutdown
     /// path, which freezes with `EIO`.
-    #[ktest]
     fn journal_abort_takes_filesystem_read_only() {
         crate::time::clocks::init_for_ktest();
         let f = Ext4FixtureBuilder::new(2048, 256, 2048)
@@ -5274,7 +5541,6 @@ mod tests {
     /// ANY mode — the single-threaded stand-in for a concurrent double
     /// shutdown — finds the flag already raised and returns cleanly, never
     /// re-running the mode's sync/abort work. The modes themselves still work.
-    #[ktest]
     fn shutdown_is_single_winner_across_modes() {
         crate::time::clocks::init_for_ktest();
         let f = Ext4FixtureBuilder::new(2048, 256, 2048)
@@ -5299,7 +5565,6 @@ mod tests {
         assert!(journal.is_aborted());
     }
 
-    #[ktest]
     fn mount_rejects_nonstandard_journal_inum() {
         crate::time::clocks::init_for_ktest();
         let f = Ext4FixtureBuilder::new(2048, 256, 2048)
@@ -5322,7 +5587,6 @@ mod tests {
     /// Mount contract (report §4.5): an external journal (`s_journal_dev != 0`)
     /// is unsupported and must fail the mount, not be silently treated as an
     /// internal ino-8 journal.
-    #[ktest]
     fn mount_rejects_external_journal_device() {
         crate::time::clocks::init_for_ktest();
         let f = Ext4FixtureBuilder::new(2048, 256, 2048)
@@ -5347,7 +5611,6 @@ mod tests {
     /// `i_size`, then unlists it; it is never freed (DECISION §D). Here the tree
     /// is already empty (`i_size = 0`), so the re-truncate frees nothing but must
     /// still leave the inode live and the list drained.
-    #[ktest]
     fn mount_scan_retruncates_live_orphan() {
         crate::time::clocks::init_for_ktest();
         let first = Ext4FixtureBuilder::new(2048, 256, 2048)
@@ -5412,7 +5675,6 @@ mod tests {
     /// the inode, then crashed before freeing `[3, 8)`) is finished by the scan:
     /// the tail blocks are freed, the kept prefix survives, the inode stays live,
     /// and the list drains — never the free-and-forget path (DECISION §D/§F).
-    #[ktest]
     fn crash_mid_truncate_recovers_by_retruncate() {
         crate::time::clocks::init_for_ktest();
         let first = Ext4FixtureBuilder::new(2048, 256, 2048)
@@ -5498,7 +5760,6 @@ mod tests {
     /// finishes the interrupted truncate and drains the list, re-listing the
     /// (already-truncated) inode and mounting again must free nothing more (the
     /// tail extents are gone from the tree) — no double-free — and still drain.
-    #[ktest]
     fn retruncate_is_idempotent() {
         crate::time::clocks::init_for_ktest();
         let first = Ext4FixtureBuilder::new(2048, 256, 2048)
@@ -5561,7 +5822,6 @@ mod tests {
     /// is reclaimed by the mount scan through the chunked, restartable free path —
     /// its data blocks and its inode bit are freed and the list drains. Guards
     /// the `orphan_del` + `free_inode` relocated to the last chunk.
-    #[ktest]
     fn mount_scan_frees_crashed_orphan_with_blocks() {
         crate::time::clocks::init_for_ktest();
         let first = Ext4FixtureBuilder::new(2048, 256, 2048)
@@ -5626,7 +5886,6 @@ mod tests {
     /// return the successor; a non-head removal splices the predecessor's
     /// on-disk `i_dtime` with a journaled 4-byte patch; head removals advance
     /// the head; a non-journaled add is a no-op (the machinery is journal-only).
-    #[ktest]
     fn orphan_chain_journaled_add_del_and_disk_splice() {
         crate::time::clocks::init_for_ktest();
         let f = Ext4FixtureBuilder::new(2048, 256, 2048)
@@ -5698,7 +5957,6 @@ mod tests {
     /// The journaled inode writeback serializes an on-list inode's `i_dtime`
     /// from the in-memory chain, not from its (possibly stale) descriptor — a
     /// non-head splice can never be resurrected by a later writeback.
-    #[ktest]
     fn journaled_writeback_pulls_orphan_next_from_chain() {
         crate::time::clocks::init_for_ktest();
         let f = Ext4FixtureBuilder::new(2048, 256, 2048)
@@ -5749,7 +6007,6 @@ mod tests {
     /// between the unlink transaction and the reclaim transaction leaves — gets
     /// that deletion finished at the next mount: inode freed, list drained, and
     /// the drained head persisted.
-    #[ktest]
     fn mount_scan_frees_crashed_orphan() {
         crate::time::clocks::init_for_ktest();
         let first = Ext4FixtureBuilder::new(2048, 256, 2048)
@@ -5799,7 +6056,6 @@ mod tests {
     /// Mount-time orphan recovery distrusts the disk: a garbage `s_last_orphan`
     /// (out of range / unallocated) must not panic the mount or free anything —
     /// the head is cleared and the volume mounts normally.
-    #[ktest]
     fn mount_scan_clears_garbage_orphan_head() {
         crate::time::clocks::init_for_ktest();
         let first = Ext4FixtureBuilder::new(2048, 256, 2048)
@@ -5864,6 +6120,15 @@ mod tests {
         );
     }
 
+    #[ktest]
+    fn ext4_journal_pressure() {
+        crate::fs::fs_impls::ext4::test_utils::scenarios!(
+            small_journal_pressure_lazy_checkpoint_completes_clean,
+            small_journal_pressure_concurrent_ops,
+            uncheckpointed_map_newest_wins_at_depth,
+        );
+    }
+
     /// Small-journal pressure (P7c-3, the lazy-checkpoint gate): a DELIBERATELY
     /// tiny journal — real `mke2fs` journals (≥1024 blocks) never reach the
     /// capacity/space path (experience §10.4) — with the commit thread RUNNING,
@@ -5874,7 +6139,6 @@ mod tests {
     /// completes without an `ENOSPC` journal abort, and the log flushes clean at
     /// unmount. A backpressure deadlock would hang this test (a ktest timeout);
     /// an overflow would abort the journal (the assert).
-    #[ktest]
     fn small_journal_pressure_lazy_checkpoint_completes_clean() {
         crate::time::clocks::init_for_ktest();
         // usable ≈ 23 log blocks: room for only a few transactions at a time, so
@@ -5933,7 +6197,6 @@ mod tests {
     /// log-space waits. Concurrent `journal_start`s blocked on space must all
     /// make progress (the committer frees the tail without any of their locks)
     /// — no deadlock, no abort.
-    #[ktest]
     fn small_journal_pressure_concurrent_ops() {
         crate::time::clocks::init_for_ktest();
         let f = Ext4FixtureBuilder::new(2048, 256, 2048)
@@ -5983,7 +6246,6 @@ mod tests {
     /// (each also capturing a private block, so the map is genuinely deep) and
     /// commit WITHOUT checkpoint; a later `get_write_access(S)` must seed from
     /// the NEWEST image, and the full checkpoint then lands that newest content.
-    #[ktest]
     fn uncheckpointed_map_newest_wins_at_depth() {
         crate::time::clocks::init_for_ktest();
         let f = Ext4FixtureBuilder::new(2048, 256, 2048)
@@ -6077,6 +6339,13 @@ mod nv_mode_tests {
 
     use super::*;
     #[ktest]
+    fn ext4_research_mode_selection() {
+        crate::fs::fs_impls::ext4::test_utils::scenarios!(
+            mount_options_resolve_rnvpc_mode_switches,
+            nv_mode_conflict_is_rejected_before_mount,
+        );
+    }
+
     fn mount_options_resolve_rnvpc_mode_switches() {
         use crate::fs::rnvpc::mode::RnvpcMode;
 
@@ -6120,7 +6389,6 @@ mod nv_mode_tests {
         assert_eq!(err.error(), Errno::EINVAL);
     }
 
-    #[ktest]
     fn nv_mode_conflict_is_rejected_before_mount() {
         crate::time::clocks::init_for_ktest();
         let result = super::super::test_utils::Ext4FixtureBuilder::new(2048, 256, 2048)

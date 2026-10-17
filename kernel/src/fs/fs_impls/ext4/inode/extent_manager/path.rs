@@ -321,7 +321,9 @@ impl NodeBuf {
         }
         let access = journal::get_write_access(handle, self.bid)?;
         access.patch(|buf| buf.copy_from_slice(self.bytes.as_ref()))?;
-        if !access.is_live() {
+        if !access.is_live()
+            && !cache.is_some_and(|cache| cache.defer_write(self.bid, self.bytes.as_ref()))
+        {
             device.write_val(Bid::new(self.bid).to_offset(), self.bytes.as_ref())?;
         }
         if let Some(cache) = cache {

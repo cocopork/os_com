@@ -48,15 +48,23 @@ impl<const NR_CONT_FRAMES: usize, const COUNT: usize> CacheArray<NR_CONT_FRAMES,
     /// It may allocate directly from this cache. If the cache is empty, it
     /// will fill the cache.
     fn alloc(&mut self, guard: &DisabledLocalIrqGuard) -> Option<Paddr> {
+        self.alloc_with(|layout| super::pools::alloc(guard, layout))
+    }
+
+    fn alloc_with(&mut self, mut allocate: impl FnMut(Layout) -> Option<Paddr>) -> Option<Paddr> {
         if let Some(frame) = self.pop_front() {
             return Some(frame);
         }
 
         let nr_to_alloc = COUNT * 2 / 3;
-        let allocated = super::pools::alloc(
-            guard,
+        let Some(allocated) = allocate(
             Layout::from_size_align(nr_to_alloc * Self::segment_size(), PAGE_SIZE).unwrap(),
-        )?;
+        ) else {
+            // Refilling is an optimization, not part of the caller's request.
+            // Fragmented pools can satisfy one segment without containing a
+            // contiguous batch. Do not report OOM until that request fails too.
+            return allocate(Layout::from_size_align(Self::segment_size(), PAGE_SIZE).unwrap());
+        };
 
         for i in 1..nr_to_alloc {
             self.push_front(allocated + i * Self::segment_size());
@@ -151,5 +159,61 @@ pub(super) fn dealloc(guard: &DisabledLocalIrqGuard, addr: Paddr, size: usize) {
         3 => cache.cache3.dealloc(guard, addr),
         4 => cache.cache4.dealloc(guard, addr),
         _ => super::pools::dealloc(guard, [(addr, size)].into_iter()),
+    }
+}
+
+#[cfg(ktest)]
+mod tests {
+    use ostd::prelude::ktest;
+
+    use super::*;
+    use crate::{
+        chunk::{greater_order_of, split_to_chunks},
+        set::BuddySet,
+        test::MockMemoryRegion,
+    };
+
+    fn check_refill_fallback<const NR: usize, const COUNT: usize>() {
+        let region = MockMemoryRegion::alloc(16 * PAGE_SIZE);
+        let start = region.paddr();
+        let mut pool = BuddySet::<5>::new_empty();
+        split_to_chunks(start, NR.next_power_of_two() * PAGE_SIZE)
+            .for_each(|(addr, order)| pool.insert_chunk(addr, order));
+        let mut cache = CacheArray::<NR, COUNT>::new();
+        let allocated = cache.alloc_with(|layout| {
+            let order = greater_order_of(layout.size());
+            let addr = pool.alloc_chunk(order)?;
+            let remainder = (PAGE_SIZE << order) - layout.size();
+            split_to_chunks(addr + layout.size(), remainder)
+                .for_each(|(addr, order)| pool.insert_chunk(addr, order));
+            Some(addr)
+        });
+        let cached = cache.size;
+        let free = pool.total_size();
+        // Drain the mock region before RED assertions as well.
+        while cache.pop_front().is_some() {}
+        while pool.alloc_chunk(0).is_some() {}
+        assert_eq!(
+            allocated,
+            Some(start),
+            "cache refill must not turn an available small request into OOM"
+        );
+        assert_eq!(cached, 0);
+        assert_eq!(free, (NR.next_power_of_two() - NR) * PAGE_SIZE);
+    }
+
+    #[ktest]
+    fn small_request_survives_failed_cache_refill() {
+        check_refill_fallback::<1, 12>();
+        check_refill_fallback::<2, 6>();
+        check_refill_fallback::<3, 6>();
+        check_refill_fallback::<4, 6>();
+    }
+
+    #[ktest]
+    fn empty_cache_and_pool_report_no_memory() {
+        let mut cache = CacheArray::<1, 12>::new();
+        assert!(cache.alloc_with(|_| None).is_none());
+        assert_eq!(cache.size, 0);
     }
 }

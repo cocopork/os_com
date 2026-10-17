@@ -1677,6 +1677,26 @@ mod tests {
     }
 
     #[ktest]
+    fn ext4_journal_format_superblock_encoding() {
+        crate::fs::fs_impls::ext4::test_utils::scenarios!(
+            be_newtypes_round_trip,
+            journal_superblock_ground_truth_bytes,
+            parse_valid_journal_superblock,
+            reject_bad_magic,
+            reject_bad_blocktype,
+            accept_superblock_v1_blocktype,
+            reject_bad_blocksize,
+            reject_bad_first,
+            reject_too_small,
+            parse_gates_csum_layouts_on_superblock_integrity,
+            reject_v1_checksum_with_csum_v2or3,
+            v1_blocktype_ignores_feature_words,
+            superblock_checksum_excludes_own_field,
+            accept_revoke_incompat,
+            superblock_stamp_only_under_csum_features,
+        );
+    }
+
     fn be_newtypes_round_trip() {
         assert_eq!(Be16::new(0x1234).get(), 0x1234);
         assert_eq!(Be32::new(0xC03B_3998).get(), 0xC03B_3998);
@@ -1691,7 +1711,6 @@ mod tests {
     /// The on-disk journal superblock must reproduce the ground-truth bytes of a
     /// real `mke2fs`-made journal (physical block 521 of a `-O has_journal`
     /// image): magic, block type, and the leading geometry fields.
-    #[ktest]
     fn journal_superblock_ground_truth_bytes() {
         let raw = valid_raw(1024, 1, 1, 0);
         let bytes = raw.as_bytes();
@@ -1709,7 +1728,6 @@ mod tests {
         assert_eq!(&bytes[64..68], &[0x00, 0x00, 0x00, 0x01]);
     }
 
-    #[ktest]
     fn parse_valid_journal_superblock() {
         let raw = valid_raw(1024, 1, 7, 3);
         let sb = JournalSuperblock::try_from(raw).unwrap();
@@ -1721,35 +1739,30 @@ mod tests {
         assert_eq!(sb.blocksize(), BLOCK_SIZE as u32);
     }
 
-    #[ktest]
     fn reject_bad_magic() {
         let mut raw = valid_raw(1024, 1, 1, 0);
         raw.header.h_magic = Be32::new(0x1234_5678);
         assert!(JournalSuperblock::try_from(raw).is_err());
     }
 
-    #[ktest]
     fn reject_bad_blocktype() {
         let mut raw = valid_raw(1024, 1, 1, 0);
         raw.header.h_blocktype = Be32::new(BLOCKTYPE_DESCRIPTOR);
         assert!(JournalSuperblock::try_from(raw).is_err());
     }
 
-    #[ktest]
     fn accept_superblock_v1_blocktype() {
         let mut raw = valid_raw(1024, 1, 1, 0);
         raw.header.h_blocktype = Be32::new(BLOCKTYPE_SUPERBLOCK_V1);
         assert!(JournalSuperblock::try_from(raw).is_ok());
     }
 
-    #[ktest]
     fn reject_bad_blocksize() {
         let mut raw = valid_raw(1024, 1, 1, 0);
         raw.s_blocksize = Be32::new(1024);
         assert!(JournalSuperblock::try_from(raw).is_err());
     }
 
-    #[ktest]
     fn reject_bad_first() {
         let raw = valid_raw(1024, 0, 1, 0); // s_first == 0
         assert!(JournalSuperblock::try_from(raw).is_err());
@@ -1758,7 +1771,6 @@ mod tests {
         assert!(JournalSuperblock::try_from(raw).is_err());
     }
 
-    #[ktest]
     fn reject_too_small() {
         let raw = valid_raw(1, 1, 1, 0);
         assert!(JournalSuperblock::try_from(raw).is_err());
@@ -1768,7 +1780,6 @@ mod tests {
     /// `load_geometry`'s separate mount gate (which still refuses these; see
     /// the mod.rs test) — but a csum layout must pass the integrity gate:
     /// a named crc32c algorithm and a matching superblock checksum.
-    #[ktest]
     fn parse_gates_csum_layouts_on_superblock_integrity() {
         // 64bit alone: no csum feature, parses with no seed.
         let mut raw = valid_raw(1024, 1, 1, 0);
@@ -1802,7 +1813,6 @@ mod tests {
     /// algorithm, correct self-checksum), so it is THIS gate that refuses,
     /// not the checksum-type or integrity one. `COMPAT_CHECKSUM` alone stays
     /// ignorable — a COMPAT bit by definition.
-    #[ktest]
     fn reject_v1_checksum_with_csum_v2or3() {
         for csum_feature in [INCOMPAT_CSUM_V2, INCOMPAT_CSUM_V3] {
             let mut raw = valid_raw(1024, 1, 1, 0);
@@ -1825,7 +1835,6 @@ mod tests {
     /// with garbage in ALL THREE feature words must parse as a featureless
     /// v0 journal — 8-byte tags, no seed, and none of the feature-derived
     /// refusals (v2×v3, v1×v2/3, checksum type/integrity) in play.
-    #[ktest]
     fn v1_blocktype_ignores_feature_words() {
         let mut raw = valid_raw(1024, 1, 1, 0);
         raw.header.h_blocktype = Be32::new(BLOCKTYPE_SUPERBLOCK_V1);
@@ -1844,7 +1853,6 @@ mod tests {
     /// The superblock checksum covers everything BUT its own field: patching
     /// `s_checksum` leaves `checksum()` unchanged, patching any covered byte
     /// changes it.
-    #[ktest]
     fn superblock_checksum_excludes_own_field() {
         let raw = valid_raw(1024, 1, 1, 0);
         let base = raw.checksum();
@@ -1858,17 +1866,30 @@ mod tests {
         assert_ne!(touched.checksum(), base);
     }
 
-    #[ktest]
     fn accept_revoke_incompat() {
         let mut raw = valid_raw(1024, 1, 1, 0);
         raw.s_feature_incompat = Be32::new(INCOMPAT_REVOKE);
         assert!(JournalSuperblock::try_from(raw).is_ok());
     }
 
+    #[ktest]
+    fn ext4_journal_format_tag_encoding() {
+        crate::fs::fs_impls::ext4::test_utils::scenarios!(
+            tag_layout_derivation_vectors,
+            tag_layout_capacity_math,
+            writer_requires_seed_iff_csum_layout,
+            put_blocknr_width_is_layout_gated,
+            tag_round_trip_64bit_layout,
+            tag_round_trip_csum_v3_layout,
+            csum_v3_without_64bit_ignores_stray_blocknr_high,
+            tag_round_trip_csum_v2_quirk_strides,
+            tag_area_excludes_descriptor_tail,
+        );
+    }
+
     /// Feature bits → tag geometry, the Linux 6.6 `journal_tag_bytes()` +
     /// `jbd2_journal_has_csum_v2or3` vectors (including csum_v2's frozen
     /// 10/14-byte stride quirk).
-    #[ktest]
     fn tag_layout_derivation_vectors() {
         let cases: [(u32, usize, usize); 7] = [
             (0, 8, 0),
@@ -1893,7 +1914,6 @@ mod tests {
     /// Single-descriptor capacity per layout: `(tag area − header − UUID) /
     /// tag bytes`, the exact bound `max_credits` builds on. The v0 value is
     /// pinned to the pre-TagLayout constant.
-    #[ktest]
     fn tag_layout_capacity_math() {
         let capacity = |features: u32| {
             TagLayout::from_features(features)
@@ -1925,7 +1945,6 @@ mod tests {
     /// The writer demands a seed exactly when the layout carries csum v2/v3:
     /// a csum layout without one could emit unstamped tags (which our own
     /// recovery would refuse), and a plain layout has nothing to stamp with.
-    #[ktest]
     fn writer_requires_seed_iff_csum_layout() {
         let v3 = TagLayout::from_features(INCOMPAT_CSUM_V3).unwrap();
         let err = v3
@@ -1944,7 +1963,6 @@ mod tests {
 
     /// A block number above 32 bits is `EFBIG` on a layout without
     /// `t_blocknr_high`, and round-trips on one with it.
-    #[ktest]
     fn put_blocknr_width_is_layout_gated() {
         let wide: Ext4Bid = (1 << 32) | 5;
         let data = zero_block();
@@ -1969,7 +1987,6 @@ mod tests {
     /// 12-byte (64-bit) tags round-trip through the tag writer + the walker,
     /// including a > 32-bit block number, and land at the exact on-disk
     /// offsets (low word, high word, first-tag UUID gap).
-    #[ktest]
     fn tag_round_trip_64bit_layout() {
         let layout = TagLayout::from_features(INCOMPAT_64BIT).unwrap();
         let data = zero_block();
@@ -2001,7 +2018,6 @@ mod tests {
     /// 16-byte (csum-v3) tags round-trip with their stamped data checksums at
     /// the tag3 offsets, the widened flags in place, and the sealed
     /// descriptor tail verifying.
-    #[ktest]
     fn tag_round_trip_csum_v3_layout() {
         let layout = TagLayout::from_features(INCOMPAT_CSUM_V3 | INCOMPAT_64BIT).unwrap();
         let seed = linux_seed();
@@ -2052,7 +2068,6 @@ mod tests {
     /// when the journal has the 64bit FEATURE — the gate is the feature, not
     /// the tag format. A stray nonzero high word must decode to the low word
     /// alone.
-    #[ktest]
     fn csum_v3_without_64bit_ignores_stray_blocknr_high() {
         let layout = TagLayout::from_features(INCOMPAT_CSUM_V3).unwrap();
         let mut block = Box::new([0u8; BLOCK_SIZE]);
@@ -2075,7 +2090,6 @@ mod tests {
     /// csum_v2's frozen 10/14-byte strides round-trip (the two quirk padding
     /// bytes stay zero and the walker steps over them), with the stamped
     /// low-16-bit data checksums verifying end to end.
-    #[ktest]
     fn tag_round_trip_csum_v2_quirk_strides() {
         let seed = linux_seed();
         let tid = Tid::new(3);
@@ -2107,7 +2121,6 @@ mod tests {
     /// Both sides respect the reserved descriptor tail: the writer refuses a
     /// tag that would intrude into it, and a walker on a LAST_TAG-less (all
     /// zeros) descriptor stops with an error before reading the tail as a tag.
-    #[ktest]
     fn tag_area_excludes_descriptor_tail() {
         let v3 = TagLayout::from_features(INCOMPAT_CSUM_V3).unwrap();
         let data = zero_block();
@@ -2293,8 +2306,22 @@ mod tests {
         block
     }
 
-    /// Our seed derivation reproduces Linux's `j_csum_seed` for the real UUID.
     #[ktest]
+    fn ext4_journal_format_checksum_vectors() {
+        crate::fs::fs_impls::ext4::test_utils::scenarios!(
+            csum_seed_matches_linux,
+            superblock_csum_matches_real_linux_bytes,
+            descriptor_tail_csum_matches_real_linux_bytes,
+            commit_block_csum_matches_real_linux_bytes,
+            tag3_data_csum_matches_real_linux_bytes,
+            tag_csum_v2_stores_low_16_bits,
+            tag_data_csum_covers_escaped_form,
+            tag_without_csum_layout_verifies_vacuously,
+            write_side_reproduces_real_linux_csums,
+        );
+    }
+
+    /// Our seed derivation reproduces Linux's `j_csum_seed` for the real UUID.
     fn csum_seed_matches_linux() {
         assert_eq!(linux_seed().0, LINUX_SEED);
     }
@@ -2303,7 +2330,6 @@ mod tests {
     /// the real bytes; a bit flip breaks it; and the parse boundary both
     /// accepts the intact superblock (deriving the seed) and refuses the
     /// corrupt one with `EUCLEAN`.
-    #[ktest]
     fn superblock_csum_matches_real_linux_bytes() {
         let raw = linux_journal_superblock();
         assert_eq!(raw.checksum(), LINUX_SB_CSUM);
@@ -2323,7 +2349,6 @@ mod tests {
 
     /// The descriptor-tail formula reproduces the stored value on the real
     /// bytes; a bit flip anywhere in the covered area breaks verification.
-    #[ktest]
     fn descriptor_tail_csum_matches_real_linux_bytes() {
         let block = linux_descriptor_block();
         let seed = linux_seed();
@@ -2337,7 +2362,6 @@ mod tests {
 
     /// The commit-block formula reproduces the stored value on the real
     /// bytes; a bit flip breaks verification.
-    #[ktest]
     fn commit_block_csum_matches_real_linux_bytes() {
         let block = linux_commit_block();
         let seed = linux_seed();
@@ -2354,7 +2378,6 @@ mod tests {
     /// checksum out of `decode_tag`; nothing re-slices the descriptor): the
     /// right block under the right tid verifies; a flipped bit, the wrong
     /// tid, or the wrong tag all fail.
-    #[ktest]
     fn tag3_data_csum_matches_real_linux_bytes() {
         let layout = TagLayout::from_features(INCOMPAT_64BIT | INCOMPAT_CSUM_V3).unwrap();
         let descriptor = linux_descriptor_block();
@@ -2387,7 +2410,6 @@ mod tests {
     /// WRITER stamps must equal the LOW half of the computed crc32c, per
     /// jbd2's `cpu_to_be16(csum32)` truncation (commit.c:339 /
     /// recovery.c:460).
-    #[ktest]
     fn tag_csum_v2_stores_low_16_bits() {
         let layout = TagLayout::from_features(INCOMPAT_CSUM_V2).unwrap();
         let seed = linux_seed();
@@ -2418,7 +2440,6 @@ mod tests {
     /// verifies against that copy and NOT against the restored original, so
     /// verification must run before the magic head is put back
     /// (recovery.c:656 vs :686).
-    #[ktest]
     fn tag_data_csum_covers_escaped_form() {
         let seed = linux_seed();
         let tid = Tid::new(5);
@@ -2453,7 +2474,6 @@ mod tests {
     /// verification is vacuous (Linux returns 1 when
     /// `!jbd2_journal_has_csum_v2or3`) — production callers never reach it
     /// there because no seed exists to gate on.
-    #[ktest]
     fn tag_without_csum_layout_verifies_vacuously() {
         let layout = TagLayout::from_features(INCOMPAT_64BIT).unwrap();
         let mut writer = layout.writer(zero_block(), Tid::new(1), None).unwrap();
@@ -2473,7 +2493,6 @@ mod tests {
     /// reproduces the stored `s_checksum`, and
     /// [`JournalCsumSeed::stamp_commit_block`] reproduces the stored
     /// `h_chksum[0]` byte for byte.
-    #[ktest]
     fn write_side_reproduces_real_linux_csums() {
         let seed = linux_seed();
         let tid = Tid::new(LINUX_TID);
@@ -2513,7 +2532,6 @@ mod tests {
     /// [`RawJournalSuperblock::stamp_checksum`] keys off the superblock's own
     /// feature bits: a featureless (v0) superblock is left byte-untouched —
     /// the frozen v0 byte path every pre-P7 image rides on.
-    #[ktest]
     fn superblock_stamp_only_under_csum_features() {
         let mut raw = valid_raw(1024, 1, 1, 0);
         let before = raw;
@@ -2523,11 +2541,22 @@ mod tests {
 
     // --- P7b-3/4: the revoke block format. ---
 
+    #[ktest]
+    fn ext4_journal_format_revoke_encoding() {
+        crate::fs::fs_impls::ext4::test_utils::scenarios!(
+            revoke_entry_capacity_math,
+            revoke_writer_requires_seed_iff_csum_layout,
+            revoke_block_round_trip_v0,
+            revoke_block_round_trip_wide_with_tail_csum,
+            revoke_writer_bounds_at_capacity,
+            revoke_walk_r_count_boundaries,
+        );
+    }
+
     /// Per-block revoke entry capacity per layout: `(blocksize − 16-byte
     /// header − tail) / entry_size`, with the entry width keyed on 64BIT
     /// alone (the csum features reserve the 4-byte tail but do NOT widen
     /// entries — Linux revoke.c:597-601 / recovery.c:926-927).
-    #[ktest]
     fn revoke_entry_capacity_math() {
         let capacity = |features: u32| {
             TagLayout::from_features(features)
@@ -2550,7 +2579,6 @@ mod tests {
 
     /// The revoke writer demands a seed exactly when the layout carries csum
     /// v2/v3, like [`TagLayout::writer`].
-    #[ktest]
     fn revoke_writer_requires_seed_iff_csum_layout() {
         let v3 = TagLayout::from_features(INCOMPAT_CSUM_V3).unwrap();
         let err = v3.revoke_writer(Tid::new(1), None).map(|_| ()).unwrap_err();
@@ -2568,7 +2596,6 @@ mod tests {
     /// pinned: header (magic / REVOKE / tid), `r_count` = 16 + n·4 (bytes
     /// used INCLUDING the header — revoke.c:616/655), and each be32 entry at
     /// its offset. A > 32-bit block number refuses with `EFBIG`.
-    #[ktest]
     fn revoke_block_round_trip_v0() {
         let layout = TagLayout::from_features(0).unwrap();
         let mut writer = layout.revoke_writer(Tid::new(7), None).unwrap();
@@ -2596,7 +2623,6 @@ mod tests {
     /// `r_count` counts the wide strides, and `finish` seals the tail
     /// checksum over the stamped `r_count` (the descriptor-tail formula —
     /// one funnel, `stamp_block_tail`).
-    #[ktest]
     fn revoke_block_round_trip_wide_with_tail_csum() {
         let layout = TagLayout::from_features(INCOMPAT_CSUM_V3 | INCOMPAT_64BIT).unwrap();
         let seed = linux_seed();
@@ -2624,7 +2650,6 @@ mod tests {
     /// The writer refuses an entry past the usable area (`ENOSPC`) at
     /// exactly the capacity the math promises, on a csum layout (whose tail
     /// the last entry must not touch).
-    #[ktest]
     fn revoke_writer_bounds_at_capacity() {
         let layout = TagLayout::from_features(INCOMPAT_CSUM_V3 | INCOMPAT_64BIT).unwrap();
         let capacity = layout.revoke_entries_per_block();
@@ -2645,7 +2670,6 @@ mod tests {
     /// recovery.c:923-924); one below the header yields zero entries; one
     /// stopping mid-entry drops the partial trailing entry (the
     /// `offset + record_len <= max` loop bound, recovery.c:929).
-    #[ktest]
     fn revoke_walk_r_count_boundaries() {
         let v0 = TagLayout::from_features(0).unwrap();
         let mut writer = v0.revoke_writer(Tid::new(1), None).unwrap();

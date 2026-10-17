@@ -390,10 +390,18 @@ mod tests {
 
     use super::*;
 
+    #[ktest]
+    fn ext4_journal_revoke_table() {
+        crate::fs::fs_impls::ext4::test_utils::scenarios!(
+            revoke_table_max_wins_and_window,
+            revoke_table_retire_through_boundary,
+            revoke_table_survives_tid_wraparound,
+        );
+    }
+
     /// Max-wins recording and the suppression predicate's tid window:
     /// `suppresses(bid, T)` fires exactly for `T ≤ tid_r`, and a newer
     /// re-revoke raises the bar while an older one cannot lower it.
-    #[ktest]
     fn revoke_table_max_wins_and_window() {
         let mut t = RevokeTable::new();
         assert!(!t.suppresses(7, Tid::new(1)));
@@ -416,7 +424,6 @@ mod tests {
     }
 
     /// Retirement drops exactly the records the checkpoint boundary covers.
-    #[ktest]
     fn revoke_table_retire_through_boundary() {
         let mut t = RevokeTable::new();
         t.record(7, Tid::new(5));
@@ -433,7 +440,6 @@ mod tests {
 
     /// The tid comparisons stay wrap-correct: a revoke just past the `u32`
     /// wrap still suppresses images from just before it.
-    #[ktest]
     fn revoke_table_survives_tid_wraparound() {
         let mut t = RevokeTable::new();
         let before_wrap = Tid::new(u32::MAX);

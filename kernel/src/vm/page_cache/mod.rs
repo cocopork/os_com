@@ -90,11 +90,13 @@ use ostd::mm::{Segment, VmIo, VmIoFill, io::util::HasVmReaderWriter};
 
 use crate::prelude::*;
 
+mod accounting;
 mod cache_page;
 #[cfg(ktest)]
 mod tests;
 mod vmo;
 
+pub use accounting::PageCacheAccounting;
 pub use cache_page::{CachePage, CachePageExt, CachePageMeta, LockedCachePage};
 pub use vmo::{Vmo, VmoCommitError, VmoFlags, VmoOptions, WritableMappingStatus};
 
@@ -135,6 +137,31 @@ impl PageCache {
         Ok(Self::from(
             VmoOptions::new_page_cache(size, backend).alloc()?,
         ))
+    }
+
+    /// Snapshots dirty indices so filesystems can prepare mappings before I/O.
+    pub(crate) fn dirty_page_indices(&self, limit: usize) -> Vec<usize> {
+        self.0
+            .as_backed_vmo()
+            .map_or_else(Vec::new, |vmo| vmo.dirty_page_indices(limit))
+    }
+
+    /// Writes back at most `limit` dirty pages, waiting for submitted I/O.
+    ///
+    /// Requires the same filesystem serialization as [`Self::flush_range`].
+    pub fn flush_some_pages(&self, limit: usize) -> Result<usize> {
+        match self.0.as_backed_vmo() {
+            Some(vmo) => vmo.flush_some_dirty_pages(limit),
+            None => Ok(0),
+        }
+    }
+
+    /// Reclaims at most `limit` clean, unpinned pages without waiting for I/O.
+    ///
+    /// Unlike range invalidation, this operation needs no mapping exclusion:
+    /// every external frame reference, including a PTE, pins the cache entry.
+    pub fn reclaim_clean_pages(&self, limit: usize) -> usize {
+        self.0.reclaim_clean_pages(limit)
     }
 
     /// Creates an anonymous page cache with the specified initial capacity in
@@ -675,29 +702,17 @@ pub(crate) fn read_run_complete_fn(pages: Vec<LockedCachePage>) -> BioCompleteFn
 /// callback in [`write_page_async`](PageCacheBackend::write_page_async) applies
 /// to its one page:
 ///
-/// - clear the writing-back flag (waking anyone blocked in
-///   [`LockedCachePage::wait_until_finish_writing_back`]) regardless of status;
-/// - on a non-[`BioStatus::Complete`] status log the failure and, following
-///   Linux, deliberately do *not* re-dirty — a persistent device fault must not
-///   spin writeback forever; the data is considered lost and a later sync
-///   syscall is expected to surface the error the caller propagates from
-///   [`IoBatch::wait_all`].
-///
-/// This deliberately duplicates the single-page closure rather than sharing
-/// code with it: the batched writeback path must not perturb the established
-/// single-page write path.
+/// Failed BIOs atomically re-dirty each page before clearing writeback. This
+/// keeps the authoritative bytes resident and charged to dirty pressure; the
+/// caller receives the I/O error and decides when a retry is appropriate.
 pub(crate) fn write_run_complete_fn(pages: Vec<(usize, CachePage)>) -> BioCompleteFn {
     Box::new(move |status| {
         for (idx, page) in &pages {
-            page.clear_writing_back();
             if status != BioStatus::Complete {
-                // TODO: Record the writeback error (e.g., EIO) in the VMO
-                // (or the corresponding inode) so that a subsequent sync syscall
-                // can detect and report it to userspace.
-                ostd::error!(
-                    "writeback I/O failed for page index {idx} with status {status:?}; data may be lost"
-                );
+                page.redirty_after_writeback_error();
+                ostd::error!("writeback I/O failed for page index {idx} with status {status:?}");
             }
+            page.clear_writing_back();
         }
     })
 }
@@ -745,25 +760,7 @@ impl<T: BlockAsPageCacheBackend> PageCacheBackend for T {
         locked_page.set_up_to_date();
 
         let page = locked_page.unlock();
-        let submit_page = page.clone();
-
-        let complete_fn: BioCompleteFn = Box::new(move |status| {
-            submit_page.clear_writing_back();
-            if status != BioStatus::Complete {
-                // TODO: Record the writeback error (e.g., EIO) in the VMO
-                // (or the corresponding inode) so that a subsequent sync syscall
-                // can detect and report it to userspace.
-                //
-                // Following Linux's design, we intentionally do **not** re-dirty the
-                // page here. Re-dirtying would cause the writeback mechanism to retry
-                // the I/O indefinitely, which could stall the entire system if the
-                // underlying device has a persistent hardware fault. Instead, the page
-                // is left clean and the data is considered lost.
-                ostd::error!(
-                    "writeback I/O failed for page index {idx} with status {status:?}; data may be lost"
-                );
-            }
-        });
+        let complete_fn = write_run_complete_fn(vec![(idx, page.clone())]);
 
         let res = self.submit_write_bio(idx, bio_segment, complete_fn, io_batch);
         if res.is_err() {

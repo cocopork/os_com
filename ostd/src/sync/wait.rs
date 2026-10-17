@@ -107,25 +107,34 @@ impl WaitQueue {
         }
     }
 
-    /// Wakes up all waiting threads, returning the number of threads that were woken up.
+    /// Wakes the threads queued at one point during this call, returning the
+    /// number of threads that were woken up. Newly queued waiters are left for
+    /// the next wake operation.
     pub fn wake_all(&self) -> usize {
+        self.wake_all_with(|waker| waker.wake_up())
+    }
+
+    // Keeping notification separate lets tests reproduce a concurrent requeue
+    // at the exact notification boundary without requiring another CPU.
+    fn wake_all_with(&self, mut wake: impl FnMut(&Arc<Waker>) -> bool) -> usize {
         // Fast path
         if self.is_empty() {
             return 0;
         }
 
-        let mut num_woken = 0;
-
-        loop {
+        // Detach a finite snapshot. A woken task may immediately requeue while
+        // its condition is still false; draining the live queue can otherwise
+        // livelock forever and prevent the producer from making progress.
+        let wakers = {
             let mut wakers = self.wakers.lock();
-            let Some(waker) = wakers.pop_front() else {
-                break;
-            };
-            self.num_wakers.fetch_sub(1, Ordering::Release);
-            // Avoid holding lock when calling `wake_up`
-            drop(wakers);
+            self.num_wakers.store(0, Ordering::Release);
+            core::mem::take(&mut *wakers)
+        };
 
-            if waker.wake_up() {
+        let mut num_woken = 0;
+        for waker in wakers {
+            // Avoid holding the queue lock when calling `wake_up`.
+            if wake(&waker) {
                 num_woken += 1;
             }
         }
@@ -324,6 +333,30 @@ mod test {
         queue_wake(|queue| {
             queue.wake_all();
         });
+    }
+
+    #[ktest]
+    fn queue_broadcast_preserves_requeued_waiter() {
+        let queue = WaitQueue::new();
+        let (waiter, waker) = Waiter::new_pair();
+        queue.enqueue(waker.clone());
+        let mut requeues = 0;
+        let count = queue.wake_all_with(|waker| {
+            let woken = waker.wake_up();
+            if woken && requeues < 8 {
+                // Model the target CPU consuming the notification and waiting
+                // again before this broadcaster continues.
+                waiter.wait();
+                queue.enqueue(waker.clone());
+                requeues += 1;
+            }
+            woken
+        });
+        assert_eq!(count, 1, "broadcast must not consume newly queued waiters");
+        assert_eq!(requeues, 1);
+        assert!(queue.wake_one(), "requeued notification must remain queued");
+        waiter.wait();
+        assert_eq!(queue.wake_all(), 0);
     }
 
     #[ktest]

@@ -1542,6 +1542,13 @@ mod tests {
     }
 
     #[ktest]
+    fn ext4_transaction_state_machine() {
+        crate::fs::fs_impls::ext4::test_utils::scenarios!(
+            transaction_new_starts_running_and_empty,
+            commit_phase_pipeline_order,
+        );
+    }
+
     fn transaction_new_starts_running_and_empty() {
         let txn = Transaction::new(Tid::new(7));
         assert_eq!(txn.tid(), Tid::new(7));
@@ -1552,7 +1559,6 @@ mod tests {
     /// The commit pipeline's legal phase order is exactly Locked → Flush →
     /// Commit → CommitRecord → Finished, with Finished terminal — the single
     /// table [`Journal::advance_committing_phase`] enforces.
-    #[ktest]
     fn commit_phase_pipeline_order() {
         use super::CommitPhase::*;
         assert_eq!(Locked.next_in_pipeline(), Some(Flush));
@@ -1563,6 +1569,17 @@ mod tests {
     }
 
     #[ktest]
+    fn ext4_transaction_capture_and_patch() {
+        crate::fs::fs_impls::ext4::test_utils::scenarios!(
+            transaction_capture_create_is_idempotent,
+            transaction_capture_write_seeds_from_device_once,
+            transaction_apply_patch_accumulates_sub_objects,
+            transaction_apply_patch_uncaptured_errors,
+            fresh_capture_spends_one_reserved_credit,
+            over_capacity_capture_fails_loud,
+        );
+    }
+
     fn transaction_capture_create_is_idempotent() {
         let mut txn = Transaction::new(Tid::new(1));
         let generation = txn.capture_create(42);
@@ -1579,7 +1596,6 @@ mod tests {
         assert_eq!(&txn.buffer_bytes(42).unwrap()[0..4], &[1, 2, 3, 4]);
     }
 
-    #[ktest]
     fn transaction_capture_write_seeds_from_device_once() {
         let f = Ext4FixtureBuilder::new(2048, 256, 2048)
             .with_block_bitmap_metadata_marked()
@@ -1607,7 +1623,6 @@ mod tests {
         assert_eq!(txn.buffer_bytes(300), Some(first.as_slice()));
     }
 
-    #[ktest]
     fn transaction_apply_patch_accumulates_sub_objects() {
         let mut txn = Transaction::new(Tid::new(1));
         let generation = txn.capture_create(7);
@@ -1627,7 +1642,6 @@ mod tests {
         assert_eq!(&bytes[4..64], &[0u8; 60]);
     }
 
-    #[ktest]
     fn transaction_apply_patch_uncaptured_errors() {
         let mut txn = Transaction::new(Tid::new(1));
         // A generation from ANOTHER block's capture: block 99 itself was
@@ -1637,6 +1651,20 @@ mod tests {
     }
 
     #[ktest]
+    fn ext4_transaction_handle_credits() {
+        crate::fs::fs_impls::ext4::test_utils::scenarios!(
+            journal_start_creates_and_shares_running_transaction,
+            journal_start_over_capacity_errors,
+            journal_start_waits_for_credit_release,
+            journal_extend_grows_and_caps_credits,
+            journal_restart_re_reserves_credits,
+            journal_restart_from_locking_seat_readmits_after_staging,
+            max_credits_matches_geometry,
+            capacity_charges_revoke_block_footprint,
+            reservation_footprint_charges_revoke_blocks_once,
+        );
+    }
+
     fn journal_start_creates_and_shares_running_transaction() {
         let j = journaled_fixture(64, 1, 1);
 
@@ -1673,14 +1701,12 @@ mod tests {
         journal_stop(h2).unwrap();
     }
 
-    #[ktest]
     fn journal_start_over_capacity_errors() {
         let j = journaled_fixture(64, 1, 1);
         let over = j.max_credits() + 1;
         assert!(journal_start(&j, over).is_err());
     }
 
-    #[ktest]
     fn journal_start_waits_for_credit_release() {
         let j = journaled_fixture(64, 1, 1);
         let h1 = journal_start(&j, j.max_credits()).unwrap();
@@ -1701,7 +1727,6 @@ mod tests {
         releaser.join();
     }
 
-    #[ktest]
     fn journal_extend_grows_and_caps_credits() {
         let j = journaled_fixture(64, 1, 1);
         let mut h = journal_start(&j, 4).unwrap();
@@ -1724,7 +1749,6 @@ mod tests {
         journal_stop(h).unwrap();
     }
 
-    #[ktest]
     fn journal_restart_re_reserves_credits() {
         let j = journaled_fixture(64, 1, 1);
         let mut h = journal_start(&j, 10).unwrap();
@@ -1757,7 +1781,6 @@ mod tests {
     /// on the locked barrier until the seat stages, then joining the successor
     /// tid. Disabling the release-first ordering would leave the seat's update
     /// count nonzero, the drain would never complete, and this test would hang.
-    #[ktest]
     fn journal_restart_from_locking_seat_readmits_after_staging() {
         crate::time::clocks::init_for_ktest();
         let j = journaled_fixture(64, 1, 1);
@@ -1813,7 +1836,6 @@ mod tests {
         journal_stop(h2).unwrap();
     }
 
-    #[ktest]
     fn max_credits_matches_geometry() {
         // maxlen 64, first 1: usable = 63. v0 tags: t = 508 per descriptor.
         // Conservative bound t * (usable - 2) / (t + 1) = 508 * 61 / 509 = 60;
@@ -1828,7 +1850,6 @@ mod tests {
     /// set spanning two v0 revoke blocks (1021 records at 1020 per block),
     /// two credits of headroom vanish — an extension that would fit without
     /// the charge is refused.
-    #[ktest]
     fn capacity_charges_revoke_block_footprint() {
         let j = journaled_fixture(64, 1, 1); // max_credits = 60
         let mut h = journal_start(&j, 30).unwrap();
@@ -1861,7 +1882,6 @@ mod tests {
     /// idempotent re-capture spends nothing. Running dry grows the reservation
     /// in place (`journal_extend`) rather than silently over-running, so the
     /// footprint stays a safe upper bound (`reserved ≥ captured`) throughout.
-    #[ktest]
     fn fresh_capture_spends_one_reserved_credit() {
         let j = journaled_fixture(64, 1, 1); // max_credits = 60
         let h = journal_start(&j, 4).unwrap();
@@ -1938,7 +1958,6 @@ mod tests {
     /// `journal_restart`, P7d-2, is what turns it into a real restart on the
     /// unbounded paths) — rather than silently building a transaction that
     /// cannot commit.
-    #[ktest]
     fn over_capacity_capture_fails_loud() {
         let j = journaled_fixture(64, 1, 1); // max_credits = 60
         let h = journal_start(&j, 4).unwrap();
@@ -1968,6 +1987,14 @@ mod tests {
     }
 
     #[ktest]
+    fn ext4_transaction_ordered_data_and_revoke() {
+        crate::fs::fs_impls::ext4::test_utils::scenarios!(
+            ordered_data_dedup_and_liveness,
+            forget_block_cancels_capture_and_records_revoke,
+            recapture_cancels_revoke,
+        );
+    }
+
     fn ordered_data_dedup_and_liveness() {
         use super::super::super::test_utils::make_empty_file_inode;
 
@@ -2029,7 +2056,6 @@ mod tests {
     /// capture is cancelled (it must not commit), the revoke is recorded, and
     /// a patch through a stale credential path errors instead of resurrecting
     /// the block.
-    #[ktest]
     fn forget_block_cancels_capture_and_records_revoke() {
         let mut txn = Transaction::new(Tid::new(1));
         let generation = txn.capture_create(42);
@@ -2062,7 +2088,6 @@ mod tests {
     /// transaction cancels the revoke, through both capture funnels —
     /// load-bearing for freed-then-reallocated metadata within one
     /// transaction, whose new image a surviving revoke would suppress.
-    #[ktest]
     fn recapture_cancels_revoke() {
         // The create funnel (a freed block reallocated as fresh metadata).
         let mut txn = Transaction::new(Tid::new(1));
@@ -2089,9 +2114,19 @@ mod tests {
     // Deterministic: no commit thread runs; `commit_if_due_for_test` is one
     // unforced pipeline advance — exactly the commit thread's wake.
 
+    #[ktest]
+    fn ext4_transaction_commit_triggers() {
+        crate::fs::fs_impls::ext4::test_utils::scenarios!(
+            journal_stop_batches_instead_of_committing,
+            size_threshold_makes_transaction_due,
+            age_makes_transaction_due,
+            commit_request_makes_transaction_due,
+            revoke_footprint_counts_toward_size_trigger,
+        );
+    }
+
     /// `journal_stop` no longer commits: below every trigger the batch
     /// persists across operations — a second op joins the SAME transaction.
-    #[ktest]
     fn journal_stop_batches_instead_of_committing() {
         let j = journaled_fixture(64, 1, 1);
         let h = journal_start(&j, 4).unwrap();
@@ -2117,7 +2152,6 @@ mod tests {
     /// The size trigger: the captured footprint reaching a quarter of
     /// `max_credits` (jbd2's `j_max_transaction_buffers = total/4`) makes
     /// the transaction due — one capture short of it does not.
-    #[ktest]
     fn size_threshold_makes_transaction_due() {
         // maxlen 64 → max_credits 60 → the quarter trigger is 15.
         let j = journaled_fixture(64, 1, 1);
@@ -2148,7 +2182,6 @@ mod tests {
     /// The age trigger: a batch too small for the size trigger commits once
     /// its transaction outlives the commit interval (deterministically
     /// back-dated; the real deadline is the commit thread's timed sleep).
-    #[ktest]
     fn age_makes_transaction_due() {
         let j = journaled_fixture(64, 1, 1);
         let h = journal_start(&j, 4).unwrap();
@@ -2170,7 +2203,6 @@ mod tests {
     /// The durability trigger: `request_commit_for` (what `log_wait_commit`
     /// and the capacity escalation call) makes the named transaction due
     /// immediately, and is cleared by its staging.
-    #[ktest]
     fn commit_request_makes_transaction_due() {
         let j = journaled_fixture(64, 1, 1);
         let h = journal_start(&j, 4).unwrap();
@@ -2199,7 +2231,6 @@ mod tests {
     /// capture-equivalents, so a transaction that mostly FREES still
     /// commits at the quarter footprint (and its 14 revoke blocks + 1 data
     /// + 1 descriptor + 1 commit chain passes the commit fit guard).
-    #[ktest]
     fn revoke_footprint_counts_toward_size_trigger() {
         // maxlen 64 → trigger 15: 1 capture + 14 revoke blocks (13*1020+1
         // records at 1020 per v0 block) = 15.
@@ -2242,7 +2273,6 @@ mod tests {
     /// boundary, so a full checkpoint always frees enough and the wait
     /// terminates even with revoke_blocks > 0. (The original pressure tests all
     /// had revoke_blocks == 0, so none exercised this term.)
-    #[ktest]
     fn reservation_footprint_charges_revoke_blocks_once() {
         // usable 63, max_credits 60, t = 508 (see `max_credits_matches_geometry`).
         let j = journaled_fixture(64, 1, 1);

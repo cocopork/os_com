@@ -11,7 +11,7 @@ use xarray::XArray;
 use super::{Vmo, VmoFlags, WritableMappingStatus};
 use crate::{
     prelude::*,
-    vm::page_cache::{CachePage, CachePageMeta, PageCacheBackend},
+    vm::page_cache::{CachePage, CachePageMeta, PageCacheAccounting, PageCacheBackend},
 };
 
 /// Options for allocating a root VMO.
@@ -41,6 +41,7 @@ pub struct VmoOptions {
     size: usize,
     flags: VmoFlags,
     backend: Option<Weak<dyn PageCacheBackend>>,
+    accounting: Option<Arc<PageCacheAccounting>>,
 }
 
 impl VmoOptions {
@@ -57,6 +58,7 @@ impl VmoOptions {
             size,
             flags: VmoFlags::empty(),
             backend: None,
+            accounting: None,
         }
     }
 
@@ -68,6 +70,12 @@ impl VmoOptions {
     /// Creates options for a page-cache VMO with a backend.
     pub fn new_page_cache(size: usize, backend: Weak<dyn PageCacheBackend>) -> Self {
         Self::new(size).flags(VmoFlags::RESIZABLE).backend(backend)
+    }
+
+    /// Accounts backend frames against a shared filesystem-local budget.
+    pub fn accounting(mut self, accounting: Arc<PageCacheAccounting>) -> Self {
+        self.accounting = Some(accounting);
+        self
     }
 
     /// Sets the VMO flags.
@@ -94,9 +102,11 @@ impl VmoOptions {
             size,
             flags,
             backend,
+            accounting,
             ..
         } = self;
-        let vmo = alloc_vmo(size, flags, backend)?;
+        let mut vmo = alloc_vmo(size, flags, backend)?;
+        vmo.accounting = accounting;
         Ok(Arc::new(vmo))
     }
 }
@@ -110,6 +120,8 @@ fn alloc_vmo(
     let pages = committed_pages_if_continuous(flags, size)?;
     let writable_mapping_status = WritableMappingStatus::default();
     Ok(Vmo {
+        commit_lock: SpinLock::new(()),
+        accounting: None,
         backend,
         flags,
         pages,

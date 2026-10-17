@@ -13,6 +13,7 @@ use ostd::{
     sync::WaitQueue,
 };
 
+use super::PageCacheAccounting;
 use crate::prelude::*;
 
 /// The state of a page in the page cache.
@@ -76,15 +77,31 @@ pub struct CachePageMeta {
     /// cleared without the page lock only from the BIO completion callback after
     /// the VMO writeback path has handed off the writeback state.
     is_writing_back: AtomicBool,
+    accounting: Option<Arc<PageCacheAccounting>>,
     // TODO: Add a reverse mapping from the page to VMO for eviction.
 }
 
 impl Default for CachePageMeta {
     fn default() -> Self {
         Self {
+            accounting: None,
             state: AtomicPageState::new(PageState::Uninit),
             lock: AtomicBool::new(false),
             is_writing_back: AtomicBool::new(false),
+        }
+    }
+}
+
+impl Drop for CachePageMeta {
+    fn drop(&mut self) {
+        if let Some(accounting) = &self.accounting {
+            if self.state.load(Ordering::Relaxed) == PageState::Dirty {
+                accounting.dirty.fetch_sub(1, Ordering::Release);
+            }
+            if self.is_writing_back.load(Ordering::Relaxed) {
+                accounting.writeback.fetch_sub(1, Ordering::Release);
+            }
+            accounting.resident.fetch_sub(1, Ordering::Release);
         }
     }
 }
@@ -133,15 +150,57 @@ pub trait CachePageExt: Sized {
     /// previously started with [`LockedCachePage::set_writing_back`], either
     /// from its completion callback or while handling submission failure.
     fn clear_writing_back(&self) {
-        self.metadata()
+        if self
+            .metadata()
             .is_writing_back
-            .store(false, Ordering::Release);
+            .swap(false, Ordering::AcqRel)
+        {
+            if let Some(accounting) = &self.metadata().accounting {
+                accounting.writeback.fetch_sub(1, Ordering::Release);
+            }
+        }
         self.wait_queue().wake_all();
+    }
+
+    /// Preserves dirty data after a failed BIO without taking the page lock.
+    ///
+    /// Completion can run in IRQ context while a writer owns the page lock.
+    /// Charge before the atomic transition so another writeback cannot observe
+    /// Dirty and remove its charge before it has been added.
+    fn redirty_after_writeback_error(&self) {
+        let accounting = &self.metadata().accounting;
+        if let Some(accounting) = accounting {
+            accounting.dirty.fetch_add(1, Ordering::Relaxed);
+        }
+        if self
+            .metadata()
+            .state
+            .compare_exchange(
+                PageState::UpToDate,
+                PageState::Dirty,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
+            if let Some(accounting) = accounting {
+                accounting.dirty.fetch_sub(1, Ordering::Release);
+            }
+        }
     }
 
     /// Allocates a new cache page which content and state are uninitialized.
     fn alloc_uninit() -> Result<CachePage> {
-        let meta = CachePageMeta::default();
+        Self::alloc_uninit_accounted(None)
+    }
+
+    /// Allocates a frame charged to the optional filesystem accounting group.
+    fn alloc_uninit_accounted(accounting: Option<Arc<PageCacheAccounting>>) -> Result<CachePage> {
+        if let Some(accounting) = &accounting {
+            accounting.resident.fetch_add(1, Ordering::Relaxed);
+        }
+        let mut meta = CachePageMeta::default();
+        meta.accounting = accounting;
         let page = FrameAllocOptions::new()
             .zeroed(false)
             .alloc_frame_with(meta)?;
@@ -150,10 +209,8 @@ pub trait CachePageExt: Sized {
 
     /// Allocates a new zeroed cache page with the up-to-date state.
     fn alloc_zero() -> Result<CachePage> {
-        let meta = CachePageMeta {
-            state: AtomicPageState::new(PageState::UpToDate),
-            ..Default::default()
-        };
+        let meta = CachePageMeta::default();
+        meta.state.store(PageState::UpToDate, Ordering::Relaxed);
         let page = FrameAllocOptions::new()
             .zeroed(true)
             .alloc_frame_with(meta)?;
@@ -286,10 +343,16 @@ impl<PageRef: Borrow<CachePage>> LockedCachePage<PageRef> {
     /// This indicates that the page's contents are synchronized with disk
     /// and can be safely read.
     pub fn set_up_to_date(&self) {
-        self.page()
+        if self
             .metadata()
             .state
-            .store(PageState::UpToDate, Ordering::Release);
+            .swap(PageState::UpToDate, Ordering::AcqRel)
+            == PageState::Dirty
+        {
+            if let Some(accounting) = &self.metadata().accounting {
+                accounting.dirty.fetch_sub(1, Ordering::Release);
+            }
+        }
     }
 
     /// Marks the page as dirty.
@@ -297,17 +360,30 @@ impl<PageRef: Borrow<CachePage>> LockedCachePage<PageRef> {
     /// This indicates that the page has been modified and needs to be
     /// written back to disk eventually.
     pub fn set_dirty(&self) {
-        self.metadata()
+        if self
+            .metadata()
             .state
-            .store(PageState::Dirty, Ordering::Release);
+            .swap(PageState::Dirty, Ordering::AcqRel)
+            != PageState::Dirty
+        {
+            if let Some(accounting) = &self.metadata().accounting {
+                accounting.dirty.fetch_add(1, Ordering::Release);
+            }
+        }
     }
 
     /// Sets the writing back flag of the page, indicating that the page
     /// is in-flight to storage.
     pub fn set_writing_back(&self) {
-        self.metadata()
+        // Charge before publishing the flag: completion may clear it in IRQ context.
+        if let Some(accounting) = &self.metadata().accounting {
+            accounting.writeback.fetch_add(1, Ordering::Relaxed);
+        }
+        let was_writing_back = self
+            .metadata()
             .is_writing_back
-            .store(true, Ordering::Release);
+            .swap(true, Ordering::Release);
+        debug_assert!(!was_writing_back);
     }
 
     /// Waits until the page finishes writing back to storage.

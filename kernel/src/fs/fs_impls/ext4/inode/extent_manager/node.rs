@@ -289,6 +289,17 @@ mod tests {
     use super::*;
 
     #[ktest]
+    fn ext4_extent_node_encoding() {
+        crate::fs::fs_impls::ext4::test_utils::scenarios!(
+            parse_leaf_header,
+            reject_bad_magic,
+            decode_extent_pblock_and_len,
+            decode_unwritten_extent,
+            max_unwritten_extent_round_trips,
+            decode_index_leaf_pblock,
+        );
+    }
+
     fn parse_leaf_header() {
         let raw = RawExtentHeader {
             magic: EXTENT_MAGIC,
@@ -303,7 +314,6 @@ mod tests {
         assert_eq!(hdr.max(), 4);
     }
 
-    #[ktest]
     fn reject_bad_magic() {
         let raw = RawExtentHeader {
             magic: 0x1234,
@@ -315,7 +325,6 @@ mod tests {
         assert!(ExtentHeader::try_from(&raw).is_err());
     }
 
-    #[ktest]
     fn decode_extent_pblock_and_len() {
         let raw = RawExtent {
             block: 0,
@@ -332,7 +341,6 @@ mod tests {
         assert!(!ext.covers(5));
     }
 
-    #[ktest]
     fn decode_unwritten_extent() {
         let raw = RawExtent {
             block: 10,
@@ -346,7 +354,6 @@ mod tests {
         assert_eq!(ext.start(), 100);
     }
 
-    #[ktest]
     fn max_unwritten_extent_round_trips() {
         // Regression: a full-group unwritten run must encode within `ee_len`.
         // `MAX_UNWRITTEN_LEN` (32767) bias-encodes to 65535 (still non-zero) and
@@ -363,7 +370,6 @@ mod tests {
         assert_eq!(decoded.start(), 1000);
     }
 
-    #[ktest]
     fn decode_index_leaf_pblock() {
         let raw = RawExtentIdx {
             block: 7,

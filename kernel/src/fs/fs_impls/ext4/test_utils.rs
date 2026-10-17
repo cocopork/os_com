@@ -27,6 +27,31 @@ use super::{
     super_block::{MAGIC_NUM, RawSuperBlock, SUPER_BLOCK_OFFSET, SuperBlock},
 };
 
+/// Runs a feature's scenarios, preserving each scenario's fixture lifetime.
+///
+/// A panic retains the assertion's original file and line. The serial markers
+/// identify the active scenario and let the host audit completed coverage.
+pub(super) fn run_scenarios(module: &str, scenarios: &[(&str, fn())]) {
+    for (name, scenario) in scenarios {
+        ostd::early_println!("EXT4_SCENARIO_BEGIN {}::{}", module, name);
+        scenario();
+        ostd::early_println!("EXT4_SCENARIO_PASS {}::{}", module, name);
+    }
+}
+
+// Stringifies scenario identifiers once so the coverage markers cannot drift
+// from the functions actually invoked by a functional test.
+macro_rules! scenarios {
+    ($($scenario:ident),+ $(,)?) => {
+        $crate::fs::fs_impls::ext4::test_utils::run_scenarios(
+            module_path!(),
+            &[$((stringify!($scenario), $scenario)),+],
+        );
+    };
+}
+
+pub(super) use scenarios;
+
 /// An in-memory block device backed by a zeroed frame segment.
 pub(super) struct Ext4MemoryDisk {
     segment: Segment<()>,
@@ -35,6 +60,7 @@ pub(super) struct Ext4MemoryDisk {
     /// metadata writeback failure (e.g. to exercise `create_inode` rollback).
     fail_writes: AtomicBool,
     fail_flushes: AtomicBool,
+    fail_write_block: AtomicUsize,
 }
 
 impl Ext4MemoryDisk {
@@ -49,6 +75,7 @@ impl Ext4MemoryDisk {
             flush_count: AtomicUsize::new(0),
             fail_writes: AtomicBool::new(false),
             fail_flushes: AtomicBool::new(false),
+            fail_write_block: AtomicUsize::new(usize::MAX),
         }
     }
 
@@ -59,6 +86,11 @@ impl Ext4MemoryDisk {
     /// Makes every subsequent write bio fail (or stops failing them).
     pub(super) fn set_fail_writes(&self, fail: bool) {
         self.fail_writes.store(fail, Ordering::Relaxed);
+    }
+
+    pub(super) fn set_fail_write_block(&self, block: Option<usize>) {
+        self.fail_write_block
+            .store(block.unwrap_or(usize::MAX), Ordering::Relaxed);
     }
 
     pub(super) fn set_fail_flushes(&self, fail: bool) {
@@ -93,7 +125,12 @@ impl BlockDevice for Ext4MemoryDisk {
             return Ok(());
         }
 
-        if bio.type_() == BioType::Write && self.fail_writes.load(Ordering::Relaxed) {
+        let failing = self.fail_write_block.load(Ordering::Relaxed);
+        let failed_range = bio.sid_range().start.to_raw() as usize / (BLOCK_SIZE / SECTOR_SIZE)
+            ..(bio.sid_range().end.to_raw() as usize).div_ceil(BLOCK_SIZE / SECTOR_SIZE);
+        if bio.type_() == BioType::Write
+            && (self.fail_writes.load(Ordering::Relaxed) || failed_range.contains(&failing))
+        {
             bio.complete(BioStatus::IoError);
             return Ok(());
         }
@@ -244,7 +281,7 @@ impl Ext4FixtureBuilder {
             journal_inode: None,
             reserved_blocks: 0,
             uuid: [0; 16],
-            mount_options: None,
+            mount_options: Some(CString::new("nodelalloc").unwrap()),
         }
     }
 

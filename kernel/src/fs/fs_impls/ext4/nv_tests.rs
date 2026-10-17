@@ -13,6 +13,16 @@ use crate::fs::{
 };
 
 #[ktest]
+fn ext4_research_routes() {
+    crate::fs::fs_impls::ext4::test_utils::scenarios!(
+        nv_route_rnvpce_direct_partial_write_and_deferred_export,
+        nv_route_rnvpc_wal_and_native_paths_remain_distinct,
+        nv_route_busy_lease_read_and_partial_write_retry,
+        nv_route_rnvpc_failed_allocation_flush_does_not_append_wal,
+        nv_route_mount_rejects_switching_persistent_authority,
+    );
+}
+
 fn nv_route_rnvpce_direct_partial_write_and_deferred_export() {
     crate::fs::rnvpc::init_for_ext4_tests();
     crate::time::clocks::init_for_ktest();
@@ -82,7 +92,6 @@ fn nv_route_rnvpce_direct_partial_write_and_deferred_export() {
     );
 }
 
-#[ktest]
 fn nv_route_rnvpc_wal_and_native_paths_remain_distinct() {
     crate::fs::rnvpc::init_for_ext4_tests();
     crate::time::clocks::init_for_ktest();
@@ -138,7 +147,6 @@ fn nv_route_rnvpc_wal_and_native_paths_remain_distinct() {
     inode.resize(0).unwrap();
 }
 
-#[ktest]
 fn nv_route_busy_lease_read_and_partial_write_retry() {
     use core::sync::atomic::{AtomicUsize, Ordering};
     crate::fs::rnvpc::init_for_ext4_tests();
@@ -221,7 +229,6 @@ fn nv_route_busy_lease_read_and_partial_write_retry() {
     );
 }
 
-#[ktest]
 fn nv_route_rnvpc_failed_allocation_flush_does_not_append_wal() {
     crate::fs::rnvpc::init_for_ext4_tests();
     crate::time::clocks::init_for_ktest();
@@ -252,7 +259,6 @@ fn nv_route_rnvpc_failed_allocation_flush_does_not_append_wal() {
     assert_eq!(fixture.read_raw_inode(11).size_lo, 31);
 }
 
-#[ktest]
 fn nv_route_mount_rejects_switching_persistent_authority() {
     crate::fs::rnvpc::init_for_ext4_tests();
     crate::time::clocks::init_for_ktest();

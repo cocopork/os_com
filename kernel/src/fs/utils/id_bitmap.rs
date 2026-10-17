@@ -45,7 +45,6 @@ impl IdBitmap {
     }
 
     /// Returns the length of the ID bitmap, i.e., the maximum number of IDs.
-    #[expect(unused)]
     pub const fn len(&self) -> u16 {
         self.len
     }

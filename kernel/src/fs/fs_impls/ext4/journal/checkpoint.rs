@@ -794,9 +794,29 @@ mod tests {
         txn
     }
 
+    #[ktest]
+    fn ext4_journal_checkpoint() {
+        crate::fs::fs_impls::ext4::test_utils::scenarios!(
+            checkpoint_applies_after_image_and_cleans_journal,
+            checkpoint_restores_escaped_block,
+            checkpoint_newest_wins_on_shared_block,
+            checkpoint_then_commit_reclaims_cleanly,
+            apply_log_transaction_is_idempotent,
+            checkpoint_suppresses_revoked_block_over_reuse,
+            checkpoint_applies_image_newer_than_revoke,
+            checkpoint_defers_across_unpublished_revoke,
+            checkpoint_defers_on_the_committing_slots_unpublished_revoke,
+            checkpoint_partial_prefix_stops_before_deferred_txn,
+            defer_decision_walks_revoke_led_chain,
+            pinning_closes_the_mid_pass_reuse_window,
+            checkpoint_defers_on_the_locking_seats_unpublished_revoke,
+            checkpoint_advance_stops_at_the_free_target,
+            checkpoint_suppresses_across_a_deep_log,
+        );
+    }
+
     /// Test 1: checkpoint applies a committed after-image to its final location
     /// and makes the journal clean.
-    #[ktest]
     fn checkpoint_applies_after_image_and_cleans_journal() {
         crate::time::clocks::init_for_ktest();
         let f = journaled_fixture(16, 1, 1);
@@ -836,7 +856,6 @@ mod tests {
 
     /// Test 2: an escaped block round-trips through checkpoint — the final
     /// location gets the ORIGINAL bytes (magic restored), not the zeroed log copy.
-    #[ktest]
     fn checkpoint_restores_escaped_block() {
         crate::time::clocks::init_for_ktest();
         let f = journaled_fixture(16, 1, 1);
@@ -860,7 +879,6 @@ mod tests {
 
     /// Test 3: two transactions writing the same final block — checkpoint applies
     /// in tid order, so the newest (last-applied) wins.
-    #[ktest]
     fn checkpoint_newest_wins_on_shared_block() {
         crate::time::clocks::init_for_ktest();
         let f = journaled_fixture(24, 1, 1);
@@ -890,7 +908,6 @@ mod tests {
     /// Test 4: after a clean checkpoint, a fresh commit re-establishes `s_start`
     /// (was-clean path), advances `committed_tid`, and a second checkpoint applies
     /// it — the log is reusable.
-    #[ktest]
     fn checkpoint_then_commit_reclaims_cleanly() {
         crate::time::clocks::init_for_ktest();
         let f = journaled_fixture(16, 1, 1);
@@ -933,7 +950,6 @@ mod tests {
 
     /// Test 5: `apply_log_transaction` is idempotent — applying the same committed
     /// transaction twice writes the same bytes to the final location.
-    #[ktest]
     fn apply_log_transaction_is_idempotent() {
         crate::time::clocks::init_for_ktest();
         let f = journaled_fixture(16, 1, 1);
@@ -987,7 +1003,6 @@ mod tests {
     /// `RevokeTable::suppresses` gate in `apply_log_transaction` writes T1's
     /// image over X and fails this test). A control block journaled by T1
     /// and NOT revoked is restored normally, proving the skip is targeted.
-    #[ktest]
     fn checkpoint_suppresses_revoked_block_over_reuse() {
         crate::time::clocks::init_for_ktest();
         let f = journaled_fixture(24, 1, 1);
@@ -1040,7 +1055,6 @@ mod tests {
     /// "A log entry for a block beyond the last revoke still gets replayed"
     /// (revoke.c): a revoke in T1 suppresses nothing from T2 — a block freed
     /// and then re-journaled by a LATER transaction gets that newer image.
-    #[ktest]
     fn checkpoint_applies_image_newer_than_revoke() {
         crate::time::clocks::init_for_ktest();
         let f = journaled_fixture(24, 1, 1);
@@ -1077,7 +1091,6 @@ mod tests {
     /// Reverting the defer gate writes T1's stale image over X in the first
     /// pass and fails the content assert; retiring anyway fails the tail
     /// asserts.
-    #[ktest]
     fn checkpoint_defers_across_unpublished_revoke() {
         crate::time::clocks::init_for_ktest();
         let f = journaled_fixture(24, 1, 1);
@@ -1148,7 +1161,6 @@ mod tests {
     /// itself and defer in front of T1. Once T2's commit finishes
     /// (publishing the revoke), the next pass applies T1 under ordinary
     /// suppression and reclaims the whole log.
-    #[ktest]
     fn checkpoint_defers_on_the_committing_slots_unpublished_revoke() {
         crate::time::clocks::init_for_ktest();
         let f = journaled_fixture(24, 1, 1);
@@ -1210,7 +1222,6 @@ mod tests {
     /// (`s_start`/`s_sequence` point at T2, the journal stays dirty) and in
     /// memory — never past the unapplied transaction. After T3 commits, the
     /// next pass finishes under published suppression.
-    #[ktest]
     fn checkpoint_partial_prefix_stops_before_deferred_txn() {
         crate::time::clocks::init_for_ktest();
         let f = journaled_fixture(24, 1, 1);
@@ -1279,7 +1290,6 @@ mod tests {
     /// reuse). The pass must defer in front of T1, and the next pass (T2
     /// committed, revoke published) must finish the same walk on the apply
     /// side.
-    #[ktest]
     fn defer_decision_walks_revoke_led_chain() {
         crate::time::clocks::init_for_ktest();
         let f = journaled_fixture(24, 1, 1);
@@ -1351,7 +1361,6 @@ mod tests {
     /// finds B unreused; after T2 commits, the pin releases with the revoke
     /// publication, the next pass suppresses T1's image of B (suspenders),
     /// and B is allocatable again.
-    #[ktest]
     fn pinning_closes_the_mid_pass_reuse_window() {
         crate::time::clocks::init_for_ktest();
         let f = Ext4FixtureBuilder::new(2048, 256, 2048)
@@ -1429,7 +1438,6 @@ mod tests {
     /// in the seat itself and defer in front of T1. Once T2 drains and
     /// commits (publishing the revoke), the next pass applies T1 under
     /// ordinary suppression and reclaims the whole log.
-    #[ktest]
     fn checkpoint_defers_on_the_locking_seats_unpublished_revoke() {
         crate::time::clocks::init_for_ktest();
         let f = journaled_fixture(24, 1, 1);
@@ -1494,7 +1502,6 @@ mod tests {
     /// oldest-first only until the free segment reaches `target`, leaving the
     /// newer tail dirty — not the whole-log reclaim the full pass does. A
     /// second pass finishes it.
-    #[ktest]
     fn checkpoint_advance_stops_at_the_free_target() {
         crate::time::clocks::init_for_ktest();
         // usable = 23; each single-block transaction occupies 3 log blocks
@@ -1546,7 +1553,6 @@ mod tests {
     /// (two transactions older) is applied, and drops it only once the tail
     /// advances past T3. A control block T1 journaled and no one revoked lands
     /// normally, proving the deep-log skip is targeted.
-    #[ktest]
     fn checkpoint_suppresses_across_a_deep_log() {
         crate::time::clocks::init_for_ktest();
         let f = journaled_fixture(40, 1, 1);
