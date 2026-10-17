@@ -34,6 +34,7 @@ pub(super) struct Ext4MemoryDisk {
     /// When set, every write bio fails with `IoError`. Lets tests force a
     /// metadata writeback failure (e.g. to exercise `create_inode` rollback).
     fail_writes: AtomicBool,
+    fail_flushes: AtomicBool,
 }
 
 impl Ext4MemoryDisk {
@@ -47,6 +48,7 @@ impl Ext4MemoryDisk {
             segment,
             flush_count: AtomicUsize::new(0),
             fail_writes: AtomicBool::new(false),
+            fail_flushes: AtomicBool::new(false),
         }
     }
 
@@ -57,6 +59,10 @@ impl Ext4MemoryDisk {
     /// Makes every subsequent write bio fail (or stops failing them).
     pub(super) fn set_fail_writes(&self, fail: bool) {
         self.fail_writes.store(fail, Ordering::Relaxed);
+    }
+
+    pub(super) fn set_fail_flushes(&self, fail: bool) {
+        self.fail_flushes.store(fail, Ordering::Relaxed);
     }
 
     /// The number of Flush bios issued so far (each [`BlockDevice::sync`] barrier
@@ -79,7 +85,11 @@ impl BlockDevice for Ext4MemoryDisk {
     fn enqueue(&self, bio: SubmittedBio) -> core::result::Result<(), BioEnqueueError> {
         if bio.type_() == BioType::Flush {
             self.flush_count.fetch_add(1, Ordering::Relaxed);
-            bio.complete(BioStatus::Complete);
+            bio.complete(if self.fail_flushes.load(Ordering::Relaxed) {
+                BioStatus::IoError
+            } else {
+                BioStatus::Complete
+            });
             return Ok(());
         }
 
@@ -210,6 +220,7 @@ pub(super) struct Ext4FixtureBuilder {
     reserved_blocks: u32,
     /// Volume UUID (`s_uuid`); `statfs` folds its low 8 bytes into `f_fsid`.
     uuid: [u8; 16],
+    mount_options: Option<CString>,
 }
 
 /// The physical block where the fixture places the journal (log block 0 → this
@@ -233,7 +244,13 @@ impl Ext4FixtureBuilder {
             journal_inode: None,
             reserved_blocks: 0,
             uuid: [0; 16],
+            mount_options: None,
         }
+    }
+
+    pub(super) fn with_mount_options(mut self, options: &str) -> Self {
+        self.mount_options = Some(CString::new(options).unwrap());
+        self
     }
 
     /// Sets `s_r_blocks_count` so `statfs` has reserved blocks to subtract from
@@ -543,7 +560,10 @@ impl Ext4FixtureBuilder {
             )?;
         }
 
-        let ext4 = Ext4::open(disk.clone() as Arc<dyn BlockDevice>, None)?;
+        let ext4 = Ext4::open(
+            disk.clone() as Arc<dyn BlockDevice>,
+            self.mount_options.as_deref(),
+        )?;
         Ok(Ext4Fixture { disk, ext4, sb })
     }
 }

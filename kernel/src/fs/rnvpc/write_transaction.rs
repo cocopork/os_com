@@ -598,6 +598,11 @@ pub(crate) fn reserve_ssd_capacity(
         return_errno_with_message!(Errno::EINVAL, "zero SSD reservation requested");
     }
     let started = read_ns();
+    let key = PageKey::new(fs_id, inode, SPACE_RESERVATION_LOGICAL_INDEX);
+    let existing = pool.current_metadata_ref(key);
+    let guard = existing
+        .map(|reference| pool.lock_metadata_mutation(reference))
+        .transpose()?;
     let current = space_reservation(pool, fs_id, inode)?;
     LATENCY_STATS.fg_reserve_lookup.record_since(started);
     let (generation, reserved, consumed) = match current {
@@ -617,18 +622,28 @@ pub(crate) fn reserve_ssd_capacity(
     };
     let record = SpaceReservationRecord::new(fs_id, inode, generation, reserved, consumed)?;
     let started = read_ns();
-    let result = mutation.persist_or_update_control(
-        PageKey::new(fs_id, inode, SPACE_RESERVATION_LOGICAL_INDEX),
-        &record,
-        None,
-    );
+    let result = match (existing, guard.as_ref()) {
+        (Some(reference), Some(guard)) => {
+            pool.update_authoritative_metadata_with_guard(guard, reference, &record, None)
+        }
+        _ => mutation.persist_or_update_control(key, &record, None),
+    };
     LATENCY_STATS.fg_reserve_update.record_since(started);
     result
 }
 
 pub(crate) fn consume_ssd_capacity(
     pool: &Arc<Rnvpc>,
-    mutation: &ExtentMutation,
+    _mutation: &ExtentMutation,
+    fs_id: u64,
+    inode: u64,
+    blocks: u64,
+) -> Result<PersistentObjectRef> {
+    consume_ssd_capacity_locked(pool, fs_id, inode, blocks)
+}
+
+pub(super) fn consume_ssd_capacity_locked(
+    pool: &Arc<Rnvpc>,
     fs_id: u64,
     inode: u64,
     blocks: u64,
@@ -637,6 +652,14 @@ pub(crate) fn consume_ssd_capacity(
         return_errno_with_message!(Errno::EINVAL, "zero SSD reservation consumption");
     }
     let started = read_ns();
+    let reference = pool
+        .current_metadata_ref(PageKey::new(fs_id, inode, SPACE_RESERVATION_LOGICAL_INDEX))
+        .ok_or_else(|| Error::with_message(Errno::EUCLEAN, "missing SSD reservation"))?;
+    let lock_started = read_ns();
+    let guard = pool.lock_metadata_mutation(reference)?;
+    LATENCY_STATS
+        .migration_reservation_lock_wait
+        .record_since(lock_started);
     let current = space_reservation(pool, fs_id, inode)?
         .ok_or_else(|| Error::with_message(Errno::EUCLEAN, "missing SSD reservation"))?;
     LATENCY_STATS
@@ -660,11 +683,7 @@ pub(crate) fn consume_ssd_capacity(
         consumed,
     )?;
     let started = read_ns();
-    let result = mutation.persist_or_update_control(
-        PageKey::new(fs_id, inode, SPACE_RESERVATION_LOGICAL_INDEX),
-        &record,
-        None,
-    );
+    let result = pool.update_authoritative_metadata_with_guard(&guard, reference, &record, None);
     LATENCY_STATS
         .migration_reservation_update
         .record_since(started);
@@ -727,6 +746,10 @@ pub(crate) fn reconcile_ssd_capacity(
 pub(crate) fn outstanding_ssd_capacity(pool: &Arc<Rnvpc>, fs_id: u64) -> Result<u64> {
     let mut total = 0u64;
     for reference in pool.committed_metadata_refs() {
+        let key = pool.persistent_metadata_key(reference)?;
+        if key.fs_id != fs_id || super::pcache_store::typed_object_type(key.page_index).is_some() {
+            continue;
+        }
         if pool.persistent_metadata_kind(reference)?
             != super::metadata::PersistentMetadataKind::SpaceReservation
         {
@@ -1769,7 +1792,7 @@ pub(crate) struct SsdMigrationPage {
     pub(crate) ssd_block: u64,
 }
 
-/// Holds one inode publication right and persists each touched leaf once.
+/// Holds one leaf modification right at a time and persists each touched leaf once.
 /// Per-page results allow successful leaves to reclaim even if another fails.
 pub(crate) fn migrate_mapped_nv_pages_to_ssd_by_reverse(
     pool: &Arc<Rnvpc>,
@@ -1777,21 +1800,6 @@ pub(crate) fn migrate_mapped_nv_pages_to_ssd_by_reverse(
     inode: u64,
     pages: &[SsdMigrationPage],
     fault: Option<FaultPoint>,
-) -> Result<Vec<Result<bool>>> {
-    if pages.is_empty() || pages.len() > SSD_MIGRATION_BATCH_PAGES {
-        return_errno_with_message!(Errno::EINVAL, "invalid completion group size");
-    }
-    let mutation = ExtentMutation::new_completion(pool.clone(), fs_id, inode)?;
-    migrate_mapped_nv_pages_with_mutation(pool, fs_id, inode, pages, fault, mutation)
-}
-
-pub(crate) fn migrate_mapped_nv_pages_with_mutation(
-    pool: &Arc<Rnvpc>,
-    fs_id: u64,
-    inode: u64,
-    pages: &[SsdMigrationPage],
-    fault: Option<FaultPoint>,
-    mutation: ExtentMutation,
 ) -> Result<Vec<Result<bool>>> {
     if pages.is_empty() || pages.len() > SSD_MIGRATION_BATCH_PAGES {
         return_errno_with_message!(Errno::EINVAL, "invalid completion group size");
@@ -1811,7 +1819,7 @@ pub(crate) fn migrate_mapped_nv_pages_with_mutation(
             {
                 return_errno_with_message!(Errno::ESTALE, "rTIO migration identity changed");
             }
-            // Resolve after acquiring publication: a split may have moved the entry.
+            // The leaf helper revalidates this hint after acquiring its node guard.
             pool.validate_migration_and_reverse(
                 page.reference,
                 PageKey::new(fs_id, inode, page.logical_block),
@@ -1836,17 +1844,21 @@ pub(crate) fn migrate_mapped_nv_pages_with_mutation(
     for group in leaves.values() {
         let started = read_ns();
         let updates: Vec<_> = group.iter().map(|(_, update)| *update).collect();
-        let published = mutation.publish_ssd_extents_by_reverse(&updates, fault);
+        let published =
+            ExtentMutation::publish_ssd_extents_locked(pool, fs_id, inode, &updates, fault);
         LATENCY_STATS.migration_leaf.record_since(started);
-        if let Err(error) = published {
-            for (index, _) in group {
-                outcomes[*index] = Err(error);
-            }
-            continue;
-        }
         let started = read_ns();
         for (index, update) in group {
             let release = (|| {
+                match published {
+                    Ok(_) => {}
+                    Err(error) if error.error() == Errno::ESTALE && fault.is_none() => {
+                        // A concurrent split can move entries after candidate grouping.
+                        // Re-resolve only the affected pages; the normal path stays batched.
+                        publish_relocated_ssd_extent(pool, fs_id, inode, *update)?;
+                    }
+                    Err(error) => return Err(error),
+                }
                 if !pool.persistent_data_has_migration_target(update.expected)?
                     || pool.persistent_data_migration_credit_released(update.expected)?
                 {
@@ -1865,13 +1877,37 @@ pub(crate) fn migrate_mapped_nv_pages_with_mutation(
     }
     if consumed != 0 {
         let started = read_ns();
-        if let Err(error) = consume_ssd_capacity(pool, &mutation, fs_id, inode, consumed) {
+        if let Err(error) = consume_ssd_capacity_locked(pool, fs_id, inode, consumed) {
             // Recovery reconstructs this conservative ledger from the forward graph.
             warn!("rNVPCe batch reservation ledger update deferred to recovery: {error:?}");
         }
         LATENCY_STATS.migration_reservation.record_since(started);
     }
     Ok(outcomes)
+}
+
+fn publish_relocated_ssd_extent(
+    pool: &Arc<Rnvpc>,
+    fs_id: u64,
+    inode: u64,
+    mut update: SsdExtentUpdate,
+) -> Result<()> {
+    for _ in 0..8 {
+        update.locator = pool.validate_migration_and_reverse(
+            update.expected,
+            PageKey::new(fs_id, inode, update.logical_block),
+            update.ssd_block,
+        )?;
+        match ExtentMutation::publish_ssd_extents_locked(pool, fs_id, inode, &[update], None) {
+            Ok(_) => return Ok(()),
+            Err(error) if error.error() == Errno::ESTALE => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Err(Error::with_message(
+        Errno::EAGAIN,
+        "extent relocation did not settle",
+    ))
 }
 
 #[cfg(ktest)]
@@ -1935,13 +1971,15 @@ fn reclaim_unused_allocations(pool: &Arc<Rnvpc>, fs_id: u64, inode: u64) -> Resu
     }
 
     for reference in pool.committed_metadata_refs() {
-        if pool.persistent_metadata_kind(reference)?
-            != super::metadata::PersistentMetadataKind::Allocation
+        let key = pool.persistent_metadata_key(reference)?;
+        if (key.fs_id, key.inode) != (fs_id, inode)
+            || super::pcache_store::typed_object_type(key.page_index).is_some()
         {
             continue;
         }
-        let key = pool.persistent_metadata_key(reference)?;
-        if (key.fs_id, key.inode) != (fs_id, inode) {
+        if pool.persistent_metadata_kind(reference)?
+            != super::metadata::PersistentMetadataKind::Allocation
+        {
             continue;
         }
         let allocation = pool.read_authoritative_metadata::<AllocationRecord>(reference)?;

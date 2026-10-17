@@ -1,0 +1,108 @@
+[
+  {
+    "path": "kernel/src/fs/rnvpc/frame.rs",
+    "file": "post-checkpoint-candidates/kernel/src/fs/rnvpc/frame.rs",
+    "anchor": {
+      "path": "kernel/src/fs/rnvpc/frame.rs",
+      "git_blob": "e6dc871a4eb0ae9a9dd0eddc14c1269c3ab7b313",
+      "sha256": "c8c43fcd4cb62e472ce919191773cba5bfb3bc8958d6cafa9bb7dce41008c6c8",
+      "file": "fingerprint-versions/kernel/src/fs/rnvpc/frame.rs/e6dc871a4eb0ae9a9dd0eddc14c1269c3ab7b313.rs",
+      "bytes": 167710,
+      "parent_blob": "8fa7c68adadabb6ec7f572ec771d19ca3bc2592d",
+      "reverse": false,
+      "matched_prefix": "e6dc871a4",
+      "timestamp": "2026-10-13T06:56:49.827Z",
+      "record_sha256": "16035651099c33f813d4dfa874cabc89b791d6d5a5bc9684eac8e740834cbf62",
+      "exact_target": false,
+      "status": "full reconstructed body matching observed diff fingerprint"
+    },
+    "applied": [
+      {
+        "event": "exec-44db2271-48d1-4f3c-a9de-28ecc92bec0e",
+        "timestamp": "2026-10-13T07:00:24.414Z",
+        "context_shifts": []
+      },
+      {
+        "event": "exec-f4df5eea-3fe5-483f-ae02-40630560bfca",
+        "timestamp": "2026-10-13T07:00:35.281Z",
+        "context_shifts": []
+      },
+      {
+        "event": "exec-b79f8a7f-d80f-46c0-8b1e-68df799cec86",
+        "timestamp": "2026-10-13T07:01:05.078Z",
+        "context_shifts": []
+      },
+      {
+        "event": "exec-a0a9816f-7da2-4929-a0cd-bc4d1020aaa7",
+        "timestamp": "2026-10-13T07:01:16.310Z",
+        "context_shifts": []
+      },
+      {
+        "event": "exec-8007f5e3-2b8e-4e25-92bc-79668b331054",
+        "timestamp": "2026-10-13T07:01:39.164Z",
+        "context_shifts": []
+      },
+      {
+        "event": "exec-c7c7a307-131d-43b1-adf8-7d0203089442",
+        "timestamp": "2026-10-13T07:02:15.950Z",
+        "context_shifts": []
+      },
+      {
+        "event": "exec-06c39d9d-4aeb-4070-bda3-c2e7889dddbd",
+        "timestamp": "2026-10-13T07:03:53.470Z",
+        "context_shifts": []
+      },
+      {
+        "event": "exec-816771a2-098e-4a62-afc8-2323fafb4970",
+        "timestamp": "2026-10-13T07:05:56.842Z",
+        "context_shifts": []
+      },
+      {
+        "event": "exec-1f78d5c3-acd0-4bbd-a316-154e810394de",
+        "timestamp": "2026-10-13T07:12:35.168Z",
+        "context_shifts": []
+      },
+      {
+        "event": "exec-2185e05c-e757-45fc-8922-812124539ef8",
+        "timestamp": "2026-10-13T07:13:22.737Z",
+        "context_shifts": []
+      },
+      {
+        "event": "exec-483c5060-d7cb-413a-8ec1-50effa14d35d",
+        "timestamp": "2026-10-13T14:39:04.865Z",
+        "context_shifts": []
+      }
+    ],
+    "blocked_at": null,
+    "sha256": "bf6dcd23acbe73c15740afad85bcff7f74e6f22f390b81ea28dd6bb8381ad2cd",
+    "git_blob": "4028fe8afd038e012d0fbecbf1c35736d1c3f17c",
+    "syntax_parse_pass": true,
+    "parse_error": "",
+    "status": "candidate_after_known_fingerprint; complete final working tree not established"
+  },
+  {
+    "path": "kernel/src/fs/rnvpc/frame/object_table.rs",
+    "file": "post-checkpoint-candidates/kernel/src/fs/rnvpc/frame/object_table.rs",
+    "anchor": {
+      "path": "kernel/src/fs/rnvpc/frame/object_table.rs",
+      "git_blob": "1945e1a86e3239ca8cb9e951d2783bb5edeb06f4",
+      "sha256": "b5f8565f244db81a23f46a98de3b763457736c180b99b40ed8f6549e68d52d0b",
+      "file": "fingerprint-versions/kernel/src/fs/rnvpc/frame/object_table.rs/1945e1a86e3239ca8cb9e951d2783bb5edeb06f4.rs",
+      "bytes": 6036,
+      "parent_blob": "6dc6c083a7048963926782fa8cc4ec9e3fc79603",
+      "reverse": false,
+      "matched_prefix": "1945e1a86",
+      "timestamp": "2026-10-13T04:43:58.503Z",
+      "record_sha256": "d8678a82c3d8941ebbe8c261390548a965a1130fb5bbd83b4251488c10164a26",
+      "exact_target": false,
+      "status": "full reconstructed body matching observed diff fingerprint"
+    },
+    "applied": [],
+    "blocked_at": null,
+    "sha256": "b5f8565f244db81a23f46a98de3b763457736c180b99b40ed8f6549e68d52d0b",
+    "git_blob": "1945e1a86e3239ca8cb9e951d2783bb5edeb06f4",
+    "syntax_parse_pass": true,
+    "parse_error": "",
+    "status": "candidate_after_known_fingerprint; complete final working tree not established"
+  }
+]

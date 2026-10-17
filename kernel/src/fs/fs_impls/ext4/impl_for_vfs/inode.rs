@@ -77,7 +77,9 @@ impl FileOps for Ext4Inode {
         // buffered path is byte-for-byte unchanged, including the read-ahead
         // detector, which the direct path deliberately does not feed. atime is
         // touched the same way on both.
-        let len = if status_flags.contains(StatusFlags::O_DIRECT) {
+        let len = if status_flags.contains(StatusFlags::O_DIRECT)
+            && self.fs()?.rnvpc_mode() == crate::fs::rnvpc::mode::RnvpcMode::Native
+        {
             self.read_direct_at(offset, writer)?
         } else {
             self.read_at(offset, writer)?
@@ -95,7 +97,9 @@ impl FileOps for Ext4Inode {
         // O_DIRECT bypasses the page cache: the data is DMA'd to the device and
         // the extent converted to written only after it lands, so a crash never
         // exposes stale bytes. The buffered path is byte-for-byte unchanged.
-        let len = if status_flags.contains(StatusFlags::O_DIRECT) {
+        let len = if status_flags.contains(StatusFlags::O_DIRECT)
+            && self.fs()?.rnvpc_mode() == crate::fs::rnvpc::mode::RnvpcMode::Native
+        {
             self.write_direct_at(offset, reader)?
         } else {
             self.write_at(offset, reader)?
@@ -223,6 +227,11 @@ impl Inode for Ext4Inode {
         if fs.is_rdonly() {
             return Ok(());
         }
+        if self.inode_type() == InodeType::File && fs.rnvpc_extend_enabled() {
+            // Every successful NV write already persisted data and the fixed inode.
+            // Native EXT4 extent export belongs to filesystem sync/unmount only.
+            return Ok(());
+        }
         fs.sync_metadata()?;
         self.sync_data_and_meta(SyncScope::Full)
     }
@@ -238,11 +247,22 @@ impl Inode for Ext4Inode {
         if fs.is_rdonly() {
             return Ok(());
         }
+        if self.inode_type() == InodeType::File && fs.rnvpc_extend_enabled() {
+            // Every successful NV write already persisted data and the fixed inode.
+            // Native EXT4 extent export belongs to filesystem sync/unmount only.
+            return Ok(());
+        }
         fs.sync_metadata()?;
         self.sync_data_and_meta(SyncScope::DataOnly)
     }
 
     fn page_cache(&self) -> Option<PageCache> {
+        if self
+            .fs()
+            .is_ok_and(|fs| fs.rnvpc_mode() != crate::fs::rnvpc::mode::RnvpcMode::Native)
+        {
+            return None;
+        }
         self.page_cache()
     }
 

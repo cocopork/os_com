@@ -1,0 +1,135 @@
+{
+  "base_commit": "49e7829d6f6718f0def92231fcdbb5691c883629",
+  "branch": "recovery/rnvpc-rebuild",
+  "kind": "evidence-led restoration plus integration adaptations, NOT exact historical blobs",
+  "source_files": [
+    {
+      "path": "kernel/src/fs/fs_impls/ext4/fs.rs",
+      "sha256": "e587f78ea74429108d625d69aaf595d22ed39d0a76365186b5236b2aa1c695b1"
+    },
+    {
+      "path": "kernel/src/fs/fs_impls/ext4/impl_for_vfs/inode.rs",
+      "sha256": "5c41ca735a2f3eaf5a0f96d554fafa3f3fd2e6a8af816a3bda0db80e41b62576"
+    },
+    {
+      "path": "kernel/src/fs/fs_impls/ext4/inode/dir/mod.rs",
+      "sha256": "e63021fa53f2a0d53171ac3d44d724555730a26c41a18009bee44961c5cd476c"
+    },
+    {
+      "path": "kernel/src/fs/fs_impls/ext4/inode/extent_manager/mod.rs",
+      "sha256": "b0a30a76e48aec0c885c8a4863d52b0f3f13511c4ff10b722a316fe4e0a0a595"
+    },
+    {
+      "path": "kernel/src/fs/fs_impls/ext4/inode/mod.rs",
+      "sha256": "d46f6c75cb2bdaabf3ab8ce1115fc2e15387e3aa23e13ef117723df88fe3ebd5"
+    },
+    {
+      "path": "kernel/src/fs/fs_impls/ext4/migration.rs",
+      "sha256": "49a276c7c52f734e07543ca66ad5940e85896f7de766f076c840dabbb3dcfe77"
+    },
+    {
+      "path": "kernel/src/fs/fs_impls/ext4/mod.rs",
+      "sha256": "7297d4013d84f4b12629136ed6cbb105f7ae32ca8d067ef7006d3e4f4f20a80c"
+    },
+    {
+      "path": "kernel/src/fs/fs_impls/ext4/nv_tests.rs",
+      "sha256": "34c6d04276b1ff959c71ab75cfd88750dce147f9f7933a10887c10a38f540f54"
+    },
+    {
+      "path": "kernel/src/fs/fs_impls/ext4/stats.rs",
+      "sha256": "e945c636e9f48809c29849548ea6ac429a2aa2361c40bab9baac82b9269c50a9"
+    },
+    {
+      "path": "kernel/src/fs/fs_impls/ext4/test_utils.rs",
+      "sha256": "c72fe644cdc94008d7ea583a71cf671827206669212de2d404117107cafcdc35"
+    },
+    {
+      "path": "kernel/src/fs/rnvpc/backend.rs",
+      "sha256": "a36d8b0d863278c202c338bf58226ef6047922ffeb7b4aa2cf63ee11762c49e2"
+    },
+    {
+      "path": "kernel/src/fs/rnvpc/config.rs",
+      "sha256": "cf7ccabade92d5d142205c8b50b186e5be2d7b99c6e4670c47cedb64facd4be7"
+    },
+    {
+      "path": "kernel/src/fs/rnvpc/cow.rs",
+      "sha256": "721ae9279b85e2b51bdc4d09fe23493ea391999af7813dbae3ddac60eb1fa52f"
+    },
+    {
+      "path": "kernel/src/fs/rnvpc/descriptor.rs",
+      "sha256": "a3a72e8f8debf82f9b6e7747a129bdd64638ea7e1af5c1fa053693681b0008ed"
+    },
+    {
+      "path": "kernel/src/fs/rnvpc/dram.rs",
+      "sha256": "cba71cc4f6449d5a992b6779c7a6e6919af314c48500a542e51f2b5d33b8f4ce"
+    },
+    {
+      "path": "kernel/src/fs/rnvpc/extend_cow.rs",
+      "sha256": "9381757c7643964ef948d54eaa776e850c374ab3c300658ec5dc465351b73e84"
+    },
+    {
+      "path": "kernel/src/fs/rnvpc/extent_mutation.rs",
+      "sha256": "fb3ed9e3af1fcca2acafdde8099f831c2ee1618a066d29c8bb32887603b1832e"
+    },
+    {
+      "path": "kernel/src/fs/rnvpc/frame.rs",
+      "sha256": "6e80ed38440c773f6cbb1f858311087a552eaa31873d727364106648b8918111"
+    },
+    {
+      "path": "kernel/src/fs/rnvpc/frame/object_table.rs",
+      "sha256": "b5f8565f244db81a23f46a98de3b763457736c180b99b40ed8f6549e68d52d0b"
+    },
+    {
+      "path": "kernel/src/fs/rnvpc/frame/pcache.rs",
+      "sha256": "40f1ec0f20c6453a3a96e1646f692f3dc0c71280215ff85f45e8004b6c205570"
+    },
+    {
+      "path": "kernel/src/fs/rnvpc/index.rs",
+      "sha256": "7f784a58524a3d6d66ce57085b507505bbe55d1b650a570597219472afd01b72"
+    },
+    {
+      "path": "kernel/src/fs/rnvpc/metadata.rs",
+      "sha256": "d11b111ea99dba7f2874d51acdca01114a2f660f081fbdccf7c8579cf7ed6002"
+    },
+    {
+      "path": "kernel/src/fs/rnvpc/mod.rs",
+      "sha256": "41ea6413de8cde97672e10fe47a7625c0f302eb05cbf006fe09a77350fc26650"
+    },
+    {
+      "path": "kernel/src/fs/rnvpc/pcache_layout.rs",
+      "sha256": "900de276a8281fa8355f33a2dd4205a3b0131bade76162142607367ed4550dc4"
+    },
+    {
+      "path": "kernel/src/fs/rnvpc/pcache_store.rs",
+      "sha256": "fba304e6d74a8007bf0a7a5e8a19b9e900e386f9693318e14effc8be58332baa"
+    },
+    {
+      "path": "kernel/src/fs/rnvpc/persistent_btree.rs",
+      "sha256": "300e3d88ed6a33207a9aff1405d83d2af4d315937ef00c6851a39767b0027047"
+    },
+    {
+      "path": "kernel/src/fs/rnvpc/persistent_tests.rs",
+      "sha256": "332edcaecbf70fd97c23edb0d841b3a6b75d0d3fe11711ee1a3dade1879a5aac"
+    },
+    {
+      "path": "kernel/src/fs/rnvpc/recover.rs",
+      "sha256": "7c3bbc4254154ab4b37258305ae1ba5c1fcb2c8294d6bc101dafea7d577223e0"
+    },
+    {
+      "path": "kernel/src/fs/rnvpc/rnvpce_integrity_tests.rs",
+      "sha256": "045f3f492af246068349b57a6ceaf0a248fcf410a680e3e275ad7e9045a05ecd"
+    },
+    {
+      "path": "kernel/src/fs/rnvpc/tests.rs",
+      "sha256": "321acf241111bc0efef04c25f0df40bb39056f84a0d0afe9e8980e6bcd7d57b7"
+    },
+    {
+      "path": "kernel/src/fs/rnvpc/wal.rs",
+      "sha256": "e9f156982df2fc76c4501e29de502b9cbaa9d118dc2928c1f52dfdb5d93c8e9d"
+    },
+    {
+      "path": "kernel/src/fs/rnvpc/write_transaction.rs",
+      "sha256": "a42c8c672b92b3ca84f8909af5c247d889f1e2c92e41b07bb695cf66f23683f0"
+    }
+  ]
+}

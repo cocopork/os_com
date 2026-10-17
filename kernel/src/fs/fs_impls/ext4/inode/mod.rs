@@ -42,6 +42,7 @@ use super::{
     journal,
     journal::Tid,
     prelude::*,
+    stats::{LATENCY_STATS, read_ns},
 };
 
 mod dir;
@@ -1103,7 +1104,475 @@ impl Inode {
     /// reads arrive. The detector lock is dropped before [`page_cache`] (which
     /// briefly takes `inner`), so the two never nest; the prefetch is
     /// best-effort and its errors are swallowed.
+    fn ensure_native_mutation(&self) -> Result<()> {
+        if self.fs()?.rnvpc_mode() != crate::fs::rnvpc::mode::RnvpcMode::Native {
+            return_errno_with_message!(
+                Errno::EOPNOTSUPP,
+                "operation requires a persistent graph mutation"
+            );
+        }
+        Ok(())
+    }
+    fn read_rnvpc_at(&self, fs: &Arc<Ext4>, offset: usize, writer: &mut VmWriter) -> Result<usize> {
+        let context = crate::fs::rnvpc::cow_context(fs.rnvpc_fs_id(), self.ino as u64)?;
+        let pool = crate::fs::rnvpc::pool().ok_or_else(|| Error::new(Errno::EINVAL))?;
+        let requested = writer.avail();
+        let mut done = 0;
+        let mut bytes = [0u8; PAGE_SIZE];
+        while done < requested {
+            let inner = self.inner.read();
+            let position = offset
+                .checked_add(done)
+                .ok_or_else(|| Error::new(Errno::EOVERFLOW))?;
+            if position >= inner.file_size() {
+                break;
+            }
+            let page =
+                Iblock::try_from(position / PAGE_SIZE).map_err(|_| Error::new(Errno::EFBIG))?;
+            let start = position % PAGE_SIZE;
+            let amount = (requested - done)
+                .min(inner.file_size() - position)
+                .min(PAGE_SIZE - start);
+            let lease_epoch = pool.data_page_lease_epoch();
+            let resident = match context.read_page(page as u64, &mut bytes) {
+                Ok(resident) => resident,
+                Err(error) if error.error() == Errno::EBUSY => {
+                    drop(inner);
+                    pool.wait_for_data_page_lease_change(lease_epoch);
+                    continue;
+                }
+                Err(error) => return if done != 0 { Ok(done) } else { Err(error) },
+            };
+            // Only an absent mapping permits SSD fallback. An in-flight NV
+            // lease must complete before its backing extent is authoritative.
+            if !resident {
+                bytes.fill(0);
+                if let extent_manager::Mapping::Mapped {
+                    pblock,
+                    written: true,
+                    ..
+                } = inner.extent_manager()?.map_blocks(page)?
+                {
+                    let segment = BioSegment::alloc(1, BioDirection::FromDevice);
+                    let mut batch = IoBatch::new();
+                    fs.read_blocks_async(pblock, segment.clone(), None, &mut batch)?;
+                    batch.wait_all()?;
+                    segment
+                        .reader()?
+                        .read_fallible(&mut VmWriter::from(bytes.as_mut_slice()).to_fallible())?;
+                }
+            }
+            match VmReader::from(&bytes[start..start + amount]).read_fallible(writer) {
+                Ok(copied) => done += copied,
+                Err((error, copied)) => {
+                    done += copied;
+                    return if done != 0 {
+                        Ok(done)
+                    } else {
+                        Err(error.into())
+                    };
+                }
+            }
+        }
+        Ok(done)
+    }
+
+    fn write_rnvpc_at(
+        &self,
+        fs: &Arc<Ext4>,
+        offset: usize,
+        reader: &mut VmReader,
+    ) -> Result<usize> {
+        fs.ensure_writable()?;
+        let end = offset
+            .checked_add(reader.remain())
+            .ok_or_else(|| Error::new(Errno::EOVERFLOW))?;
+        if end > fs.max_file_size() {
+            return_errno!(Errno::EFBIG);
+        }
+        let context = crate::fs::rnvpc::cow_context(fs.rnvpc_fs_id(), self.ino as u64)?;
+        let pool = crate::fs::rnvpc::pool().ok_or_else(|| Error::new(Errno::EINVAL))?;
+        let mut done = 0;
+        let mut bytes = [0u8; PAGE_SIZE];
+        let mut input = [0u8; PAGE_SIZE];
+        while offset + done < end {
+            let position = offset + done;
+            let page =
+                Iblock::try_from(position / PAGE_SIZE).map_err(|_| Error::new(Errno::EFBIG))?;
+            let start = position % PAGE_SIZE;
+            let amount = (end - position).min(PAGE_SIZE - start);
+            // Consume this user prefix once. A retry reloads the current page
+            // and overlays this same prefix, preserving concurrent changes.
+            let copied = match reader.read_fallible(&mut VmWriter::from(&mut input[..amount])) {
+                Ok(copied) => copied,
+                Err((_, copied)) if copied != 0 => copied,
+                Err((error, _)) => {
+                    return if done != 0 {
+                        Ok(done)
+                    } else {
+                        Err(error.into())
+                    };
+                }
+            };
+            if copied == 0 {
+                break;
+            }
+            let mut durable_target = None;
+            loop {
+                let mut inner = self.inner.write();
+                let next = page
+                    .checked_add(1)
+                    .ok_or_else(|| Error::new(Errno::EFBIG))?;
+                let op = fs.begin_op(fs.write_credits(inner.extent_manager()?.root_depth()))?;
+                inner.extent_manager()?.ensure_allocated(
+                    page,
+                    next,
+                    op.get(),
+                    &mut extent_manager::NewMappings::default(),
+                )?;
+                let mapping = inner.extent_manager()?.map_blocks(page)?;
+                let target = mapping
+                    .mapped_pblock()
+                    .ok_or_else(|| Error::new(Errno::EIO))?;
+                if durable_target != Some(target) {
+                    // A persistent WAL reference must never name an allocation
+                    // that EXT4 recovery can still consider free. Capture the
+                    // unwritten extent/root and wait for native durability with
+                    // neither the inode lock nor a journal handle held.
+                    let captured = inner.is_dirty();
+                    if let Err(error) = inner.write_back_inode_desc_forced(fs, self.ino, op.get()) {
+                        return if done != 0 { Ok(done) } else { Err(error) };
+                    }
+                    if captured {
+                        inner.stamp_datasync_tid(op.get());
+                    }
+                    drop(inner);
+                    drop(op);
+                    let persisted = fs
+                        .sync_metadata()
+                        .and_then(|_| self.sync_data_and_meta(SyncScope::DataOnly));
+                    if let Err(error) = persisted {
+                        return if done != 0 { Ok(done) } else { Err(error) };
+                    }
+                    durable_target = Some(target);
+                    // Reacquire and recheck the mapping and visible size. In
+                    // particular, do not reuse a pre-wait partial-page image.
+                    continue;
+                }
+                let lease_epoch = pool.data_page_lease_epoch();
+                let resident = match context.read_page(page as u64, &mut bytes) {
+                    Ok(resident) => resident,
+                    Err(error) if error.error() == Errno::EBUSY => {
+                        drop(inner);
+                        drop(op);
+                        pool.wait_for_data_page_lease_change(lease_epoch);
+                        continue;
+                    }
+                    Err(error) => return if done != 0 { Ok(done) } else { Err(error) },
+                };
+                if !resident {
+                    bytes.fill(0);
+                    if matches!(
+                        mapping,
+                        extent_manager::Mapping::Mapped { written: true, .. }
+                    ) && (start != 0 || copied != PAGE_SIZE)
+                    {
+                        let segment = BioSegment::alloc(1, BioDirection::FromDevice);
+                        let mut batch = IoBatch::new();
+                        fs.read_blocks_async(target, segment.clone(), None, &mut batch)?;
+                        batch.wait_all()?;
+                        segment.reader()?.read_fallible(
+                            &mut VmWriter::from(bytes.as_mut_slice()).to_fallible(),
+                        )?;
+                    }
+                }
+                let page_start = position - start;
+                let valid = inner.file_size().saturating_sub(page_start).min(PAGE_SIZE);
+                if valid < start {
+                    bytes[valid..start].fill(0);
+                }
+                bytes[start..start + copied].copy_from_slice(&input[..copied]);
+                let lease_epoch = pool.data_page_lease_epoch();
+                match context.update(page as u64, target, |contents| {
+                    contents.copy_from_slice(&bytes)
+                }) {
+                    Ok(_) => {}
+                    Err(error) if error.error() == Errno::EBUSY => {
+                        drop(inner);
+                        drop(op);
+                        pool.wait_for_data_page_lease_change(lease_epoch);
+                        continue;
+                    }
+                    Err(error) => return if done != 0 { Ok(done) } else { Err(error) },
+                }
+                let size = inner.file_size().max(position + copied);
+                inner.set_file_size(size);
+                let captured = inner.is_dirty();
+                if let Err(error) = inner.write_back_inode_desc_forced(fs, self.ino, op.get()) {
+                    return if done != 0 { Ok(done) } else { Err(error) };
+                }
+                if captured {
+                    inner.stamp_datasync_tid(op.get());
+                }
+                drop(inner);
+                drop(op);
+                // The WAL carries data, not native i_size. Do not report this
+                // prefix successful until native recovery can expose its size.
+                if let Err(error) = self.sync_data_and_meta(SyncScope::DataOnly) {
+                    return if done != 0 { Ok(done) } else { Err(error) };
+                }
+                done += copied;
+                break;
+            }
+            if copied != amount {
+                break;
+            }
+        }
+        Ok(done)
+    }
+
+    pub(super) fn export_rnvpce_extents(&self, fs: &Ext4) -> Result<()> {
+        if !fs.rnvpc_extend_enabled() || self.type_ != InodeType::File {
+            return Ok(());
+        }
+        let pool = crate::fs::rnvpc::pool().ok_or_else(|| Error::new(Errno::EINVAL))?;
+        let mut inner = self.inner.write();
+        let _publication = pool.begin_publication_for(fs.rnvpc_fs_id(), self.ino as u64)?;
+        if let Some(state) = crate::fs::rnvpc::write_transaction::authoritative_inode_state(
+            pool,
+            fs.rnvpc_fs_id(),
+            self.ino as u64,
+        )? {
+            inner.set_file_size(
+                usize::try_from(state.file_size()).map_err(|_| Error::new(Errno::EOVERFLOW))?,
+            );
+            inner.desc.set_sector_count(state.block_count());
+        }
+        crate::fs::rnvpc::write_transaction::visit_ssd_extents(
+            pool,
+            fs.rnvpc_fs_id(),
+            self.ino as u64,
+            |extent| {
+                let crate::fs::rnvpc::metadata::ExtentDataRef::Ssd(block) = extent.data_ref()?
+                else {
+                    return_errno!(Errno::EUCLEAN);
+                };
+                for delta in 0..extent.length() as u64 {
+                    let logical = Iblock::try_from(extent.logical_block() + delta)
+                        .map_err(|_| Error::new(Errno::EOVERFLOW))?;
+                    let op = fs.begin_op(fs.write_credits(inner.extent_manager()?.root_depth()))?;
+                    inner.extent_manager()?.install_preallocated_written(
+                        logical,
+                        block + delta,
+                        op.get(),
+                    )?;
+                    inner.write_back_inode_desc_forced(fs, self.ino, op.get())?;
+                }
+                Ok(())
+            },
+        )
+    }
+
+    fn read_rnvpce_at(
+        &self,
+        fs: &Arc<Ext4>,
+        offset: usize,
+        writer: &mut VmWriter,
+    ) -> Result<usize> {
+        let pool = crate::fs::rnvpc::pool()
+            .ok_or_else(|| Error::with_message(Errno::EINVAL, "rNVPC pool is not configured"))?
+            .clone();
+        fs.nv_inodes.lock().insert(self.ino);
+        let fs_id = fs.rnvpc_fs_id();
+        let inode_id = self.ino as u64;
+        if crate::fs::rnvpc::write_transaction::authoritative_inode_state(&pool, fs_id, inode_id)?
+            .is_none()
+        {
+            let inner = self.inner.write();
+            if crate::fs::rnvpc::write_transaction::authoritative_inode_state(
+                &pool, fs_id, inode_id,
+            )?
+            .is_none()
+            {
+                let snapshot_extents = inner.extent_manager()?.snapshot_ssd_extents()?;
+                let snapshot = crate::fs::rnvpc::write_transaction::AuthoritySnapshot::new(
+                    1,
+                    &snapshot_extents,
+                    inner.file_size() as u64,
+                    inner.sector_count(),
+                    self.type_ as u32 | inner.desc.perm().bits() as u32,
+                    inner.desc.flags().bits(),
+                )?;
+                crate::fs::rnvpc::write_transaction::bootstrap_inode_authority(
+                    pool.clone(),
+                    fs_id,
+                    inode_id,
+                    &snapshot,
+                    None,
+                )?;
+            }
+        }
+        let authority =
+            crate::fs::rnvpc::write_transaction::authoritative_inode_state(&pool, fs_id, inode_id)?
+                .ok_or_else(|| Error::new(Errno::EUCLEAN))?;
+        let file_size =
+            usize::try_from(authority.file_size()).map_err(|_| Error::new(Errno::EOVERFLOW))?;
+        if offset >= file_size || writer.avail() == 0 {
+            return Ok(0);
+        }
+        let read_len = writer.avail().min(file_size - offset);
+        writer.limit(read_len);
+        let mut inner = Some(self.inner.read());
+        let mut position = offset;
+        let end = offset + read_len;
+        while position < end {
+            let logical_block = (position / PAGE_SIZE) as u64;
+            let page_offset = position % PAGE_SIZE;
+            let amount = (end - position).min(PAGE_SIZE - page_offset);
+            if let Some(reference) = crate::fs::rnvpc::write_transaction::mapped_nv_page_ref(
+                &pool,
+                fs_id,
+                inode_id,
+                logical_block,
+            )? {
+                let lease_epoch = pool.data_page_lease_epoch();
+                let page = match pool.pin_persistent_data_page(reference) {
+                    Ok(page) => page,
+                    Err(error) if error.error() == Errno::EBUSY => {
+                        drop(inner.take());
+                        pool.wait_for_data_page_lease_change(lease_epoch);
+                        inner = Some(self.inner.read());
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                };
+                let copied = match page.copy_to_writer(page_offset, writer, amount) {
+                    Ok(copied) => copied,
+                    Err(_error) if position != offset => return Ok(position - offset),
+                    Err(error) => return Err(error),
+                };
+                if copied != amount {
+                    return Ok(position - offset + copied);
+                }
+            } else if let Some(mapping) = crate::fs::rnvpc::write_transaction::current_page_mapping(
+                &pool,
+                fs_id,
+                inode_id,
+                logical_block,
+            )? {
+                if mapping.is_written() {
+                    let segment = BioSegment::alloc(1, BioDirection::FromDevice);
+                    let mut batch = IoBatch::new();
+                    fs.read_blocks_async(mapping.ssd_block(), segment.clone(), None, &mut batch)?;
+                    batch.wait_all()?;
+                    let mut source = segment.reader()?;
+                    source.skip(page_offset).limit(amount);
+                    match source.read_fallible(writer) {
+                        Ok(copied) if copied == amount => {}
+                        Ok(copied) => return Ok(position - offset + copied),
+                        Err((error, copied)) => {
+                            let total = position - offset + copied;
+                            return if total != 0 {
+                                Ok(total)
+                            } else {
+                                Err(error.into())
+                            };
+                        }
+                    }
+                } else {
+                    match writer.fill_zeros(amount) {
+                        Ok(copied) if copied == amount => {}
+                        Ok(copied) => return Ok(position - offset + copied),
+                        Err((error, copied)) => {
+                            let total = position - offset + copied;
+                            return if total != 0 {
+                                Ok(total)
+                            } else {
+                                Err(error.into())
+                            };
+                        }
+                    }
+                }
+            } else {
+                match writer.fill_zeros(amount) {
+                    Ok(copied) if copied == amount => {}
+                    Ok(copied) => return Ok(position - offset + copied),
+                    Err((error, copied)) => {
+                        let total = position - offset + copied;
+                        return if total != 0 {
+                            Ok(total)
+                        } else {
+                            Err(error.into())
+                        };
+                    }
+                }
+            }
+            position += amount;
+        }
+        Ok(read_len)
+    }
+
+    pub(super) fn restore_rnvpce_inode_fields(&self) -> Result<()> {
+        if self.type_ != InodeType::File {
+            return Ok(());
+        }
+        let fs = self.fs()?;
+        if !fs.rnvpc_extend_enabled() {
+            return Ok(());
+        }
+        let pool = crate::fs::rnvpc::pool()
+            .ok_or_else(|| Error::with_message(Errno::EINVAL, "rNVPC pool is not configured"))?;
+        let Some(authority) = crate::fs::rnvpc::write_transaction::authoritative_inode_state(
+            pool,
+            fs.rnvpc_fs_id(),
+            self.ino as u64,
+        )?
+        else {
+            return Ok(());
+        };
+        let file_size =
+            usize::try_from(authority.file_size()).map_err(|_| Error::new(Errno::EOVERFLOW))?;
+        let mut inner = self.inner.write();
+        inner.set_file_size(file_size);
+        inner.desc.set_sector_count(authority.block_count());
+        Ok(())
+    }
+
+    pub(super) fn materialize_rnvpce_ssd_page(
+        &self,
+        fs: &Ext4,
+        logical_block: u64,
+        ssd_block: u64,
+    ) -> Result<()> {
+        let iblock = Iblock::try_from(logical_block).map_err(|_| Error::new(Errno::EOVERFLOW))?;
+        let t_lock = read_ns();
+        let mut inner = self.inner.write();
+        LATENCY_STATS
+            .rnvpce_completion_inner_wait
+            .record_since(t_lock);
+        let t_hold = read_ns();
+        let depth = inner.extent_manager()?.root_depth();
+        let op = fs.begin_op(fs.write_credits(depth))?;
+        inner
+            .extent_manager()?
+            .install_preallocated_written(iblock, ssd_block, op.get())?;
+        let result = inner.write_back_inode_desc_forced(fs, self.ino, op.get());
+        LATENCY_STATS
+            .rnvpce_completion_inner_hold
+            .record_since(t_hold);
+        result
+    }
+
     pub(super) fn read_at(&self, offset: usize, writer: &mut VmWriter) -> Result<usize> {
+        let fs = self.fs()?;
+        if self.type_ == InodeType::File && fs.rnvpc_extend_enabled() {
+            return self.read_rnvpce_at(&fs, offset, writer);
+        }
+        if self.type_ == InodeType::File
+            && fs.rnvpc_mode() == crate::fs::rnvpc::mode::RnvpcMode::Rnvpc
+        {
+            return self.read_rnvpc_at(&fs, offset, writer);
+        }
         let len = writer.avail();
         if len > 0 {
             // Take the detector lock only for `on_read`; the trailing `;` drops
@@ -1192,6 +1661,153 @@ impl Inode {
     /// is unchanged; chunking them needs a re-windowable data source the page-cache
     /// write API does not offer for an in-place bounded read (a P9 refinement,
     /// ledger: `within-file-write-restart`).
+    fn write_rnvpce_at(
+        &self,
+        fs: &Arc<Ext4>,
+        offset: usize,
+        reader: &mut VmReader,
+    ) -> Result<usize> {
+        fs.ensure_not_shutdown()?;
+        if fs.is_rdonly() {
+            return_errno_with_message!(Errno::EROFS, "read-only filesystem");
+        }
+        let write_len = reader.remain();
+        let end = offset
+            .checked_add(write_len)
+            .ok_or_else(|| Error::with_message(Errno::EINVAL, "write range overflow"))?;
+        if end > fs.max_file_size() {
+            return_errno_with_message!(Errno::EFBIG, "write exceeds maximum file size");
+        }
+        let pool = crate::fs::rnvpc::pool()
+            .ok_or_else(|| Error::with_message(Errno::EINVAL, "rNVPC pool is not configured"))?
+            .clone();
+        fs.nv_inodes.lock().insert(self.ino);
+        let fs_id = fs.rnvpc_fs_id();
+        let inode_id = self.ino as u64;
+        let t_lock = read_ns();
+        let mut inner = self.inner.write();
+        LATENCY_STATS.rnvpce_write_inner_wait.record_since(t_lock);
+        let old_size = inner.file_size();
+        let authority = if let Some(authority) =
+            crate::fs::rnvpc::write_transaction::authoritative_inode_state(&pool, fs_id, inode_id)?
+        {
+            authority
+        } else {
+            let snapshot_extents = inner.extent_manager()?.snapshot_ssd_extents()?;
+            let snapshot = crate::fs::rnvpc::write_transaction::AuthoritySnapshot::new(
+                1,
+                &snapshot_extents,
+                old_size as u64,
+                inner.sector_count(),
+                self.type_ as u32 | inner.desc.perm().bits() as u32,
+                inner.desc.flags().bits(),
+            )?;
+            crate::fs::rnvpc::write_transaction::bootstrap_inode_authority(
+                pool.clone(),
+                fs_id,
+                inode_id,
+                &snapshot,
+                None,
+            )?;
+            crate::fs::rnvpc::write_transaction::authoritative_inode_state(&pool, fs_id, inode_id)?
+                .ok_or_else(|| Error::new(Errno::EUCLEAN))?
+        };
+        let mut targets = Vec::new();
+        let first_page = offset / PAGE_SIZE;
+        let last_page = end.div_ceil(PAGE_SIZE);
+        let page_count = last_page - first_page;
+        targets
+            .try_reserve_exact(page_count)
+            .map_err(|_| Error::new(Errno::ENOMEM))?;
+        let mut spans = Vec::new();
+        let mut newly_reserved = 0u64;
+        spans
+            .try_reserve_exact(page_count)
+            .map_err(|_| Error::new(Errno::ENOMEM))?;
+        for page_index in first_page..last_page {
+            let logical_block = page_index as u64;
+            let page_start = page_index * PAGE_SIZE;
+            let copy_start = offset.max(page_start);
+            let copy_end = end.min(page_start + PAGE_SIZE);
+            let page_offset = copy_start - page_start;
+            let len = copy_end - copy_start;
+            let mut newly_allocated = false;
+            if let Some(mapping) = crate::fs::rnvpc::write_transaction::current_page_mapping(
+                &pool,
+                fs_id,
+                inode_id,
+                logical_block,
+            )? {
+                targets.push(mapping.ssd_block());
+            } else {
+                targets.push(0);
+                newly_reserved = newly_reserved
+                    .checked_add(1)
+                    .ok_or_else(|| Error::new(Errno::EOVERFLOW))?;
+                newly_allocated = true;
+            }
+            spans.push(crate::fs::rnvpc::write_transaction::RangeWritePage::new(
+                logical_block,
+                *targets.last().unwrap(),
+                page_offset,
+                len,
+                newly_allocated,
+            )?);
+        }
+        let request = crate::fs::rnvpc::write_transaction::RangeWriteBatch::new(
+            authority
+                .generation()
+                .checked_add(1)
+                .ok_or_else(|| Error::new(Errno::EOVERFLOW))?,
+            offset as u64,
+            write_len,
+            &[],
+            &spans,
+            authority.file_size(),
+            authority.block_count(),
+            (BLOCK_SIZE / 512) as u64,
+        )?;
+        fs.reserve_rnvpce_blocks(newly_reserved)?;
+        let result = crate::fs::rnvpc::write_transaction::commit_range_write(
+            pool.clone(),
+            fs_id,
+            inode_id,
+            &request,
+            reader,
+            |block, staging| {
+                let segment =
+                    BioSegment::new_from_segment(staging.dma_segment()?, BioDirection::FromDevice);
+                let mut batch = IoBatch::new();
+                fs.read_blocks_async(block, segment, None, &mut batch)?;
+                batch.wait_all()?;
+                Ok(())
+            },
+            None,
+        );
+        match result {
+            Ok(committed) => {
+                fs.release_rnvpce_blocks(
+                    newly_reserved.saturating_sub(committed.reserved_blocks()),
+                )?;
+                inner.set_file_size(old_size.max(offset + committed.copied()));
+                let state = crate::fs::rnvpc::write_transaction::authoritative_inode_state(
+                    &pool, fs_id, inode_id,
+                )?
+                .ok_or_else(|| Error::new(Errno::EUCLEAN))?;
+                inner.desc.set_sector_count(state.block_count());
+                Ok(committed.copied())
+            }
+            Err(error) => {
+                // Publication can fail after durable capacity reservation. Rebuild the
+                // admission count from persistent records before admitting more writes.
+                // Keep the admission charge conservatively: a failed persist may
+                // have made the reservation reachable. Mount-time recovery rebuilds
+                // this counter; never reset it over another writer's reservation.
+                Err(error)
+            }
+        }
+    }
+
     pub(super) fn write_at(&self, offset: usize, reader: &mut VmReader) -> Result<usize> {
         if self.type_ == InodeType::Dir {
             return_errno!(Errno::EISDIR);
@@ -1200,6 +1816,14 @@ impl Inode {
             return Ok(0);
         }
         let fs = self.fs()?;
+        if self.type_ == InodeType::File && fs.rnvpc_extend_enabled() {
+            return self.write_rnvpce_at(&fs, offset, reader);
+        }
+        if self.type_ == InodeType::File
+            && fs.rnvpc_mode() == crate::fs::rnvpc::mode::RnvpcMode::Rnvpc
+        {
+            return self.write_rnvpc_at(&fs, offset, reader);
+        }
         // `ext4_should_retry_alloc`: a write consuming the last unpinned blocks
         // can hit a transient `ENOSPC` while a just-freed run (a prior
         // `unlink`/`truncate`) is still pinned to its uncommitted transaction —
@@ -1736,6 +2360,7 @@ impl Inode {
     /// partial last block; expanding is sparse (the gap is a hole that reads as
     /// zeros). Directories are rejected with `EISDIR` (P2 resizes only files).
     pub(super) fn resize(&self, new_size: usize) -> Result<()> {
+        self.ensure_native_mutation()?;
         if self.type_ == InodeType::Dir {
             return_errno!(Errno::EISDIR);
         }
@@ -2026,6 +2651,7 @@ impl Inode {
     /// `fallocate` is a regular-file operation; a directory or special inode is
     /// rejected the same way (Linux ext4 gates on `S_ISREG`).
     pub(super) fn fallocate(&self, mode: FallocMode, offset: usize, len: usize) -> Result<()> {
+        self.ensure_native_mutation()?;
         if self.type_ != InodeType::File {
             return_errno_with_message!(
                 Errno::EOPNOTSUPP,

@@ -1113,6 +1113,9 @@ impl Inode {
         // `child.inner.write()`; were the guard still held this would self-
         // deadlock. Do NOT reorder these two locals.
         let child = fs.read_inode(entry_info.ino)?;
+        if child.inode_type() == InodeType::File {
+            child.ensure_native_mutation()?;
+        }
 
         // The `DirDentry.children` lock in the VFS layer keeps the parent
         // directory entry stable during this operation, so we only need to lock
@@ -1319,6 +1322,12 @@ impl Inode {
                 .map(|entry_info| fs.read_inode(entry_info.ino))
                 .transpose()?
         };
+
+        if let Some(replaced) = &replaced_inode {
+            if replaced.inode_type() == InodeType::File {
+                replaced.ensure_native_mutation()?;
+            }
+        }
 
         // The `DirDentry.children` lock in the VFS layer keeps both directory
         // entries stable during this operation, so we only need to lock all

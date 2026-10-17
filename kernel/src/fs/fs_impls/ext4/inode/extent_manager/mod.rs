@@ -207,6 +207,77 @@ impl ExtentManager {
     ///
     /// The returned length spans from `iblock` to the end of the covering
     /// extent, so callers can batch contiguous reads.
+    pub(super) fn snapshot_ssd_extents(
+        &self,
+    ) -> Result<Vec<crate::fs::rnvpc::metadata::ExtentRecordEntry>> {
+        let fs = self.fs()?;
+        let tree = self.state.read();
+        let mut snapshot = Vec::new();
+        let mut failure = None;
+        tree.walk_range(&fs, 0..u32::MAX as u64 + 1, &mut |extent| {
+            match crate::fs::rnvpc::metadata::ExtentRecordEntry::leaf(
+                extent.block() as u64,
+                extent.len() as u32,
+                extent.start(),
+                extent.is_unwritten(),
+            ) {
+                Ok(entry) => snapshot.push(entry),
+                Err(error) => {
+                    failure = Some(error);
+                    return core::ops::ControlFlow::Break(());
+                }
+            }
+            core::ops::ControlFlow::Continue(())
+        })?;
+        if let Some(error) = failure {
+            return Err(error);
+        }
+        Ok(snapshot)
+    }
+
+    pub(super) fn install_preallocated_written(
+        &self,
+        iblock: Iblock,
+        pblock: Ext4Bid,
+        handle: Option<&journal::Handle>,
+    ) -> Result<()> {
+        match self.map_blocks(iblock)? {
+            Mapping::Mapped {
+                pblock: current,
+                written,
+                ..
+            } if current == pblock => {
+                if !written {
+                    self.mark_range_written(
+                        iblock,
+                        iblock
+                            .checked_add(1)
+                            .ok_or_else(|| Error::new(Errno::EOVERFLOW))?,
+                        handle,
+                    )?;
+                }
+                Ok(())
+            }
+            Mapping::Mapped { .. } => Err(Error::with_message(
+                Errno::ESTALE,
+                "migration target conflicts with native extent",
+            )),
+            Mapping::Hole { .. } => {
+                let fs = self.fs()?;
+                self.state.write().insert_with_intent(
+                    &fs,
+                    iblock,
+                    pblock,
+                    1,
+                    node::ExtentKind::Written,
+                    handle,
+                    self.csum_seed,
+                    super::super::fs::AllocIntent::MetadataReserve,
+                )
+            }
+        }
+    }
+
     pub(super) fn map_blocks(&self, iblock: Iblock) -> Result<Mapping> {
         let fs = self.fs()?;
         let tree = self.state.read();

@@ -7,10 +7,13 @@
 //! a durable mutation mark from parent publication through old-child repair, so
 //! recovery can finish the local mutation without rebuilding the whole tree.
 
+use core::cell::RefCell;
+
 use super::{
     fault::{FaultPoint, inject},
     frame::{
-        BoxedMetadataRecord, FIXED_INODE_LOGICAL_INDEX, PublicationGuard, PublicationRole, Rnvpc,
+        BoxedMetadataRecord, FIXED_INODE_LOGICAL_INDEX, MetadataMutationGuard, PublicationGuard,
+        PublicationRole, Rnvpc,
     },
     id::NvFrameId,
     index::{PageKey, ReverseExtentRef},
@@ -57,6 +60,7 @@ pub(crate) struct ExtentMutation {
     pool: Arc<Rnvpc>,
     fs_id: u64,
     inode: u64,
+    node_guards: RefCell<Vec<(PersistentObjectRef, MetadataMutationGuard)>>,
     publication: PublicationGuard,
 }
 
@@ -74,6 +78,7 @@ impl ExtentMutation {
             pool,
             fs_id,
             inode,
+            node_guards: RefCell::new(Vec::new()),
             publication,
         })
     }
@@ -84,6 +89,7 @@ impl ExtentMutation {
             pool,
             fs_id,
             inode,
+            node_guards: RefCell::new(Vec::new()),
             publication,
         })
     }
@@ -95,6 +101,7 @@ impl ExtentMutation {
             pool,
             fs_id,
             inode,
+            node_guards: RefCell::new(Vec::new()),
             publication,
         })
     }
@@ -130,23 +137,63 @@ impl ExtentMutation {
         updates: &[SsdExtentUpdate],
         fault: Option<FaultPoint>,
     ) -> Result<bool> {
+        Self::publish_ssd_extents_locked(&self.pool, self.fs_id, self.inode, updates, fault)
+    }
+
+    pub(crate) fn publish_ssd_extents_locked(
+        pool: &Arc<Rnvpc>,
+        fs_id: u64,
+        inode: u64,
+        updates: &[SsdExtentUpdate],
+        fault: Option<FaultPoint>,
+    ) -> Result<bool> {
+        let started = read_ns();
+        let result = Self::publish_ssd_extents_profiled(pool, fs_id, inode, updates, fault);
+        LATENCY_STATS.leaf_detail_total.record_since(started);
+        result
+    }
+
+    fn publish_ssd_extents_profiled(
+        pool: &Arc<Rnvpc>,
+        fs_id: u64,
+        inode: u64,
+        updates: &[SsdExtentUpdate],
+        fault: Option<FaultPoint>,
+    ) -> Result<bool> {
+        let started = read_ns();
         let first = updates.first().ok_or_else(|| Error::new(Errno::EINVAL))?;
         let locator = first.locator;
         let frame = NvFrameId::try_from(
             usize::try_from(locator.leaf_slot()).map_err(|_| Error::new(Errno::EOVERFLOW))?,
         )?;
-        let leaf_ref = self.pool.persistent_metadata_ref(frame)?;
-        let leaf = self
-            .pool
-            .read_authoritative_metadata_boxed::<ExtentNodeRecord>(leaf_ref)?;
-        self.validate_owner(&leaf)?;
+        let leaf_ref = pool.persistent_metadata_ref(frame)?;
+        LATENCY_STATS.leaf_detail_identity.record_since(started);
+        let started = read_ns();
+        let guard = pool.lock_metadata_mutation(leaf_ref)?;
+        LATENCY_STATS.migration_leaf_lock_wait.record_since(started);
+        let started = read_ns();
+        let pending = Self::check_leaf_repair_pending(pool, fs_id, inode, leaf_ref);
+        LATENCY_STATS.leaf_detail_pending.record_since(started);
+        pending?;
+        let started = read_ns();
+        let leaf = pool.read_authoritative_metadata_boxed::<ExtentNodeRecord>(leaf_ref)?;
+        LATENCY_STATS.leaf_detail_read.record_since(started);
+        let started = read_ns();
+        if leaf.header().fs_id() != fs_id || leaf.header().inode() != inode {
+            return_errno_with_message!(Errno::ESTALE, "reverse leaf owner changed");
+        }
         if leaf.level() != 0 {
             return_errno_with_message!(Errno::ESTALE, "reverse locator is not a leaf");
         }
         let mut entries = Vec::from(leaf.entries()?);
+        LATENCY_STATS.leaf_detail_entries.record_since(started);
+        let started = read_ns();
         let mut changed = false;
         let mut seen = [false; EXTENT_NODE_ENTRY_CAPACITY];
         for update in updates {
+            if pool.reverse_lookup(update.expected)? != Some(update.locator) {
+                return_errno_with_message!(Errno::ESTALE, "reverse locator moved");
+            }
             let index = update.locator.entry_index();
             if update.locator.leaf_slot() != locator.leaf_slot()
                 || index >= seen.len()
@@ -179,12 +226,14 @@ impl ExtentMutation {
             )?;
             changed = true;
         }
+        LATENCY_STATS.leaf_detail_validate.record_since(started);
         if !changed {
             return Ok(false);
         }
+        let started = read_ns();
         let updated = ExtentNodeRecord::new(
-            self.fs_id,
-            self.inode,
+            fs_id,
+            inode,
             leaf.header()
                 .generation()
                 .checked_add(1)
@@ -195,14 +244,81 @@ impl ExtentMutation {
             leaf.right_sibling(),
             &entries,
         )?;
-        self.pool.update_authoritative_metadata_in_place(
-            &self.publication,
-            leaf_ref,
-            &updated,
-            fault,
-        )?;
+        LATENCY_STATS.leaf_detail_construct.record_since(started);
+        let started = read_ns();
+        let result =
+            pool.update_authoritative_metadata_with_guard(&guard, leaf_ref, &updated, fault);
+        LATENCY_STATS.leaf_detail_update.record_since(started);
+        result?;
         LATENCY_STATS.rnvpce_completion_leaf_updates.record_event();
         Ok(true)
+    }
+
+    fn check_leaf_repair_pending(
+        pool: &Arc<Rnvpc>,
+        fs_id: u64,
+        inode: u64,
+        leaf: PersistentObjectRef,
+    ) -> Result<()> {
+        let key = PageKey::new(fs_id, inode, PENDING_EXTENT_MUTATION_LOGICAL_INDEX);
+        for _ in 0..8 {
+            let Some(reference) = pool.current_metadata_ref_for_completion(key) else {
+                return Ok(());
+            };
+            let started = read_ns();
+            let result = pool.read_authoritative_metadata::<PendingExtentMutationRecord>(reference);
+            LATENCY_STATS.leaf_pending_read.record_since(started);
+            match result {
+                Ok(mark) => {
+                    if [
+                        mark.old_child(),
+                        mark.old_parent(),
+                        mark.new_child(),
+                        mark.new_parent(),
+                    ]
+                    .contains(&leaf)
+                    {
+                        return_errno_with_message!(
+                            Errno::EBUSY,
+                            "extent leaf has unfinished repair"
+                        );
+                    }
+                    return Ok(());
+                }
+                Err(error)
+                    if matches!(error.error(), Errno::ESTALE | Errno::EINVAL | Errno::EBUSY) =>
+                {
+                    // Another leaf's foreground mutation may be clearing its mark.
+                    LATENCY_STATS.leaf_pending_retry.record_event();
+                    crate::thread::Thread::yield_now();
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Err(Error::with_message(
+            Errno::EAGAIN,
+            "extent repair mark is changing",
+        ))
+    }
+
+    fn read_locked_node(
+        &self,
+        reference: PersistentObjectRef,
+    ) -> Result<BoxedMetadataRecord<ExtentNodeRecord>> {
+        let held = self
+            .node_guards
+            .borrow()
+            .iter()
+            .any(|(current, _)| *current == reference);
+        if !held {
+            let guard = self.pool.lock_metadata_mutation(reference)?;
+            if !guard.matches(&self.pool, reference, self.fs_id, self.inode) {
+                return_errno_with_message!(Errno::ESTALE, "extent node owner changed");
+            }
+            self.node_guards.borrow_mut().push((reference, guard));
+        }
+        self.pool
+            .read_authoritative_metadata_boxed::<ExtentNodeRecord>(reference)
     }
 
     /// Persists a fresh node before any parent can reference it.
@@ -251,9 +367,7 @@ impl ExtentMutation {
         }
         self.validate_owner(replacement_parent)?;
 
-        let old_parent = self
-            .pool
-            .read_authoritative_metadata_boxed::<ExtentNodeRecord>(current_parent)?;
+        let old_parent = self.read_locked_node(current_parent)?;
         self.validate_owner(&old_parent)?;
         if replacement_parent.node_id() != old_parent.node_id()
             || replacement_parent.level() != old_parent.level()
@@ -269,9 +383,7 @@ impl ExtentMutation {
             return_errno_with_message!(Errno::EINVAL, "extent child level does not match parent");
         }
 
-        let committed_child = self
-            .pool
-            .read_authoritative_metadata_boxed::<ExtentNodeRecord>(child.reference)?;
+        let committed_child = self.read_locked_node(child.reference)?;
         self.validate_owner(&committed_child)?;
         if committed_child.node_id() != child.node_id || committed_child.level() != child.level {
             return_errno_with_message!(Errno::ESTALE, "initialized extent child was replaced");
@@ -328,12 +440,8 @@ impl ExtentMutation {
         split_logical_block: u64,
     ) -> Result<()> {
         self.validate_owner(parent)?;
-        let old_child = self
-            .pool
-            .read_authoritative_metadata_boxed::<ExtentNodeRecord>(old_child_ref)?;
-        let new_child = self
-            .pool
-            .read_authoritative_metadata_boxed::<ExtentNodeRecord>(new_child_ref)?;
+        let old_child = self.read_locked_node(old_child_ref)?;
+        let new_child = self.read_locked_node(new_child_ref)?;
         self.validate_owner(&old_child)?;
         self.validate_owner(&new_child)?;
 
@@ -434,15 +542,9 @@ impl ExtentMutation {
             return_errno_with_message!(Errno::EINVAL, "invalid extent split identity");
         }
 
-        let parent = self
-            .pool
-            .read_authoritative_metadata_boxed::<ExtentNodeRecord>(old_parent)?;
-        let old = self
-            .pool
-            .read_authoritative_metadata_boxed::<ExtentNodeRecord>(old_child)?;
-        let new = self
-            .pool
-            .read_authoritative_metadata_boxed::<ExtentNodeRecord>(new_child.reference)?;
+        let parent = self.read_locked_node(old_parent)?;
+        let old = self.read_locked_node(old_child)?;
+        let new = self.read_locked_node(new_child.reference)?;
         self.validate_owner(&parent)?;
         self.validate_owner(&old)?;
         self.validate_owner(&new)?;
@@ -591,7 +693,7 @@ impl ExtentMutation {
             self.inode,
             PENDING_EXTENT_MUTATION_LOGICAL_INDEX,
         );
-        let Some(mut reference) = self.pool.current_metadata_ref(key) else {
+        let Some(mut reference) = self.pool.current_metadata_ref_for_completion(key) else {
             return Ok(None);
         };
         let mut record = self
@@ -614,11 +716,7 @@ impl ExtentMutation {
                             .pool
                             .current_metadata_ref(parent_key)
                             .ok_or_else(|| Error::new(Errno::ESTALE))?;
-                        let parent = self
-                            .pool
-                            .read_authoritative_metadata_boxed::<ExtentNodeRecord>(
-                                current_parent,
-                            )?;
+                        let parent = self.read_locked_node(current_parent)?;
                         let parent_has_new_child = parent
                             .entries()?
                             .iter()
@@ -665,11 +763,7 @@ impl ExtentMutation {
                     if inode_ref != record.old_parent() {
                         return_errno_with_message!(Errno::ESTALE, "root-split inode was replaced");
                     }
-                    let root = self
-                        .pool
-                        .read_authoritative_metadata_boxed::<ExtentNodeRecord>(
-                            record.new_parent(),
-                        )?;
+                    let root = self.read_locked_node(record.new_parent())?;
                     self.validate_owner(&root)?;
                     let routes_right = root.entries()?.iter().any(|entry| {
                         entry.logical_block() == record.split_logical_block()
@@ -736,9 +830,7 @@ impl ExtentMutation {
             .pool
             .current_metadata_ref(old_child_key)
             .ok_or_else(|| Error::new(Errno::ESTALE))?;
-        let current_old_child = self
-            .pool
-            .read_authoritative_metadata_boxed::<ExtentNodeRecord>(current_old_child_ref)?;
+        let current_old_child = self.read_locked_node(current_old_child_ref)?;
         self.validate_owner(&current_old_child)?;
         let split = record.split_logical_block();
         let already_repaired = current_old_child.entries()?.iter().all(|entry| {
@@ -800,9 +892,7 @@ impl ExtentMutation {
             .pool
             .current_metadata_ref(pending.parent_key)
             .ok_or_else(|| Error::new(Errno::ESTALE))?;
-        let current_parent = self
-            .pool
-            .read_authoritative_metadata_boxed::<ExtentNodeRecord>(current_parent_ref)?;
+        let current_parent = self.read_locked_node(current_parent_ref)?;
         self.validate_owner(&current_parent)?;
         let has_repaired = current_parent
             .entries()?
@@ -936,9 +1026,7 @@ impl ExtentMutation {
                 )?;
             }
             ExtentMutationOperation::NodeRewrite => {
-                let repaired_child = self
-                    .pool
-                    .read_authoritative_metadata_boxed::<ExtentNodeRecord>(pending.old_child)?;
+                let repaired_child = self.read_locked_node(pending.old_child)?;
                 if repaired_child
                     .entries()?
                     .first()
@@ -981,18 +1069,14 @@ impl ExtentMutation {
             return_errno_with_message!(Errno::ESTALE, "pending root split cannot be completed");
         }
 
-        let new_root = self
-            .pool
-            .read_authoritative_metadata_boxed::<ExtentNodeRecord>(record.new_parent())?;
+        let new_root = self.read_locked_node(record.new_parent())?;
         self.validate_owner(&new_root)?;
         let root_reuses_old = new_root
             .entries()?
             .iter()
             .any(|entry| entry.child_ref() == Some(record.old_child()));
         if root_reuses_old {
-            let old_root = self
-                .pool
-                .read_authoritative_metadata_boxed::<ExtentNodeRecord>(record.old_child())?;
+            let old_root = self.read_locked_node(record.old_child())?;
             self.validate_owner(&old_root)?;
             let split = record.split_logical_block();
             let already_repaired = old_root.right_sibling() == record.new_child()
@@ -1164,9 +1248,7 @@ impl ExtentMutation {
         current_root: PersistentObjectRef,
         fault: Option<FaultPoint>,
     ) -> Result<PersistentObjectRef> {
-        let root = self
-            .pool
-            .read_authoritative_metadata_boxed::<ExtentNodeRecord>(current_root)?;
+        let root = self.read_locked_node(current_root)?;
         self.validate_owner(&root)?;
         if root.entries()?.len() <= EXTENT_NODE_ENTRY_CAPACITY - 2 {
             return Ok(current_root);
@@ -1183,9 +1265,7 @@ impl ExtentMutation {
         let mut current = root;
         let mut parent: Option<(PersistentObjectRef, usize)> = None;
         loop {
-            let node = self
-                .pool
-                .read_authoritative_metadata_boxed::<ExtentNodeRecord>(current)?;
+            let node = self.read_locked_node(current)?;
             self.validate_owner(&node)?;
             if node.level() == 0 {
                 let mut entries = Vec::from(node.entries()?);
@@ -1208,9 +1288,7 @@ impl ExtentMutation {
             let mut child_ref = entries[child_index]
                 .child_ref()
                 .ok_or_else(|| Error::new(Errno::EUCLEAN))?;
-            let child = self
-                .pool
-                .read_authoritative_metadata_boxed::<ExtentNodeRecord>(child_ref)?;
+            let child = self.read_locked_node(child_ref)?;
             self.validate_owner(&child)?;
 
             if child.entries()?.len() > EXTENT_NODE_ENTRY_CAPACITY - 2 {
@@ -1431,9 +1509,7 @@ impl ExtentMutation {
             .map(ExtentRecordEntry::logical_block)
             .ok_or_else(|| Error::new(Errno::EUCLEAN))?;
         let repaired_parent = if let Some((parent_ref, child_index)) = parent {
-            let parent_record = self
-                .pool
-                .read_authoritative_metadata_boxed::<ExtentNodeRecord>(parent_ref)?;
+            let parent_record = self.read_locked_node(parent_ref)?;
             self.validate_owner(&parent_record)?;
             let mut parent_entries = Vec::from(parent_record.entries()?);
             let routed = parent_entries
@@ -1744,9 +1820,7 @@ impl ExtentMutation {
         target: PersistentObjectRef,
         expected: &ExtentNodeRecord,
     ) -> Result<()> {
-        let actual = self
-            .pool
-            .read_authoritative_metadata_boxed::<ExtentNodeRecord>(target)?;
+        let actual = self.read_locked_node(target)?;
         if actual.as_bytes() != expected.as_bytes() {
             return_errno_with_message!(Errno::EUCLEAN, "extent repair did not persist");
         }
@@ -1760,9 +1834,7 @@ impl ExtentMutation {
         new_child_ref: PersistentObjectRef,
         split: u64,
     ) -> Result<()> {
-        let parent = self
-            .pool
-            .read_authoritative_metadata_boxed::<ExtentNodeRecord>(parent_ref)?;
+        let parent = self.read_locked_node(parent_ref)?;
         self.validate_split_parent_topology(&parent, old_child_ref, new_child_ref, split)
     }
 
@@ -1775,6 +1847,10 @@ impl ExtentMutation {
         reference: PersistentObjectRef,
         fault: Option<FaultPoint>,
     ) -> Result<()> {
+        // Recovery can release a temporary repair image that was inspected above.
+        self.node_guards
+            .borrow_mut()
+            .retain(|(current, _)| *current != reference);
         let slot = reference
             .slot()
             .and_then(|slot| usize::try_from(slot).ok())
@@ -1790,9 +1866,7 @@ impl ExtentMutation {
         fault: Option<FaultPoint>,
     ) -> Result<InitializedExtentNode> {
         let old_root_ref = split.old_child;
-        let old_root = self
-            .pool
-            .read_authoritative_metadata_boxed::<ExtentNodeRecord>(old_root_ref)?;
+        let old_root = self.read_locked_node(old_root_ref)?;
         self.validate_owner(&old_root)?;
         if old_root.level() != 0 || !old_root.parent().is_none() {
             return_errno_with_message!(Errno::EINVAL, "root growth requires a root leaf");
@@ -1888,19 +1962,13 @@ impl ExtentMutation {
         split: MaterializedNodeSplit,
         fault: Option<FaultPoint>,
     ) -> Result<InitializedExtentNode> {
-        let old_root = self
-            .pool
-            .read_authoritative_metadata_boxed::<ExtentNodeRecord>(old_root_ref)?;
+        let old_root = self.read_locked_node(old_root_ref)?;
         self.validate_owner(&old_root)?;
         if !old_root.parent().is_none() {
             return_errno_with_message!(Errno::EINVAL, "root split references a non-root node");
         }
-        let left = self
-            .pool
-            .read_authoritative_metadata_boxed::<ExtentNodeRecord>(split.left.reference)?;
-        let right = self
-            .pool
-            .read_authoritative_metadata_boxed::<ExtentNodeRecord>(split.right.reference)?;
+        let left = self.read_locked_node(split.left.reference)?;
+        let right = self.read_locked_node(split.right.reference)?;
         let root_level = left
             .level()
             .checked_add(1)
@@ -1969,9 +2037,7 @@ impl ExtentMutation {
         replacement: ExtentRecordEntry,
         fault: Option<FaultPoint>,
     ) -> Result<TreeExtentUpdate> {
-        let node = self
-            .pool
-            .read_authoritative_metadata_boxed::<ExtentNodeRecord>(current)?;
+        let node = self.read_locked_node(current)?;
         self.validate_owner(&node)?;
         if node.level() == 0 {
             return self.replace_one_leaf_extent(current, node, replacement, fault);
@@ -2054,9 +2120,7 @@ impl ExtentMutation {
         split: LeafSplit,
         fault: Option<FaultPoint>,
     ) -> Result<TreeExtentUpdate> {
-        let old_child = self
-            .pool
-            .read_authoritative_metadata_boxed::<ExtentNodeRecord>(split.old_child)?;
+        let old_child = self.read_locked_node(split.old_child)?;
         let child_key = self.transient_metadata_key(split.old_child)?;
         let right = ExtentNodeRecord::new(
             self.fs_id,
@@ -2120,9 +2184,7 @@ impl ExtentMutation {
         child: InitializedExtentNode,
         fault: Option<FaultPoint>,
     ) -> Result<TreeExtentUpdate> {
-        let child_node = self
-            .pool
-            .read_authoritative_metadata_boxed::<ExtentNodeRecord>(child.reference)?;
+        let child_node = self.read_locked_node(child.reference)?;
         let child_boundary = child_node
             .entries()?
             .first()
@@ -2160,9 +2222,7 @@ impl ExtentMutation {
         split: LeafSplit,
         fault: Option<FaultPoint>,
     ) -> Result<MaterializedNodeSplit> {
-        let old_leaf = self
-            .pool
-            .read_authoritative_metadata_boxed::<ExtentNodeRecord>(split.old_child)?;
+        let old_leaf = self.read_locked_node(split.old_child)?;
         self.validate_owner(&old_leaf)?;
         if old_leaf.level() != 0 {
             return_errno_with_message!(Errno::EINVAL, "leaf split references an index node");
@@ -2215,9 +2275,7 @@ impl ExtentMutation {
         split: MaterializedNodeSplit,
         fault: Option<FaultPoint>,
     ) -> Result<TreeExtentUpdate> {
-        let left = self
-            .pool
-            .read_authoritative_metadata_boxed::<ExtentNodeRecord>(split.left.reference)?;
+        let left = self.read_locked_node(split.left.reference)?;
         let left_boundary = left
             .entries()?
             .first()
@@ -2392,8 +2450,7 @@ impl ExtentMutation {
         {
             return_errno_with_message!(Errno::ESTALE, "inode extent root was replaced");
         }
-        self.pool
-            .read_authoritative_metadata_boxed::<ExtentNodeRecord>(replacement.reference)?;
+        self.read_locked_node(replacement.reference)?;
         let updated = inode.with_extent_root(
             inode
                 .header()
@@ -2457,8 +2514,7 @@ impl ExtentMutation {
         {
             return_errno_with_message!(Errno::ESTALE, "inode extent root was replaced");
         }
-        self.pool
-            .read_authoritative_metadata_boxed::<ExtentNodeRecord>(replacement.reference)?;
+        self.read_locked_node(replacement.reference)?;
         let updated = inode.with_extent_root_and_size(
             generation,
             replacement.reference,
@@ -2473,9 +2529,7 @@ impl ExtentMutation {
         &self,
         reference: PersistentObjectRef,
     ) -> Result<InitializedExtentNode> {
-        let node = self
-            .pool
-            .read_authoritative_metadata_boxed::<ExtentNodeRecord>(reference)?;
+        let node = self.read_locked_node(reference)?;
         self.validate_owner(&node)?;
         Ok(InitializedExtentNode {
             reference,
@@ -2506,9 +2560,7 @@ impl ExtentMutation {
         &self,
         reference: PersistentObjectRef,
     ) -> Result<BoxedMetadataRecord<ExtentNodeRecord>> {
-        let leaf = self
-            .pool
-            .read_authoritative_metadata_boxed::<ExtentNodeRecord>(reference)?;
+        let leaf = self.read_locked_node(reference)?;
         self.validate_owner(&leaf)?;
         if leaf.level() != 0 {
             return_errno_with_message!(Errno::EINVAL, "local extent mutation requires a leaf");
@@ -2549,9 +2601,7 @@ impl ExtentMutation {
     }
 
     fn refresh_leaf_reverse(&self, leaf_ref: PersistentObjectRef) -> Result<()> {
-        let leaf = self
-            .pool
-            .read_authoritative_metadata_boxed::<ExtentNodeRecord>(leaf_ref)?;
+        let leaf = self.read_locked_node(leaf_ref)?;
         if leaf.level() != 0 {
             return Ok(());
         }

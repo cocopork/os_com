@@ -49,6 +49,8 @@ static DATA_PAGE_LEASE_WAITERS: WaitQueue = WaitQueue::new();
 static METADATA_PIN_EPOCH: AtomicU64 = AtomicU64::new(0);
 static METADATA_PIN_WAITERS: WaitQueue = WaitQueue::new();
 
+mod pcache;
+pub(crate) use pcache::{PersistentDataRef, PersistentFrameUpdate};
 mod object_table;
 use object_table::ObjectTable;
 mod publication;
@@ -164,6 +166,62 @@ pub(crate) struct PublicationGuard {
     role: PublicationRole,
 }
 
+/// Owns semantic read-modify-persist access to one committed metadata slot.
+///
+/// This is deliberately separate from pins and `persisting`: it serializes a
+/// logical metadata mutation across the caller's read and subsequent durable
+/// update, while the latter still takes its short-lived exclusive pin.
+pub(crate) struct MetadataMutationGuard {
+    pool: Arc<Rnvpc>,
+    reference: PersistentObjectRef,
+    fs_id: u64,
+    inode: u64,
+}
+
+impl MetadataMutationGuard {
+    pub(crate) fn matches(
+        &self,
+        pool: &Arc<Rnvpc>,
+        reference: PersistentObjectRef,
+        fs_id: u64,
+        inode: u64,
+    ) -> bool {
+        Arc::ptr_eq(&self.pool, pool)
+            && self.reference == reference
+            && self.fs_id == fs_id
+            && self.inode == inode
+    }
+}
+
+impl Debug for MetadataMutationGuard {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MetadataMutationGuard")
+            .field("reference", &self.reference)
+            .field("fs_id", &self.fs_id)
+            .field("inode", &self.inode)
+            .finish()
+    }
+}
+
+impl Drop for MetadataMutationGuard {
+    fn drop(&mut self) {
+        let Some(slot) = self
+            .reference
+            .slot()
+            .and_then(|slot| usize::try_from(slot).ok())
+        else {
+            return;
+        };
+        if let Err(error) = self
+            .pool
+            .objects
+            .release_metadata_mutation(slot, self.reference.allocation_seq())
+        {
+            error!("RNVPC metadata mutation guard release failed: {:?}", error);
+        }
+    }
+}
+
 impl PublicationGuard {
     pub(super) fn matches(&self, pool: &Arc<Rnvpc>, fs_id: u64, inode: u64) -> bool {
         Arc::ptr_eq(&self.pool, pool) && self.fs_id == fs_id && self.inode == inode
@@ -189,6 +247,65 @@ impl Drop for PublicationGuard {
 }
 
 pub(crate) const FIXED_INODE_LOGICAL_INDEX: u64 = (1 << 61) | 3;
+
+const PENDING_EXTENT_INDEX_SHARDS: usize = 64;
+
+/// Volatile, inode-sharded directory of durably pending extent mutations.
+///
+/// Entries carry the allocation sequence so clearing or reusing a slot cannot
+/// erase a newer pending mark. Recovery reconstructs this directory before it
+/// begins pending-mutation reconciliation.
+struct PendingExtentIndex {
+    shards: [Mutex<BTreeMap<(u64, u64), PersistentObjectRef>>; PENDING_EXTENT_INDEX_SHARDS],
+}
+
+impl PendingExtentIndex {
+    const fn new() -> Self {
+        Self {
+            shards: [const { Mutex::new(BTreeMap::new()) }; PENDING_EXTENT_INDEX_SHARDS],
+        }
+    }
+
+    fn shard(&self, fs_id: u64, inode: u64) -> &Mutex<BTreeMap<(u64, u64), PersistentObjectRef>> {
+        &self.shards[Self::shard_index(fs_id, inode)]
+    }
+
+    fn shard_index(fs_id: u64, inode: u64) -> usize {
+        let hash =
+            fs_id.wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ inode.wrapping_mul(0xc2b2_ae3d_27d4_eb4f);
+        (hash as usize) % PENDING_EXTENT_INDEX_SHARDS
+    }
+
+    fn replace(&self, key: PageKey, reference: PersistentObjectRef) -> Option<PersistentObjectRef> {
+        self.shard(key.fs_id, key.inode)
+            .lock()
+            .insert((key.fs_id, key.inode), reference)
+    }
+
+    fn restore_if_current(
+        &self,
+        key: PageKey,
+        current: PersistentObjectRef,
+        previous: Option<PersistentObjectRef>,
+    ) {
+        let mut entries = self.shard(key.fs_id, key.inode).lock();
+        if entries.get(&(key.fs_id, key.inode)) != Some(&current) {
+            return;
+        }
+        if let Some(previous) = previous {
+            entries.insert((key.fs_id, key.inode), previous);
+        } else {
+            entries.remove(&(key.fs_id, key.inode));
+        }
+    }
+
+    fn remove_if_current(&self, key: PageKey, reference: PersistentObjectRef) {
+        let mut entries = self.shard(key.fs_id, key.inode).lock();
+        if entries.get(&(key.fs_id, key.inode)) == Some(&reference) {
+            entries.remove(&(key.fs_id, key.inode));
+        }
+    }
+}
 
 struct AllocationState {
     free_ids: Vec<usize>,
@@ -227,6 +344,9 @@ pub(crate) struct Rnvpc {
     // Cleared repair images remain allocated here to avoid hot-path frame churn.
     // This mutex is independent from the global pool control state.
     repair_workspace: Mutex<RepairWorkspace>,
+    // Completion checks this inode-sharded directory instead of `state`.
+    pending_extent_index: PendingExtentIndex,
+    recovered_pcache: Mutex<Option<recover::RecoveredPcacheCatalog>>,
     objects: ObjectTable,
     // Diagnostic total only. Admission/freeing uses the slot-protected pins.
     pinned_frames: AtomicUsize,
@@ -324,6 +444,8 @@ impl Rnvpc {
             pinned_frames: AtomicUsize::new(0),
             publication_contexts: Mutex::new(BTreeMap::new()),
             repair_workspace: Mutex::new(RepairWorkspace::new(config.meta_reserve_pages())),
+            pending_extent_index: PendingExtentIndex::new(),
+            recovered_pcache: Mutex::new(None),
             allocation: SpinLock::new(AllocationState {
                 free_ids,
                 next_alloc_seq: 1,
@@ -440,6 +562,7 @@ impl Rnvpc {
                     .ok_or_else(|| Error::new(Errno::EOVERFLOW))?;
             }
         }
+        pool.rebuild_pending_extent_index();
         recovery_profile.runtime_rebuild_ns = recovery_elapsed_ns(profile, rebuild_start);
         pool.persist = persist;
         let pool = Arc::new(pool);
@@ -1475,7 +1598,6 @@ impl Rnvpc {
     }
 
     /// 某 `(fs_id, inode)` 下所有已提交数据页：`(page_index, slot)`。
-    #[cfg(ktest)]
     pub(crate) fn committed_data_pages_of(&self, fs_id: u64, inode: u64) -> Vec<(u64, NvPageId)> {
         self.objects.collect(|index, record| {
             let key = record.key?;
@@ -1607,6 +1729,8 @@ impl Rnvpc {
         objects.records[frame.index()].persisting = false;
         self.account_unpin();
         if result.is_err() {
+            drop(objects);
+            note_metadata_pin_change();
             return result;
         }
 
@@ -1615,6 +1739,7 @@ impl Rnvpc {
         objects.records[frame.index()].key = None;
         objects.records[frame.index()].version = 0;
         drop(objects);
+        note_metadata_pin_change();
 
         if indexed {
             if let Some(key) = key {
@@ -1622,6 +1747,8 @@ impl Rnvpc {
                 if state.metadata_index.get(&key) == Some(&frame.index()) {
                     state.metadata_index.remove(&key);
                 }
+                drop(state);
+                self.remove_pending_extent_index(key, reference);
             }
         }
         self.recycle_repair_frame(frame)
@@ -1669,23 +1796,56 @@ impl Rnvpc {
     where
         T: PersistentMetadataRecord,
     {
+        self.decode_metadata_pin(
+            self.pin_persistent_metadata(self.persistent_metadata_ref(frame)?)?,
+        )
+    }
+
+    fn pin_persistent_metadata(
+        self: &Arc<Self>,
+        reference: PersistentObjectRef,
+    ) -> Result<PinnedFrame> {
+        let slot = Self::metadata_mutation_slot(reference)?;
+        let frame = NvFrameId::try_from(slot)?;
+        loop {
+            let observed = METADATA_PIN_EPOCH.load(Ordering::Acquire);
+            {
+                let mut state = self.objects.lock_checked(slot)?;
+                let record = &state.records[slot];
+                if record.kind != ObjectKind::Metadata
+                    || !record.committed
+                    || record.alloc_seq != reference.allocation_seq()
+                {
+                    return_errno_with_message!(
+                        Errno::ESTALE,
+                        "persistent metadata was cleared or reused"
+                    );
+                }
+                if !record.persisting {
+                    let pins = record
+                        .pins
+                        .checked_add(1)
+                        .ok_or_else(|| Error::new(Errno::EOVERFLOW))?;
+                    self.account_pin()?;
+                    state.records[slot].pins = pins;
+                    return Ok(PinnedFrame {
+                        pool: self.clone(),
+                        id: frame,
+                    });
+                }
+            }
+            METADATA_PIN_WAITERS.wait_until(|| {
+                (METADATA_PIN_EPOCH.load(Ordering::Acquire) != observed).then_some(())
+            });
+        }
+    }
+
+    fn decode_metadata_pin<T>(&self, pin: PinnedFrame) -> Result<T>
+    where
+        T: PersistentMetadataRecord,
+    {
         if size_of::<T>() > PAGE_SIZE {
             return_errno_with_message!(Errno::E2BIG, "persistent metadata record exceeds one NVBH");
-        }
-
-        let pin = self.pin_frame(frame)?;
-        let is_committed = {
-            let state = self.objects.lock_checked(frame.index())?;
-            state
-                .records
-                .get(frame.index())
-                .is_some_and(|record| record.kind == ObjectKind::Metadata && record.committed)
-        };
-        if !is_committed {
-            return_errno_with_message!(
-                Errno::EINVAL,
-                "persistent metadata record is not committed"
-            );
         }
 
         let mut page = [0u8; PAGE_SIZE];
@@ -1700,23 +1860,17 @@ impl Rnvpc {
     where
         T: PersistentMetadataRecord,
     {
+        self.decode_metadata_pin_boxed(
+            self.pin_persistent_metadata(self.persistent_metadata_ref(frame)?)?,
+        )
+    }
+
+    fn decode_metadata_pin_boxed<T>(&self, pin: PinnedFrame) -> Result<BoxedMetadataRecord<T>>
+    where
+        T: PersistentMetadataRecord,
+    {
         if size_of::<T>() > PAGE_SIZE {
             return_errno_with_message!(Errno::E2BIG, "persistent metadata record exceeds one NVBH");
-        }
-
-        let pin = self.pin_frame(frame)?;
-        let is_committed = {
-            let state = self.objects.lock_checked(frame.index())?;
-            state
-                .records
-                .get(frame.index())
-                .is_some_and(|record| record.kind == ObjectKind::Metadata && record.committed)
-        };
-        if !is_committed {
-            return_errno_with_message!(
-                Errno::EINVAL,
-                "persistent metadata record is not committed"
-            );
         }
 
         let mut bytes = vec![0u8; PAGE_SIZE].into_boxed_slice();
@@ -1978,6 +2132,10 @@ impl Rnvpc {
 
     fn extent_references_data(self: &Arc<Self>, target: PersistentObjectRef) -> Result<bool> {
         for reference in self.committed_metadata_refs() {
+            let key = self.persistent_metadata_key(reference)?;
+            if super::pcache_store::typed_object_type(key.page_index).is_some() {
+                continue;
+            }
             if self.persistent_metadata_kind(reference)? != PersistentMetadataKind::ExtentNode {
                 continue;
             }
@@ -2011,6 +2169,120 @@ impl Rnvpc {
         self.free_frame(frame)
     }
 
+    /// Returns an inode's pending-mutation mark without acquiring `pool.state`.
+    pub(crate) fn current_metadata_ref_for_completion(
+        &self,
+        key: PageKey,
+    ) -> Option<PersistentObjectRef> {
+        if key.page_index != super::metadata::PENDING_EXTENT_MUTATION_LOGICAL_INDEX {
+            return self.current_metadata_ref(key);
+        }
+        let started = read_ns();
+        let entries = self.pending_extent_index.shard(key.fs_id, key.inode).lock();
+        let acquired = read_ns();
+        let result = entries.get(&(key.fs_id, key.inode)).copied();
+        let held = read_ns().saturating_sub(acquired);
+        drop(entries);
+        if LATENCY_ENABLED {
+            // Retain the established labels so pre/post optimization traces compare directly.
+            LATENCY_STATS
+                .leaf_pending_index_wait
+                .record_ns(acquired.saturating_sub(started));
+            LATENCY_STATS.leaf_pending_index_hold.record_ns(held);
+        }
+        let reference = result?;
+        let slot = Self::metadata_mutation_slot(reference).ok()?;
+        let started = read_ns();
+        let objects = self.objects.lock_checked(slot).ok()?;
+        let waited = read_ns().saturating_sub(started);
+        let record = &objects.records[slot];
+        // A clear may have invalidated the descriptor before removing its directory
+        // entry. Preserve the old lookup's committed-generation admission rule.
+        let valid = record.kind == ObjectKind::Metadata
+            && record.committed
+            && record.key == Some(key)
+            && record.alloc_seq == reference.allocation_seq();
+        drop(objects);
+        LATENCY_STATS.leaf_pending_slot_wait.record_ns(waited);
+        valid.then_some(reference)
+    }
+
+    fn install_pending_extent_index(
+        &self,
+        key: PageKey,
+        reference: PersistentObjectRef,
+    ) -> Option<PersistentObjectRef> {
+        debug_assert_eq!(
+            key.page_index,
+            super::metadata::PENDING_EXTENT_MUTATION_LOGICAL_INDEX
+        );
+        self.pending_extent_index.replace(key, reference)
+    }
+
+    fn restore_pending_extent_index(
+        &self,
+        key: PageKey,
+        current: PersistentObjectRef,
+        previous: Option<PersistentObjectRef>,
+    ) {
+        self.pending_extent_index
+            .restore_if_current(key, current, previous);
+    }
+
+    fn remove_pending_extent_index(&self, key: PageKey, reference: PersistentObjectRef) {
+        if key.page_index == super::metadata::PENDING_EXTENT_MUTATION_LOGICAL_INDEX {
+            self.pending_extent_index.remove_if_current(key, reference);
+        }
+    }
+
+    fn rebuild_pending_extent_index(&self) {
+        let pending = {
+            let state = self.state.lock();
+            state
+                .metadata_index
+                .iter()
+                .filter(|(key, _)| {
+                    key.page_index == super::metadata::PENDING_EXTENT_MUTATION_LOGICAL_INDEX
+                })
+                .filter_map(|(key, index)| {
+                    let record = self.objects.get(*index)?;
+                    (record.kind == ObjectKind::Metadata
+                        && record.committed
+                        && record.key == Some(*key))
+                    .then(|| PersistentObjectRef::new(*index as u64, record.alloc_seq).ok())
+                    .flatten()
+                    .map(|reference| (*key, reference))
+                })
+                .collect::<Vec<_>>()
+        };
+        for (key, reference) in pending {
+            self.install_pending_extent_index(key, reference);
+        }
+    }
+
+    #[cfg(ktest)]
+    pub(super) fn pending_extent_shard_for_test(&self, fs_id: u64, inode: u64) -> usize {
+        PendingExtentIndex::shard_index(fs_id, inode)
+    }
+
+    #[cfg(ktest)]
+    pub(super) fn install_pending_reference_for_test(
+        &self,
+        key: PageKey,
+        reference: PersistentObjectRef,
+    ) {
+        self.install_pending_extent_index(key, reference);
+    }
+
+    #[cfg(ktest)]
+    pub(super) fn pending_lookup_with_pool_state_held_for_test(
+        &self,
+        key: PageKey,
+    ) -> Option<PersistentObjectRef> {
+        let _state = self.state.lock();
+        self.current_metadata_ref_for_completion(key)
+    }
+
     pub(crate) fn current_metadata_ref(&self, key: PageKey) -> Option<PersistentObjectRef> {
         let profiling = LATENCY_ENABLED
             && key.page_index == super::write_transaction::SPACE_RESERVATION_LOGICAL_INDEX;
@@ -2033,6 +2305,47 @@ impl Rnvpc {
         (record.kind == ObjectKind::Metadata && record.committed && record.key == Some(key))
             .then(|| PersistentObjectRef::new(index as u64, record.alloc_seq).ok())
             .flatten()
+    }
+
+    /// Enumerates fixed roots, including recovered inodes not yet accessed by VFS.
+    /// Refuse changing authority schemes while this pool still owns the filesystem.
+    pub(crate) fn validate_fs_mode(&self, fs_id: u64, uses_wal: Option<bool>) -> Result<()> {
+        for reference in self.committed_metadata_refs() {
+            let key = self.persistent_metadata_key(reference)?;
+            if key.fs_id != fs_id {
+                continue;
+            }
+            let typed = super::pcache_store::typed_object_type(key.page_index).is_some();
+            if uses_wal != Some(typed) {
+                return_errno_with_message!(
+                    Errno::EINVAL,
+                    "filesystem has incompatible persistent NV ownership"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn fixed_inode_ids(self: &Arc<Self>, fs_id: u64) -> Result<Vec<u64>> {
+        let owners: BTreeSet<_> = self
+            .objects
+            .collect(|_, record| {
+                let key = record.key?;
+                (record.committed
+                    && record.kind == ObjectKind::Metadata
+                    && key.fs_id == fs_id
+                    && key.page_index == FIXED_INODE_LOGICAL_INDEX)
+                    .then_some(key.inode)
+            })
+            .into_iter()
+            .collect();
+        let mut ids = Vec::new();
+        for inode in owners {
+            self.fixed_inode_ref(fs_id, inode)?
+                .ok_or_else(|| Error::new(Errno::EUCLEAN))?;
+            ids.push(inode);
+        }
+        Ok(ids)
     }
 
     /// Returns the stable NV identity of an inode's fixed persistent root.
@@ -2239,6 +2552,8 @@ impl Rnvpc {
         state.records[frame.index()].pins = 0;
         state.records[frame.index()].persisting = false;
         self.account_unpin();
+        drop(state);
+        note_metadata_pin_change();
         result.map(|_| current)
     }
 
@@ -2349,6 +2664,8 @@ impl Rnvpc {
         state.records[frame.index()].pins = 0;
         state.records[frame.index()].persisting = false;
         self.account_unpin();
+        drop(state);
+        note_metadata_pin_change();
         result.map(|_| current)
     }
 
@@ -2394,25 +2711,9 @@ impl Rnvpc {
             );
         }
 
-        {
-            let mut state = self.objects.lock_checked(frame.index())?;
-            let object = state
-                .records
-                .get(frame.index())
-                .ok_or_else(|| Error::new(Errno::EINVAL))?;
-            if object.kind != ObjectKind::Metadata
-                || !object.committed
-                || object.alloc_seq != current.allocation_seq()
-            {
-                return_errno_with_message!(Errno::ESTALE, "extent mutation mark was replaced");
-            }
-            if object.pins != 0 || object.persisting {
-                return_errno_with_message!(Errno::EBUSY, "extent mutation mark is busy");
-            }
-            self.account_pin()?;
-            state.records[frame.index()].pins = 1;
-            state.records[frame.index()].persisting = true;
-        }
+        // Completion may inspect another leaf's mark. Close reader admission
+        // and wait for those short reads instead of failing a foreground write.
+        self.begin_exclusive_metadata_update(frame, current.allocation_seq())?;
 
         let result = (|| {
             let mut page = [0u8; PAGE_SIZE];
@@ -2434,6 +2735,8 @@ impl Rnvpc {
         state.records[frame.index()].pins = 0;
         state.records[frame.index()].persisting = false;
         self.account_unpin();
+        drop(state);
+        note_metadata_pin_change();
         result.map(|_| current)
     }
 
@@ -2508,6 +2811,97 @@ impl Rnvpc {
         result.map(|_| target)
     }
 
+    /// Acquires the semantic mutation right for one committed metadata object.
+    ///
+    /// Waiting never holds the slot spin lock. The returned guard keeps the
+    /// same allocation generation reserved until it is dropped.
+    pub(crate) fn lock_metadata_mutation(
+        self: &Arc<Self>,
+        reference: PersistentObjectRef,
+    ) -> Result<MetadataMutationGuard> {
+        let slot = Self::metadata_mutation_slot(reference)?;
+        loop {
+            if let Some(guard) = self.try_claim_metadata_mutation(reference)? {
+                return Ok(guard);
+            }
+            self.objects.wait_for_metadata_mutation_release(slot)?;
+        }
+    }
+
+    /// Attempts to acquire the semantic mutation right without sleeping.
+    pub(crate) fn try_lock_metadata_mutation(
+        self: &Arc<Self>,
+        reference: PersistentObjectRef,
+    ) -> Result<MetadataMutationGuard> {
+        self.try_claim_metadata_mutation(reference)?.ok_or_else(|| {
+            Error::with_message(Errno::EBUSY, "metadata mutation is already in progress")
+        })
+    }
+
+    fn try_claim_metadata_mutation(
+        self: &Arc<Self>,
+        reference: PersistentObjectRef,
+    ) -> Result<Option<MetadataMutationGuard>> {
+        let slot = Self::metadata_mutation_slot(reference)?;
+        let mut state = self.objects.lock_checked(slot)?;
+        if state.metadata_mutation.is_some() {
+            return Ok(None);
+        }
+        let (key, persisting) = {
+            let record = state
+                .records
+                .get(slot)
+                .ok_or_else(|| Error::new(Errno::EINVAL))?;
+            if record.kind != ObjectKind::Metadata
+                || !record.committed
+                || record.alloc_seq != reference.allocation_seq()
+            {
+                return_errno_with_message!(Errno::ESTALE, "stale persistent metadata reference");
+            }
+            (
+                record.key.ok_or_else(|| Error::new(Errno::EIO))?,
+                record.persisting,
+            )
+        };
+        if persisting {
+            return_errno_with_message!(Errno::EBUSY, "metadata persistence is in progress");
+        }
+        state.metadata_mutation = Some(reference.allocation_seq());
+        Ok(Some(MetadataMutationGuard {
+            pool: self.clone(),
+            reference,
+            fs_id: key.fs_id,
+            inode: key.inode,
+        }))
+    }
+
+    fn validate_metadata_mutation_guard(
+        self: &Arc<Self>,
+        guard: &MetadataMutationGuard,
+        current: PersistentObjectRef,
+        key: PageKey,
+    ) -> Result<NvFrameId> {
+        if !guard.matches(self, current, key.fs_id, key.inode) {
+            return_errno_with_message!(Errno::EPERM, "metadata mutation guard does not own object");
+        }
+        let (frame, current_key) = self.metadata_identity(current)?;
+        if current_key != key
+            || !self
+                .objects
+                .metadata_mutation_matches(frame.index(), current.allocation_seq())?
+        {
+            return_errno_with_message!(Errno::ESTALE, "metadata mutation guard is stale");
+        }
+        Ok(frame)
+    }
+
+    fn metadata_mutation_slot(reference: PersistentObjectRef) -> Result<usize> {
+        reference
+            .slot()
+            .ok_or_else(|| Error::new(Errno::EINVAL))
+            .and_then(|slot| usize::try_from(slot).map_err(|_| Error::new(Errno::EINVAL)))
+    }
+
     /// Updates a typed metadata object in its existing NVBH.
     ///
     /// The descriptor, slot, and allocation sequence remain unchanged. The
@@ -2535,13 +2929,71 @@ impl Rnvpc {
                 "metadata update lacks the inode publication right"
             );
         }
+        self.update_authoritative_metadata_in_place_inner(
+            frame,
+            current,
+            record,
+            fault,
+            Some(publication.role),
+        )
+    }
+
+    /// Updates a typed metadata object while holding its semantic mutation
+    /// guard, independent of inode publication ownership.
+    pub(crate) fn update_authoritative_metadata_with_guard<T>(
+        self: &Arc<Self>,
+        guard: &MetadataMutationGuard,
+        current: PersistentObjectRef,
+        record: &T,
+        fault: Option<FaultPoint>,
+    ) -> Result<PersistentObjectRef>
+    where
+        T: AuthoritativeMetadataRecord,
+    {
+        let profile_leaf = LATENCY_ENABLED
+            && matches!(
+                record.metadata_header().kind(),
+                Ok(PersistentMetadataKind::ExtentNode)
+            );
+        let started = read_ns();
+        record.validate_record()?;
+        let (_, key) = self.metadata_identity(current)?;
+        Self::validate_metadata_identity(key, record)?;
+        let frame = self.validate_metadata_mutation_guard(guard, current, key)?;
+        if profile_leaf {
+            LATENCY_STATS.leaf_update_validate.record_since(started);
+        }
+        self.update_authoritative_metadata_in_place_inner(frame, current, record, fault, None)
+    }
+
+    fn update_authoritative_metadata_in_place_inner<T>(
+        self: &Arc<Self>,
+        frame: NvFrameId,
+        current: PersistentObjectRef,
+        record: &T,
+        fault: Option<FaultPoint>,
+        publication_role: Option<PublicationRole>,
+    ) -> Result<PersistentObjectRef>
+    where
+        T: AuthoritativeMetadataRecord,
+    {
+        // Guarded extent-node updates are completion's leaf path; foreground uses publication.
+        let profile_leaf = LATENCY_ENABLED
+            && publication_role.is_none()
+            && matches!(
+                record.metadata_header().kind(),
+                Ok(PersistentMetadataKind::ExtentNode)
+            );
         if size_of::<T>() > PAGE_SIZE {
             return_errno_with_message!(Errno::E2BIG, "persistent metadata record exceeds one NVBH");
         }
 
         let started = read_ns();
         self.begin_exclusive_metadata_update(frame, current.allocation_seq())?;
-        if LATENCY_ENABLED && publication.role == PublicationRole::Completion {
+        if profile_leaf {
+            LATENCY_STATS.leaf_update_exclusive.record_since(started);
+        }
+        if LATENCY_ENABLED && publication_role == Some(PublicationRole::Completion) {
             if matches!(
                 record.metadata_header().kind(),
                 Ok(PersistentMetadataKind::SpaceReservation)
@@ -2557,24 +3009,48 @@ impl Rnvpc {
             }
         }
 
+        let started = read_ns();
         let mut old_page = vec![0u8; PAGE_SIZE].into_boxed_slice();
         let mut new_page = vec![0u8; PAGE_SIZE].into_boxed_slice();
+        if profile_leaf {
+            LATENCY_STATS.leaf_update_buffers.record_since(started);
+        }
         let mut old_page_loaded = false;
         let mut content_persisted = false;
         let result = (|| {
+            let started = read_ns();
             self.backend.read_page(self.page_id(frame), &mut old_page)?;
+            if profile_leaf {
+                LATENCY_STATS.leaf_update_old_read.record_since(started);
+            }
             old_page_loaded = true;
+            let started = read_ns();
             let old_record = T::ref_from_bytes(&old_page[..size_of::<T>()])
                 .map_err(|_| Error::new(Errno::EUCLEAN))?;
             old_record.validate_record()?;
             if record.metadata_header().generation() <= old_record.metadata_header().generation() {
                 return_errno_with_message!(Errno::ESTALE, "metadata generation did not advance");
             }
+            if profile_leaf {
+                LATENCY_STATS.leaf_update_old_validate.record_since(started);
+            }
+            let started = read_ns();
             new_page[..size_of::<T>()].copy_from_slice(record.as_bytes());
+            if profile_leaf {
+                LATENCY_STATS.leaf_update_copy.record_since(started);
+            }
             inject(fault, FaultPoint::BeforeContentPersist)?;
+            let started = read_ns();
             self.backend.write_page(self.page_id(frame), &new_page)?;
+            if profile_leaf {
+                LATENCY_STATS.leaf_update_write.record_since(started);
+            }
+            let started = read_ns();
             self.backend.persist(frame.index() * PAGE_SIZE, PAGE_SIZE)?;
             self.backend.fence()?;
+            if profile_leaf {
+                LATENCY_STATS.leaf_update_persist.record_since(started);
+            }
             content_persisted = true;
             inject(fault, FaultPoint::AfterContentPersist)
         })();
@@ -2582,6 +3058,7 @@ impl Rnvpc {
         if result.is_err() && old_page_loaded && !content_persisted {
             let _ = self.backend.write_page(self.page_id(frame), &old_page);
         }
+        let started = read_ns();
         let mut state = self.objects.lock(frame.index());
         state.records[frame.index()].pins -= 1;
         state.records[frame.index()].persisting = false;
@@ -2590,7 +3067,14 @@ impl Rnvpc {
         }
         self.account_unpin();
         drop(state);
+        if profile_leaf {
+            LATENCY_STATS.leaf_update_finalize.record_since(started);
+        }
+        let started = read_ns();
         note_metadata_pin_change();
+        if profile_leaf {
+            LATENCY_STATS.leaf_update_notify.record_since(started);
+        }
         result.map(|_| current)
     }
 
@@ -2601,13 +3085,7 @@ impl Rnvpc {
     where
         T: PersistentMetadataRecord,
     {
-        let slot = reference.slot().ok_or_else(|| Error::new(Errno::EINVAL))?;
-        let slot = usize::try_from(slot).map_err(|_| Error::new(Errno::EINVAL))?;
-        let frame = NvFrameId::try_from(slot).map_err(|_| Error::new(Errno::EINVAL))?;
-        if self.persistent_metadata_ref(frame)? != reference {
-            return_errno_with_message!(Errno::EINVAL, "stale persistent metadata reference");
-        }
-        self.read_metadata_record(frame)
+        self.decode_metadata_pin(self.pin_persistent_metadata(reference)?)
     }
 
     /// Persists the first version of an authoritative EXT4 metadata object and
@@ -2652,8 +3130,7 @@ impl Rnvpc {
     where
         T: AuthoritativeMetadataRecord,
     {
-        let (frame, _) = self.metadata_identity(reference)?;
-        self.read_metadata_record(frame)
+        self.decode_metadata_pin(self.pin_persistent_metadata(reference)?)
     }
 
     pub(crate) fn read_authoritative_metadata_boxed<T>(
@@ -2663,8 +3140,7 @@ impl Rnvpc {
     where
         T: AuthoritativeMetadataRecord,
     {
-        let (frame, _) = self.metadata_identity(reference)?;
-        self.read_metadata_record_boxed(frame)
+        self.decode_metadata_pin_boxed(self.pin_persistent_metadata(reference)?)
     }
 
     fn validate_metadata_identity<T>(key: PageKey, record: &T) -> Result<()>
@@ -2782,8 +3258,24 @@ impl Rnvpc {
         replace: bool,
         expected_old: Option<PersistentObjectRef>,
     ) -> Result<Option<NvFrameId>> {
+        let pending = (key.page_index == super::metadata::PENDING_EXTENT_MUTATION_LOGICAL_INDEX)
+            .then(|| {
+                self.frame_seq(id)
+                    .and_then(|sequence| PersistentObjectRef::new(id.index() as u64, sequence).ok())
+                    .ok_or_else(|| Error::new(Errno::EINVAL))
+            })
+            .transpose()?
+            .map(|reference| (reference, self.install_pending_extent_index(key, reference)));
         let (version, old) =
-            self.begin_commit(id.index(), ObjectKind::Metadata, key, replace, expected_old)?;
+            match self.begin_commit(id.index(), ObjectKind::Metadata, key, replace, expected_old) {
+                Ok(committed) => committed,
+                Err(error) => {
+                    if let Some((reference, previous)) = pending {
+                        self.restore_pending_extent_index(key, reference, previous);
+                    }
+                    return Err(error);
+                }
+            };
         let descriptor =
             self.descriptor_for(PoolClass::Metadata, key, version, id.index(), None)?;
         let result = self.persist.commit_frame(id.index(), &descriptor, fault);
@@ -2993,7 +3485,7 @@ impl Rnvpc {
         if !record.committed {
             return_errno_with_message!(Errno::EINVAL, "RNVPC frame is not committed");
         }
-        if record.pins != 0 || record.persisting {
+        if record.pins != 0 || record.persisting || state.metadata_mutation.is_some() {
             return_errno_with_message!(Errno::EBUSY, "RNVPC frame is pinned");
         }
         self.account_pin()?;
@@ -3105,8 +3597,11 @@ impl Rnvpc {
         objects.records[index].pins -= 1;
         objects.records[index].persisting = false;
         self.account_unpin();
-        if result.is_ok() {
-            if let Some(key) = objects.records[index].key {
+        let cleared = if result.is_ok() {
+            let key = objects.records[index].key;
+            let reference =
+                PersistentObjectRef::new(index as u64, objects.records[index].alloc_seq).ok();
+            if let Some(key) = key {
                 if matches!(objects.records[index].kind, ObjectKind::Data(_)) {
                     state.index.remove(key);
                 } else if state.metadata_index.get(&key) == Some(&index) {
@@ -3119,6 +3614,17 @@ impl Rnvpc {
             if let Some(next) = next {
                 objects.records[index].kind = next;
             }
+            key.zip(reference)
+        } else {
+            None
+        };
+        drop(objects);
+        drop(state);
+        if let Some((key, reference)) = cleared {
+            self.remove_pending_extent_index(key, reference);
+        }
+        if expected == ObjectKind::Metadata {
+            note_metadata_pin_change();
         }
         result
     }
@@ -3189,6 +3695,7 @@ impl Rnvpc {
             .checked_add(1)
             .ok_or_else(|| Error::new(Errno::EOVERFLOW))?;
         let mut objects = self.objects.lock_checked(frame.index())?;
+        let metadata_mutating = objects.metadata_mutation.is_some();
         let record = objects
             .records
             .get(frame.index())
@@ -3197,6 +3704,7 @@ impl Rnvpc {
             || record.committed
             || record.pins != 0
             || record.persisting
+            || metadata_mutating
         {
             return_errno_with_message!(Errno::EBUSY, "cached repair frame is not reusable");
         }
@@ -3212,6 +3720,7 @@ impl Rnvpc {
     fn recycle_repair_frame(&self, frame: NvFrameId) -> Result<()> {
         {
             let objects = self.objects.lock_checked(frame.index())?;
+            let metadata_mutating = objects.metadata_mutation.is_some();
             let record = objects
                 .records
                 .get(frame.index())
@@ -3220,6 +3729,7 @@ impl Rnvpc {
                 || record.committed
                 || record.pins != 0
                 || record.persisting
+                || metadata_mutating
             {
                 return_errno_with_message!(Errno::EBUSY, "repair frame is not clear for reuse");
             }
@@ -3236,6 +3746,7 @@ impl Rnvpc {
         if objects.records[index].committed {
             return_errno_with_message!(Errno::EBUSY, "RNVPC frame is still committed");
         }
+        let metadata_mutating = objects.metadata_mutation.is_some();
         let record = objects
             .records
             .get_mut(index)
@@ -3253,7 +3764,7 @@ impl Rnvpc {
         if record.kind != expected {
             return_errno_with_message!(Errno::EINVAL, "RNVPC frame is not allocated");
         }
-        if record.pins != 0 || record.persisting {
+        if record.pins != 0 || record.persisting || metadata_mutating {
             return_errno_with_message!(Errno::EBUSY, "RNVPC frame is pinned");
         }
         record.kind = ObjectKind::Free;
@@ -3285,6 +3796,13 @@ impl Rnvpc {
         };
         if old.is_some() && !replace {
             return_errno_with_message!(Errno::EBUSY, "RNVPC home already has a committed version");
+        }
+        if matches!(expected, ObjectKind::Metadata)
+            && old.is_some_and(|(old_index, _)| {
+                self.objects.lock(old_index).metadata_mutation.is_some()
+            })
+        {
+            return_errno_with_message!(Errno::EBUSY, "RNVPC metadata mutation is in progress");
         }
         if let Some(expected_old) = expected_old {
             let expected_index = expected_old
@@ -3353,6 +3871,14 @@ impl Rnvpc {
     }
 
     fn begin_clear(&self, index: usize, expected: ObjectKind) -> Result<()> {
+        if expected == ObjectKind::Metadata {
+            let sequence = self.objects.lock_checked(index)?.records[index].alloc_seq;
+            return self.begin_exclusive_metadata_access(
+                NvFrameId::try_from(index)?,
+                sequence,
+                false,
+            );
+        }
         let mut state = self.objects.lock(index);
         if !state.records[index].committed {
             return_errno_with_message!(Errno::EINVAL, "RNVPC object is not committed");
@@ -3361,9 +3887,21 @@ impl Rnvpc {
     }
 
     fn begin_exclusive_metadata_update(&self, frame: NvFrameId, allocation_seq: u64) -> Result<()> {
+        self.begin_exclusive_metadata_access(frame, allocation_seq, true)
+    }
+
+    fn begin_exclusive_metadata_access(
+        &self,
+        frame: NvFrameId,
+        allocation_seq: u64,
+        allow_mutation: bool,
+    ) -> Result<()> {
         let wait_started = read_ns();
         {
             let mut state = self.objects.lock_checked(frame.index())?;
+            if !allow_mutation && state.metadata_mutation.is_some() {
+                return_errno_with_message!(Errno::EBUSY, "metadata mutation is in progress");
+            }
             let object = state
                 .records
                 .get(frame.index())
@@ -3419,6 +3957,9 @@ impl Rnvpc {
             .ok_or_else(|| Error::new(Errno::EINVAL))?;
         if record.kind != expected {
             return_errno_with_message!(Errno::EINVAL, "RNVPC object has the wrong class");
+        }
+        if expected == ObjectKind::Metadata && state.metadata_mutation.is_some() {
+            return_errno_with_message!(Errno::EBUSY, "RNVPC metadata mutation is in progress");
         }
         if record.persisting {
             return_errno_with_message!(
@@ -3809,6 +4350,13 @@ impl EvictingFrame {
         record.pins = 0;
         record.persisting = false;
         self.pool.account_unpin();
+        let cleared = objects.records[self.id.index()].key.zip(
+            PersistentObjectRef::new(
+                self.id.index() as u64,
+                objects.records[self.id.index()].alloc_seq,
+            )
+            .ok(),
+        );
         if let Some(key) = objects.records[self.id.index()].key
             && state.metadata_index.get(&key) == Some(&self.id.index())
         {
@@ -3817,6 +4365,11 @@ impl EvictingFrame {
         objects.records[self.id.index()].committed = false;
         objects.records[self.id.index()].key = None;
         objects.records[self.id.index()].version = 0;
+        drop(objects);
+        drop(state);
+        if let Some((key, reference)) = cleared {
+            self.pool.remove_pending_extent_index(key, reference);
+        }
         self.active = false;
         Ok(())
     }
@@ -3846,6 +4399,15 @@ pub(crate) struct EvictingDataPage {
 }
 
 impl EvictingDataPage {
+    /// Returns the pinned physical NV page for DMA. The caller retains this
+    /// eviction lease until device completion and process-context finalization.
+    pub(crate) fn dma_segment(&self) -> Result<USegment> {
+        if !self.active {
+            return_errno!(Errno::EINVAL);
+        }
+        self.pool.backend.data_page_segment(self.id)
+    }
+
     pub(crate) fn profile_times(&self) -> [u64; 3] {
         self.profile_times
     }
@@ -3932,11 +4494,12 @@ impl EvictingDataPage {
 
             set_completion_stage(COMPLETION_FINISH_FINALIZE_LOCK, 0, page);
             let started = read_ns();
+            let times;
             {
                 let mut allocation = self.pool.allocation.lock();
                 let t_lock = read_ns();
                 let mut state = self.pool.objects.lock(self.id.index());
-                LATENCY_STATS.rnvpce_reclaim_state_lock.record_since(t_lock);
+                let slot_locked = read_ns();
                 let record = &state.records[self.id.index()];
                 // The lease stayed active across descriptor clearing; the
                 // identity validated above cannot change before this reclaim.
@@ -3954,10 +4517,43 @@ impl EvictingDataPage {
                 record.committed = false;
                 record.key = None;
                 record.version = 0;
+                let reset_done = read_ns();
                 self.pool.account_unpin();
+                let unpin_done = read_ns();
                 allocation.free_ids.push(self.id.index());
                 allocation.capacity.account_free(PoolClass::Data);
                 self.active = false;
+                let capacity_done = read_ns();
+                drop(state);
+                drop(allocation);
+                times = [
+                    started,
+                    t_lock,
+                    slot_locked,
+                    reset_done,
+                    unpin_done,
+                    capacity_done,
+                    read_ns(),
+                ];
+            }
+            if LATENCY_ENABLED {
+                // Record after unlocking so shared counters do not extend the critical section.
+                for (stat, pair) in [
+                    &LATENCY_STATS.reclaim_allocation_wait,
+                    &LATENCY_STATS.reclaim_slot_wait,
+                    &LATENCY_STATS.reclaim_reset,
+                    &LATENCY_STATS.reclaim_unpin,
+                    &LATENCY_STATS.reclaim_capacity,
+                    &LATENCY_STATS.reclaim_unlock,
+                ]
+                .into_iter()
+                .zip(times.windows(2))
+                {
+                    stat.record_ns(pair[1].saturating_sub(pair[0]));
+                }
+                LATENCY_STATS
+                    .rnvpce_reclaim_state_lock
+                    .record_ns(times[2].saturating_sub(times[1]));
             }
             LATENCY_STATS
                 .nvpc_finish_finalize_lock

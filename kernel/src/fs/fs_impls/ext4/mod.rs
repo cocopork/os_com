@@ -49,3 +49,10 @@ mod test_utils;
 pub(super) fn init() {
     registry::register(&Ext4Type).unwrap();
 }
+
+mod migration;
+mod stats;
+pub(crate) use stats::*;
+
+#[cfg(ktest)]
+mod nv_tests;

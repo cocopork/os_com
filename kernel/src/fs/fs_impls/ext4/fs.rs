@@ -9,9 +9,9 @@
 //! writes the mutated metadata back. `Ext4` also owns the per-group inode cache,
 //! the orphan chain, and inode-descriptor writeback (`write_back_inode_desc`).
 
-use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 #[cfg(ktest)]
-use core::sync::atomic::{AtomicI64, AtomicU64};
+use core::sync::atomic::AtomicI64;
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use device_id::DeviceId;
 
@@ -27,7 +27,11 @@ use super::{
     utils,
 };
 use crate::{
-    fs::vfs::file_system::FsEventSubscriberStats, process::posix_thread::AsPosixThread,
+    fs::{
+        rnvpc::mode::{RnvpcMode, RnvpcModeConfig, parse_onoff},
+        vfs::file_system::FsEventSubscriberStats,
+    },
+    process::posix_thread::AsPosixThread,
     thread::Thread,
 };
 
@@ -93,6 +97,7 @@ pub(super) enum AllocIntent {
     /// (or its `ZERO_RANGE` mirror) forces. May draw the reserve down to empty
     /// (Linux `EXT4_GET_BLOCKS_METADATA_NOFAIL` → `EXT4_MB_USE_RESERVED`).
     MetadataReserve,
+    RnvpceReserved,
 }
 
 /// Policy for how `statfs` reports the total block count (`f_blocks`).
@@ -118,9 +123,23 @@ pub(super) enum StatBlockAccounting {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct Ext4MountOptions {
     stat_block_accounting: StatBlockAccounting,
+    rnvpc: Option<bool>,
+    rnvpc_extend: Option<bool>,
+    rtio: Option<bool>,
 }
 
 impl Ext4MountOptions {
+    pub(super) fn rnvpc_mode(&self) -> Result<RnvpcModeConfig> {
+        match (self.rnvpc, self.rnvpc_extend, self.rtio) {
+            (None, None, None) => RnvpcModeConfig::from_command_line(),
+            (rnvpc, rnvpc_extend, rtio) => RnvpcModeConfig::resolve(
+                rnvpc.unwrap_or(false),
+                rnvpc_extend.unwrap_or(false),
+                rtio.unwrap_or(false),
+            ),
+        }
+    }
+
     /// Parses the comma-separated `mount(2)` data string.
     ///
     /// Recognizes `bsddf`/`minixdf` with last-one-wins, matching Linux's
@@ -137,9 +156,23 @@ impl Ext4MountOptions {
         let data = data.to_string_lossy();
         for token in data.split(',') {
             match token.trim() {
+                "rnvpc" => options.rnvpc = Some(true),
+                "rnvpc_extend" | "rnvpce" => options.rnvpc_extend = Some(true),
+                "rtio" => options.rtio = Some(true),
                 "bsddf" => options.stat_block_accounting = StatBlockAccounting::ExcludeOverhead,
                 "minixdf" => options.stat_block_accounting = StatBlockAccounting::IncludeOverhead,
-                _ => {}
+                token => {
+                    if let Some(value) = token.strip_prefix("rnvpc=") {
+                        options.rnvpc = Some(parse_onoff(value));
+                    } else if let Some(value) = token
+                        .strip_prefix("rnvpc_extend=")
+                        .or_else(|| token.strip_prefix("rnvpce="))
+                    {
+                        options.rnvpc_extend = Some(parse_onoff(value));
+                    } else if let Some(value) = token.strip_prefix("rtio=") {
+                        options.rtio = Some(parse_onoff(value));
+                    }
+                }
             }
         }
 
@@ -196,6 +229,16 @@ pub struct Ext4 {
     s_orphan_lock: Mutex<OrphanChain>,
     /// Runtime mount options that affect block-count reporting.
     mount_options: Ext4MountOptions,
+    rnvpc_mode: RnvpcModeConfig,
+    pub(super) nv_migration_lock: Mutex<()>,
+    pub(super) nv_completion_lock: Mutex<()>,
+    pub(super) nv_completion_queue: super::migration::CompletionQueue,
+    pub(super) nv_completion_trigger: Arc<ostd::sync::WaitQueue>,
+    pub(super) nv_in_flight: AtomicUsize,
+    pub(super) nv_migration_failed: AtomicBool,
+    pub(super) nv_inodes: Mutex<BTreeSet<Ext4Ino>>,
+    rnvpc_fs_id: u64,
+    rnvpce_reserved_blocks: AtomicU64,
     /// The JBD2 journal, present iff the volume carries the `HAS_JOURNAL` compat
     /// feature (jbd2 `journal_t`).
     ///
@@ -233,6 +276,48 @@ pub struct Ext4 {
 }
 
 impl Ext4 {
+    pub(super) fn nv_migration_enabled(&self) -> bool {
+        self.rnvpc_mode.rtio() && self.rnvpc_mode() != RnvpcMode::Native
+    }
+    pub(super) fn rnvpc_mode(&self) -> RnvpcMode {
+        self.rnvpc_mode.mode()
+    }
+    pub(super) fn rnvpc_extend_enabled(&self) -> bool {
+        self.rnvpc_mode() == RnvpcMode::RnvpcExtend
+    }
+    pub(super) fn rnvpc_fs_id(&self) -> u64 {
+        self.rnvpc_fs_id
+    }
+    pub(super) fn reserve_rnvpce_blocks(&self, blocks: u64) -> Result<()> {
+        let sb = self.super_block.write();
+        let available = sb
+            .free_blocks_count()
+            .saturating_sub(Self::metadata_reserve_floor(sb.total_blocks()));
+        self.rnvpce_reserved_blocks
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                current
+                    .checked_add(blocks)
+                    .filter(|next| *next <= available)
+            })
+            .map_err(|_| Error::new(Errno::ENOSPC))?;
+        Ok(())
+    }
+    pub(super) fn release_rnvpce_blocks(&self, blocks: u64) -> Result<()> {
+        self.rnvpce_reserved_blocks
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                current.checked_sub(blocks)
+            })
+            .map_err(|_| Error::new(Errno::EUCLEAN))?;
+        Ok(())
+    }
+    pub(super) fn reconcile_rnvpce_reservations(&self) -> Result<()> {
+        let pool = crate::fs::rnvpc::pool().ok_or_else(|| Error::new(Errno::EINVAL))?;
+        let outstanding =
+            crate::fs::rnvpc::write_transaction::outstanding_ssd_capacity(pool, self.rnvpc_fs_id)?;
+        self.rnvpce_reserved_blocks
+            .store(outstanding, Ordering::Release);
+        Ok(())
+    }
     /// Mounts an ext4 volume from a block device.
     ///
     /// `data` is the raw `mount(2)` option string; see
@@ -241,6 +326,21 @@ impl Ext4 {
         let raw_super_block = device.read_val::<RawSuperBlock>(SUPER_BLOCK_OFFSET)?;
         let super_block = SuperBlock::try_from(raw_super_block)?;
         let mount_options = Ext4MountOptions::parse(data);
+        let rnvpc_mode = mount_options.rnvpc_mode()?;
+        if rnvpc_mode.mode() != RnvpcMode::Native && crate::fs::rnvpc::pool().is_none() {
+            return_errno_with_message!(Errno::EINVAL, "rNVPC mount requires a configured pool");
+        }
+        let rnvpc_fs_id = u64::from_le_bytes(super_block.uuid()[..8].try_into().unwrap());
+        if let Some(pool) = crate::fs::rnvpc::pool() {
+            pool.validate_fs_mode(
+                rnvpc_fs_id,
+                match rnvpc_mode.mode() {
+                    RnvpcMode::Native => None,
+                    RnvpcMode::Rnvpc => Some(true),
+                    RnvpcMode::RnvpcExtend => Some(false),
+                },
+            )?;
+        }
         let nr_inodes_per_group = super_block.nr_inodes_per_group();
         let total_inodes = super_block.total_inodes();
 
@@ -257,6 +357,18 @@ impl Ext4 {
             rdonly: AtomicBool::new(false),
             s_orphan_lock: Mutex::new(OrphanChain::new()),
             mount_options,
+            rnvpc_mode,
+            nv_migration_lock: Mutex::new(()),
+            nv_completion_lock: Mutex::new(()),
+            nv_completion_queue: Arc::new(SpinLock::new(VecDeque::with_capacity(
+                super::migration::MAX_IN_FLIGHT,
+            ))),
+            nv_completion_trigger: Arc::new(ostd::sync::WaitQueue::new()),
+            nv_in_flight: AtomicUsize::new(0),
+            nv_migration_failed: AtomicBool::new(false),
+            nv_inodes: Mutex::new(BTreeSet::new()),
+            rnvpc_fs_id,
+            rnvpce_reserved_blocks: AtomicU64::new(0),
             journal: RwMutex::new(None),
             fs_event_subscriber_stats: FsEventSubscriberStats::new(),
             #[cfg(ktest)]
@@ -365,6 +477,10 @@ impl Ext4 {
             ext4.recover_orphan_list();
         }
 
+        if ext4.rnvpc_extend_enabled() {
+            ext4.reconcile_rnvpce_reservations()?;
+        }
+        ext4.start_nv_migration();
         Ok(ext4)
     }
 
@@ -414,6 +530,13 @@ impl Ext4 {
     }
 
     /// Returns a read guard of the superblock.
+    pub(super) fn free_blocks_count(&self) -> u64 {
+        self.super_block().free_blocks_count()
+    }
+    pub(super) fn free_inodes_count(&self) -> u32 {
+        self.super_block().free_inodes_count()
+    }
+
     pub(super) fn super_block(&self) -> RwMutexReadGuard<'_, Dirty<SuperBlock>> {
         self.super_block.read()
     }
@@ -1187,10 +1310,10 @@ impl Ext4 {
         // reserve remains, for `Normal`; genuinely empty, for either) is
         // `ENOSPC`.
         let allocatable = match intent {
-            AllocIntent::Normal => {
-                sb_free_blocks.saturating_sub(Self::metadata_reserve_floor(sb.total_blocks()))
-            }
-            AllocIntent::MetadataReserve => sb_free_blocks,
+            AllocIntent::Normal => sb_free_blocks
+                .saturating_sub(Self::metadata_reserve_floor(sb.total_blocks()))
+                .saturating_sub(self.rnvpce_reserved_blocks.load(Ordering::Acquire)),
+            AllocIntent::MetadataReserve | AllocIntent::RnvpceReserved => sb_free_blocks,
         };
         if allocatable == 0 {
             return_errno_with_message!(Errno::ENOSPC, "no free blocks available above the reserve");
@@ -2094,6 +2217,7 @@ impl Ext4 {
     /// `metadata.write()` — no inversion.
     pub(super) fn sync_all(&self) -> Result<()> {
         self.ensure_not_shutdown()?;
+        self.export_nv_for_sync()?;
         for group in &self.block_groups {
             group.sync_inodes()?;
         }
@@ -2428,8 +2552,11 @@ impl Ext4 {
     /// filesystem-level sync relies on to enumerate and flush all dirty inodes.
     pub(super) fn read_inode(&self, ino: Ext4Ino) -> Result<Arc<Inode>> {
         let journal = self.journal();
-        self.find_group(ino)?
-            .lookup_inode(ino, self.self_ref.clone(), journal.as_deref())
+        let inode =
+            self.find_group(ino)?
+                .lookup_inode(ino, self.self_ref.clone(), journal.as_deref())?;
+        inode.restore_rnvpce_inode_fields()?;
+        Ok(inode)
     }
 
     /// Reads the root directory inode.
@@ -2451,6 +2578,14 @@ impl Ext4 {
 /// cell is `None` and this is a no-op.
 impl Drop for Ext4 {
     fn drop(&mut self) {
+        // Callback queue ownership must outlive every submitted BIO. Drain in
+        // process context before field destruction, even after shutdown.
+        if let Err(error) = self.drain_nv_in_flight() {
+            warn!("NV completion drain failed: {error:?}");
+        }
+        // Native export ran through Path::unmount -> FileSystem::sync while
+        // the filesystem still had a strong owner. Weak inode backends cannot
+        // be upgraded from this last-owner Drop context.
         // A shut-down filesystem unmounts without touching the device: no
         // journal flush, no RECOVER clear — the disk stays exactly as the
         // "crash" left it, and the next mount replays (Linux `ext4_put_super`
@@ -5921,5 +6056,80 @@ mod tests {
             "checkpoint landed the newest image"
         );
         assert!(journal.uncheckpointed_blocks_for_test().is_empty());
+    }
+}
+
+// Runtime diagnostics use real pool counters; detailed timing remains optional.
+pub(super) use super::stats::dump_latency_stats_once;
+pub(super) fn dump_nvpage_profile() {
+    if let Some(pool) = crate::fs::rnvpc::pool() {
+        ostd::info!(
+            "[RNVPC] capacity={:?} contexts={:?}",
+            pool.stats(),
+            crate::fs::rnvpc::snapshot()
+        );
+    }
+}
+
+#[cfg(ktest)]
+mod nv_mode_tests {
+    use ostd::prelude::*;
+
+    use super::*;
+    #[ktest]
+    fn mount_options_resolve_rnvpc_mode_switches() {
+        use crate::fs::rnvpc::mode::RnvpcMode;
+
+        let opts = |s: &str| Ext4MountOptions::parse(Some(CString::new(s).unwrap().as_c_str()));
+
+        // 未表态 ⇒ 回落 cmdline（ktest 内核不带 `rnvpc*=` 参数 ⇒ 全关）。
+        let fallback = opts("noacl,bsddf").rnvpc_mode().unwrap();
+        assert_eq!(fallback.mode(), RnvpcMode::Native);
+        assert!(!fallback.rtio());
+
+        // 单 token 选中对应路线；裸 token 等价于 `=on`。
+        assert_eq!(
+            opts("rnvpc=on").rnvpc_mode().unwrap().mode(),
+            RnvpcMode::Rnvpc
+        );
+        assert_eq!(opts("rnvpc").rnvpc_mode().unwrap().mode(), RnvpcMode::Rnvpc);
+        assert_eq!(
+            opts("rnvpc_extend=1").rnvpc_mode().unwrap().mode(),
+            RnvpcMode::RnvpcExtend
+        );
+
+        // `rtio` 正交：单独开不改变路线，可与任一模式组合。
+        let rtio_only = opts("rtio=on").rnvpc_mode().unwrap();
+        assert_eq!(rtio_only.mode(), RnvpcMode::Native);
+        assert!(rtio_only.rtio());
+        let both = opts("rnvpc_extend=on,rtio=on").rnvpc_mode().unwrap();
+        assert_eq!(both.mode(), RnvpcMode::RnvpcExtend);
+        assert!(both.rtio());
+
+        // 显式 `off` 也属于"已表态"：只关自己，不牵连另一开关。
+        assert_eq!(
+            opts("rnvpc=off,rnvpc_extend=on")
+                .rnvpc_mode()
+                .unwrap()
+                .mode(),
+            RnvpcMode::RnvpcExtend
+        );
+
+        // 冲突 ⇒ EINVAL，绝不静默取其一。
+        let err = opts("rnvpc=on,rnvpc_extend").rnvpc_mode().unwrap_err();
+        assert_eq!(err.error(), Errno::EINVAL);
+    }
+
+    #[ktest]
+    fn nv_mode_conflict_is_rejected_before_mount() {
+        crate::time::clocks::init_for_ktest();
+        let result = super::super::test_utils::Ext4FixtureBuilder::new(2048, 256, 2048)
+            .with_block_bitmap_metadata_marked()
+            .with_mount_options("rnvpc=on,rnvpce=on")
+            .build();
+        match result {
+            Err(error) => assert_eq!(error.error(), Errno::EINVAL),
+            Ok(_) => panic!("conflicting modes mounted"),
+        }
     }
 }

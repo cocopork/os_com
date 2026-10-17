@@ -1,0 +1,68 @@
+[
+  {
+    "path": "kernel/src/fs/rnvpc/backend.rs",
+    "sha256": "a36d8b0d863278c202c338bf58226ef6047922ffeb7b4aa2cf63ee11762c49e2",
+    "lines": 64,
+    "classification": "evidence-led reconstruction, not exact target blob"
+  },
+  {
+    "path": "kernel/src/fs/rnvpc/config.rs",
+    "sha256": "cf7ccabade92d5d142205c8b50b186e5be2d7b99c6e4670c47cedb64facd4be7",
+    "lines": 277,
+    "classification": "evidence-led reconstruction, not exact target blob"
+  },
+  {
+    "path": "kernel/src/fs/rnvpc/cow.rs",
+    "sha256": "4bb7f672e845c941c5eaf6f7ca74eae43e9da75aa7099546f53ea3d49af69683",
+    "lines": 570,
+    "classification": "evidence-led reconstruction, not exact target blob"
+  },
+  {
+    "path": "kernel/src/fs/rnvpc/descriptor.rs",
+    "sha256": "a3a72e8f8debf82f9b6e7747a129bdd64638ea7e1af5c1fa053693681b0008ed",
+    "lines": 335,
+    "classification": "evidence-led reconstruction, not exact target blob"
+  },
+  {
+    "path": "kernel/src/fs/rnvpc/dram.rs",
+    "sha256": "cba71cc4f6449d5a992b6779c7a6e6919af314c48500a542e51f2b5d33b8f4ce",
+    "lines": 846,
+    "classification": "evidence-led reconstruction, not exact target blob"
+  },
+  {
+    "path": "kernel/src/fs/rnvpc/extend_cow.rs",
+    "sha256": "9381757c7643964ef948d54eaa776e850c374ab3c300658ec5dc465351b73e84",
+    "lines": 789,
+    "classification": "evidence-led reconstruction, not exact target blob"
+  },
+  {
+    "path": "kernel/src/fs/rnvpc/index.rs",
+    "sha256": "7f784a58524a3d6d66ce57085b507505bbe55d1b650a570597219472afd01b72",
+    "lines": 239,
+    "classification": "evidence-led reconstruction, not exact target blob"
+  },
+  {
+    "path": "kernel/src/fs/rnvpc/metadata.rs",
+    "sha256": "d11b111ea99dba7f2874d51acdca01114a2f660f081fbdccf7c8579cf7ed6002",
+    "lines": 1413,
+    "classification": "evidence-led reconstruction, not exact target blob"
+  },
+  {
+    "path": "kernel/src/fs/rnvpc/mod.rs",
+    "sha256": "e163ab3249346c3eed35caf6d9dbcc5c62a9feae5ad050a1162a696861bd602b",
+    "lines": 416,
+    "classification": "evidence-led reconstruction, not exact target blob"
+  },
+  {
+    "path": "kernel/src/fs/rnvpc/recover.rs",
+    "sha256": "1ecba017df334c4ac5b87daac5e9d421152897d26f5abc22bd4005d66f45f5a2",
+    "lines": 521,
+    "classification": "evidence-led reconstruction, not exact target blob"
+  },
+  {
+    "path": "kernel/src/fs/rnvpc/tests.rs",
+    "sha256": "603893e066a4fbd963a9787872561332f8ea198808aebd0eb18be015e56bc6b9",
+    "lines": 715,
+    "classification": "evidence-led reconstruction, not exact target blob"
+  }
+]

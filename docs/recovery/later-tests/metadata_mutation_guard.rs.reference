@@ -1,0 +1,55 @@
+// SPDX-License-Identifier: MPL-2.0
+
+// Noncompiled historical test: requires absent later Rnvpc::lock_metadata_mutation API.
+// Source: tests.rs.changes.json, 2026-10-13T04:40:00.410Z.
+// See README.md for provenance and the retained-version boundary.
+
+#[ktest]
+fn rnvpce_metadata_mutation_guard_wakes_a_waiting_leaf_mutator() {
+    const FS_ID: u64 = 0x9923;
+    const INODE: u64 = 33;
+    let pool = test_pool(8, 8, 0, None);
+    let key = PageKey::new(FS_ID, INODE, 0x9b00);
+    let leaf = ExtentNodeRecord::new(
+        FS_ID,
+        INODE,
+        1,
+        key.page_index,
+        0,
+        PersistentObjectRef::NONE,
+        PersistentObjectRef::NONE,
+        &[],
+    )
+    .unwrap();
+    let reference = pool
+        .persist_authoritative_metadata(key, &leaf, None)
+        .unwrap();
+    let held = pool.lock_metadata_mutation(reference).unwrap();
+
+    let state = Arc::new(AtomicUsize::new(0));
+    let waiter_pool = pool.clone();
+    let waiter_state = state.clone();
+    let waiter = crate::thread::kernel_thread::ThreadOptions::new(move || {
+        waiter_state.store(1, Ordering::Release);
+        let guard = waiter_pool.lock_metadata_mutation(reference).unwrap();
+        drop(guard);
+        waiter_state.store(2, Ordering::Release);
+    })
+    .spawn();
+
+    while state.load(Ordering::Acquire) == 0 {
+        crate::thread::Thread::yield_now();
+    }
+    for _ in 0..4 {
+        crate::thread::Thread::yield_now();
+    }
+    assert_eq!(
+        state.load(Ordering::Acquire),
+        1,
+        "a same-leaf mutator must wait for the held guard"
+    );
+
+    drop(held);
+    waiter.join();
+    assert_eq!(state.load(Ordering::Acquire), 2);
+}
