@@ -1,0 +1,1941 @@
+{
+  "config": {
+    "device": "nvme",
+    "workload": "randwrite-4k",
+    "mode": "orderless",
+    "njobs": 16,
+    "fs": "ext2like,ext4",
+    "min_ts": "20260922_221845",
+    "json": "../../os_com_refactor_plan/011-nojournal-vs-journal-writeback/archive/wb_per_round_v2.json"
+  },
+  "rounds": {
+    "ext2like": [
+      {
+        "run": "20260922_221845_aster-ext4-baseline",
+        "bw": 158.27,
+        "write_mib": 2048.0,
+        "stats": {
+          "fsync_total": {
+            "count": 0,
+            "avg_us": 0,
+            "max_us": 0
+          },
+          "fsync_lock": {
+            "count": 0,
+            "avg_us": 0,
+            "max_us": 0
+          },
+          "fsync_alloc": {
+            "count": 0,
+            "avg_us": 0,
+            "max_us": 0
+          },
+          "fsync_data_flush": {
+            "count": 0,
+            "avg_us": 0,
+            "max_us": 0
+          },
+          "fsync_capture": {
+            "count": 0,
+            "avg_us": 0,
+            "max_us": 0
+          },
+          "fsync_commit_wait": {
+            "count": 0,
+            "avg_us": 0,
+            "max_us": 0
+          },
+          "fsync_barrier": {
+            "count": 0,
+            "avg_us": 0,
+            "max_us": 0
+          },
+          "fsync_barrier_flush": {
+            "count": 0,
+            "avg_us": 0,
+            "max_us": 0
+          },
+          "fsync_barrier_wait": {
+            "count": 0,
+            "avg_us": 0,
+            "max_us": 0
+          },
+          "commit_total": {
+            "count": 0,
+            "avg_us": 0,
+            "max_us": 0
+          },
+          "commit_ordered": {
+            "count": 0,
+            "avg_us": 0,
+            "max_us": 0
+          },
+          "commit_log": {
+            "count": 0,
+            "avg_us": 0,
+            "max_us": 0
+          },
+          "commit_barrier1": {
+            "count": 0,
+            "avg_us": 0,
+            "max_us": 0
+          },
+          "commit_barrier2": {
+            "count": 0,
+            "avg_us": 0,
+            "max_us": 0
+          },
+          "alloc_meta_flush": {
+            "count": 314,
+            "avg_us": 11368,
+            "max_us": 24682
+          },
+          "alloc_meta_block": {
+            "count": 28634,
+            "avg_us": 124,
+            "max_us": 455
+          },
+          "alloc_desc": {
+            "count": 314,
+            "avg_us": 173,
+            "max_us": 4137
+          },
+          "commit_stage_wait": {
+            "count": 0,
+            "avg_us": 0,
+            "max_us": 0
+          },
+          "commit_parked": {
+            "count": 0,
+            "avg_us": 0,
+            "max_us": 0
+          },
+          "commit_thread_sleep": {
+            "count": 0,
+            "avg_us": 0,
+            "max_us": 0
+          },
+          "commit_thread_busy": {
+            "count": 0,
+            "avg_us": 0,
+            "max_us": 0
+          },
+          "commit_checkpoint": {
+            "count": 0,
+            "avg_us": 0,
+            "max_us": 0
+          },
+          "commit_flush_tail": {
+            "count": 0,
+            "avg_us": 0,
+            "max_us": 0
+          },
+          "commit_one_total": {
+            "count": 0,
+            "avg_us": 0,
+            "max_us": 0
+          },
+          "commit_advance": {
+            "count": 0,
+            "avg_us": 0,
+            "max_us": 0
+          },
+          "commit_advance_lock": {
+            "count": 0,
+            "avg_us": 0,
+            "max_us": 0
+          },
+          "commit_credits_wake": {
+            "count": 0,
+            "avg_us": 0,
+            "max_us": 0
+          },
+          "commit_thread_age": {
+            "count": 0,
+            "avg_us": 0,
+            "max_us": 0
+          },
+          "write_total": {
+            "count": 521204,
+            "avg_us": 359,
+            "max_us": 210825
+          },
+          "write_inner_lock": {
+            "count": 521214,
+            "avg_us": 9,
+            "max_us": 37984
+          },
+          "write_page_cache": {
+            "count": 521214,
+            "avg_us": 18,
+            "max_us": 178534
+          },
+          "write_mark_dirty": {
+            "count": 521214,
+            "avg_us": 1,
+            "max_us": 92
+          },
+          "write_throttle": {
+            "count": 521204,
+            "avg_us": 323,
+            "max_us": 192341
+          },
+          "wb_total": {
+            "count": 105,
+            "avg_us": 96225,
+            "max_us": 251632
+          },
+          "wb_read_inode": {
+            "count": 314,
+            "avg_us": 0,
+            "max_us": 11
+          },
+          "wb_inner_lock": {
+            "count": 314,
+            "avg_us": 1086,
+            "max_us": 103716
+          },
+          "wb_alloc_pending": {
+            "count": 314,
+            "avg_us": 19318,
+            "max_us": 136558
+          },
+          "wb_journal_capture": {
+            "count": 628,
+            "avg_us": 87,
+            "max_us": 4137
+          },
+          "wb_flush_async": {
+            "count": 314,
+            "avg_us": 9569,
+            "max_us": 25470
+          },
+          "wb_alloc_blocks": {
+            "count": 448067,
+            "avg_us": 0,
+            "max_us": 39
+          },
+          "wb_tree_insert": {
+            "count": 448067,
+            "avg_us": 1,
+            "max_us": 60738
+          },
+          "wb_map_blocks": {
+            "count": 448067,
+            "avg_us": 0,
+            "max_us": 629
+          },
+          "wb_wait_page_io": {
+            "count": 508107,
+            "avg_us": 0,
+            "max_us": 19
+          },
+          "wb_walk_range": {
+            "count": 448067,
+            "avg_us": 1,
+            "max_us": 5087
+          },
+          "wb_convert_unwritten": {
+            "count": 448067,
+            "avg_us": 2,
+            "max_us": 106204
+          },
+          "wb_begin_op": {
+            "count": 628,
+            "avg_us": 0,
+            "max_us": 4
+          },
+          "wb_reap": {
+            "count": 104,
+            "avg_us": 6094,
+            "max_us": 131924
+          },
+          "wb_dirty_lock": {
+            "count": 105,
+            "avg_us": 0,
+            "max_us": 7
+          },
+          "wb_wait_all": {
+            "count": 0,
+            "avg_us": 0,
+            "max_us": 0
+          },
+          "wb_collect": {
+            "count": 104,
+            "avg_us": 0,
+            "max_us": 0
+          },
+          "wb_sync_total": {
+            "count": 314,
+            "avg_us": 30156,
+            "max_us": 146675
+          },
+          "wb_wake": {
+            "count": 0,
+            "avg_us": 0,
+            "max_us": 0
+          },
+          "wb_round": {
+            "count": 105,
+            "avg_us": 96225,
+            "max_us": 251633
+          }
+        }
+      },
+      {
+        "run": "20260922_222007_aster-ext4-baseline",
+        "bw": 12.45,
+        "write_mib": 382.8,
+        "stats": {
+          "fsync_total": {
+            "count": 0,
+            "avg_us": 0,
+            "max_us": 0
+          },
+          "fsync_lock": {
+            "count": 0,
+            "avg_us": 0,
+            "max_us": 0
+          },
+          "fsync_alloc": {
+            "count": 0,
+            "avg_us": 0,
+            "max_us": 0
+          },
+          "fsync_data_flush": {
+            "count": 0,
+            "avg_us": 0,
+            "max_us": 0
+          },
+          "fsync_capture": {
+            "count": 0,
+            "avg_us": 0,
+            "max_us": 0
+          },
+          "fsync_commit_wait": {
+            "count": 0,
+            "avg_us": 0,
+            "max_us": 0
+          },
+          "fsync_barrier": {
+            "count": 0,
+            "avg_us": 0,
+            "max_us": 0
+          },
+          "fsync_barrier_flush": {
+            "count": 0,
+            "avg_us": 0,
+            "max_us": 0
+          },
+          "fsync_barrier_wait": {
+            "count": 0,
+            "avg_us": 0,
+            "max_us": 0
+          },
+          "commit_total": {
+            "count": 0,
+            "avg_us": 0,
+            "max_us": 0
+          },
+          "commit_ordered": {
+            "count": 0,
+            "avg_us": 0,
+            "max_us": 0
+          },
+          "commit_log": {
+            "count": 0,
+            "avg_us": 0,
+            "max_us": 0
+          },
+          "commit_barrier1": {
+            "count": 0,
+            "avg_us": 0,
+            "max_us": 0
+          },
+          "commit_barrier2": {
+            "count": 0,
+            "avg_us": 0,
+            "max_us": 0
+          },
+          "alloc_meta_flush": {
+            "count": 59,
+            "avg_us": 470106,
+            "max_us": 870616
+          },
+          "alloc_meta_block": {
+            "count": 1701,
+            "avg_us": 16304,
+            "max_us": 18173
+          },
+          "alloc_desc": {
+            "count": 59,
+            "avg_us": 17145,
+            "max_us": 36017
+          },
+          "commit_stage_wait": {
+            "count": 0,
+            "avg_us": 0,
+            "max_us": 0
+          },
+          "commit_parked": {
+            "count": 0,
+            "avg_us": 0,
+            "max_us": 0
+          },
+          "commit_thread_sleep": {
+            "count": 0,
+            "avg_us": 0,
+            "max_us": 0
+          },
+          "commit_thread_busy": {
+            "count": 0,
+            "avg_us": 0,
+            "max_us": 0
+          },
+          "commit_checkpoint": {
+            "count": 0,
+            "avg_us": 0,
+            "max_us": 0
+          },
+          "commit_flush_tail": {
+            "count": 0,
+            "avg_us": 0,
+            "max_us": 0
+          },
+          "commit_one_total": {
+            "count": 0,
+            "avg_us": 0,
+            "max_us": 0
+          },
+          "commit_advance": {
+            "count": 0,
+            "avg_us": 0,
+            "max_us": 0
+          },
+          "commit_advance_lock": {
+            "count": 0,
+            "avg_us": 0,
+            "max_us": 0
+          },
+          "commit_credits_wake": {
+            "count": 0,
+            "avg_us": 0,
+            "max_us": 0
+          },
+          "commit_thread_age": {
+            "count": 0,
+            "avg_us": 0,
+            "max_us": 0
+          },
+          "write_total": {
+            "count": 98001,
+            "avg_us": 4937,
+            "max_us": 902025
+          },
+          "write_inner_lock": {
+            "count": 98001,
+            "avg_us": 270,
+            "max_us": 888968
+          },
+          "write_page_cache": {
+            "count": 98001,
+            "avg_us": 4,
+            "max_us": 5606
+          },
+          "write_mark_dirty": {
+            "count": 98001,
+            "avg_us": 1,
+            "max_us": 99
+          },
+          "write_throttle": {
+            "count": 98001,
+            "avg_us": 4652,
+            "max_us": 900509
+          },
+          "wb_total": {
+            "count": 20,
+            "avg_us": 1495598,
+            "max_us": 2526823
+          },
+          "wb_read_inode": {
+            "count": 59,
+            "avg_us": 0,
+            "max_us": 4
+          },
+          "wb_inner_lock": {
+            "count": 59,
+            "avg_us": 0,
+            "max_us": 14
+          },
+          "wb_alloc_pending": {
+            "count": 59,
+            "avg_us": 483050,
+            "max_us": 876711
+          },
+          "wb_journal_capture": {
+            "count": 118,
+            "avg_us": 8572,
+            "max_us": 36018
+          },
+          "wb_flush_async": {
+            "count": 59,
+            "avg_us": 6766,
+            "max_us": 10686
+          },
+          "wb_alloc_blocks": {
+            "count": 80628,
+            "avg_us": 0,
+            "max_us": 49
+          },
+          "wb_tree_insert": {
+            "count": 80628,
+            "avg_us": 3,
+            "max_us": 13823
+          },
+          "wb_map_blocks": {
+            "count": 80628,
+            "avg_us": 1,
+            "max_us": 293
+          },
+          "wb_wait_page_io": {
+            "count": 86360,
+            "avg_us": 0,
+            "max_us": 33
+          },
+          "wb_walk_range": {
+            "count": 80628,
+            "avg_us": 1,
+            "max_us": 40
+          },
+          "wb_convert_unwritten": {
+            "count": 80628,
+            "avg_us": 3,
+            "max_us": 18286
+          },
+          "wb_begin_op": {
+            "count": 118,
+            "avg_us": 0,
+            "max_us": 3
+          },
+          "wb_reap": {
+            "count": 19,
+            "avg_us": 14,
+            "max_us": 105
+          },
+          "wb_dirty_lock": {
+            "count": 20,
+            "avg_us": 0,
+            "max_us": 4
+          },
+          "wb_wait_all": {
+            "count": 0,
+            "avg_us": 0,
+            "max_us": 0
+          },
+          "wb_collect": {
+            "count": 19,
+            "avg_us": 0,
+            "max_us": 2
+          },
+          "wb_sync_total": {
+            "count": 59,
+            "avg_us": 506975,
+            "max_us": 899947
+          },
+          "wb_wake": {
+            "count": 0,
+            "avg_us": 0,
+            "max_us": 0
+          },
+          "wb_round": {
+            "count": 20,
+            "avg_us": 1495599,
+            "max_us": 2526824
+          }
+        }
+      },
+      {
+        "run": "20260922_222116_aster-ext4-baseline",
+        "bw": 12.84,
+        "write_mib": 393.1,
+        "stats": {
+          "fsync_total": {
+            "count": 0,
+            "avg_us": 0,
+            "max_us": 0
+          },
+          "fsync_lock": {
+            "count": 0,
+            "avg_us": 0,
+            "max_us": 0
+          },
+          "fsync_alloc": {
+            "count": 0,
+            "avg_us": 0,
+            "max_us": 0
+          },
+          "fsync_data_flush": {
+            "count": 0,
+            "avg_us": 0,
+            "max_us": 0
+          },
+          "fsync_capture": {
+            "count": 0,
+            "avg_us": 0,
+            "max_us": 0
+          },
+          "fsync_commit_wait": {
+            "count": 0,
+            "avg_us": 0,
+            "max_us": 0
+          },
+          "fsync_barrier": {
+            "count": 0,
+            "avg_us": 0,
+            "max_us": 0
+          },
+          "fsync_barrier_flush": {
+            "count": 0,
+            "avg_us": 0,
+            "max_us": 0
+          },
+          "fsync_barrier_wait": {
+            "count": 0,
+            "avg_us": 0,
+            "max_us": 0
+          },
+          "commit_total": {
+            "count": 0,
+            "avg_us": 0,
+            "max_us": 0
+          },
+          "commit_ordered": {
+            "count": 0,
+            "avg_us": 0,
+            "max_us": 0
+          },
+          "commit_log": {
+            "count": 0,
+            "avg_us": 0,
+            "max_us": 0
+          },
+          "commit_barrier1": {
+            "count": 0,
+            "avg_us": 0,
+            "max_us": 0
+          },
+          "commit_barrier2": {
+            "count": 0,
+            "avg_us": 0,
+            "max_us": 0
+          },
+          "alloc_meta_flush": {
+            "count": 62,
+            "avg_us": 445209,
+            "max_us": 906421
+          },
+          "alloc_meta_block": {
+            "count": 1742,
+            "avg_us": 15844,
+            "max_us": 18182
+          },
+          "alloc_desc": {
+            "count": 62,
+            "avg_us": 17562,
+            "max_us": 41216
+          },
+          "commit_stage_wait": {
+            "count": 0,
+            "avg_us": 0,
+            "max_us": 0
+          },
+          "commit_parked": {
+            "count": 0,
+            "avg_us": 0,
+            "max_us": 0
+          },
+          "commit_thread_sleep": {
+            "count": 0,
+            "avg_us": 0,
+            "max_us": 0
+          },
+          "commit_thread_busy": {
+            "count": 0,
+            "avg_us": 0,
+            "max_us": 0
+          },
+          "commit_checkpoint": {
+            "count": 0,
+            "avg_us": 0,
+            "max_us": 0
+          },
+          "commit_flush_tail": {
+            "count": 0,
+            "avg_us": 0,
+            "max_us": 0
+          },
+          "commit_one_total": {
+            "count": 0,
+            "avg_us": 0,
+            "max_us": 0
+          },
+          "commit_advance": {
+            "count": 0,
+            "avg_us": 0,
+            "max_us": 0
+          },
+          "commit_advance_lock": {
+            "count": 0,
+            "avg_us": 0,
+            "max_us": 0
+          },
+          "commit_credits_wake": {
+            "count": 0,
+            "avg_us": 0,
+            "max_us": 0
+          },
+          "commit_thread_age": {
+            "count": 0,
+            "avg_us": 0,
+            "max_us": 0
+          },
+          "write_total": {
+            "count": 100631,
+            "avg_us": 4783,
+            "max_us": 950029
+          },
+          "write_inner_lock": {
+            "count": 100631,
+            "avg_us": 258,
+            "max_us": 928952
+          },
+          "write_page_cache": {
+            "count": 100631,
+            "avg_us": 4,
+            "max_us": 4356
+          },
+          "write_mark_dirty": {
+            "count": 100631,
+            "avg_us": 1,
+            "max_us": 1191
+          },
+          "write_throttle": {
+            "count": 100631,
+            "avg_us": 4511,
+            "max_us": 937390
+          },
+          "wb_total": {
+            "count": 20,
+            "avg_us": 1489853,
+            "max_us": 2939485
+          },
+          "wb_read_inode": {
+            "count": 62,
+            "avg_us": 0,
+            "max_us": 3
+          },
+          "wb_inner_lock": {
+            "count": 62,
+            "avg_us": 0,
+            "max_us": 4
+          },
+          "wb_alloc_pending": {
+            "count": 62,
+            "avg_us": 456439,
+            "max_us": 914794
+          },
+          "wb_journal_capture": {
+            "count": 124,
+            "avg_us": 8781,
+            "max_us": 41216
+          },
+          "wb_flush_async": {
+            "count": 62,
+            "avg_us": 6572,
+            "max_us": 9114
+          },
+          "wb_alloc_blocks": {
+            "count": 83358,
+            "avg_us": 0,
+            "max_us": 32
+          },
+          "wb_tree_insert": {
+            "count": 83358,
+            "avg_us": 3,
+            "max_us": 13243
+          },
+          "wb_map_blocks": {
+            "count": 83358,
+            "avg_us": 0,
+            "max_us": 4225
+          },
+          "wb_wait_page_io": {
+            "count": 89153,
+            "avg_us": 0,
+            "max_us": 31
+          },
+          "wb_walk_range": {
+            "count": 83358,
+            "avg_us": 1,
+            "max_us": 30
+          },
+          "wb_convert_unwritten": {
+            "count": 83358,
+            "avg_us": 3,
+            "max_us": 18148
+          },
+          "wb_begin_op": {
+            "count": 124,
+            "avg_us": 0,
+            "max_us": 1
+          },
+          "wb_reap": {
+            "count": 19,
+            "avg_us": 28,
+            "max_us": 191
+          },
+          "wb_dirty_lock": {
+            "count": 20,
+            "avg_us": 0,
+            "max_us": 3
+          },
+          "wb_wait_all": {
+            "count": 0,
+            "avg_us": 0,
+            "max_us": 0
+          },
+          "wb_collect": {
+            "count": 19,
+            "avg_us": 0,
+            "max_us": 1
+          },
+          "wb_sync_total": {
+            "count": 62,
+            "avg_us": 480586,
+            "max_us": 940846
+          },
+          "wb_wake": {
+            "count": 0,
+            "avg_us": 0,
+            "max_us": 0
+          },
+          "wb_round": {
+            "count": 20,
+            "avg_us": 1489853,
+            "max_us": 2939485
+          }
+        }
+      }
+    ],
+    "ext4": [
+      {
+        "run": "20260922_221845_aster-ext4-baseline",
+        "bw": 174.45,
+        "write_mib": 2048.0,
+        "stats": {
+          "fsync_total": {
+            "count": 0,
+            "avg_us": 0,
+            "max_us": 0
+          },
+          "fsync_lock": {
+            "count": 0,
+            "avg_us": 0,
+            "max_us": 0
+          },
+          "fsync_alloc": {
+            "count": 0,
+            "avg_us": 0,
+            "max_us": 0
+          },
+          "fsync_data_flush": {
+            "count": 0,
+            "avg_us": 0,
+            "max_us": 0
+          },
+          "fsync_capture": {
+            "count": 0,
+            "avg_us": 0,
+            "max_us": 0
+          },
+          "fsync_commit_wait": {
+            "count": 0,
+            "avg_us": 0,
+            "max_us": 0
+          },
+          "fsync_barrier": {
+            "count": 0,
+            "avg_us": 0,
+            "max_us": 0
+          },
+          "fsync_barrier_flush": {
+            "count": 0,
+            "avg_us": 0,
+            "max_us": 0
+          },
+          "fsync_barrier_wait": {
+            "count": 0,
+            "avg_us": 0,
+            "max_us": 0
+          },
+          "commit_total": {
+            "count": 2,
+            "avg_us": 66975,
+            "max_us": 77810
+          },
+          "commit_ordered": {
+            "count": 2,
+            "avg_us": 38402,
+            "max_us": 51723
+          },
+          "commit_log": {
+            "count": 2,
+            "avg_us": 7556,
+            "max_us": 10186
+          },
+          "commit_barrier1": {
+            "count": 2,
+            "avg_us": 17833,
+            "max_us": 17853
+          },
+          "commit_barrier2": {
+            "count": 2,
+            "avg_us": 1039,
+            "max_us": 1425
+          },
+          "alloc_meta_flush": {
+            "count": 347,
+            "avg_us": 0,
+            "max_us": 2
+          },
+          "alloc_meta_block": {
+            "count": 0,
+            "avg_us": 0,
+            "max_us": 0
+          },
+          "alloc_desc": {
+            "count": 347,
+            "avg_us": 1,
+            "max_us": 9
+          },
+          "commit_stage_wait": {
+            "count": 0,
+            "avg_us": 0,
+            "max_us": 0
+          },
+          "commit_parked": {
+            "count": 1,
+            "avg_us": 0,
+            "max_us": 0
+          },
+          "commit_thread_sleep": {
+            "count": 4,
+            "avg_us": 2672061,
+            "max_us": 5293402
+          },
+          "commit_thread_busy": {
+            "count": 3,
+            "avg_us": 92531,
+            "max_us": 159915
+          },
+          "commit_checkpoint": {
+            "count": 5,
+            "avg_us": 1,
+            "max_us": 1
+          },
+          "commit_flush_tail": {
+            "count": 0,
+            "avg_us": 0,
+            "max_us": 0
+          },
+          "commit_one_total": {
+            "count": 5,
+            "avg_us": 55514,
+            "max_us": 159901
+          },
+          "commit_advance": {
+            "count": 5,
+            "avg_us": 20877,
+            "max_us": 101903
+          },
+          "commit_advance_lock": {
+            "count": 5,
+            "avg_us": 0,
+            "max_us": 1
+          },
+          "commit_credits_wake": {
+            "count": 2,
+            "avg_us": 0,
+            "max_us": 0
+          },
+          "commit_thread_age": {
+            "count": 5,
+            "avg_us": 1,
+            "max_us": 1
+          },
+          "write_total": {
+            "count": 522535,
+            "avg_us": 264,
+            "max_us": 2488866
+          },
+          "write_inner_lock": {
+            "count": 522536,
+            "avg_us": 10,
+            "max_us": 2488266
+          },
+          "write_page_cache": {
+            "count": 522535,
+            "avg_us": 23,
+            "max_us": 195754
+          },
+          "write_mark_dirty": {
+            "count": 522535,
+            "avg_us": 1,
+            "max_us": 100
+          },
+          "write_throttle": {
+            "count": 522535,
+            "avg_us": 221,
+            "max_us": 2472787
+          },
+          "wb_total": {
+            "count": 110,
+            "avg_us": 79813,
+            "max_us": 2518396
+          },
+          "wb_read_inode": {
+            "count": 347,
+            "avg_us": 0,
+            "max_us": 3
+          },
+          "wb_inner_lock": {
+            "count": 347,
+            "avg_us": 1681,
+            "max_us": 171324
+          },
+          "wb_alloc_pending": {
+            "count": 347,
+            "avg_us": 8661,
+            "max_us": 57260
+          },
+          "wb_journal_capture": {
+            "count": 694,
+            "avg_us": 1,
+            "max_us": 11
+          },
+          "wb_flush_async": {
+            "count": 347,
+            "avg_us": 5160,
+            "max_us": 85312
+          },
+          "wb_alloc_blocks": {
+            "count": 451457,
+            "avg_us": 1,
+            "max_us": 16729
+          },
+          "wb_tree_insert": {
+            "count": 451457,
+            "avg_us": 1,
+            "max_us": 1178
+          },
+          "wb_map_blocks": {
+            "count": 476116,
+            "avg_us": 0,
+            "max_us": 12598
+          },
+          "wb_wait_page_io": {
+            "count": 514030,
+            "avg_us": 0,
+            "max_us": 15072
+          },
+          "wb_walk_range": {
+            "count": 451457,
+            "avg_us": 1,
+            "max_us": 216
+          },
+          "wb_convert_unwritten": {
+            "count": 451457,
+            "avg_us": 1,
+            "max_us": 508
+          },
+          "wb_begin_op": {
+            "count": 694,
+            "avg_us": 3567,
+            "max_us": 2469155
+          },
+          "wb_reap": {
+            "count": 109,
+            "avg_us": 8415,
+            "max_us": 185133
+          },
+          "wb_dirty_lock": {
+            "count": 110,
+            "avg_us": 1,
+            "max_us": 60
+          },
+          "wb_wait_all": {
+            "count": 0,
+            "avg_us": 0,
+            "max_us": 0
+          },
+          "wb_collect": {
+            "count": 109,
+            "avg_us": 0,
+            "max_us": 1
+          },
+          "wb_sync_total": {
+            "count": 347,
+            "avg_us": 22655,
+            "max_us": 2488251
+          },
+          "wb_wake": {
+            "count": 0,
+            "avg_us": 0,
+            "max_us": 0
+          },
+          "wb_round": {
+            "count": 110,
+            "avg_us": 79813,
+            "max_us": 2518397
+          }
+        }
+      },
+      {
+        "run": "20260922_222007_aster-ext4-baseline",
+        "bw": 251.29,
+        "write_mib": 2048.0,
+        "stats": {
+          "fsync_total": {
+            "count": 0,
+            "avg_us": 0,
+            "max_us": 0
+          },
+          "fsync_lock": {
+            "count": 0,
+            "avg_us": 0,
+            "max_us": 0
+          },
+          "fsync_alloc": {
+            "count": 0,
+            "avg_us": 0,
+            "max_us": 0
+          },
+          "fsync_data_flush": {
+            "count": 0,
+            "avg_us": 0,
+            "max_us": 0
+          },
+          "fsync_capture": {
+            "count": 0,
+            "avg_us": 0,
+            "max_us": 0
+          },
+          "fsync_commit_wait": {
+            "count": 0,
+            "avg_us": 0,
+            "max_us": 0
+          },
+          "fsync_barrier": {
+            "count": 0,
+            "avg_us": 0,
+            "max_us": 0
+          },
+          "fsync_barrier_flush": {
+            "count": 0,
+            "avg_us": 0,
+            "max_us": 0
+          },
+          "fsync_barrier_wait": {
+            "count": 0,
+            "avg_us": 0,
+            "max_us": 0
+          },
+          "commit_total": {
+            "count": 1,
+            "avg_us": 67222,
+            "max_us": 67222
+          },
+          "commit_ordered": {
+            "count": 1,
+            "avg_us": 10075,
+            "max_us": 10075
+          },
+          "commit_log": {
+            "count": 1,
+            "avg_us": 20317,
+            "max_us": 20317
+          },
+          "commit_barrier1": {
+            "count": 1,
+            "avg_us": 17790,
+            "max_us": 17790
+          },
+          "commit_barrier2": {
+            "count": 1,
+            "avg_us": 727,
+            "max_us": 727
+          },
+          "alloc_meta_flush": {
+            "count": 361,
+            "avg_us": 0,
+            "max_us": 2
+          },
+          "alloc_meta_block": {
+            "count": 0,
+            "avg_us": 0,
+            "max_us": 0
+          },
+          "alloc_desc": {
+            "count": 361,
+            "avg_us": 1,
+            "max_us": 6
+          },
+          "commit_stage_wait": {
+            "count": 0,
+            "avg_us": 0,
+            "max_us": 0
+          },
+          "commit_parked": {
+            "count": 0,
+            "avg_us": 0,
+            "max_us": 0
+          },
+          "commit_thread_sleep": {
+            "count": 2,
+            "avg_us": 2692816,
+            "max_us": 5192373
+          },
+          "commit_thread_busy": {
+            "count": 1,
+            "avg_us": 84805,
+            "max_us": 84805
+          },
+          "commit_checkpoint": {
+            "count": 2,
+            "avg_us": 0,
+            "max_us": 0
+          },
+          "commit_flush_tail": {
+            "count": 0,
+            "avg_us": 0,
+            "max_us": 0
+          },
+          "commit_one_total": {
+            "count": 2,
+            "avg_us": 42401,
+            "max_us": 84801
+          },
+          "commit_advance": {
+            "count": 2,
+            "avg_us": 6965,
+            "max_us": 13929
+          },
+          "commit_advance_lock": {
+            "count": 2,
+            "avg_us": 0,
+            "max_us": 0
+          },
+          "commit_credits_wake": {
+            "count": 1,
+            "avg_us": 0,
+            "max_us": 0
+          },
+          "commit_thread_age": {
+            "count": 3,
+            "avg_us": 93,
+            "max_us": 279
+          },
+          "write_total": {
+            "count": 524288,
+            "avg_us": 215,
+            "max_us": 142867
+          },
+          "write_inner_lock": {
+            "count": 524288,
+            "avg_us": 5,
+            "max_us": 125618
+          },
+          "write_page_cache": {
+            "count": 524288,
+            "avg_us": 14,
+            "max_us": 115623
+          },
+          "write_mark_dirty": {
+            "count": 524288,
+            "avg_us": 1,
+            "max_us": 2058
+          },
+          "write_throttle": {
+            "count": 524288,
+            "avg_us": 186,
+            "max_us": 142857
+          },
+          "wb_total": {
+            "count": 110,
+            "avg_us": 47675,
+            "max_us": 150674
+          },
+          "wb_read_inode": {
+            "count": 361,
+            "avg_us": 0,
+            "max_us": 5
+          },
+          "wb_inner_lock": {
+            "count": 361,
+            "avg_us": 334,
+            "max_us": 69808
+          },
+          "wb_alloc_pending": {
+            "count": 361,
+            "avg_us": 8225,
+            "max_us": 36471
+          },
+          "wb_journal_capture": {
+            "count": 722,
+            "avg_us": 1,
+            "max_us": 10
+          },
+          "wb_flush_async": {
+            "count": 361,
+            "avg_us": 5383,
+            "max_us": 120711
+          },
+          "wb_alloc_blocks": {
+            "count": 457587,
+            "avg_us": 1,
+            "max_us": 14491
+          },
+          "wb_tree_insert": {
+            "count": 457587,
+            "avg_us": 1,
+            "max_us": 27571
+          },
+          "wb_map_blocks": {
+            "count": 470709,
+            "avg_us": 1,
+            "max_us": 101223
+          },
+          "wb_wait_page_io": {
+            "count": 520626,
+            "avg_us": 0,
+            "max_us": 22
+          },
+          "wb_walk_range": {
+            "count": 457587,
+            "avg_us": 1,
+            "max_us": 92
+          },
+          "wb_convert_unwritten": {
+            "count": 457587,
+            "avg_us": 1,
+            "max_us": 1007
+          },
+          "wb_begin_op": {
+            "count": 722,
+            "avg_us": 0,
+            "max_us": 8
+          },
+          "wb_reap": {
+            "count": 109,
+            "avg_us": 1867,
+            "max_us": 50462
+          },
+          "wb_dirty_lock": {
+            "count": 110,
+            "avg_us": 0,
+            "max_us": 5
+          },
+          "wb_wait_all": {
+            "count": 0,
+            "avg_us": 0,
+            "max_us": 0
+          },
+          "wb_collect": {
+            "count": 109,
+            "avg_us": 0,
+            "max_us": 1
+          },
+          "wb_sync_total": {
+            "count": 361,
+            "avg_us": 13961,
+            "max_us": 129764
+          },
+          "wb_wake": {
+            "count": 0,
+            "avg_us": 0,
+            "max_us": 0
+          },
+          "wb_round": {
+            "count": 110,
+            "avg_us": 47676,
+            "max_us": 150674
+          }
+        }
+      },
+      {
+        "run": "20260922_222116_aster-ext4-baseline",
+        "bw": 226.8,
+        "write_mib": 2048.0,
+        "stats": {
+          "fsync_total": {
+            "count": 0,
+            "avg_us": 0,
+            "max_us": 0
+          },
+          "fsync_lock": {
+            "count": 0,
+            "avg_us": 0,
+            "max_us": 0
+          },
+          "fsync_alloc": {
+            "count": 0,
+            "avg_us": 0,
+            "max_us": 0
+          },
+          "fsync_data_flush": {
+            "count": 0,
+            "avg_us": 0,
+            "max_us": 0
+          },
+          "fsync_capture": {
+            "count": 0,
+            "avg_us": 0,
+            "max_us": 0
+          },
+          "fsync_commit_wait": {
+            "count": 0,
+            "avg_us": 0,
+            "max_us": 0
+          },
+          "fsync_barrier": {
+            "count": 0,
+            "avg_us": 0,
+            "max_us": 0
+          },
+          "fsync_barrier_flush": {
+            "count": 0,
+            "avg_us": 0,
+            "max_us": 0
+          },
+          "fsync_barrier_wait": {
+            "count": 0,
+            "avg_us": 0,
+            "max_us": 0
+          },
+          "commit_total": {
+            "count": 1,
+            "avg_us": 92585,
+            "max_us": 92585
+          },
+          "commit_ordered": {
+            "count": 1,
+            "avg_us": 48257,
+            "max_us": 48257
+          },
+          "commit_log": {
+            "count": 1,
+            "avg_us": 23733,
+            "max_us": 23733
+          },
+          "commit_barrier1": {
+            "count": 1,
+            "avg_us": 628,
+            "max_us": 628
+          },
+          "commit_barrier2": {
+            "count": 1,
+            "avg_us": 18108,
+            "max_us": 18108
+          },
+          "alloc_meta_flush": {
+            "count": 352,
+            "avg_us": 0,
+            "max_us": 2
+          },
+          "alloc_meta_block": {
+            "count": 0,
+            "avg_us": 0,
+            "max_us": 0
+          },
+          "alloc_desc": {
+            "count": 352,
+            "avg_us": 1,
+            "max_us": 22
+          },
+          "commit_stage_wait": {
+            "count": 0,
+            "avg_us": 0,
+            "max_us": 0
+          },
+          "commit_parked": {
+            "count": 1,
+            "avg_us": 0,
+            "max_us": 0
+          },
+          "commit_thread_sleep": {
+            "count": 3,
+            "avg_us": 1881502,
+            "max_us": 5445223
+          },
+          "commit_thread_busy": {
+            "count": 2,
+            "avg_us": 129328,
+            "max_us": 258641
+          },
+          "commit_checkpoint": {
+            "count": 3,
+            "avg_us": 1,
+            "max_us": 1
+          },
+          "commit_flush_tail": {
+            "count": 0,
+            "avg_us": 0,
+            "max_us": 0
+          },
+          "commit_one_total": {
+            "count": 3,
+            "avg_us": 86214,
+            "max_us": 258620
+          },
+          "commit_advance": {
+            "count": 3,
+            "avg_us": 48036,
+            "max_us": 144089
+          },
+          "commit_advance_lock": {
+            "count": 3,
+            "avg_us": 0,
+            "max_us": 2
+          },
+          "commit_credits_wake": {
+            "count": 1,
+            "avg_us": 0,
+            "max_us": 0
+          },
+          "commit_thread_age": {
+            "count": 4,
+            "avg_us": 0,
+            "max_us": 1
+          },
+          "write_total": {
+            "count": 513637,
+            "avg_us": 247,
+            "max_us": 433426
+          },
+          "write_inner_lock": {
+            "count": 513639,
+            "avg_us": 5,
+            "max_us": 159929
+          },
+          "write_page_cache": {
+            "count": 513639,
+            "avg_us": 22,
+            "max_us": 234472
+          },
+          "write_mark_dirty": {
+            "count": 513639,
+            "avg_us": 1,
+            "max_us": 90
+          },
+          "write_throttle": {
+            "count": 513637,
+            "avg_us": 209,
+            "max_us": 295251
+          },
+          "wb_total": {
+            "count": 110,
+            "avg_us": 53170,
+            "max_us": 350105
+          },
+          "wb_read_inode": {
+            "count": 352,
+            "avg_us": 0,
+            "max_us": 3
+          },
+          "wb_inner_lock": {
+            "count": 352,
+            "avg_us": 326,
+            "max_us": 65618
+          },
+          "wb_alloc_pending": {
+            "count": 352,
+            "avg_us": 8295,
+            "max_us": 34185
+          },
+          "wb_journal_capture": {
+            "count": 704,
+            "avg_us": 1,
+            "max_us": 23
+          },
+          "wb_flush_async": {
+            "count": 352,
+            "avg_us": 5103,
+            "max_us": 144838
+          },
+          "wb_alloc_blocks": {
+            "count": 446231,
+            "avg_us": 1,
+            "max_us": 17484
+          },
+          "wb_tree_insert": {
+            "count": 446231,
+            "avg_us": 1,
+            "max_us": 1317
+          },
+          "wb_map_blocks": {
+            "count": 459872,
+            "avg_us": 0,
+            "max_us": 5050
+          },
+          "wb_wait_page_io": {
+            "count": 502097,
+            "avg_us": 0,
+            "max_us": 16710
+          },
+          "wb_walk_range": {
+            "count": 446231,
+            "avg_us": 1,
+            "max_us": 162
+          },
+          "wb_convert_unwritten": {
+            "count": 446231,
+            "avg_us": 1,
+            "max_us": 269
+          },
+          "wb_begin_op": {
+            "count": 704,
+            "avg_us": 198,
+            "max_us": 139139
+          },
+          "wb_reap": {
+            "count": 109,
+            "avg_us": 7992,
+            "max_us": 195719
+          },
+          "wb_dirty_lock": {
+            "count": 110,
+            "avg_us": 0,
+            "max_us": 2
+          },
+          "wb_wait_all": {
+            "count": 0,
+            "avg_us": 0,
+            "max_us": 0
+          },
+          "wb_collect": {
+            "count": 109,
+            "avg_us": 0,
+            "max_us": 5
+          },
+          "wb_sync_total": {
+            "count": 352,
+            "avg_us": 14139,
+            "max_us": 159981
+          },
+          "wb_wake": {
+            "count": 0,
+            "avg_us": 0,
+            "max_us": 0
+          },
+          "wb_round": {
+            "count": 110,
+            "avg_us": 53171,
+            "max_us": 350106
+          }
+        }
+      }
+    ]
+  },
+  "table": [
+    {
+      "counter": "write_total",
+      "group": "\u524d\u53f0 write() \u8def\u5f84",
+      "ext2like_avg_us": 4783,
+      "ext4_avg_us": 247,
+      "ext2like_count": 100631,
+      "ext4_count": 522535,
+      "ext2like_total_ms": 481318.073,
+      "ext4_total_ms": 129066.145
+    },
+    {
+      "counter": "write_inner_lock",
+      "group": "\u524d\u53f0 write() \u8def\u5f84",
+      "ext2like_avg_us": 258,
+      "ext4_avg_us": 5,
+      "ext2like_count": 100631,
+      "ext4_count": 522536,
+      "ext2like_total_ms": 25962.798,
+      "ext4_total_ms": 2612.68
+    },
+    {
+      "counter": "write_page_cache",
+      "group": "\u524d\u53f0 write() \u8def\u5f84",
+      "ext2like_avg_us": 4,
+      "ext4_avg_us": 22,
+      "ext2like_count": 100631,
+      "ext4_count": 522535,
+      "ext2like_total_ms": 402.524,
+      "ext4_total_ms": 11495.77
+    },
+    {
+      "counter": "write_mark_dirty",
+      "group": "\u524d\u53f0 write() \u8def\u5f84",
+      "ext2like_avg_us": 1,
+      "ext4_avg_us": 1,
+      "ext2like_count": 100631,
+      "ext4_count": 522535,
+      "ext2like_total_ms": 100.631,
+      "ext4_total_ms": 522.535
+    },
+    {
+      "counter": "write_throttle",
+      "group": "\u524d\u53f0 write() \u8def\u5f84",
+      "ext2like_avg_us": 4511,
+      "ext4_avg_us": 209,
+      "ext2like_count": 100631,
+      "ext4_count": 522535,
+      "ext2like_total_ms": 453946.441,
+      "ext4_total_ms": 109209.815
+    },
+    {
+      "counter": "wb_round",
+      "group": "writeback \u7ebf\u7a0b\uff1a\u6bcf\u8f6e",
+      "ext2like_avg_us": 1489853,
+      "ext4_avg_us": 53171,
+      "ext2like_count": 20,
+      "ext4_count": 110,
+      "ext2like_total_ms": 29797.06,
+      "ext4_total_ms": 5848.81
+    },
+    {
+      "counter": "wb_collect",
+      "group": "writeback \u7ebf\u7a0b\uff1a\u6bcf\u8f6e",
+      "ext2like_avg_us": 0,
+      "ext4_avg_us": 0,
+      "ext2like_count": 19,
+      "ext4_count": 109,
+      "ext2like_total_ms": 0.0,
+      "ext4_total_ms": 0.0
+    },
+    {
+      "counter": "wb_read_inode",
+      "group": "writeback \u7ebf\u7a0b\uff1a\u6bcf\u8f6e",
+      "ext2like_avg_us": 0,
+      "ext4_avg_us": 0,
+      "ext2like_count": 62,
+      "ext4_count": 352,
+      "ext2like_total_ms": 0.0,
+      "ext4_total_ms": 0.0
+    },
+    {
+      "counter": "wb_sync_total",
+      "group": "writeback \u7ebf\u7a0b\uff1a\u6bcf inode \u6f0f\u6597\uff08wb_sync_total \u5185\u90e8\uff09",
+      "ext2like_avg_us": 480586,
+      "ext4_avg_us": 14139,
+      "ext2like_count": 62,
+      "ext4_count": 352,
+      "ext2like_total_ms": 29796.332,
+      "ext4_total_ms": 4976.928
+    },
+    {
+      "counter": "wb_inner_lock",
+      "group": "writeback \u7ebf\u7a0b\uff1a\u6bcf inode \u6f0f\u6597\uff08wb_sync_total \u5185\u90e8\uff09",
+      "ext2like_avg_us": 0,
+      "ext4_avg_us": 334,
+      "ext2like_count": 62,
+      "ext4_count": 352,
+      "ext2like_total_ms": 0.0,
+      "ext4_total_ms": 117.568
+    },
+    {
+      "counter": "wb_begin_op",
+      "group": "writeback \u7ebf\u7a0b\uff1a\u6bcf inode \u6f0f\u6597\uff08wb_sync_total \u5185\u90e8\uff09",
+      "ext2like_avg_us": 0,
+      "ext4_avg_us": 198,
+      "ext2like_count": 124,
+      "ext4_count": 704,
+      "ext2like_total_ms": 0.0,
+      "ext4_total_ms": 139.392
+    },
+    {
+      "counter": "wb_alloc_pending",
+      "group": "writeback \u7ebf\u7a0b\uff1a\u6bcf inode \u6f0f\u6597\uff08wb_sync_total \u5185\u90e8\uff09",
+      "ext2like_avg_us": 456439,
+      "ext4_avg_us": 8295,
+      "ext2like_count": 62,
+      "ext4_count": 352,
+      "ext2like_total_ms": 28299.218,
+      "ext4_total_ms": 2919.84
+    },
+    {
+      "counter": "wb_alloc_blocks",
+      "group": "writeback \u7ebf\u7a0b\uff1a\u6bcf inode \u6f0f\u6597\uff08wb_sync_total \u5185\u90e8\uff09",
+      "ext2like_avg_us": 0,
+      "ext4_avg_us": 1,
+      "ext2like_count": 83358,
+      "ext4_count": 451457,
+      "ext2like_total_ms": 0.0,
+      "ext4_total_ms": 451.457
+    },
+    {
+      "counter": "wb_walk_range",
+      "group": "writeback \u7ebf\u7a0b\uff1a\u6bcf inode \u6f0f\u6597\uff08wb_sync_total \u5185\u90e8\uff09",
+      "ext2like_avg_us": 1,
+      "ext4_avg_us": 1,
+      "ext2like_count": 83358,
+      "ext4_count": 451457,
+      "ext2like_total_ms": 83.358,
+      "ext4_total_ms": 451.457
+    },
+    {
+      "counter": "wb_tree_insert",
+      "group": "writeback \u7ebf\u7a0b\uff1a\u6bcf inode \u6f0f\u6597\uff08wb_sync_total \u5185\u90e8\uff09",
+      "ext2like_avg_us": 3,
+      "ext4_avg_us": 1,
+      "ext2like_count": 83358,
+      "ext4_count": 451457,
+      "ext2like_total_ms": 250.074,
+      "ext4_total_ms": 451.457
+    },
+    {
+      "counter": "wb_map_blocks",
+      "group": "writeback \u7ebf\u7a0b\uff1a\u6bcf inode \u6f0f\u6597\uff08wb_sync_total \u5185\u90e8\uff09",
+      "ext2like_avg_us": 0,
+      "ext4_avg_us": 0,
+      "ext2like_count": 83358,
+      "ext4_count": 470709,
+      "ext2like_total_ms": 0.0,
+      "ext4_total_ms": 0.0
+    },
+    {
+      "counter": "wb_convert_unwritten",
+      "group": "writeback \u7ebf\u7a0b\uff1a\u6bcf inode \u6f0f\u6597\uff08wb_sync_total \u5185\u90e8\uff09",
+      "ext2like_avg_us": 3,
+      "ext4_avg_us": 1,
+      "ext2like_count": 83358,
+      "ext4_count": 451457,
+      "ext2like_total_ms": 250.074,
+      "ext4_total_ms": 451.457
+    },
+    {
+      "counter": "wb_journal_capture",
+      "group": "writeback \u7ebf\u7a0b\uff1a\u6bcf inode \u6f0f\u6597\uff08wb_sync_total \u5185\u90e8\uff09",
+      "ext2like_avg_us": 8572,
+      "ext4_avg_us": 1,
+      "ext2like_count": 124,
+      "ext4_count": 704,
+      "ext2like_total_ms": 1062.928,
+      "ext4_total_ms": 0.704
+    },
+    {
+      "counter": "wb_flush_async",
+      "group": "writeback \u7ebf\u7a0b\uff1a\u6bcf inode \u6f0f\u6597\uff08wb_sync_total \u5185\u90e8\uff09",
+      "ext2like_avg_us": 6766,
+      "ext4_avg_us": 5160,
+      "ext2like_count": 62,
+      "ext4_count": 352,
+      "ext2like_total_ms": 419.492,
+      "ext4_total_ms": 1816.32
+    },
+    {
+      "counter": "wb_wait_page_io",
+      "group": "writeback \u7ebf\u7a0b\uff1a\u6bcf inode \u6f0f\u6597\uff08wb_sync_total \u5185\u90e8\uff09",
+      "ext2like_avg_us": 0,
+      "ext4_avg_us": 0,
+      "ext2like_count": 89153,
+      "ext4_count": 514030,
+      "ext2like_total_ms": 0.0,
+      "ext4_total_ms": 0.0
+    },
+    {
+      "counter": "wb_reap",
+      "group": "writeback \u7ebf\u7a0b\uff1a\u6bcf inode \u6f0f\u6597\uff08wb_sync_total \u5185\u90e8\uff09",
+      "ext2like_avg_us": 28,
+      "ext4_avg_us": 7992,
+      "ext2like_count": 19,
+      "ext4_count": 109,
+      "ext2like_total_ms": 0.532,
+      "ext4_total_ms": 871.128
+    },
+    {
+      "counter": "wb_dirty_lock",
+      "group": "writeback \u7ebf\u7a0b\uff1a\u6bcf inode \u6f0f\u6597\uff08wb_sync_total \u5185\u90e8\uff09",
+      "ext2like_avg_us": 0,
+      "ext4_avg_us": 0,
+      "ext2like_count": 20,
+      "ext4_count": 110,
+      "ext2like_total_ms": 0.0,
+      "ext4_total_ms": 0.0
+    },
+    {
+      "counter": "alloc_meta_flush",
+      "group": "nojournal \u5206\u914d\u7a97\u53e3 / inode \u8868\uff08009 \u5b9a\u4e49\uff09",
+      "ext2like_avg_us": 445209,
+      "ext4_avg_us": 0,
+      "ext2like_count": 62,
+      "ext4_count": 352,
+      "ext2like_total_ms": 27602.958,
+      "ext4_total_ms": 0.0
+    },
+    {
+      "counter": "alloc_desc",
+      "group": "nojournal \u5206\u914d\u7a97\u53e3 / inode \u8868\uff08009 \u5b9a\u4e49\uff09",
+      "ext2like_avg_us": 17145,
+      "ext4_avg_us": 1,
+      "ext2like_count": 62,
+      "ext4_count": 352,
+      "ext2like_total_ms": 1062.99,
+      "ext4_total_ms": 0.352
+    },
+    {
+      "counter": "commit_total",
+      "group": "journal \u63d0\u4ea4\u4f53\uff08\u4ec5 ext4\uff0c\u4f9b\u53c2\u7167\uff09",
+      "ext2like_avg_us": 0,
+      "ext4_avg_us": 67222,
+      "ext2like_count": 0,
+      "ext4_count": 1,
+      "ext2like_total_ms": 0.0,
+      "ext4_total_ms": 67.222
+    },
+    {
+      "counter": "commit_ordered",
+      "group": "journal \u63d0\u4ea4\u4f53\uff08\u4ec5 ext4\uff0c\u4f9b\u53c2\u7167\uff09",
+      "ext2like_avg_us": 0,
+      "ext4_avg_us": 38402,
+      "ext2like_count": 0,
+      "ext4_count": 1,
+      "ext2like_total_ms": 0.0,
+      "ext4_total_ms": 38.402
+    },
+    {
+      "counter": "commit_log",
+      "group": "journal \u63d0\u4ea4\u4f53\uff08\u4ec5 ext4\uff0c\u4f9b\u53c2\u7167\uff09",
+      "ext2like_avg_us": 0,
+      "ext4_avg_us": 20317,
+      "ext2like_count": 0,
+      "ext4_count": 1,
+      "ext2like_total_ms": 0.0,
+      "ext4_total_ms": 20.317
+    },
+    {
+      "counter": "commit_barrier1",
+      "group": "journal \u63d0\u4ea4\u4f53\uff08\u4ec5 ext4\uff0c\u4f9b\u53c2\u7167\uff09",
+      "ext2like_avg_us": 0,
+      "ext4_avg_us": 17790,
+      "ext2like_count": 0,
+      "ext4_count": 1,
+      "ext2like_total_ms": 0.0,
+      "ext4_total_ms": 17.79
+    },
+    {
+      "counter": "commit_barrier2",
+      "group": "journal \u63d0\u4ea4\u4f53\uff08\u4ec5 ext4\uff0c\u4f9b\u53c2\u7167\uff09",
+      "ext2like_avg_us": 0,
+      "ext4_avg_us": 1039,
+      "ext2like_count": 0,
+      "ext4_count": 1,
+      "ext2like_total_ms": 0.0,
+      "ext4_total_ms": 1.039
+    }
+  ]
+}

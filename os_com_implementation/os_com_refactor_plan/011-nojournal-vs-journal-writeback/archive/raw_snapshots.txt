@@ -1,0 +1,720 @@
+########## ext2like 20260922_222007 ##########
+[32m[    34.337][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] fsync_total: count=0[0m
+[32m[    34.340][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] fsync_lock: count=0[0m
+[32m[    34.342][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] fsync_alloc: count=0[0m
+[32m[    34.344][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] fsync_data_flush: count=0[0m
+[32m[    34.345][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] fsync_capture: count=0[0m
+[32m[    34.347][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] fsync_commit_wait: count=0[0m
+[32m[    34.348][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] fsync_barrier: count=0[0m
+[32m[    34.350][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] fsync_barrier_flush: count=0[0m
+[32m[    34.352][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] fsync_barrier_wait: count=0[0m
+[32m[    34.353][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_total: count=0[0m
+[32m[    34.355][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_ordered: count=0[0m
+[32m[    34.356][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_log: count=0[0m
+[32m[    34.358][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_barrier1: count=0[0m
+[32m[    34.359][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_barrier2: count=0[0m
+[32m[    34.361][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] alloc_meta_flush: count=59 avg_us=470106 max_us=870616[0m
+[32m[    34.363][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] alloc_meta_block: count=1701 avg_us=16304 max_us=18173[0m
+[32m[    34.365][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] alloc_desc: count=59 avg_us=17145 max_us=36017[0m
+[32m[    34.367][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_stage_wait: count=0[0m
+[32m[    34.368][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_parked: count=0[0m
+[32m[    34.370][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_thread_sleep: count=0[0m
+[32m[    34.371][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_thread_busy: count=0[0m
+[32m[    34.373][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_checkpoint: count=0[0m
+[32m[    34.375][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_flush_tail: count=0[0m
+[32m[    34.376][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_one_total: count=0[0m
+[32m[    34.379][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_advance: count=0[0m
+[32m[    34.381][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_advance_lock: count=0[0m
+[32m[    34.383][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_credits_wake: count=0[0m
+[32m[    34.385][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_thread_age: count=0[0m
+[32m[    34.387][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] write_total: count=98001 avg_us=4937 max_us=902025[0m
+[32m[    34.389][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] write_inner_lock: count=98001 avg_us=270 max_us=888968[0m
+[32m[    34.391][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] write_page_cache: count=98001 avg_us=4 max_us=5606[0m
+[32m[    34.393][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] write_mark_dirty: count=98001 avg_us=1 max_us=99[0m
+[32m[    34.394][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] write_throttle: count=98001 avg_us=4652 max_us=900509[0m
+[32m[    34.396][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_total: count=20 avg_us=1495598 max_us=2526823[0m
+[32m[    34.398][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_read_inode: count=59 avg_us=0 max_us=4[0m
+[32m[    34.400][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_inner_lock: count=59 avg_us=0 max_us=14[0m
+[32m[    34.402][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_alloc_pending: count=59 avg_us=483050 max_us=876711[0m
+[32m[    34.405][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_journal_capture: count=118 avg_us=8572 max_us=36018[0m
+[32m[    34.409][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_flush_async: count=59 avg_us=6766 max_us=10686[0m
+[32m[    34.413][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_alloc_blocks: count=80628 avg_us=0 max_us=49[0m
+[32m[    34.416][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_tree_insert: count=80628 avg_us=3 max_us=13823[0m
+[32m[    34.419][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_map_blocks: count=80628 avg_us=1 max_us=293[0m
+[32m[    34.421][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_wait_page_io: count=86360 avg_us=0 max_us=33[0m
+[32m[    34.423][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_walk_range: count=80628 avg_us=1 max_us=40[0m
+[32m[    34.425][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_convert_unwritten: count=80628 avg_us=3 max_us=18286[0m
+[32m[    34.427][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_begin_op: count=118 avg_us=0 max_us=3[0m
+[32m[    34.429][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_reap: count=19 avg_us=14 max_us=105[0m
+[32m[    34.431][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_dirty_lock: count=20 avg_us=0 max_us=4[0m
+[32m[    34.432][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_wait_all: count=0[0m
+[32m[    34.434][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_collect: count=19 avg_us=0 max_us=2[0m
+[32m[    34.435][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_sync_total: count=59 avg_us=506975 max_us=899947[0m
+[32m[    34.437][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_wake: count=0[0m
+[32m[    34.439][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_round: count=20 avg_us=1495599 max_us=2526824[0m
+[32m[    34.440][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] max_tree_depth: 2[0m
+[32m[    34.442][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] == snapshot end ==[0m
+[32m[    34.603][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] == snapshot begin ==[0m
+[32m[    34.607][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] fsync_total: count=0[0m
+[32m[    34.610][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] fsync_lock: count=0[0m
+########## ext2like 20260922_221845 ##########
+[32m[    15.676][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] max_tree_depth: 2[0m
+[32m[    15.677][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] == snapshot end ==[0m
+[32m[    16.389][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] == snapshot begin ==[0m
+[32m[    16.391][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] fsync_total: count=0[0m
+[32m[    16.393][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] fsync_lock: count=0[0m
+[32m[    16.396][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] fsync_alloc: count=0[0m
+[32m[    16.399][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] fsync_data_flush: count=0[0m
+[32m[    16.401][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] fsync_capture: count=0[0m
+[32m[    16.403][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] fsync_commit_wait: count=0[0m
+[32m[    16.405][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] fsync_barrier: count=0[0m
+[32m[    16.408][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] fsync_barrier_flush: count=0[0m
+[32m[    16.410][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] fsync_barrier_wait: count=0[0m
+[32m[    16.411][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_total: count=0[0m
+[32m[    16.413][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_ordered: count=0[0m
+[32m[    16.414][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_log: count=0[0m
+[32m[    16.415][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_barrier1: count=0[0m
+[32m[    16.419][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_barrier2: count=0[0m
+[32m[    16.422][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] alloc_meta_flush: count=314 avg_us=11368 max_us=24682[0m
+[32m[    16.425][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] alloc_meta_block: count=28634 avg_us=124 max_us=455[0m
+[32m[    16.427][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] alloc_desc: count=314 avg_us=173 max_us=4137[0m
+[32m[    16.429][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_stage_wait: count=0[0m
+[32m[    16.431][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_parked: count=0[0m
+[32m[    16.433][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_thread_sleep: count=0[0m
+[32m[    16.435][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_thread_busy: count=0[0m
+[32m[    16.438][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_checkpoint: count=0[0m
+[32m[    16.440][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_flush_tail: count=0[0m
+[32m[    16.442][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_one_total: count=0[0m
+[32m[    16.443][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_advance: count=0[0m
+[32m[    16.445][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_advance_lock: count=0[0m
+[32m[    16.447][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_credits_wake: count=0[0m
+[32m[    16.448][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_thread_age: count=0[0m
+[32m[    16.450][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] write_total: count=521204 avg_us=359 max_us=210825[0m
+[32m[    16.455][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] write_inner_lock: count=521214 avg_us=9 max_us=37984[0m
+[32m[    16.459][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] write_page_cache: count=521214 avg_us=18 max_us=178534[0m
+[32m[    16.461][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] write_mark_dirty: count=521214 avg_us=1 max_us=92[0m
+[32m[    16.463][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] write_throttle: count=521204 avg_us=323 max_us=192341[0m
+[32m[    16.465][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_total: count=105 avg_us=96225 max_us=251632[0m
+[32m[    16.467][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_read_inode: count=314 avg_us=0 max_us=11[0m
+[32m[    16.469][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_inner_lock: count=314 avg_us=1086 max_us=103716[0m
+[32m[    16.471][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_alloc_pending: count=314 avg_us=19318 max_us=136558[0m
+[32m[    16.473][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_journal_capture: count=628 avg_us=87 max_us=4137[0m
+[32m[    16.475][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_flush_async: count=314 avg_us=9569 max_us=25470[0m
+[32m[    16.477][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_alloc_blocks: count=448067 avg_us=0 max_us=39[0m
+[32m[    16.479][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_tree_insert: count=448067 avg_us=1 max_us=60738[0m
+[32m[    16.481][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_map_blocks: count=448067 avg_us=0 max_us=629[0m
+[32m[    16.483][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_wait_page_io: count=508107 avg_us=0 max_us=19[0m
+[32m[    16.485][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_walk_range: count=448067 avg_us=1 max_us=5087[0m
+[32m[    16.487][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_convert_unwritten: count=448067 avg_us=2 max_us=106204[0m
+[32m[    16.489][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_begin_op: count=628 avg_us=0 max_us=4[0m
+[32m[    16.490][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_reap: count=104 avg_us=6094 max_us=131924[0m
+[32m[    16.492][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_dirty_lock: count=105 avg_us=0 max_us=7[0m
+[32m[    16.496][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_wait_all: count=0[0m
+[32m[    16.501][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_collect: count=104 avg_us=0 max_us=0[0m
+[32m[    16.504][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_sync_total: count=314 avg_us=30156 max_us=146675[0m
+[32m[    16.507][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_wake: count=0[0m
+[32m[    16.509][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_round: count=105 avg_us=96225 max_us=251633[0m
+[32m[    16.511][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] max_tree_depth: 2[0m
+[32m[    16.513][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] == snapshot end ==[0m
+########## ext2like 20260922_221236 ##########
+[32m[    16.971][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_round: count=110 avg_us=96796 max_us=332828[0m
+[32m[    16.973][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] max_tree_depth: 2[0m
+[32m[    16.975][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] == snapshot end ==[0m
+[32m[    17.687][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] == snapshot begin ==[0m
+[32m[    17.688][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] fsync_total: count=0[0m
+[32m[    17.690][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] fsync_lock: count=0[0m
+[32m[    17.691][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] fsync_alloc: count=0[0m
+[32m[    17.693][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] fsync_data_flush: count=0[0m
+[32m[    17.695][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] fsync_capture: count=0[0m
+[32m[    17.696][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] fsync_commit_wait: count=0[0m
+[32m[    17.698][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] fsync_barrier: count=0[0m
+[32m[    17.700][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] fsync_barrier_flush: count=0[0m
+[32m[    17.701][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] fsync_barrier_wait: count=0[0m
+[32m[    17.703][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_total: count=0[0m
+[32m[    17.705][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_ordered: count=0[0m
+[32m[    17.706][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_log: count=0[0m
+[32m[    17.708][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_barrier1: count=0[0m
+[32m[    17.710][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_barrier2: count=0[0m
+[32m[    17.711][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] alloc_meta_flush: count=0[0m
+[32m[    17.713][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] alloc_desc: count=353 avg_us=160 max_us=3286[0m
+[32m[    17.715][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_stage_wait: count=0[0m
+[32m[    17.716][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_parked: count=0[0m
+[32m[    17.719][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_thread_sleep: count=0[0m
+[32m[    17.722][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_thread_busy: count=0[0m
+[32m[    17.723][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_checkpoint: count=0[0m
+[32m[    17.725][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_flush_tail: count=0[0m
+[32m[    17.727][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_one_total: count=0[0m
+[32m[    17.728][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_advance: count=0[0m
+[32m[    17.730][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_advance_lock: count=0[0m
+[32m[    17.732][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_credits_wake: count=0[0m
+[32m[    17.734][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_thread_age: count=0[0m
+[32m[    17.735][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] write_total: count=524288 avg_us=391 max_us=415377[0m
+[32m[    17.737][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] write_inner_lock: count=524288 avg_us=12 max_us=135269[0m
+[32m[    17.739][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] write_page_cache: count=524288 avg_us=32 max_us=268160[0m
+[32m[    17.741][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] write_mark_dirty: count=524288 avg_us=1 max_us=1520[0m
+[32m[    17.743][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] write_throttle: count=524288 avg_us=339 max_us=388985[0m
+[32m[    17.745][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_total: count=115 avg_us=98921 max_us=332828[0m
+[32m[    17.747][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_read_inode: count=353 avg_us=0 max_us=3[0m
+[32m[    17.749][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_inner_lock: count=365 avg_us=1112 max_us=119915[0m
+[32m[    17.751][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_alloc_pending: count=353 avg_us=20874 max_us=191065[0m
+[32m[    17.753][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_journal_capture: count=717 avg_us=79 max_us=3286[0m
+[32m[    17.755][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_flush_async: count=364 avg_us=5929 max_us=116928[0m
+[32m[    17.757][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_alloc_blocks: count=461343 avg_us=0 max_us=32[0m
+[32m[    17.759][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_tree_insert: count=461343 avg_us=1 max_us=152090[0m
+[32m[    17.761][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_map_blocks: count=460902 avg_us=0 max_us=104772[0m
+[32m[    17.763][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_wait_page_io: count=523580 avg_us=0 max_us=16[0m
+[32m[    17.766][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_walk_range: count=461343 avg_us=1 max_us=112[0m
+[32m[    17.768][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_convert_unwritten: count=461343 avg_us=2 max_us=167152[0m
+[32m[    17.771][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_begin_op: count=718 avg_us=0 max_us=5[0m
+[32m[    17.773][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_reap: count=114 avg_us=12892 max_us=247505[0m
+[32m[    17.775][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_dirty_lock: count=115 avg_us=0 max_us=9[0m
+[32m[    17.777][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_wait_all: count=0[0m
+[32m[    17.778][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_collect: count=114 avg_us=0 max_us=0[0m
+[32m[    17.780][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_sync_total: count=353 avg_us=28061 max_us=197281[0m
+[32m[    17.782][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_wake: count=0[0m
+[32m[    17.784][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_round: count=115 avg_us=98921 max_us=332828[0m
+[32m[    17.788][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] max_tree_depth: 2[0m
+[32m[    17.792][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] == snapshot end ==[0m
+########## ext4 20260922_221236 ##########
+[32m[    13.666][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_round: count=95 avg_us=78778 max_us=305759[0m
+[32m[    13.668][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] max_tree_depth: 2[0m
+[32m[    13.670][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] == snapshot end ==[0m
+[32m[    13.858][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] == snapshot begin ==[0m
+[32m[    13.860][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] fsync_total: count=0[0m
+[32m[    13.862][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] fsync_lock: count=0[0m
+[32m[    13.863][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] fsync_alloc: count=0[0m
+[32m[    13.865][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] fsync_data_flush: count=0[0m
+[32m[    13.866][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] fsync_capture: count=0[0m
+[32m[    13.868][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] fsync_commit_wait: count=0[0m
+[32m[    13.870][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] fsync_barrier: count=0[0m
+[32m[    13.871][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] fsync_barrier_flush: count=0[0m
+[32m[    13.873][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] fsync_barrier_wait: count=0[0m
+[32m[    13.875][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_total: count=1 avg_us=14411 max_us=14411[0m
+[32m[    13.877][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_ordered: count=1 avg_us=9992 max_us=9992[0m
+[32m[    13.879][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_log: count=1 avg_us=3876 max_us=3876[0m
+[32m[    13.881][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_barrier1: count=1 avg_us=104 max_us=104[0m
+[32m[    13.883][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_barrier2: count=1 avg_us=102 max_us=102[0m
+[32m[    13.885][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] alloc_meta_flush: count=0[0m
+[32m[    13.887][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] alloc_desc: count=310 avg_us=1 max_us=6[0m
+[32m[    13.889][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_stage_wait: count=0[0m
+[32m[    13.890][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_parked: count=0[0m
+[32m[    13.892][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_thread_sleep: count=3 avg_us=1857370 max_us=5345476[0m
+[32m[    13.894][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_thread_busy: count=1 avg_us=88535 max_us=88535[0m
+[32m[    13.897][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_checkpoint: count=2 avg_us=0 max_us=0[0m
+[32m[    13.900][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_flush_tail: count=0[0m
+[32m[    13.901][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_one_total: count=2 avg_us=44267 max_us=88534[0m
+[32m[    13.904][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_advance: count=2 avg_us=36609 max_us=73219[0m
+[32m[    13.906][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_advance_lock: count=2 avg_us=0 max_us=0[0m
+[32m[    13.908][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_credits_wake: count=1 avg_us=0 max_us=0[0m
+[32m[    13.910][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_thread_age: count=4 avg_us=0 max_us=1[0m
+[32m[    13.912][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] write_total: count=512508 avg_us=290 max_us=281048[0m
+[32m[    13.914][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] write_inner_lock: count=512509 avg_us=8 max_us=84781[0m
+[32m[    13.916][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] write_page_cache: count=512509 avg_us=28 max_us=246951[0m
+[32m[    13.918][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] write_mark_dirty: count=512509 avg_us=1 max_us=1430[0m
+[32m[    13.920][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] write_throttle: count=512508 avg_us=246 max_us=254211[0m
+[32m[    13.923][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_total: count=100 avg_us=77040 max_us=305759[0m
+[32m[    13.925][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_read_inode: count=310 avg_us=0 max_us=4[0m
+[32m[    13.927][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_inner_lock: count=310 avg_us=2837 max_us=241304[0m
+[32m[    13.929][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_alloc_pending: count=310 avg_us=8660 max_us=189442[0m
+[32m[    13.931][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_journal_capture: count=620 avg_us=1 max_us=7[0m
+[32m[    13.933][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_flush_async: count=310 avg_us=9204 max_us=73930[0m
+[32m[    13.935][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_alloc_blocks: count=435971 avg_us=0 max_us=1158[0m
+[32m[    13.937][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_tree_insert: count=435971 avg_us=1 max_us=1320[0m
+[32m[    13.939][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_map_blocks: count=449091 avg_us=0 max_us=339[0m
+[32m[    13.941][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_wait_page_io: count=499402 avg_us=0 max_us=66[0m
+[32m[    13.943][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_walk_range: count=435971 avg_us=1 max_us=425[0m
+[32m[    13.945][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_convert_unwritten: count=435971 avg_us=1 max_us=55[0m
+[32m[    13.947][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_begin_op: count=620 avg_us=0 max_us=8[0m
+[32m[    13.949][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_reap: count=99 avg_us=12923 max_us=144506[0m
+[32m[    13.951][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_dirty_lock: count=100 avg_us=0 max_us=10[0m
+[32m[    13.953][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_wait_all: count=0[0m
+[32m[    13.954][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_collect: count=99 avg_us=0 max_us=3[0m
+[32m[    13.958][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_sync_total: count=310 avg_us=20722 max_us=268793[0m
+[32m[    13.961][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_wake: count=0[0m
+[32m[    13.963][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_round: count=100 avg_us=77041 max_us=305759[0m
+[32m[    13.965][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] max_tree_depth: 2[0m
+[32m[    13.967][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] == snapshot end ==[0m
+########## 20260922_223325_aster-ext4-baseline_njwb-async ##########
+[32m[     7.867][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_wake: count=0[0m
+[32m[     7.869][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_round: count=35 avg_us=75359 max_us=214406[0m
+[32m[     7.871][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] max_tree_depth: 2[0m
+[32m[     7.872][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] == snapshot end ==[0m
+[32m[    82.024][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] == snapshot begin ==[0m
+[32m[    82.026][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] fsync_total: count=0[0m
+[32m[    82.028][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] fsync_lock: count=0[0m
+[32m[    82.030][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] fsync_alloc: count=0[0m
+[32m[    82.032][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] fsync_data_flush: count=0[0m
+[32m[    82.034][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] fsync_capture: count=0[0m
+[32m[    82.036][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] fsync_commit_wait: count=0[0m
+[32m[    82.038][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] fsync_barrier: count=0[0m
+[32m[    82.040][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] fsync_barrier_flush: count=0[0m
+[32m[    82.042][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] fsync_barrier_wait: count=0[0m
+[32m[    82.044][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_total: count=0[0m
+[32m[    82.046][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_ordered: count=0[0m
+[32m[    82.048][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_log: count=0[0m
+[32m[    82.050][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_barrier1: count=0[0m
+[32m[    82.052][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_barrier2: count=0[0m
+[32m[    82.054][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] alloc_meta_flush: count=0[0m
+[32m[    82.056][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] alloc_meta_defer: count=129 avg_us=46 max_us=2809[0m
+[32m[    82.061][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] alloc_meta_block: count=0[0m
+[32m[    82.063][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] alloc_desc: count=129 avg_us=7718 max_us=31176[0m
+[32m[    82.065][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_stage_wait: count=0[0m
+[32m[    82.067][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_parked: count=0[0m
+[32m[    82.069][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_thread_sleep: count=0[0m
+[32m[    82.071][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_thread_busy: count=0[0m
+[32m[    82.073][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_checkpoint: count=0[0m
+[32m[    82.075][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_flush_tail: count=0[0m
+[32m[    82.077][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_one_total: count=0[0m
+[32m[    82.079][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_advance: count=0[0m
+[32m[    82.081][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_advance_lock: count=0[0m
+[32m[    82.083][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_credits_wake: count=0[0m
+[32m[    82.085][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_thread_age: count=0[0m
+[32m[    82.087][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] write_total: count=178633 avg_us=6951 max_us=74139113[0m
+[32m[    82.089][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] write_inner_lock: count=178633 avg_us=7 max_us=51779[0m
+[32m[    82.092][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] write_page_cache: count=178633 avg_us=3 max_us=5316[0m
+[32m[    82.094][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] write_mark_dirty: count=178633 avg_us=1 max_us=979[0m
+[32m[    82.096][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] write_throttle: count=178633 avg_us=6930 max_us=74139107[0m
+[32m[    82.098][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_total: count=40 avg_us=71743 max_us=214405[0m
+[32m[    82.100][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_read_inode: count=131 avg_us=0 max_us=2[0m
+[32m[    82.102][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_inner_lock: count=131 avg_us=0 max_us=14[0m
+[32m[    82.104][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_alloc_pending: count=129 avg_us=9289 max_us=48775[0m
+[32m[    82.106][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_journal_capture: count=260 avg_us=3830 max_us=31176[0m
+[32m[    82.108][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_flush_async: count=131 avg_us=5140 max_us=12827[0m
+[32m[    82.110][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_alloc_blocks: count=167030 avg_us=0 max_us=28[0m
+[32m[    82.112][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_tree_insert: count=167030 avg_us=2 max_us=17875[0m
+[32m[    82.113][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_map_blocks: count=167030 avg_us=0 max_us=1382[0m
+[32m[    82.115][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_wait_page_io: count=178633 avg_us=0 max_us=25[0m
+[32m[    82.118][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_walk_range: count=167030 avg_us=1 max_us=55[0m
+[32m[    82.120][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_convert_unwritten: count=167030 avg_us=2 max_us=18047[0m
+[32m[    82.122][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_begin_op: count=260 avg_us=0 max_us=2[0m
+[32m[    82.123][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_reap: count=39 avg_us=21 max_us=358[0m
+[32m[    82.125][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_dirty_lock: count=40 avg_us=0 max_us=10[0m
+[32m[    82.128][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_wait_all: count=0[0m
+[32m[    82.129][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_collect: count=39 avg_us=0 max_us=1[0m
+[32m[    82.131][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_sync_total: count=131 avg_us=21898 max_us=60660[0m
+[32m[    82.133][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_wake: count=0[0m
+########## 20260922_223203_aster-ext4-baseline_njwb-async ##########
+[32m[    12.163][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] == snapshot end ==[0m
+[32m[    12.550][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] == snapshot begin ==[0m
+[32m[    12.551][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] fsync_total: count=0[0m
+[32m[    12.553][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] fsync_lock: count=0[0m
+[32m[    12.555][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] fsync_alloc: count=0[0m
+[32m[    12.558][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] fsync_data_flush: count=0[0m
+[32m[    12.560][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] fsync_capture: count=0[0m
+[32m[    12.562][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] fsync_commit_wait: count=0[0m
+[32m[    12.564][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] fsync_barrier: count=0[0m
+[32m[    12.566][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] fsync_barrier_flush: count=0[0m
+[32m[    12.568][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] fsync_barrier_wait: count=0[0m
+[32m[    12.570][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_total: count=0[0m
+[32m[    12.570][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_ordered: count=0[0m
+[32m[    12.570][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_log: count=0[0m
+[32m[    12.570][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_barrier1: count=0[0m
+[32m[    12.570][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_barrier2: count=0[0m
+[32m[    12.570][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] alloc_meta_flush: count=0[0m
+[32m[    12.570][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] alloc_meta_defer: count=313 avg_us=156 max_us=4413[0m
+[32m[    12.570][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] alloc_meta_block: count=0[0m
+[32m[    12.570][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] alloc_desc: count=313 avg_us=214 max_us=498[0m
+[32m[    12.570][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_stage_wait: count=0[0m
+[32m[    12.570][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_parked: count=0[0m
+[32m[    12.570][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_thread_sleep: count=0[0m
+[32m[    12.570][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_thread_busy: count=0[0m
+[32m[    12.570][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_checkpoint: count=0[0m
+[32m[    12.570][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_flush_tail: count=0[0m
+[32m[    12.570][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_one_total: count=0[0m
+[32m[    12.570][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_advance: count=0[0m
+[32m[    12.570][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_advance_lock: count=0[0m
+[32m[    12.570][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_credits_wake: count=0[0m
+[32m[    12.570][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_thread_age: count=0[0m
+[32m[    12.570][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] write_total: count=522163 avg_us=225 max_us=240526[0m
+[32m[    12.570][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] write_inner_lock: count=522164 avg_us=7 max_us=73256[0m
+[32m[    12.570][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] write_page_cache: count=522163 avg_us=15 max_us=223567[0m
+[32m[    12.570][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] write_mark_dirty: count=522163 avg_us=1 max_us=1313[0m
+[32m[    12.570][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] write_throttle: count=522163 avg_us=196 max_us=220956[0m
+[32m[    12.570][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_total: count=100 avg_us=63334 max_us=256005[0m
+[32m[    12.570][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_read_inode: count=313 avg_us=0 max_us=3[0m
+[32m[    12.570][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_inner_lock: count=313 avg_us=870 max_us=121601[0m
+[32m[    12.570][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_alloc_pending: count=313 avg_us=7814 max_us=107962[0m
+[32m[    12.570][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_journal_capture: count=626 avg_us=107 max_us=498[0m
+[32m[    12.570][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_flush_async: count=313 avg_us=9141 max_us=73538[0m
+[32m[    12.570][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_alloc_blocks: count=448479 avg_us=0 max_us=18[0m
+[32m[    12.570][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_tree_insert: count=448479 avg_us=1 max_us=5475[0m
+[32m[    12.570][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_map_blocks: count=448479 avg_us=0 max_us=34560[0m
+[32m[    12.570][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_wait_page_io: count=519260 avg_us=0 max_us=37[0m
+[32m[    12.570][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_walk_range: count=448479 avg_us=1 max_us=95[0m
+[32m[    12.570][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_convert_unwritten: count=448479 avg_us=2 max_us=105114[0m
+[32m[    12.570][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_begin_op: count=626 avg_us=0 max_us=4[0m
+[32m[    12.570][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_reap: count=99 avg_us=6902 max_us=207946[0m
+[32m[    12.570][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_dirty_lock: count=100 avg_us=0 max_us=3[0m
+[32m[    12.570][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_wait_all: count=0[0m
+[32m[    12.570][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_collect: count=99 avg_us=0 max_us=2[0m
+[32m[    12.570][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_sync_total: count=313 avg_us=18049 max_us=144133[0m
+[32m[    12.570][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_wake: count=0[0m
+[32m[    12.570][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_round: count=100 avg_us=63334 max_us=256007[0m
+[32m[    12.570][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] max_tree_depth: 2[0m
+[32m[    12.570][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] == snapshot end ==[0m
+########## 20260922_225959_aster-ext4-baseline_njwb-asyncbio ##########
+[32m[    15.665][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] max_tree_depth: 2[0m
+[32m[    15.667][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] == snapshot end ==[0m
+[32m[    15.740][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] == snapshot begin ==[0m
+[32m[    15.743][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] fsync_total: count=0[0m
+[32m[    15.745][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] fsync_lock: count=0[0m
+[32m[    15.748][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] fsync_alloc: count=0[0m
+[32m[    15.751][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] fsync_data_flush: count=0[0m
+[32m[    15.755][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] fsync_capture: count=0[0m
+[32m[    15.758][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] fsync_commit_wait: count=0[0m
+[32m[    15.760][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] fsync_barrier: count=0[0m
+[32m[    15.762][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] fsync_barrier_flush: count=0[0m
+[32m[    15.764][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] fsync_barrier_wait: count=0[0m
+[32m[    15.766][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_total: count=0[0m
+[32m[    15.768][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_ordered: count=0[0m
+[32m[    15.770][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_log: count=0[0m
+[32m[    15.772][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_barrier1: count=0[0m
+[32m[    15.773][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_barrier2: count=0[0m
+[32m[    15.775][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] alloc_meta_flush: count=0[0m
+[32m[    15.777][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] alloc_meta_defer: count=324 avg_us=171 max_us=4234[0m
+[32m[    15.780][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] alloc_meta_block: count=0[0m
+[32m[    15.781][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] alloc_meta_bio: count=25233 avg_us=2 max_us=116[0m
+[32m[    15.784][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] alloc_meta_reap: count=807 avg_us=318 max_us=2582[0m
+[32m[    15.786][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] alloc_desc: count=324 avg_us=412 max_us=48851[0m
+[32m[    15.789][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_stage_wait: count=0[0m
+[32m[    15.791][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_parked: count=0[0m
+[32m[    15.793][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_thread_sleep: count=0[0m
+[32m[    15.795][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_thread_busy: count=0[0m
+[32m[    15.797][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_checkpoint: count=0[0m
+[32m[    15.799][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_flush_tail: count=0[0m
+[32m[    15.801][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_one_total: count=0[0m
+[32m[    15.803][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_advance: count=0[0m
+[32m[    15.806][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_advance_lock: count=0[0m
+[32m[    15.808][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_credits_wake: count=0[0m
+[32m[    15.811][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_thread_age: count=0[0m
+[32m[    15.814][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] write_total: count=524288 avg_us=325 max_us=454388[0m
+[32m[    15.818][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] write_inner_lock: count=524288 avg_us=8 max_us=133682[0m
+[32m[    15.821][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] write_page_cache: count=524288 avg_us=28 max_us=406375[0m
+[32m[    15.823][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] write_mark_dirty: count=524288 avg_us=0 max_us=718[0m
+[32m[    15.826][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] write_throttle: count=524288 avg_us=282 max_us=416415[0m
+[32m[    15.829][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_total: count=110 avg_us=79808 max_us=461547[0m
+[32m[    15.832][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_read_inode: count=325 avg_us=0 max_us=4[0m
+[32m[    15.834][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_inner_lock: count=359 avg_us=1449 max_us=191460[0m
+[32m[    15.838][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_alloc_pending: count=324 avg_us=8106 max_us=120014[0m
+[32m[    15.842][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_journal_capture: count=683 avg_us=197 max_us=48851[0m
+[32m[    15.846][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_flush_async: count=359 avg_us=7889 max_us=66562[0m
+[32m[    15.850][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_alloc_blocks: count=453282 avg_us=0 max_us=1078[0m
+[32m[    15.853][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_tree_insert: count=453282 avg_us=1 max_us=27711[0m
+[32m[    15.856][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_map_blocks: count=453283 avg_us=0 max_us=200[0m
+[32m[    15.859][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_wait_page_io: count=524289 avg_us=0 max_us=22[0m
+[32m[    15.862][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_walk_range: count=453282 avg_us=1 max_us=5490[0m
+[32m[    15.864][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_convert_unwritten: count=453282 avg_us=2 max_us=112184[0m
+[32m[    15.867][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_begin_op: count=683 avg_us=0 max_us=6[0m
+[32m[    15.870][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_reap: count=106 avg_us=25120 max_us=406515[0m
+[32m[    15.873][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_dirty_lock: count=110 avg_us=0 max_us=3[0m
+[32m[    15.875][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_wait_all: count=0[0m
+[32m[    15.878][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_collect: count=106 avg_us=0 max_us=3[0m
+[32m[    15.880][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_sync_total: count=325 avg_us=18816 max_us=212583[0m
+[32m[    15.883][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_wake: count=0[0m
+########## 20260922_230141_aster-ext4-baseline_njwb-asyncbio ##########
+[32m[    18.971][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] fsync_total: count=0[0m
+[32m[    18.973][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] fsync_lock: count=0[0m
+[32m[    18.976][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] fsync_alloc: count=0[0m
+[32m[    18.978][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] fsync_data_flush: count=0[0m
+[32m[    18.979][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] fsync_capture: count=0[0m
+[32m[    18.981][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] fsync_commit_wait: count=0[0m
+[32m[    18.982][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] fsync_barrier: count=0[0m
+[32m[    18.984][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] fsync_barrier_flush: count=0[0m
+[32m[    18.985][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] fsync_barrier_wait: count=0[0m
+[32m[    18.987][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_total: count=0[0m
+[32m[    18.988][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_ordered: count=0[0m
+[32m[    18.990][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_log: count=0[0m
+[32m[    18.991][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_barrier1: count=0[0m
+[32m[    18.993][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_barrier2: count=0[0m
+[32m[    18.994][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] alloc_meta_flush: count=0[0m
+[32m[    18.996][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] alloc_meta_defer: count=340 avg_us=223 max_us=6020[0m
+[32m[    18.998][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] alloc_meta_block: count=0[0m
+[32m[    18.999][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] alloc_meta_bio: count=26106 avg_us=5 max_us=48439[0m
+[32m[    19.002][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] alloc_meta_reap: count=835 avg_us=12041 max_us=297073[0m
+[32m[    19.004][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] alloc_desc: count=340 avg_us=11523 max_us=281513[0m
+[32m[    19.007][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_stage_wait: count=0[0m
+[32m[    19.009][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_parked: count=0[0m
+[32m[    19.010][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_thread_sleep: count=0[0m
+[32m[    19.012][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_thread_busy: count=0[0m
+[32m[    19.014][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_checkpoint: count=0[0m
+[32m[    19.017][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_flush_tail: count=0[0m
+[32m[    19.019][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_one_total: count=0[0m
+[32m[    19.021][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_advance: count=0[0m
+[32m[    19.022][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_advance_lock: count=0[0m
+[32m[    19.024][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_credits_wake: count=0[0m
+[32m[    19.025][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_thread_age: count=0[0m
+[32m[    19.027][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] write_total: count=514757 avg_us=474 max_us=335506[0m
+[32m[    19.029][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] write_inner_lock: count=514760 avg_us=12 max_us=279895[0m
+[32m[    19.033][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] write_page_cache: count=514760 avg_us=54 max_us=320047[0m
+[32m[    19.038][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] write_mark_dirty: count=514760 avg_us=1 max_us=5603[0m
+[32m[    19.042][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] write_throttle: count=514757 avg_us=400 max_us=299744[0m
+[32m[    19.044][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_total: count=110 avg_us=118433 max_us=348406[0m
+[32m[    19.046][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_read_inode: count=340 avg_us=0 max_us=3[0m
+[32m[    19.048][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_inner_lock: count=340 avg_us=1064 max_us=103110[0m
+[32m[    19.051][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_alloc_pending: count=340 avg_us=9953 max_us=178052[0m
+[32m[    19.052][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_journal_capture: count=680 avg_us=5762 max_us=281514[0m
+[32m[    19.054][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_flush_async: count=340 avg_us=10582 max_us=278466[0m
+[32m[    19.056][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_alloc_blocks: count=445578 avg_us=0 max_us=44[0m
+[32m[    19.058][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_tree_insert: count=445578 avg_us=2 max_us=171386[0m
+[32m[    19.060][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_map_blocks: count=445578 avg_us=1 max_us=81055[0m
+[32m[    19.061][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_wait_page_io: count=501651 avg_us=0 max_us=31[0m
+[32m[    19.063][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_walk_range: count=445578 avg_us=1 max_us=6839[0m
+[32m[    19.065][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_convert_unwritten: count=445578 avg_us=2 max_us=43554[0m
+[32m[    19.067][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_begin_op: count=680 avg_us=0 max_us=11[0m
+[32m[    19.069][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_reap: count=109 avg_us=16166 max_us=192472[0m
+[32m[    19.071][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_dirty_lock: count=110 avg_us=0 max_us=2[0m
+[32m[    19.073][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_wait_all: count=0[0m
+[32m[    19.074][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_collect: count=109 avg_us=0 max_us=0[0m
+[32m[    19.076][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_sync_total: count=340 avg_us=33132 max_us=302245[0m
+[32m[    19.078][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_wake: count=0[0m
+[32m[    19.079][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_round: count=110 avg_us=118434 max_us=348407[0m
+[32m[    19.081][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] max_tree_depth: 2[0m
+[32m[    19.083][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] == snapshot end ==[0m
+########## 20260922_230329_aster-ext4-baseline_njwb-asyncbio ##########
+[32m[    15.334][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] fsync_barrier_wait: count=0[0m
+[32m[    15.336][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_total: count=0[0m
+[32m[    15.337][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_ordered: count=0[0m
+[32m[    15.339][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_log: count=0[0m
+[32m[    15.340][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_barrier1: count=0[0m
+[32m[    15.342][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_barrier2: count=0[0m
+[32m[    15.344][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] alloc_meta_flush: count=0[0m
+[32m[    15.346][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] alloc_meta_defer: count=312 avg_us=156 max_us=3942[0m
+[32m[    15.349][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] alloc_meta_block: count=0[0m
+[32m[    15.351][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] alloc_meta_bio: count=25281 avg_us=2 max_us=120[0m
+[32m[    15.353][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] alloc_meta_reap: count=810 avg_us=341 max_us=3506[0m
+[32m[    15.355][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] alloc_desc: count=312 avg_us=280 max_us=1437[0m
+[32m[    15.356][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_stage_wait: count=0[0m
+[32m[    15.358][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_parked: count=0[0m
+[32m[    15.359][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_thread_sleep: count=0[0m
+[32m[    15.362][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_thread_busy: count=0[0m
+[32m[    15.364][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_checkpoint: count=0[0m
+[32m[    15.367][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_flush_tail: count=0[0m
+[32m[    15.369][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_one_total: count=0[0m
+[32m[    15.370][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_advance: count=0[0m
+[32m[    15.372][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_advance_lock: count=0[0m
+[32m[    15.373][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_credits_wake: count=0[0m
+[32m[    15.375][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_thread_age: count=0[0m
+[32m[    15.376][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] write_total: count=523579 avg_us=323 max_us=313103[0m
+[32m[    15.378][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] write_inner_lock: count=523581 avg_us=7 max_us=35037[0m
+[32m[    15.380][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] write_page_cache: count=523581 avg_us=35 max_us=193128[0m
+[32m[    15.382][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] write_mark_dirty: count=523581 avg_us=0 max_us=657[0m
+[32m[    15.384][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] write_throttle: count=523579 avg_us=273 max_us=252503[0m
+[32m[    15.386][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_total: count=105 avg_us=84047 max_us=261231[0m
+[32m[    15.388][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_read_inode: count=312 avg_us=0 max_us=4[0m
+[32m[    15.389][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_inner_lock: count=312 avg_us=2414 max_us=147714[0m
+[32m[    15.391][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_alloc_pending: count=312 avg_us=8118 max_us=65184[0m
+[32m[    15.393][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_journal_capture: count=624 avg_us=140 max_us=1437[0m
+[32m[    15.395][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_flush_async: count=312 avg_us=9956 max_us=33105[0m
+[32m[    15.397][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_alloc_blocks: count=448605 avg_us=0 max_us=60[0m
+[32m[    15.399][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_tree_insert: count=448605 avg_us=1 max_us=57950[0m
+[32m[    15.401][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_map_blocks: count=448605 avg_us=0 max_us=1373[0m
+[32m[    15.403][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_wait_page_io: count=510473 avg_us=0 max_us=31[0m
+[32m[    15.404][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_walk_range: count=448605 avg_us=1 max_us=7126[0m
+[32m[    15.406][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_convert_unwritten: count=448605 avg_us=1 max_us=3013[0m
+[32m[    15.408][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_begin_op: count=624 avg_us=0 max_us=4[0m
+[32m[    15.410][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_reap: count=104 avg_us=22512 max_us=171505[0m
+[32m[    15.412][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_dirty_lock: count=105 avg_us=0 max_us=6[0m
+[32m[    15.414][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_wait_all: count=0[0m
+[32m[    15.415][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_collect: count=104 avg_us=0 max_us=2[0m
+[32m[    15.417][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_sync_total: count=312 avg_us=20778 max_us=170490[0m
+[32m[    15.419][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_wake: count=0[0m
+[32m[    15.420][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_round: count=105 avg_us=84048 max_us=261232[0m
+[32m[    15.429][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] max_tree_depth: 2[0m
+[32m[    15.431][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] == snapshot end ==[0m
+[32m[    15.598][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] == snapshot begin ==[0m
+[32m[    15.604][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] fsync_total: count=0[0m
+[32m[    15.608][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] fsync_lock: count=0[0m
+[32m[    15.610][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] fsync_alloc: count=0[0m
+[32m[    15.612][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] fsync_data_flush: count=0[0m
+[32m[    15.613][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] fsync_capture: count=0[0m
+[32m[    15.616][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] fsync_commit_wait: count=0[0m
+[32m[    15.619][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] fsync_barrier: count=0[0m
+########## 20260922_233014_aster-ext4-baseline_njwb-sync ##########
+[32m[    16.452][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] fsync_barrier_flush: count=0[0m
+[32m[    16.454][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] fsync_barrier_wait: count=0[0m
+[32m[    16.457][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_total: count=0[0m
+[32m[    16.459][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_ordered: count=0[0m
+[32m[    16.461][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_log: count=0[0m
+[32m[    16.464][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_barrier1: count=0[0m
+[32m[    16.466][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_barrier2: count=0[0m
+[32m[    16.468][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] alloc_meta_flush: count=301 avg_us=11398 max_us=23190[0m
+[32m[    16.470][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] alloc_meta_defer: count=0[0m
+[32m[    16.472][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] alloc_meta_block: count=26678 avg_us=128 max_us=3789[0m
+[32m[    16.474][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] alloc_meta_bio: count=0[0m
+[32m[    16.476][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] alloc_meta_reap: count=0[0m
+[32m[    16.478][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] alloc_meta_flusher_write: count=0[0m
+[32m[    16.481][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] alloc_desc: count=301 avg_us=173 max_us=2690[0m
+[32m[    16.483][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_stage_wait: count=0[0m
+[32m[    16.485][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_parked: count=0[0m
+[32m[    16.487][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_thread_sleep: count=0[0m
+[32m[    16.489][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_thread_busy: count=0[0m
+[32m[    16.490][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_checkpoint: count=0[0m
+[32m[    16.492][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_flush_tail: count=0[0m
+[32m[    16.493][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_one_total: count=0[0m
+[32m[    16.495][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_advance: count=0[0m
+[32m[    16.496][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_advance_lock: count=0[0m
+[32m[    16.498][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_credits_wake: count=0[0m
+[32m[    16.500][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_thread_age: count=0[0m
+[32m[    16.501][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] write_total: count=503505 avg_us=372 max_us=225315[0m
+[32m[    16.503][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] write_inner_lock: count=503513 avg_us=8 max_us=42043[0m
+[32m[    16.506][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] write_page_cache: count=503513 avg_us=26 max_us=91895[0m
+[32m[    16.508][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] write_mark_dirty: count=503513 avg_us=0 max_us=1113[0m
+[32m[    16.511][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] write_throttle: count=503505 avg_us=331 max_us=184882[0m
+[32m[    16.513][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_total: count=100 avg_us=99189 max_us=209827[0m
+[32m[    16.516][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_read_inode: count=301 avg_us=0 max_us=3[0m
+[32m[    16.518][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_inner_lock: count=301 avg_us=578 max_us=67600[0m
+[32m[    16.520][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_alloc_pending: count=301 avg_us=19446 max_us=65871[0m
+[32m[    16.523][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_journal_capture: count=602 avg_us=87 max_us=2691[0m
+[32m[    16.525][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_flush_async: count=301 avg_us=10087 max_us=30092[0m
+[32m[    16.528][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_alloc_blocks: count=432756 avg_us=0 max_us=27[0m
+[32m[    16.530][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_tree_insert: count=432756 avg_us=1 max_us=38143[0m
+[32m[    16.533][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_map_blocks: count=432756 avg_us=0 max_us=1632[0m
+[32m[    16.535][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_wait_page_io: count=490405 avg_us=0 max_us=39[0m
+[32m[    16.537][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_walk_range: count=432756 avg_us=1 max_us=6434[0m
+[32m[    16.540][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_convert_unwritten: count=432756 avg_us=2 max_us=41845[0m
+[32m[    16.542][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_begin_op: count=602 avg_us=0 max_us=5[0m
+[32m[    16.544][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_reap: count=99 avg_us=8075 max_us=73099[0m
+[32m[    16.546][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_dirty_lock: count=100 avg_us=1 max_us=15[0m
+[32m[    16.548][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_wait_all: count=0[0m
+[32m[    16.549][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_collect: count=99 avg_us=0 max_us=5[0m
+[32m[    16.551][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_sync_total: count=301 avg_us=30294 max_us=103934[0m
+[32m[    16.553][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_wake: count=0[0m
+[32m[    16.554][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_round: count=100 avg_us=99190 max_us=209828[0m
+[32m[    16.556][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] max_tree_depth: 2[0m
+[32m[    16.558][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] == snapshot end ==[0m
+[32m[    17.236][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] == snapshot begin ==[0m
+[32m[    17.240][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] fsync_total: count=0[0m
+[32m[    17.242][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] fsync_lock: count=0[0m
+[32m[    17.245][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] fsync_alloc: count=0[0m
+[32m[    17.247][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] fsync_data_flush: count=0[0m
+[32m[    17.250][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] fsync_capture: count=0[0m
+[32m[    17.252][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] fsync_commit_wait: count=0[0m
+[32m[    17.254][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] fsync_barrier: count=0[0m
+[32m[    17.257][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] fsync_barrier_flush: count=0[0m
+[32m[    17.259][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] fsync_bar
+########## 20260922_233116_aster-ext4-baseline_njwb-async ##########
+[32m[     8.784][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] max_tree_depth: 2[0m
+[32m[     8.787][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] == snapshot end ==[0m
+[32m[     9.443][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] == snapshot begin ==[0m
+[32m[     9.447][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] fsync_total: count=0[0m
+[32m[     9.449][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] fsync_lock: count=0[0m
+[32m[     9.451][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] fsync_alloc: count=0[0m
+[32m[     9.454][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] fsync_data_flush: count=0[0m
+[32m[     9.456][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] fsync_capture: count=0[0m
+[32m[     9.459][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] fsync_commit_wait: count=0[0m
+[32m[     9.461][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] fsync_barrier: count=0[0m
+[32m[     9.463][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] fsync_barrier_flush: count=0[0m
+[32m[     9.465][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] fsync_barrier_wait: count=0[0m
+[32m[     9.468][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_total: count=0[0m
+[32m[     9.470][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_ordered: count=0[0m
+[32m[     9.473][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_log: count=0[0m
+[32m[     9.476][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_barrier1: count=0[0m
+[32m[     9.478][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_barrier2: count=0[0m
+[32m[     9.480][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] alloc_meta_flush: count=0[0m
+[32m[     9.483][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] alloc_meta_defer: count=111 avg_us=93 max_us=3131[0m
+[32m[     9.485][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] alloc_meta_block: count=0[0m
+[32m[     9.487][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] alloc_meta_bio: count=0[0m
+[32m[     9.490][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] alloc_meta_reap: count=0[0m
+[32m[     9.492][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] alloc_meta_flusher_write: count=480 avg_us=8547 max_us=44916[0m
+[32m[     9.494][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] alloc_desc: count=111 avg_us=8328 max_us=28106[0m
+[32m[     9.497][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_stage_wait: count=0[0m
+[32m[     9.499][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_parked: count=0[0m
+[32m[     9.501][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_thread_sleep: count=0[0m
+[32m[     9.503][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_thread_busy: count=0[0m
+[32m[     9.505][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_checkpoint: count=0[0m
+[32m[     9.507][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_flush_tail: count=0[0m
+[32m[     9.510][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_one_total: count=0[0m
+[32m[     9.512][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_advance: count=0[0m
+[32m[     9.514][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_advance_lock: count=0[0m
+[32m[     9.516][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_credits_wake: count=0[0m
+[32m[     9.518][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_thread_age: count=0[0m
+[32m[     9.520][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] write_total: count=174136 avg_us=416 max_us=255097[0m
+[32m[     9.523][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] write_inner_lock: count=174152 avg_us=12 max_us=99608[0m
+[32m[     9.526][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] write_page_cache: count=174152 avg_us=36 max_us=204318[0m
+[32m[     9.529][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] write_mark_dirty: count=174152 avg_us=1 max_us=1330[0m
+[32m[     9.532][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] write_throttle: count=174136 avg_us=360 max_us=234328[0m
+[32m[     9.536][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_total: count=35 avg_us=103358 max_us=307287[0m
+[32m[     9.539][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_read_inode: count=111 avg_us=2 max_us=12[0m
+[32m[     9.542][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_inner_lock: count=111 avg_us=2028 max_us=198987[0m
+[32m[     9.544][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_alloc_pending: count=111 avg_us=12943 max_us=71154[0m
+[32m[     9.547][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_journal_capture: count=222 avg_us=4165 max_us=28107[0m
+[32m[     9.550][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_flush_async: count=111 avg_us=8307 max_us=32756[0m
+[32m[     9.553][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_alloc_blocks: count=150097 avg_us=0 max_us=49[0m
+[32m[     9.556][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_tree_insert: count=150097 avg_us=3 max_us=36298[0m
+[32m[     9.559][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_map_blocks: count=150097 avg_us=0 max_us=246[0m
+[32m[     9.562][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_wait_page_io: count=161033 avg_us=0 max_us=98[0m
+[32m[     9.566][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_walk_range: count=150097 avg_us=1 max_us=148[0m
+[32m[     9.569][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_convert_unwritten: count=150097 avg_us=3 max_us=62544[0m
+[32m[     9.573][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_begin_op: count=222 avg_us=0 max_us=3[0m
+[32m[     9.576][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_reap: count=34 avg_us=3134 max_us=44286[0m
+[32m[     9.579][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_dirty_lock: count=35 avg_us=1 max_us=4[0m
+[32m[     9.581][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_wait_all: count=0[0m
+[32m[     9.584][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_collect: count=34 avg_us=1 max_us=3[0m
+[32m[     9.587][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_sync_total: count=111 avg_us=31625 max_us=241849[0m
+[32m[     9.590][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_wake: count=0[0m
+[32m[     9.593][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_round: count=35 avg_us=103359 max_us=307288[0m
+[32m[     9.596][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] max_tree_depth: 2[0m
+[32m[     9.599][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] == snapshot end ==[0m
+########## 20260922_233300_aster-ext4-baseline_njwb-asyncbio ##########
+[32m[    18.166][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] max_tree_depth: 2[0m
+[32m[    18.168][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] == snapshot end ==[0m
+[32m[    18.553][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] == snapshot begin ==[0m
+[32m[    18.556][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] fsync_total: count=0[0m
+[32m[    18.558][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] fsync_lock: count=0[0m
+[32m[    18.559][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] fsync_alloc: count=0[0m
+[32m[    18.561][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] fsync_data_flush: count=0[0m
+[32m[    18.562][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] fsync_capture: count=0[0m
+[32m[    18.563][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] fsync_commit_wait: count=0[0m
+[32m[    18.565][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] fsync_barrier: count=0[0m
+[32m[    18.566][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] fsync_barrier_flush: count=0[0m
+[32m[    18.568][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] fsync_barrier_wait: count=0[0m
+[32m[    18.569][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_total: count=0[0m
+[32m[    18.571][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_ordered: count=0[0m
+[32m[    18.572][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_log: count=0[0m
+[32m[    18.574][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_barrier1: count=0[0m
+[32m[    18.575][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_barrier2: count=0[0m
+[32m[    18.577][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] alloc_meta_flush: count=0[0m
+[32m[    18.578][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] alloc_meta_defer: count=345 avg_us=393 max_us=47966[0m
+[32m[    18.580][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] alloc_meta_block: count=0[0m
+[32m[    18.582][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] alloc_meta_bio: count=27191 avg_us=3 max_us=853[0m
+[32m[    18.584][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] alloc_meta_reap: count=868 avg_us=9233 max_us=99975[0m
+[32m[    18.586][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] alloc_meta_flusher_write: count=0[0m
+[32m[    18.588][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] alloc_desc: count=345 avg_us=9350 max_us=36838[0m
+[32m[    18.589][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_stage_wait: count=0[0m
+[32m[    18.591][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_parked: count=0[0m
+[32m[    18.593][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_thread_sleep: count=0[0m
+[32m[    18.594][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_thread_busy: count=0[0m
+[32m[    18.596][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_checkpoint: count=0[0m
+[32m[    18.598][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_flush_tail: count=0[0m
+[32m[    18.599][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_one_total: count=0[0m
+[32m[    18.601][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_advance: count=0[0m
+[32m[    18.602][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_advance_lock: count=0[0m
+[32m[    18.604][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_credits_wake: count=0[0m
+[32m[    18.606][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] commit_thread_age: count=0[0m
+[32m[    18.607][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] write_total: count=524288 avg_us=424 max_us=456570[0m
+[32m[    18.609][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] write_inner_lock: count=524288 avg_us=8 max_us=206225[0m
+[32m[    18.611][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] write_page_cache: count=524288 avg_us=36 max_us=298970[0m
+[32m[    18.615][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] write_mark_dirty: count=524288 avg_us=1 max_us=4350[0m
+[32m[    18.618][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] write_throttle: count=524288 avg_us=372 max_us=350437[0m
+[32m[    18.620][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_total: count=110 avg_us=109005 max_us=446068[0m
+[32m[    18.622][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_read_inode: count=345 avg_us=0 max_us=5[0m
+[32m[    18.624][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_inner_lock: count=345 avg_us=715 max_us=124540[0m
+[32m[    18.626][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_alloc_pending: count=345 avg_us=10883 max_us=179916[0m
+[32m[    18.628][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_journal_capture: count=690 avg_us=4675 max_us=36839[0m
+[32m[    18.630][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_flush_async: count=345 avg_us=7116 max_us=86299[0m
+[32m[    18.632][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_alloc_blocks: count=453948 avg_us=0 max_us=65[0m
+[32m[    18.635][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_tree_insert: count=453948 avg_us=1 max_us=35346[0m
+[32m[    18.637][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_map_blocks: count=453948 avg_us=1 max_us=79918[0m
+[32m[    18.639][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_wait_page_io: count=516294 avg_us=0 max_us=42[0m
+[32m[    18.641][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_walk_range: count=453948 avg_us=1 max_us=1009[0m
+[32m[    18.642][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_convert_unwritten: count=453948 avg_us=3 max_us=171354[0m
+[32m[    18.645][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_begin_op: count=690 avg_us=0 max_us=2[0m
+[32m[    18.648][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_reap: count=109 avg_us=21132 max_us=289987[0m
+[32m[    18.650][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_dirty_lock: count=110 avg_us=0 max_us=5[0m
+[32m[    18.653][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_wait_all: count=0[0m
+[32m[    18.655][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_collect: count=109 avg_us=0 max_us=2[0m
+[32m[    18.657][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_sync_total: count=345 avg_us=28076 max_us=219058[0m
+[32m[    18.660][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_wake: count=0[0m
+[32m[    18.662][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] wb_round: count=110 avg_us=109005 max_us=446069[0m
+[32m[    18.664][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] max_tree_depth: 2[0m
+[32m[    18.666][0m [31mERROR [0m: [39mext4: [0m[39m[LATENCY] == snapshot end ==[0m

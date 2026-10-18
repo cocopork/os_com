@@ -8,6 +8,12 @@
 >
 > 赛题方向：面向 RustOS 的高性能强一致性文件系统研究
 
+## 研究设计与恢复进展
+
+- [设计、实现计划与实验脚本](os_com_implementation/README.md)：与代码共用本仓库和远端。
+- [恢复后的验证与性能报告](docs/recovery/)：当前 rebuild 的实测证据。
+- [工作区合并说明](docs/recovery/REPOSITORY-CONSOLIDATION-2026-10-18.md)：目录迁移与历史归档位置。
+
 ## 项目目录
 
 - [一、基本信息](#一基本信息)

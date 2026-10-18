@@ -1,0 +1,7 @@
+interface:
+  display_name: "Filesystem Development"
+  short_description: "Filesystem design and evidence guidance"
+  default_prompt: "Use $filesystem-development to analyze this filesystem mechanism."
+
+policy:
+  allow_implicit_invocation: true

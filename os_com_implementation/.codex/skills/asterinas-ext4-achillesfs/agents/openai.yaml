@@ -1,0 +1,7 @@
+interface:
+  display_name: "Asterinas EXT4 AchillesFS"
+  short_description: "Current project filesystem guidance"
+  default_prompt: "Use $asterinas-ext4-achillesfs to validate this AchillesFS change."
+
+policy:
+  allow_implicit_invocation: true

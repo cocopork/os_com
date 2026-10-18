@@ -1,0 +1,47 @@
+# ============================================================================
+# os_com_implementation —— Asterinas ext4 研究实验记录
+#
+# 入库范围：**文档**（方案 / 设计 / 结论）+ **脚本**（可复现实验的输入）。
+# 不入库：**所有数据与运行产物**——每轮结果目录、汇总 CSV、图表、原始日志；
+#         它们体积大（当前约 190 MiB）、机器相关、可由脚本重新生成。
+# ============================================================================
+
+# ---- 数据目录：结果批次、绘图与汇总产物、废弃批次 ----
+results/
+plots/
+_aborted/
+
+# ---- 散落在脚本目录里的数据文件（汇总 / 回填留痕 / 诊断输出）----
+**/summary*.csv
+**/*_patch.csv
+**/anomalous_points_*.csv
+**/three_arm_byflag.txt
+
+# ---- 日志：内核与 guest 串口、构建、驱动流水 ----
+*.log
+qemu-*.log
+qemu-serial-*.log
+
+# ---- 工具缓存 ----
+__pycache__/
+*.py[cod]
+
+**/.build-stamp
+# ---- 例外：archive/ 是**蒸馏后的关键数据**（小体积、结论可追溯），必须入库；
+#      上面的 *.csv / *.log / results / plots 规则不得把它扫掉。
+#      注意必须用 `**/archive/**`（带 `**/` 前缀）：带斜杠的模式默认锚定在仓库根，
+#      而归档目录在 test/aster-ext4-baseline-test/archive/ 下。
+!**/archive/
+!**/archive/**
+!**/archive/**/*.csv
+!**/archive/**/*.txt
+!**/archive/**/*.md
+
+# ---- 编辑器/系统杂项 ----
+.worktrees/
+*.swp
+*~
+.DS_Store
+
+# Local workflow state remains unversioned in the unified repository.
+.superpowers/

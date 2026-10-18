@@ -1,0 +1,61 @@
+=== nvme/randwrite-4k/orderless nj16：ext2like#_njwb-sync vs ext2like#_njwb-async vs ext2like#_njwb-asyncbio（截止 20260922_225804）===
+  ext2like#_njwb-sync 轮数=3  drain_bw=[12.4, 131.8, 137.4] MiB/s  中位=131.8  写入=2048 MiB  树深=2
+  ext2like#_njwb-async 轮数=3  drain_bw=[190.0, 178.2, 169.3] MiB/s  中位=178.2  写入=2048 MiB  树深=2
+  ext2like#_njwb-asyncbio 轮数=3  drain_bw=[171.7, 124.3, 171.8] MiB/s  中位=171.7  写入=2048 MiB  树深=2
+
+组件                    ext2like#_njwb-sync µs/次ext2like#_njwb-async µs/次    B/A   │         每轮次数 A/B           累计 ms A/B
+--------------------------------------------------------------------------------------------------------------
+[前台 write() 路径]
+  write_total                        433               315  1.37x   │    4993.2/4993.2       227017/165151
+  write_inner_lock                     9                 7  1.29x   │    4993.2/4993.2           4719/3670
+  write_page_cache                    31                37  0.84x   │    4993.2/4993.2         16253/19399
+  write_mark_dirty                     0                 0      -   │    4993.2/4993.2                 0/0
+  write_throttle                     374               264  1.42x   │    4993.2/4993.2       196084/138412
+[writeback 线程：每轮]
+  wb_round                        115573             79263  1.46x   │          1.0/1.0          12135/8323
+  wb_collect                           0                 0      -   │          1.0/1.0                 0/0
+  wb_read_inode                        0                 0      -   │          3.0/3.0                 0/0
+[writeback 线程：每 inode 漏斗（wb_sync_total 内部）]
+  wb_sync_total                    34361             21900  1.57x   │          3.0/3.0          10721/6877
+  wb_inner_lock                     1523              1303  1.17x   │          3.0/3.0             475/409
+  wb_begin_op                          0                 0      -   │          5.9/6.0                 0/0
+  wb_alloc_pending                 20065              8353  2.40x   │          3.0/3.0           6260/2623
+  wb_alloc_blocks                      0                 0      -   │    4283.9/4287.3                 0/0
+  wb_walk_range                        1                 1  1.00x   │    4283.9/4287.3             450/450
+  wb_tree_insert                       1                 1  1.00x   │    4283.9/4287.3             450/450
+  wb_map_blocks                        0                 0      -   │    4283.9/4287.3                 0/0
+  wb_convert_unwritten                 2                 2  1.00x   │    4283.9/4287.3             900/900
+  wb_journal_capture                  86               119  0.72x   │          5.9/6.0               54/75
+  wb_flush_async                   11556             10504  1.10x   │          3.0/3.0           3605/3298
+  wb_wait_page_io                      0                 0      -   │    4881.8/4877.8                 0/0
+  wb_reap                          19688             13867  1.42x   │          1.0/1.0           2048/1442
+  wb_dirty_lock                        0                 0      -   │          1.0/1.0                 0/0
+[nojournal 分配窗口 / inode 表（009 定义）]
+  alloc_meta_flush                 11791                 0      -   │          3.0/0.0              3679/0
+  alloc_meta_defer                     0               199  0.00x   │          0.0/3.0                0/62
+  alloc_meta_block                   127                 0      -   │        272.7/0.0              3636/0
+  alloc_desc                         172               239  0.72x   │          3.0/3.0               54/75
+
+[每 inode 漏斗的账目闭合（中位值，µs/次）]
+  ext2like#_njwb-sync 子项合计=  52922  wb_sync_total=  34361  未记账= -18561  子项占比=154.0%
+  ext2like#_njwb-async 子项合计=  34150  wb_sync_total=  21900  未记账= -12250  子项占比=155.9%
+  ext2like#_njwb-asyncbio 子项合计=  42406  wb_sync_total=  20778  未记账= -21628  子项占比=204.1%
+
+[每轮账目闭合（中位值，µs/轮）]
+  ext2like#_njwb-sync 漏斗×次数= 10720632  子项合计= 14241376  wb_round=   115573  轮内未记账=-10605059
+  ext2like#_njwb-async 漏斗×次数=  6876600  子项合计=  9647808  wb_round=    79263  轮内未记账= -6797337
+  ext2like#_njwb-asyncbio 漏斗×次数=  6711294  子项合计= 10626676  wb_round=    84048  轮内未记账= -6627246
+
+[每轮明细：吞吐 / 关键阶段 µs/次]
+  fs              bw  write  write_throttl       wb_round  wb_sync_total  wb_alloc_pend  alloc_meta_fl  alloc_meta_de  alloc_meta_bi  alloc_meta_re  alloc_meta_bl     alloc_desc  wb_flush_asyn        wb_reap
+  ext2like#_njwb-sync     12.4    385           4677              0         506121         477132         463364              0              0              0          15902          16858          11556            321
+  ext2like#_njwb-sync    131.8   2048            372         121611          34361          20065          11791              0              0              0            127            172          12591          19688
+  ext2like#_njwb-sync    137.4   2048            374         115573          31902          19269          11070              0              0              0            120            169          10879          20971
+  ext2like#_njwb-async    169.3   2048            273          82875          22085           8647              0            175              0              0              0            230          11894          16984
+  ext2like#_njwb-async    178.2   2048            264          79263          21900           8353          15965            360              0              0            115            239          10504          13685
+  ext2like#_njwb-async    190.0   2048            244          70712          19110           8212              0            199              0              0              0            240           9521          13867
+  ext2like#_njwb-asyncbio    124.3   2048            400         118434          33132           9953              0            223              5          12041              0          11523          10582          16166
+  ext2like#_njwb-asyncbio    171.7   2048            282          83472          18888           8104              0            170              2            318              0            412           8751          25603
+  ext2like#_njwb-asyncbio    171.8   2048            273          84048          20778           8118              0            156              2            341              0            280           9956          22512
+
+已写出 ../../os_com_refactor_plan/011-nojournal-vs-journal-writeback/archive/wb_njwb3arms.json
