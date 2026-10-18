@@ -29,6 +29,7 @@ pub fn create_new_user_task(
     thread_local: ThreadLocal,
 ) -> Task {
     let user_task_entry = move |user_ctx: UserContext| {
+        super::io_test_affinity::trace(super::io_test_affinity::Role::User);
         let current_task = Task::current().unwrap();
         let current_thread = current_task.as_thread().unwrap();
         let current_posix_thread = current_thread.as_posix_thread().unwrap();

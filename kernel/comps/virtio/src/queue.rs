@@ -13,7 +13,7 @@ use aster_util::{field_ptr, safe_ptr::SafePtr};
 use bitflags::bitflags;
 use ostd::{
     debug,
-    mm::{HasPaddr, PodOnce, Split, dma::DmaCoherent},
+    mm::{HasPaddr, PAGE_SIZE, PodOnce, Split, dma::DmaCoherent},
 };
 
 use crate::{
@@ -102,6 +102,20 @@ struct DescriptorSlot {
 }
 
 impl VirtQueue {
+    fn alloc_modern_ring_memory(size: u16) -> Result<[DmaCoherent; 3], CreationError> {
+        let size = size as usize;
+        let lengths = [
+            size_of::<Descriptor>() * size,
+            offset_of!(AvailRing, ring) + size_of::<u16>() * size + size_of::<u16>(),
+            offset_of!(UsedRing, ring) + size_of::<UsedElem>() * size + size_of::<u16>(),
+        ];
+        let alloc = |length: usize| {
+            DmaCoherent::alloc(length.div_ceil(PAGE_SIZE), true)
+                .map_err(CreationError::ResourceAlloc)
+        };
+        Ok([alloc(lengths[0])?, alloc(lengths[1])?, alloc(lengths[2])?])
+    }
+
     /// Creates a new virtqueue.
     pub(crate) fn new(
         idx: u16,
@@ -163,14 +177,12 @@ impl VirtQueue {
                 .max_queue_size(idx)
                 .map_err(CreationError::Transport)? as usize;
 
-            // There can be a maximum of 256 descriptors on one page.
-            if size as usize > max_queue_size || size > 256 {
+            // Large queues need multiple pages for descriptor and used rings.
+            if size as usize > max_queue_size || size > 1024 {
                 return Err(CreationError::InvalidArgs);
             }
 
-            let desc_frame = DmaCoherent::alloc(1, true).map_err(CreationError::ResourceAlloc)?;
-            let avail_frame = DmaCoherent::alloc(1, true).map_err(CreationError::ResourceAlloc)?;
-            let used_frame = DmaCoherent::alloc(1, true).map_err(CreationError::ResourceAlloc)?;
+            let [desc_frame, avail_frame, used_frame] = Self::alloc_modern_ring_memory(size)?;
 
             (
                 SafePtr::new(Arc::new(desc_frame), 0),
@@ -625,3 +637,32 @@ bitflags! {
 }
 
 impl PodOnce for AvailFlags {}
+
+#[cfg(ktest)]
+mod tests {
+    use ostd::{mm::HasSize, prelude::ktest};
+
+    use super::*;
+
+    #[ktest]
+    fn modern_queue_dma_covers_last_descriptor_and_ring_slots() {
+        for size in [64u16, 256, 1024] {
+            let buffers = VirtQueue::alloc_modern_ring_memory(size).unwrap();
+            let lengths = [
+                size_of::<Descriptor>() * size as usize,
+                6 + size_of::<u16>() * size as usize,
+                6 + size_of::<UsedElem>() * size as usize,
+            ];
+            for (buffer, length) in buffers.into_iter().zip(lengths) {
+                assert!(
+                    buffer.size() >= length,
+                    "DMA region must cover all queue slots"
+                );
+                let mut last = SafePtr::<u16, _>::new(Arc::new(buffer), 0);
+                last.byte_add(length - 2);
+                last.write_once(&0xa55a).unwrap();
+                assert_eq!(last.read_once().unwrap(), 0xa55a);
+            }
+        }
+    }
+}

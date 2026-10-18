@@ -19,6 +19,7 @@ mod stats;
 use stats::CONTEXT_SWITCH_COUNTER;
 pub use stats::collect_context_switch_count;
 pub mod exception;
+pub(crate) mod io_test_affinity;
 pub mod kernel_thread;
 pub mod oops;
 pub mod task;

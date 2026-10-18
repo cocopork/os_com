@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MPL-2.0
 
 pub mod device;
+mod segment_merge;
 
 use core::mem::offset_of;
 

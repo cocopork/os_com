@@ -27,7 +27,7 @@ impl ThreadOptions {
     where
         F: FnOnce() + Send + 'static,
     {
-        let cpu_affinity = CpuSet::new_full();
+        let cpu_affinity = super::io_test_affinity::affinity(super::io_test_affinity::Role::Kernel);
         let sched_policy = SchedPolicy::Fair(Nice::default());
         Self {
             func: Some(Box::new(func)),

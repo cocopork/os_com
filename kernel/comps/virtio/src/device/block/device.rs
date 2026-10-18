@@ -26,8 +26,12 @@ use ostd::{
     mm::{PAGE_SIZE, VmIo, dma::DmaStream},
     sync::SpinLock,
 };
+use smallvec::SmallVec;
 
-use super::{BlockFeatures, VirtioBlockConfig};
+use super::{
+    BlockFeatures, VirtioBlockConfig,
+    segment_merge::{DmaSpan, append_data},
+};
 use crate::{
     VIRTIO_BLOCK_MAJOR_ID,
     device::{
@@ -92,13 +96,12 @@ impl BlockDevice {
         );
         let name = Self::formatted_device_name(index);
 
+        let max_segments = usize::from(device.queue_size - 2).min(62);
         let block_device = Arc::new_cyclic(|weak_self| BlockDevice {
             device,
-            // Each bio request includes an additional 1 request and 1 response descriptor,
-            // therefore this upper bound is set to (QUEUE_SIZE - 2).
-            queue: BioRequestSingleQueue::with_max_nr_segments_per_bio(
-                (DeviceInner::QUEUE_SIZE - 2) as usize,
-            ),
+            // Keep the existing BIO aggregation bound independent of queue depth.
+            // Reserve a header and status descriptor even for fully fragmented DMA.
+            queue: BioRequestSingleQueue::with_max_nr_segments_per_bio(max_segments),
             id,
             name,
             partitions: SpinLock::new(None),
@@ -199,6 +202,7 @@ struct DeviceInner {
     config_manager: ConfigManager<VirtioBlockConfig>,
     features: BlockFeatures,
     queue: SpinLock<VirtQueue>,
+    queue_size: u16,
     transport: SpinLock<Box<dyn VirtioTransport>>,
     block_requests: Arc<DmaStream>,
     block_responses: Arc<DmaStream>,
@@ -207,7 +211,7 @@ struct DeviceInner {
 }
 
 impl DeviceInner {
-    const QUEUE_SIZE: u16 = 64;
+    const QUEUE_SIZE: u16 = 1024;
 
     /// Creates and inits the device.
     fn init(mut transport: Box<dyn VirtioTransport>) -> Result<Arc<Self>, VirtioDeviceError> {
@@ -241,25 +245,31 @@ impl DeviceInner {
             );
         }
 
-        let queue = VirtQueue::new(0, Self::QUEUE_SIZE, transport.as_mut())?;
-
-        let block_requests =
-            Arc::new(DmaStream::alloc(1, false).map_err(VirtioDeviceError::ResourceAlloc)?);
-        let block_responses =
-            Arc::new(DmaStream::alloc(1, false).map_err(VirtioDeviceError::ResourceAlloc)?);
-        const {
-            assert!(Self::QUEUE_SIZE as usize * REQ_SIZE <= PAGE_SIZE);
-            assert!(Self::QUEUE_SIZE as usize * RESP_SIZE <= PAGE_SIZE);
+        let queue_size = Self::QUEUE_SIZE.min(transport.max_queue_size(0)?);
+        if queue_size < 4 {
+            return Err(VirtioDeviceError::InvalidQueueArgs);
         }
+        let queue = VirtQueue::new(0, queue_size, transport.as_mut())?;
+
+        // Every request ID needs its own header and response until completion.
+        let block_requests = Arc::new(
+            DmaStream::alloc((queue_size as usize * REQ_SIZE).div_ceil(PAGE_SIZE), false)
+                .map_err(VirtioDeviceError::ResourceAlloc)?,
+        );
+        let block_responses = Arc::new(
+            DmaStream::alloc((queue_size as usize * RESP_SIZE).div_ceil(PAGE_SIZE), false)
+                .map_err(VirtioDeviceError::ResourceAlloc)?,
+        );
 
         let device = Arc::new(Self {
             config_manager,
             features,
             queue: SpinLock::new(queue),
+            queue_size,
             transport: SpinLock::new(transport),
             block_requests,
             block_responses,
-            id_allocator: SyncIdAlloc::with_capacity(Self::QUEUE_SIZE as usize),
+            id_allocator: SyncIdAlloc::with_capacity(queue_size as usize),
             submitted_requests: SpinLock::new(BTreeMap::new()),
         });
 
@@ -370,20 +380,24 @@ impl DeviceInner {
         };
 
         let outputs = {
-            let mut outputs: Vec<&Slice<_>> = Vec::with_capacity(bio_request.num_segments() + 1);
+            let mut outputs = Vec::with_capacity(bio_request.num_segments() + 1);
             let dma_slices_iter = bio_request.bios().flat_map(|bio| {
                 bio.segments()
                     .iter()
                     .map(|segment| segment.inner_dma_slice())
             });
-            outputs.extend(dma_slices_iter);
-            outputs.push(&resp_slice);
+            for dma_slice in dma_slices_iter {
+                append_data(&mut outputs, dma_slice, u32::MAX as usize - 1);
+            }
+            // The status byte must stay separate from data, even if adjacent.
+            outputs.push(DmaSpan::single(&resp_slice));
             outputs
         };
 
+        let output_refs: SmallVec<[_; 64]> = outputs.iter().collect();
         let num_used_descs = outputs.len() + 1;
         // FIXME: Split the request if it is too big
-        if num_used_descs > Self::QUEUE_SIZE as usize {
+        if num_used_descs > self.queue_size as usize {
             panic!("The request size surpasses the queue size");
         }
 
@@ -393,8 +407,10 @@ impl DeviceInner {
                 continue;
             }
             let token = queue
-                .add_dma_bufs(&[&req_slice], outputs.as_slice())
+                .add_dma_bufs(&[&req_slice], output_refs.as_slice())
                 .expect("add queue failed");
+            drop(output_refs);
+            drop(outputs);
             if queue.should_notify() {
                 queue.notify();
             }
@@ -438,8 +454,7 @@ impl DeviceInner {
         };
 
         let inputs = {
-            let mut inputs: Vec<&Slice<_>> = Vec::with_capacity(bio_request.num_segments() + 1);
-            inputs.push(&req_slice);
+            let mut inputs = Vec::with_capacity(bio_request.num_segments() + 1);
             let dma_slices_iter = bio_request.bios().flat_map(|bio| {
                 bio.segments()
                     .iter()
@@ -447,14 +462,17 @@ impl DeviceInner {
             });
             for dma_slice in dma_slices_iter {
                 dma_slice.sync_to_device().unwrap();
-                inputs.push(dma_slice);
+                append_data(&mut inputs, dma_slice, u32::MAX as usize - 1);
             }
+            // Keep the protocol header distinct from the data descriptor(s).
+            inputs.insert(0, DmaSpan::single(&req_slice));
             inputs
         };
 
+        let input_refs: SmallVec<[_; 64]> = inputs.iter().collect();
         let num_used_descs = inputs.len() + 1;
         // FIXME: Split the request if it is too big
-        if num_used_descs > Self::QUEUE_SIZE as usize {
+        if num_used_descs > self.queue_size as usize {
             panic!("The request size surpasses the queue size");
         }
         loop {
@@ -463,8 +481,10 @@ impl DeviceInner {
                 continue;
             }
             let token = queue
-                .add_dma_bufs(inputs.as_slice(), &[&resp_slice])
+                .add_dma_bufs(input_refs.as_slice(), &[&resp_slice])
                 .expect("add queue failed");
+            drop(input_refs);
+            drop(inputs);
             if queue.should_notify() {
                 queue.notify();
             }

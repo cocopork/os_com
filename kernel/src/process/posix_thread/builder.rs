@@ -6,7 +6,6 @@ use core::sync::atomic::{AtomicU32, AtomicU64};
 use ostd::arch::cpu::context::{FsBase, GsBase};
 use ostd::{
     arch::cpu::context::{FpuContext, UserContext},
-    cpu::CpuSet,
     sync::RwArc,
     task::Task,
 };
@@ -209,7 +208,9 @@ impl PosixThreadBuilder {
                 }
             };
 
-            let cpu_affinity = CpuSet::new_full();
+            let cpu_affinity = crate::thread::io_test_affinity::affinity(
+                crate::thread::io_test_affinity::Role::User,
+            );
             let thread = Arc::new(Thread::new(
                 weak_task.clone(),
                 posix_thread,

@@ -1897,8 +1897,12 @@ impl Journal {
         self.commit_servicer.store(true, Ordering::Release);
         let weak: Weak<Journal> = Arc::downgrade(self);
         let thread = crate::thread::kernel_thread::ThreadOptions::new(move || {
+            crate::thread::io_test_affinity::trace(crate::thread::io_test_affinity::Role::Journal);
             Self::commit_thread_loop(&weak);
         })
+        .cpu_affinity(crate::thread::io_test_affinity::affinity(
+            crate::thread::io_test_affinity::Role::Journal,
+        ))
         .spawn();
         *self.commit_thread.lock() = Some(thread);
     }

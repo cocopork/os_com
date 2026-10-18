@@ -13,6 +13,17 @@ pub(super) const IO_CHUNK: usize = 256 * 1024;
 const WRITEBACK_BATCH: usize = 1024;
 const RECLAIM_BATCH: usize = 4096;
 
+// Selects the worker's retry interval after one bounded round.
+fn round_delay(busy: bool, made_progress: bool) -> Duration {
+    if busy && made_progress {
+        Duration::ZERO
+    } else if busy {
+        Duration::from_millis(10)
+    } else {
+        Duration::from_secs(1)
+    }
+}
+
 /// Per-filesystem controller. Reservations cover worst-case cache growth until
 /// the syscall chunk completes. They are acquired before inode locks/handles.
 pub(super) struct CachePressure {
@@ -40,8 +51,8 @@ impl CachePressure {
             reservations: Mutex::new(0),
             inodes: Mutex::new(BTreeMap::new()),
             next_inode: AtomicUsize::new(0),
-            resident_high: AtomicUsize::new(512 * 1024 * 1024 / PAGE_SIZE),
-            dirty_high: AtomicUsize::new(128 * 1024 * 1024 / PAGE_SIZE),
+            resident_high: AtomicUsize::new(64 * 1024 * 1024 / PAGE_SIZE),
+            dirty_high: AtomicUsize::new(64 * 1024 * 1024 / PAGE_SIZE),
             background: AtomicUsize::new(64 * 1024 * 1024 / PAGE_SIZE),
             trigger: WaitQueue::new(),
             progress: WaitQueue::new(),
@@ -69,12 +80,21 @@ impl CachePressure {
     }
 
     fn resident_low(&self) -> usize {
-        self.resident_high.load(Ordering::Relaxed) * 3 / 4
+        self.resident_high.load(Ordering::Relaxed) / 2
     }
 
     fn needs_work(&self) -> bool {
         self.waiting.load(Ordering::Acquire) != 0
             || self.dirty_pressure() >= self.background.load(Ordering::Relaxed)
+            || self.accounting.resident_pages() > self.resident_low()
+    }
+
+    // Once triggered, drain below the background threshold before sleeping.
+    // Resident accounting includes pinned and RCU-retired pages; an empty
+    // round must back off rather than spin waiting for those frames to vanish.
+    fn needs_drain(&self) -> bool {
+        self.waiting.load(Ordering::Acquire) != 0
+            || self.dirty_pressure() > (self.background.load(Ordering::Relaxed) / 2)
             || self.accounting.resident_pages() > self.resident_low()
     }
 
@@ -177,47 +197,60 @@ impl Ext4 {
         let weak = Arc::downgrade(self);
         let pressure = self.cache_pressure.clone();
         crate::thread::kernel_thread::ThreadOptions::new(move || {
+            crate::thread::io_test_affinity::trace(crate::thread::io_test_affinity::Role::Flush);
             loop {
-                let busy = {
+                let (busy, made_progress) = {
                     let Some(fs) = weak.upgrade() else {
                         break;
                     };
                     if fs.is_shutdown() {
                         break;
                     }
-                    if let Err(error) = fs.writeback_cache_round() {
-                        warn!("native cache writeback failed: {error:?}");
-                        pressure.failed.store(true, Ordering::Release);
-                        pressure.progress.wake_all();
-                        break;
-                    }
-                    pressure.needs_work()
+                    let made_progress = match fs.writeback_cache_round() {
+                        Ok(made_progress) => made_progress,
+                        Err(error) => {
+                            warn!("native cache writeback failed: {error:?}");
+                            pressure.failed.store(true, Ordering::Release);
+                            pressure.progress.wake_all();
+                            break;
+                        }
+                    };
+                    (pressure.needs_drain(), made_progress)
                 };
-                // Always yield between rounds, including pressure rounds. This
-                // permits RCU grace periods to release removed array entries.
-                let timeout = if busy {
-                    Duration::from_millis(10)
-                } else {
-                    Duration::from_secs(1)
-                };
-                // The OSDK unit runner has no timer/idle servicing; exercise
-                // the same worker cooperatively in that environment.
-                #[cfg(ktest)]
-                {
-                    let _ = timeout;
-                    crate::thread::Thread::yield_now();
+                // Release all filesystem/inode locks before yielding. Keep
+                // scheduling and RCU progress without a timer between useful
+                // batches. No-progress rounds retain a bounded retry interval.
+                crate::thread::Thread::yield_now();
+                let timeout = round_delay(busy, made_progress);
+                if timeout.is_zero() {
+                    continue;
                 }
+                // The OSDK unit runner has no timer/idle servicing.
                 #[cfg(not(ktest))]
-                let _ = pressure.trigger.wait_until_or_timeout(
-                    || (!busy && pressure.needs_work()).then_some(()),
-                    &timeout,
-                );
+                {
+                    let epoch = pressure.progress_epoch.load(Ordering::Acquire);
+                    let _ = pressure.trigger.wait_until_or_timeout(
+                        || {
+                            (if busy {
+                                pressure.progress_epoch.load(Ordering::Acquire) != epoch
+                                    || !pressure.needs_drain()
+                            } else {
+                                pressure.needs_work()
+                            })
+                            .then_some(())
+                        },
+                        &timeout,
+                    );
+                }
             }
         })
+        .cpu_affinity(crate::thread::io_test_affinity::affinity(
+            crate::thread::io_test_affinity::Role::Flush,
+        ))
         .spawn();
     }
 
-    pub(super) fn writeback_cache_round(&self) -> Result<()> {
+    pub(super) fn writeback_cache_round(&self) -> Result<bool> {
         self.ensure_not_shutdown()?;
         let pressure = &self.cache_pressure;
         let start = pressure.next_inode.load(Ordering::Relaxed) as Ext4Ino;
@@ -271,7 +304,7 @@ impl Ext4 {
         }
         pressure.progress_epoch.fetch_add(1, Ordering::Release);
         pressure.progress.wake_all();
-        Ok(())
+        Ok(written != 0 || reclaimed != 0)
     }
 }
 
@@ -281,6 +314,54 @@ mod tests {
 
     use super::*;
     use crate::fs::fs_impls::ext4::test_utils::{Ext4FixtureBuilder, make_empty_file_inode};
+
+    #[ktest]
+    fn ext4_writeback_progress_runs_without_timer_delay() {
+        assert_eq!(round_delay(true, true), Duration::ZERO);
+        assert_eq!(round_delay(true, false), Duration::from_millis(10));
+        assert_eq!(round_delay(false, true), Duration::from_secs(1));
+        assert_eq!(round_delay(false, false), Duration::from_secs(1));
+    }
+
+    #[ktest]
+    fn ext4_writeback_drains_below_trigger_and_reclaims_clean_pages() {
+        crate::time::clocks::init_for_ktest();
+        let fixture = Ext4FixtureBuilder::new(4096, 256, 4096)
+            .with_block_bitmap_metadata_marked()
+            .build()
+            .unwrap();
+        let pressure = &fixture.ext4.cache_pressure;
+        pressure.set_limits_for_test(128, 64, 16);
+        fixture.write_raw_inode(11, &make_empty_file_inode());
+        let file = fixture.ext4.read_inode(11).unwrap();
+        let input = vec![0x51; 12 * PAGE_SIZE];
+        file.write_at(0, &mut VmReader::from(input.as_slice()).to_fallible())
+            .unwrap();
+        assert!(!pressure.needs_work(), "below the dirty start threshold");
+        assert!(
+            pressure.needs_drain(),
+            "continue an active drain below the trigger"
+        );
+        assert!(fixture.ext4.writeback_cache_round().unwrap());
+        assert_eq!(pressure.dirty_pressure(), 0);
+        assert!(!pressure.needs_drain());
+        assert!(!fixture.ext4.writeback_cache_round().unwrap());
+
+        // Clean resident pages also sustain a drain until the resident low
+        // watermark is met. This path must work on read-only mounts as well.
+        pressure.set_limits_for_test(12, 64, 16);
+        fixture.ext4.set_read_only(true).unwrap();
+        assert!(pressure.needs_work());
+        assert!(fixture.ext4.writeback_cache_round().unwrap());
+        // RCU-delayed frees still count as resident; do not spin if the next
+        // pass cannot reclaim anything else.
+        assert!(!fixture.ext4.writeback_cache_round().unwrap());
+        pressure.set_limits_for_test(128, 64, 16);
+        let mut output = vec![0; input.len()];
+        file.read_at(0, &mut VmWriter::from(output.as_mut_slice()).to_fallible())
+            .unwrap();
+        assert_eq!(output, input);
+    }
 
     #[ktest]
     fn ext4_native_cache_pressure() {
