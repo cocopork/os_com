@@ -678,6 +678,7 @@ impl NvMemoryBackend for DramNvBackend {
 
     fn persist(&self, offset: usize, len: usize) -> Result<()> {
         self.validate_data_range(offset, len)?;
+        super::batch_metrics::count(super::batch_metrics::Event::DataPersist, 1);
         if self.image.inner.skip_persistence {
             return Ok(());
         }
@@ -700,6 +701,7 @@ impl NvMemoryBackend for DramNvBackend {
 
     fn persist_control(&self, offset: usize, len: usize) -> Result<()> {
         self.validate_control_range(offset, len)?;
+        super::batch_metrics::count(super::batch_metrics::Event::ControlPersist, 1);
         if self.image.inner.skip_persistence {
             return Ok(());
         }
@@ -730,6 +732,7 @@ impl NvMemoryBackend for DramNvBackend {
 
     fn fence(&self) -> Result<()> {
         self.check_epoch()?;
+        super::batch_metrics::count(super::batch_metrics::Event::Fence, 1);
         if self.image.inner.skip_persistence {
             return Ok(());
         }

@@ -2,13 +2,15 @@
 
 //! RNVPC frame-table formatting and persistence protocol.
 
+use core::sync::atomic::{AtomicBool, Ordering};
+
 use super::{
     backend::NvMemoryBackend,
     descriptor::NvDescriptor,
     fault::{FaultPoint, inject},
     layout::{
-        FRAME_COMMIT_WORD, NV_IMAGE_MAGIC, NV_IMAGE_VERSION, NvEntry, NvImageHeader, commit_offset,
-        control_len, entry_offset,
+        NV_IMAGE_MAGIC, NV_IMAGE_VERSION, NvEntry, NvImageHeader, commit_offset, control_len,
+        descriptor_offset,
     },
 };
 use crate::prelude::*;
@@ -16,6 +18,7 @@ use crate::prelude::*;
 pub(crate) struct PersistEngine {
     backend: Arc<dyn NvMemoryBackend>,
     capacity_pages: usize,
+    publication_uncertain: AtomicBool,
 }
 
 impl PersistEngine {
@@ -28,6 +31,7 @@ impl PersistEngine {
         Ok(Self {
             backend,
             capacity_pages,
+            publication_uncertain: AtomicBool::new(false),
         })
     }
 
@@ -63,73 +67,169 @@ impl PersistEngine {
         Ok(header)
     }
 
-    /// 读出一个**已提交**对象的自描述描述符；未提交（提交字不为 `FRAME_COMMIT_WORD`）
-    /// 或描述符不自洽则返回 `None`/`EINVAL`。
+    /// Reads only the selected descriptor, retrying if publication races a read.
+    /// Callers retain a lifetime pin/lease; this does not grant mutation ownership.
     pub(super) fn read_entry(&self, index: usize) -> Result<Option<NvDescriptor>> {
         self.check_index(index)?;
-        if self.backend.load_control_u64(commit_offset(index)?)? != FRAME_COMMIT_WORD {
-            return Ok(None);
+        for _ in 0..16 {
+            let selector = self.backend.load_control_u64(commit_offset(index)?)?;
+            if selector == 0 {
+                return Ok(None);
+            }
+            let mut descriptor = NvDescriptor::default();
+            self.backend.read_control(
+                descriptor_offset(index, selector)?,
+                descriptor.as_mut_bytes(),
+            )?;
+            if self.backend.load_control_u64(commit_offset(index)?)? != selector {
+                continue;
+            }
+            if !descriptor.is_valid() {
+                return_errno_with_message!(Errno::EINVAL, "invalid selected NV descriptor");
+            }
+            return Ok(Some(descriptor));
         }
-        let mut entry = NvEntry::default();
-        self.backend
-            .read_control(entry_offset(index)?, entry.as_mut_bytes())?;
-        if !entry.descriptor.is_valid() {
-            return_errno_with_message!(Errno::EINVAL, "invalid RNVPC object descriptor");
-        }
-        Ok(Some(entry.descriptor))
+        return_errno!(Errno::EBUSY)
     }
 
-    /// 提交一个自描述对象（两阶段：内容先落盘，再落提交字）。
+    /// Persists changed data before publishing a descriptor. Existing selected
+    /// descriptor bytes remain untouched until the new copy is complete.
     pub(super) fn commit_frame(
         &self,
         index: usize,
         descriptor: &NvDescriptor,
         fault: Option<FaultPoint>,
     ) -> Result<()> {
-        self.check_index(index)?;
-        if !descriptor.is_valid() {
-            return_errno_with_message!(
-                Errno::EINVAL,
-                "refusing to persist an invalid NV descriptor"
-            );
-        }
-        // NV 槽位由 `index` 定位；描述符里的 `ssd_backing_block` 是独立的
-        // 最终回写目标，二者不能混为一个地址空间。
+        self.ensure_writable()?;
+        self.check_descriptor(index, descriptor)?;
         inject(fault, FaultPoint::BeforeContentPersist)?;
-        let entry = NvEntry {
-            descriptor: *descriptor,
-            commit_word: 0,
-        };
-        self.backend
-            .write_control(entry_offset(index)?, entry.as_bytes())?;
         self.backend.persist(index * PAGE_SIZE, PAGE_SIZE)?;
-        self.backend
-            .persist_control(entry_offset(index)?, size_of::<NvEntry>())?;
+        self.publish_descriptors(&[(index, *descriptor)], fault)
+    }
+
+    /// Updates already committed descriptors without persisting unchanged data.
+    /// The caller owns an exclusive mutation/eviction lease for every entry.
+    pub(super) fn update_descriptors(
+        &self,
+        updates: &[(usize, NvDescriptor)],
+        fault: Option<FaultPoint>,
+    ) -> Result<()> {
+        for (index, descriptor) in updates {
+            self.check_descriptor(*index, descriptor)?;
+            let old = self
+                .read_entry(*index)?
+                .ok_or_else(|| Error::new(Errno::ESTALE))?;
+            if old.allocation_seq() != descriptor.allocation_seq()
+                || old.fs_id != descriptor.fs_id
+                || old.inode != descriptor.inode
+                || old.logical_index != descriptor.logical_index
+                || old.kind != descriptor.kind
+            {
+                return_errno!(Errno::ESTALE);
+            }
+        }
+        self.publish_descriptors(updates, fault)
+    }
+
+    fn publish_descriptors(
+        &self,
+        updates: &[(usize, NvDescriptor)],
+        fault: Option<FaultPoint>,
+    ) -> Result<()> {
+        self.ensure_writable()?;
+        if updates.is_empty() {
+            return Ok(());
+        }
+        if updates.len() > 128 {
+            return_errno!(Errno::EINVAL);
+        }
+        let mut selected = Vec::with_capacity(updates.len());
+        let mut slots = BTreeSet::new();
+        // Validate the whole batch before touching any inactive copy.
+        for (index, descriptor) in updates {
+            self.check_descriptor(*index, descriptor)?;
+            if !slots.insert(*index) {
+                return_errno!(Errno::EINVAL);
+            }
+            let old = self.backend.load_control_u64(commit_offset(*index)?)?;
+            let next = old
+                .checked_add(1)
+                .ok_or_else(|| Error::new(Errno::EOVERFLOW))?;
+            selected.push((*index, next));
+        }
+        inject(fault, FaultPoint::BeforeContentPersist)?;
+        for ((index, descriptor), (_, next)) in updates.iter().zip(&selected) {
+            let offset = descriptor_offset(*index, *next)?;
+            self.backend.write_control(offset, descriptor.as_bytes())?;
+            self.backend
+                .persist_control(offset, size_of::<NvDescriptor>())?;
+        }
         self.backend.fence()?;
         inject(fault, FaultPoint::AfterContentPersist)?;
-
-        let commit_offset = commit_offset(index)?;
-        self.backend
-            .store_control_u64(commit_offset, FRAME_COMMIT_WORD)?;
-        inject(fault, FaultPoint::AfterCommitStore)?;
-        self.backend
-            .persist_control(commit_offset, size_of::<u64>())?;
-        inject(fault, FaultPoint::AfterCommitPersist)?;
-        self.backend.fence()?;
+        let publication = (|| {
+            for (index, next) in selected {
+                let offset = commit_offset(index)?;
+                self.backend.store_control_u64(offset, next)?;
+                inject(fault, FaultPoint::AfterCommitStore)?;
+                self.backend.persist_control(offset, size_of::<u64>())?;
+                inject(fault, FaultPoint::AfterCommitPersist)?;
+            }
+            self.backend.fence()
+        })();
+        if let Err(error) = publication {
+            // A volatile selector may be newer than its durable value. Reusing
+            // its inactive copy could overwrite the last recoverable descriptor.
+            // Recovery constructs a fresh engine from durable selectors.
+            self.publication_uncertain.store(true, Ordering::Release);
+            return Err(error);
+        }
         inject(fault, FaultPoint::AfterCommitFence)
     }
 
     pub(super) fn clear_frame(&self, index: usize, fault: Option<FaultPoint>) -> Result<()> {
-        self.check_index(index)?;
+        self.clear_frames(&[index], fault)
+    }
+
+    /// No slot may be reused before this method's final fence succeeds.
+    pub(super) fn clear_frames(&self, indices: &[usize], fault: Option<FaultPoint>) -> Result<()> {
+        self.ensure_writable()?;
+        for index in indices {
+            self.check_index(*index)?;
+        }
+        if indices.is_empty() {
+            return Ok(());
+        }
         inject(fault, FaultPoint::BeforeClear)?;
-        let commit_offset = commit_offset(index)?;
-        self.backend.store_control_u64(commit_offset, 0)?;
-        inject(fault, FaultPoint::AfterClearStore)?;
-        self.backend
-            .persist_control(commit_offset, size_of::<u64>())?;
-        inject(fault, FaultPoint::AfterClearPersist)?;
-        self.backend.fence()?;
+        let clearing = (|| {
+            for index in indices {
+                let offset = commit_offset(*index)?;
+                self.backend.store_control_u64(offset, 0)?;
+                inject(fault, FaultPoint::AfterClearStore)?;
+                self.backend.persist_control(offset, size_of::<u64>())?;
+                inject(fault, FaultPoint::AfterClearPersist)?;
+            }
+            self.backend.fence()
+        })();
+        if let Err(error) = clearing {
+            self.publication_uncertain.store(true, Ordering::Release);
+            return Err(error);
+        }
         inject(fault, FaultPoint::AfterClearFence)
+    }
+
+    fn ensure_writable(&self) -> Result<()> {
+        if self.publication_uncertain.load(Ordering::Acquire) {
+            return_errno_with_message!(Errno::EUCLEAN, "NV selector publication requires recovery");
+        }
+        Ok(())
+    }
+
+    fn check_descriptor(&self, index: usize, descriptor: &NvDescriptor) -> Result<()> {
+        self.check_index(index)?;
+        if !descriptor.is_valid() {
+            return_errno_with_message!(Errno::EINVAL, "invalid NV descriptor");
+        }
+        Ok(())
     }
 
     fn check_index(&self, index: usize) -> Result<()> {

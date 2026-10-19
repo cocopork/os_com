@@ -361,6 +361,19 @@ impl SuperBlock {
         Ok(())
     }
 
+    /// Replaces a recovered free-block count after rebuilding it from all
+    /// block-group bitmaps. Returns whether the in-memory value changed.
+    pub(super) fn reconcile_free_blocks(&mut self, count: u64) -> Result<bool> {
+        if count > self.blocks_count {
+            return_errno_with_message!(Errno::EIO, "free block counter exceeds total blocks");
+        }
+        if self.free_blocks_count == count {
+            return Ok(false);
+        }
+        self.free_blocks_count = count;
+        Ok(true)
+    }
+
     /// Decreases the free-inode counter by one, erroring on underflow.
     ///
     /// Takes `&mut self` so that a write guard over `RwMutex<Dirty<SuperBlock>>`

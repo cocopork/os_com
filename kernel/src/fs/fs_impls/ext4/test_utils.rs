@@ -61,6 +61,8 @@ pub(super) struct Ext4MemoryDisk {
     fail_writes: AtomicBool,
     fail_flushes: AtomicBool,
     fail_write_block: AtomicUsize,
+    counted_write_block: AtomicUsize,
+    counted_writes: AtomicUsize,
 }
 
 impl Ext4MemoryDisk {
@@ -76,6 +78,8 @@ impl Ext4MemoryDisk {
             fail_writes: AtomicBool::new(false),
             fail_flushes: AtomicBool::new(false),
             fail_write_block: AtomicUsize::new(usize::MAX),
+            counted_write_block: AtomicUsize::new(usize::MAX),
+            counted_writes: AtomicUsize::new(0),
         }
     }
 
@@ -102,6 +106,15 @@ impl Ext4MemoryDisk {
     /// fired.
     pub(super) fn flush_count(&self) -> usize {
         self.flush_count.load(Ordering::Relaxed)
+    }
+
+    pub(super) fn count_writes_to(&self, block: usize) {
+        self.counted_writes.store(0, Ordering::Relaxed);
+        self.counted_write_block.store(block, Ordering::Relaxed);
+    }
+
+    pub(super) fn counted_writes(&self) -> usize {
+        self.counted_writes.load(Ordering::Relaxed)
     }
 }
 
@@ -133,6 +146,11 @@ impl BlockDevice for Ext4MemoryDisk {
         {
             bio.complete(BioStatus::IoError);
             return Ok(());
+        }
+        if bio.type_() == BioType::Write
+            && failed_range.contains(&self.counted_write_block.load(Ordering::Relaxed))
+        {
+            self.counted_writes.fetch_add(1, Ordering::Relaxed);
         }
 
         let mut cur_device_ofs = bio.sid_range().start.to_raw() as usize * SECTOR_SIZE;

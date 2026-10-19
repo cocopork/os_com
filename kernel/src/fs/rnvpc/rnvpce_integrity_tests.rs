@@ -464,3 +464,142 @@ fn rnvpce_short_reader_publishes_only_durable_prefix_and_credit() {
         2
     );
 }
+
+#[ktest]
+fn rnvpce_batch_migration_crash_recovers_authoritative_forward_graph() {
+    use super::fault::FaultPoint;
+    for phase in 0..5 {
+        ostd::early_println!("NVPAGE_CRASH_PHASE {}", phase);
+        let (image, config, pool) = restartable_pool(48);
+        let fs_id = 0x9930 + phase;
+        let inode = 51;
+        let snapshot = AuthoritySnapshot::new(1, &[], 0, 0, 0o100644, 0).unwrap();
+        bootstrap_inode_authority(pool.clone(), fs_id, inode, &snapshot, None).unwrap();
+        let pages = [
+            RangeWritePage::new(0, 0, 0, PAGE_SIZE, true).unwrap(),
+            RangeWritePage::new(1, 0, 0, PAGE_SIZE, true).unwrap(),
+        ];
+        let request = RangeWriteBatch::new(
+            2,
+            0,
+            2 * PAGE_SIZE,
+            &[],
+            &pages,
+            0,
+            0,
+            (PAGE_SIZE / 512) as u64,
+        )
+        .unwrap();
+        let input = [0x6a; 2 * PAGE_SIZE];
+        commit_range_write(
+            pool.clone(),
+            fs_id,
+            inode,
+            &request,
+            &mut VmReader::from(input.as_slice()).to_fallible(),
+            |_, _| panic!("new pages"),
+            None,
+        )
+        .unwrap();
+        let references: Vec<_> = (0..2)
+            .map(|logical| {
+                mapped_nv_page_ref(&pool, fs_id, inode, logical)
+                    .unwrap()
+                    .expect("initial NV mapping")
+            })
+            .collect();
+        let leases: Vec<_> = references
+            .iter()
+            .map(|r| {
+                pool.pin_for_writeback_seq(
+                    NvPageId::try_from(r.slot().unwrap() as usize).unwrap(),
+                    r.allocation_seq(),
+                )
+                .unwrap()
+            })
+            .collect();
+        let targets: Vec<_> = references
+            .iter()
+            .enumerate()
+            .map(|(i, r)| (*r, 46000 + i as u64))
+            .collect();
+        let target_fault = match phase {
+            0 => Some(FaultPoint::AfterContentPersist),
+            1 => Some(FaultPoint::AfterCommitPersist),
+            _ => None,
+        };
+        let result = pool.assign_migration_targets(&targets, target_fault);
+        assert_eq!(result.is_ok(), phase >= 2);
+        if phase >= 2 {
+            // Test backend has no physical SSD: simulate its successful data+flush
+            // prerequisite and verify only the NVM publication/recovery protocol.
+            let updates: Vec<_> = references
+                .iter()
+                .enumerate()
+                .map(|(i, r)| SsdMigrationPage {
+                    logical_block: i as u64,
+                    reference: *r,
+                    ssd_block: 46000 + i as u64,
+                })
+                .collect();
+            assert!(
+                migrate_mapped_nv_pages_to_ssd_by_reverse(&pool, fs_id, inode, &updates, None)
+                    .unwrap()
+                    .into_iter()
+                    .all(|r| r.unwrap())
+            );
+            let reclaim: Vec<_> = leases.into_iter().zip(references.iter().copied()).collect();
+            match phase {
+                2 => drop(reclaim), // Published SSD extents, descriptors still live.
+                3 => assert!(
+                    pool.reclaim_migrated_pages(reclaim, Some(FaultPoint::AfterClearPersist))
+                        .is_err()
+                ),
+                _ => pool.reclaim_migrated_pages(reclaim, None).unwrap(),
+            }
+        } else {
+            drop(leases);
+        }
+        drop(pool);
+        for _ in 0..2 {
+            image.simulate_crash();
+            let recovered =
+                Arc::new(Rnvpc::recover(Arc::new(image.attach()), config, None).unwrap());
+            for logical in 0..2 {
+                if phase < 2 {
+                    let reference = mapped_nv_page_ref(&recovered, fs_id, inode, logical)
+                        .unwrap()
+                        .expect("recovered NV mapping");
+                    let pin = recovered
+                        .pin_data_page(
+                            NvPageId::try_from(reference.slot().unwrap() as usize).unwrap(),
+                        )
+                        .unwrap();
+                    let mut data = [0; PAGE_SIZE];
+                    pin.read(&mut data).unwrap();
+                    assert_eq!(data, [0x6a; PAGE_SIZE]);
+                } else {
+                    assert!(
+                        mapped_nv_page_ref(&recovered, fs_id, inode, logical)
+                            .unwrap()
+                            .is_none()
+                    );
+                    assert_eq!(
+                        current_page_mapping(&recovered, fs_id, inode, logical)
+                            .unwrap()
+                            .expect("recovered SSD mapping")
+                            .ssd_block(),
+                        46000 + logical
+                    );
+                }
+            }
+            assert_eq!(
+                space_reservation(&recovered, fs_id, inode)
+                    .unwrap()
+                    .map_or(0, |record| record.outstanding_blocks()),
+                if phase < 2 { 2 } else { 0 }
+            );
+            drop(recovered);
+        }
+    }
+}

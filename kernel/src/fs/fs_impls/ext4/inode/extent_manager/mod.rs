@@ -380,6 +380,33 @@ impl ExtentManager {
             .finish_metadata_batch(fs.block_device().as_ref())
     }
 
+    /// Coalesces nojournal node after-images under the owning inode write lock.
+    /// Unlike delalloc materialization, export already owns its data blocks
+    /// and must not claim a delayed-allocation reservation.
+    pub(super) fn with_metadata_batch<T>(
+        &self,
+        operation: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
+        let fs = self.fs()?;
+        if fs.journal().is_some() {
+            return operation();
+        }
+        {
+            let tree = self.state.write();
+            tree.finish_metadata_batch(fs.block_device().as_ref())?;
+            tree.begin_metadata_batch();
+        }
+        let result = operation();
+        let persisted = self
+            .state
+            .write()
+            .finish_metadata_batch(fs.block_device().as_ref());
+        match result {
+            Ok(value) => persisted.map(|()| value),
+            Err(error) => Err(error),
+        }
+    }
+
     pub(super) fn range_known_written(&self, start: Iblock, end: Iblock) -> bool {
         self.state.read().es_cache().range_state(start, end) == EsCoverage::AllWritten
     }

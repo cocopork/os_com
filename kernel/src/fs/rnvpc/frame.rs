@@ -46,11 +46,13 @@ use crate::{
 
 static DATA_PAGE_LEASE_EPOCH: AtomicU64 = AtomicU64::new(0);
 static DATA_PAGE_LEASE_WAITERS: WaitQueue = WaitQueue::new();
+static DATA_CAPACITY_WAITERS: WaitQueue = WaitQueue::new();
 static METADATA_PIN_EPOCH: AtomicU64 = AtomicU64::new(0);
 static METADATA_PIN_WAITERS: WaitQueue = WaitQueue::new();
 
 mod pcache;
 pub(crate) use pcache::{PersistentDataRef, PersistentFrameUpdate};
+mod migration;
 mod object_table;
 use object_table::ObjectTable;
 mod publication;
@@ -409,6 +411,17 @@ impl Rnvpc {
         let _ = DATA_PAGE_LEASE_WAITERS.wait_until(|| {
             (DATA_PAGE_LEASE_EPOCH.load(Ordering::Acquire) != observed).then_some(())
         });
+    }
+
+    /// Waits on actual data-page releases, including aborted reservations.
+    /// The cancellation predicate must not acquire an inode/publication lock.
+    pub(crate) fn wait_for_data_capacity(&self, pages: usize, cancelled: impl Fn() -> bool) {
+        DATA_CAPACITY_WAITERS
+            .wait_until(|| (cancelled() || self.can_reserve_data_pages(pages)).then_some(()));
+    }
+
+    pub(crate) fn wake_data_capacity_waiters(&self) {
+        DATA_CAPACITY_WAITERS.wake_all();
     }
 
     pub(crate) fn foreground_write_must_throttle(&self) -> bool {
@@ -836,6 +849,10 @@ impl Rnvpc {
         record.kind = ObjectKind::Free;
         allocation.free_ids.push(id.index());
         allocation.capacity.account_free(PoolClass::Data);
+        drop(objects);
+        drop(allocation);
+        drop(state);
+        self.wake_data_capacity_waiters();
         Ok(())
     }
 
@@ -875,6 +892,10 @@ impl Rnvpc {
         record.kind = ObjectKind::Free;
         allocation.free_ids.push(id.index());
         allocation.capacity.account_free(PoolClass::Data);
+        drop(objects);
+        drop(allocation);
+        drop(state);
+        self.wake_data_capacity_waiters();
         Ok(true)
     }
 
@@ -897,6 +918,9 @@ impl Rnvpc {
         objects.records[id.index()] = ObjectRecord::free();
         state.free_ids.push(id.index());
         state.capacity.account_free(PoolClass::Data);
+        drop(objects);
+        drop(state);
+        self.wake_data_capacity_waiters();
         Ok(())
     }
 
@@ -985,6 +1009,9 @@ impl Rnvpc {
         self: &Arc<Self>,
         pages: usize,
     ) -> Result<CapacityReservation> {
+        if pages > self.config.data_limit_pages() {
+            return_errno_with_message!(Errno::ENOMEM, "NV reservation exceeds data capacity");
+        }
         let mut reservation = CapacityReservation {
             pool: self.clone(),
             pages: Vec::new(),
@@ -1003,6 +1030,17 @@ impl Rnvpc {
             }
         }
         Ok(reservation)
+    }
+
+    pub(crate) fn can_reserve_data_pages(&self, pages: usize) -> bool {
+        let allocation = self.allocation.lock();
+        let stats = allocation.capacity.stats();
+        pages
+            <= self
+                .config
+                .data_limit_pages()
+                .saturating_sub(stats.data_pages)
+            && pages <= stats.free_pages
     }
 
     /// 从预留里取一个页；预留耗尽 ⇒ `EAGAIN`（调用方应重新预留）。
@@ -1597,6 +1635,29 @@ impl Rnvpc {
         })
     }
 
+    /// Returns targets owned by interrupted rNVPCe migrations for one filesystem.
+    /// Recovery must exclude these blocks from allocation before starting rTIO.
+    pub(crate) fn pending_migration_targets(&self, fs_id: u64) -> Result<Vec<u64>> {
+        let mut targets = BTreeSet::new();
+        for (key, page) in self.committed_data_pages() {
+            if key.fs_id != fs_id {
+                continue;
+            }
+            let reference = self.persistent_data_ref(page)?;
+            if !self.persistent_data_has_migration_target(reference)? {
+                continue;
+            }
+            let target = self.persistent_data_ssd_backing(reference)?;
+            if target == 0 || !targets.insert(target) {
+                return_errno_with_message!(
+                    Errno::EUCLEAN,
+                    "invalid or overlapping rNVPCe migration target"
+                );
+            }
+        }
+        Ok(targets.into_iter().collect())
+    }
+
     /// 某 `(fs_id, inode)` 下所有已提交数据页：`(page_index, slot)`。
     pub(crate) fn committed_data_pages_of(&self, fs_id: u64, inode: u64) -> Vec<(u64, NvPageId)> {
         self.objects.collect(|index, record| {
@@ -2019,48 +2080,11 @@ impl Rnvpc {
         &self,
         reference: PersistentObjectRef,
     ) -> Result<()> {
-        let slot = usize::try_from(reference.slot().ok_or_else(|| Error::new(Errno::EINVAL))?)
-            .map_err(|_| Error::new(Errno::EINVAL))?;
-        let mut descriptor = self
-            .persist
-            .read_entry(slot)?
-            .filter(|descriptor| descriptor.allocation_seq() == reference.allocation_seq())
-            .ok_or_else(|| Error::new(Errno::ESTALE))?;
-        descriptor.mark_migration_credit_released()?;
-        self.persist.commit_frame(slot, &descriptor, None)
+        self.mark_migration_credits_released(&[reference], None)
     }
 
     fn persist_migration_target(&self, reference: PersistentObjectRef, target: u64) -> Result<()> {
-        let slot = usize::try_from(reference.slot().ok_or_else(|| Error::new(Errno::EINVAL))?)
-            .map_err(|_| Error::new(Errno::EINVAL))?;
-        {
-            let state = self.objects.lock_checked(slot)?;
-            let record = state
-                .records
-                .get(slot)
-                .ok_or_else(|| Error::new(Errno::EINVAL))?;
-            if record.kind != ObjectKind::Data(DataPageState::InFlight)
-                || !record.committed
-                || !record.persisting
-                || record.alloc_seq != reference.allocation_seq()
-            {
-                return_errno_with_message!(Errno::ESTALE, "migration lease is stale");
-            }
-        }
-        let mut descriptor = self
-            .persist
-            .read_entry(slot)?
-            .filter(|descriptor| descriptor.allocation_seq() == reference.allocation_seq())
-            .ok_or_else(|| Error::new(Errno::ESTALE))?;
-        descriptor.assign_migration_target(target)?;
-        self.persist.commit_frame(slot, &descriptor, None)?;
-        let key = self.validate_persistent_data_ref(reference)?;
-        let mut state = self.state.lock();
-        if let Some(entry) = state.index.lookup_mut(key) {
-            entry.ssd_backing_block = target;
-            entry.state = NvObjectState::NvWriteback;
-        }
-        Ok(())
+        self.assign_migration_targets(&[(reference, target)], None)
     }
 
     fn clear_persistent_migration_target(&self, reference: PersistentObjectRef) -> Result<()> {
@@ -2073,7 +2097,8 @@ impl Rnvpc {
             .filter(|descriptor| descriptor.allocation_seq() == reference.allocation_seq())
             .ok_or_else(|| Error::new(Errno::ESTALE))?;
         descriptor.clear_migration_target()?;
-        self.persist.commit_frame(slot, &descriptor, None)?;
+        self.persist
+            .update_descriptors(&[(slot, descriptor)], None)?;
         let mut state = self.state.lock();
         if let Some(entry) = state.index.lookup_mut(key) {
             entry.ssd_backing_block = 0;
@@ -4454,119 +4479,13 @@ impl EvictingDataPage {
     /// The caller must have replaced the forward reference while this lease
     /// remained active. The retained reverse locator is cleared below.
     pub(crate) fn reclaim_after_ssd_publish(
-        mut self,
+        self,
         reference: PersistentObjectRef,
         fault: Option<FaultPoint>,
     ) -> Result<()> {
-        let page = self.id.index() as u64;
-        let result = (|| {
-            set_completion_stage(COMPLETION_FINISH_VALIDATE_LOCK, 0, page);
-            let started = read_ns();
-            {
-                // Validate the pinned generation before destroying its persistent
-                // recovery evidence. The eviction lease excludes mutation, but an
-                // explicit pre-check keeps a stale completion from clearing a
-                // descriptor that belongs to a later allocation.
-                let t_lock = read_ns();
-                let state = self.pool.objects.lock(self.id.index());
-                LATENCY_STATS.rnvpce_reclaim_state_lock.record_since(t_lock);
-                let record = &state.records[self.id.index()];
-                if record.kind != ObjectKind::Data(DataPageState::InFlight)
-                    || record.pins != 1
-                    || !record.persisting
-                    || record.alloc_seq != reference.allocation_seq()
-                    || state.reverse.is_none()
-                {
-                    return_errno_with_message!(Errno::ESTALE, "rNVPCe migration lease changed");
-                }
-            }
-            LATENCY_STATS
-                .nvpc_finish_validate_lock
-                .record_since(started);
-
-            set_completion_stage(COMPLETION_FINISH_CLEAR_DESCRIPTOR, 0, page);
-            let started = read_ns();
-            // zn: clean NVPage description on NVDIMM
-            self.pool.persist.clear_frame(self.id.index(), fault)?;
-            LATENCY_STATS
-                .nvpc_finish_clear_descriptor
-                .record_since(started);
-
-            set_completion_stage(COMPLETION_FINISH_FINALIZE_LOCK, 0, page);
-            let started = read_ns();
-            let times;
-            {
-                let mut allocation = self.pool.allocation.lock();
-                let t_lock = read_ns();
-                let mut state = self.pool.objects.lock(self.id.index());
-                let slot_locked = read_ns();
-                let record = &state.records[self.id.index()];
-                // The lease stayed active across descriptor clearing; the
-                // identity validated above cannot change before this reclaim.
-                debug_assert_eq!(record.kind, ObjectKind::Data(DataPageState::InFlight));
-                debug_assert_eq!(record.pins, 1);
-                debug_assert!(record.persisting);
-                debug_assert_eq!(record.alloc_seq, reference.allocation_seq());
-                debug_assert!(state.reverse.is_some());
-                state.reverse = None;
-                // zn: reset in-mem runtime state of NVPage(ObjectRecord)
-                let record = &mut state.records[self.id.index()];
-                record.kind = ObjectKind::Free;
-                record.pins = 0;
-                record.persisting = false;
-                record.committed = false;
-                record.key = None;
-                record.version = 0;
-                let reset_done = read_ns();
-                self.pool.account_unpin();
-                let unpin_done = read_ns();
-                allocation.free_ids.push(self.id.index());
-                allocation.capacity.account_free(PoolClass::Data);
-                self.active = false;
-                let capacity_done = read_ns();
-                drop(state);
-                drop(allocation);
-                times = [
-                    started,
-                    t_lock,
-                    slot_locked,
-                    reset_done,
-                    unpin_done,
-                    capacity_done,
-                    read_ns(),
-                ];
-            }
-            if LATENCY_ENABLED {
-                // Record after unlocking so shared counters do not extend the critical section.
-                for (stat, pair) in [
-                    &LATENCY_STATS.reclaim_allocation_wait,
-                    &LATENCY_STATS.reclaim_slot_wait,
-                    &LATENCY_STATS.reclaim_reset,
-                    &LATENCY_STATS.reclaim_unpin,
-                    &LATENCY_STATS.reclaim_capacity,
-                    &LATENCY_STATS.reclaim_unlock,
-                ]
-                .into_iter()
-                .zip(times.windows(2))
-                {
-                    stat.record_ns(pair[1].saturating_sub(pair[0]));
-                }
-                LATENCY_STATS
-                    .rnvpce_reclaim_state_lock
-                    .record_ns(times[2].saturating_sub(times[1]));
-            }
-            LATENCY_STATS
-                .nvpc_finish_finalize_lock
-                .record_since(started);
-
-            set_completion_stage(COMPLETION_FINISH_LEASE_WAKE, 0, page);
-            let started = read_ns();
-            note_data_page_lease_change();
-            LATENCY_STATS.nvpc_finish_lease_wake.record_since(started);
-            Ok(())
-        })();
-        clear_completion_stage();
-        result
+        self.pool
+            .clone()
+            .reclaim_migrated_pages(vec![(self, reference)], fault)
     }
 
     pub(crate) fn finish(mut self, fault: Option<FaultPoint>) -> Result<()> {

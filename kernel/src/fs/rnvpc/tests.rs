@@ -763,3 +763,221 @@ fn rnvpce_metadata_mutation_guard_wakes_a_waiting_leaf_mutator() {
     waiter.join();
     assert_eq!(state.load(Ordering::Acquire), 2);
 }
+
+#[ktest]
+fn descriptor_update_keeps_old_committed_copy_on_crash() {
+    use super::{descriptor::NvDescriptor, dram::DramNvImage, persist::PersistEngine};
+    let config = RnvpcConfig::from_bytes(
+        Some(8 * PAGE_SIZE),
+        Some(2 * PAGE_SIZE),
+        Some(6 * PAGE_SIZE),
+        Some(NvSimMode::Model),
+    )
+    .unwrap()
+    .unwrap();
+    let image = DramNvImage::allocate_model(config).unwrap();
+    let backend = Arc::new(image.attach());
+    let engine = PersistEngine::new(backend, 8).unwrap();
+    engine.format().unwrap();
+    let original = NvDescriptor::for_nv_page(71, 72, 0, 0, 1)
+        .with_allocation_seq(1)
+        .unwrap();
+    engine.commit_frame(0, &original, None).unwrap();
+    let mut changed = original;
+    changed.assign_migration_target(900).unwrap();
+    assert!(
+        engine
+            .commit_frame(0, &changed, Some(FaultPoint::AfterContentPersist))
+            .is_err()
+    );
+    image.simulate_crash();
+    let recovered = PersistEngine::new(Arc::new(image.attach()), 8).unwrap();
+    assert_eq!(
+        recovered.read_entry(0).unwrap(),
+        Some(original),
+        "unfinished descriptor update must retain its selected old copy"
+    );
+}
+
+#[ktest]
+fn descriptor_batch_publication_and_clear_survive_partial_crash() {
+    use super::{descriptor::NvDescriptor, dram::DramNvImage, persist::PersistEngine};
+    for fault in [
+        None,
+        Some(FaultPoint::BeforeContentPersist),
+        Some(FaultPoint::AfterContentPersist),
+        Some(FaultPoint::AfterCommitStore),
+        Some(FaultPoint::AfterCommitPersist),
+        Some(FaultPoint::AfterCommitFence),
+    ] {
+        let config = RnvpcConfig::from_bytes(
+            Some(8 * PAGE_SIZE),
+            Some(2 * PAGE_SIZE),
+            Some(6 * PAGE_SIZE),
+            Some(NvSimMode::Model),
+        )
+        .unwrap()
+        .unwrap();
+        let image = DramNvImage::allocate_model(config).unwrap();
+        let backend = Arc::new(image.attach());
+        let engine = PersistEngine::new(backend.clone(), 8).unwrap();
+        engine.format().unwrap();
+        let old: Vec<_> = (0..3)
+            .map(|i| {
+                (
+                    i,
+                    NvDescriptor::for_nv_page(71, 72, i as u64, 0, 1)
+                        .with_allocation_seq(i as u64 + 1)
+                        .unwrap(),
+                )
+            })
+            .collect();
+        for (slot, d) in &old {
+            engine.commit_frame(*slot, d, None).unwrap();
+        }
+        let new: Vec<_> = old
+            .iter()
+            .map(|(i, d)| {
+                let mut d = *d;
+                d.assign_migration_target(900 + *i as u64).unwrap();
+                (*i, d)
+            })
+            .collect();
+        // The working data is deliberately changed without persist: descriptor-only
+        // updates must not accidentally make these bytes durable.
+        backend
+            .write_page(NvPageId::try_from(0usize).unwrap(), &[0x66; PAGE_SIZE])
+            .unwrap();
+        let before = backend.stats();
+        let result = engine.update_descriptors(&new, fault);
+        assert_eq!(result.is_ok(), fault.is_none());
+        if fault.is_none() {
+            assert_eq!(backend.stats().fence_calls - before.fence_calls, 2);
+            assert_eq!(backend.stats().persist_calls - before.persist_calls, 6);
+        }
+        if matches!(
+            fault,
+            Some(FaultPoint::AfterCommitStore | FaultPoint::AfterCommitPersist)
+        ) {
+            assert!(
+                engine.update_descriptors(&new, None).is_err(),
+                "uncertain selectors must block copy reuse until recovery"
+            );
+        }
+        image.simulate_crash();
+        let backend = Arc::new(image.attach());
+        let recovered = PersistEngine::new(backend.clone(), 8).unwrap();
+        for ((slot, old), (_, new)) in old.iter().zip(&new) {
+            let actual = recovered.read_entry(*slot).unwrap().unwrap();
+            assert!(actual == *old || actual == *new);
+            if fault == Some(FaultPoint::AfterContentPersist) {
+                assert_eq!(actual, *old);
+            }
+            if fault.is_none() || fault == Some(FaultPoint::AfterCommitFence) {
+                assert_eq!(actual, *new);
+            }
+            if fault == Some(FaultPoint::AfterCommitPersist) {
+                assert_eq!(actual, if *slot == 0 { *new } else { *old });
+            }
+        }
+        let mut data = [0; PAGE_SIZE];
+        backend
+            .read_page(NvPageId::try_from(0usize).unwrap(), &mut data)
+            .unwrap();
+        assert_eq!(
+            data, [0; PAGE_SIZE],
+            "descriptor updates must not repersist data"
+        );
+        // Recovery can be repeated without changing the selected state.
+        image.simulate_crash();
+        let backend = Arc::new(image.attach());
+        let recovered = PersistEngine::new(backend.clone(), 8).unwrap();
+        let before = backend.stats();
+        recovered.clear_frames(&[0, 1, 2], None).unwrap();
+        assert_eq!(backend.stats().fence_calls - before.fence_calls, 1);
+        image.simulate_crash();
+        let recovered = PersistEngine::new(Arc::new(image.attach()), 8).unwrap();
+        for slot in 0..3 {
+            assert!(recovered.read_entry(slot).unwrap().is_none());
+        }
+    }
+}
+
+#[ktest]
+fn rnvpce_batch_reclaim_uses_one_durability_barrier() {
+    let config = RnvpcConfig::from_bytes(
+        Some(16 * PAGE_SIZE),
+        Some(4 * PAGE_SIZE),
+        Some(12 * PAGE_SIZE),
+        Some(NvSimMode::Fast),
+    )
+    .unwrap()
+    .unwrap();
+    let backend = Arc::new(DramNvBackend::allocate_with_chunk_pages(config, 2).unwrap());
+    let pool = Arc::new(Rnvpc::new(backend.clone(), config, None).unwrap());
+    let mut pages = Vec::new();
+    for i in 0..4 {
+        let page = pool.stage_data_page(&[0x77; PAGE_SIZE]).unwrap();
+        pool.transition_data_page(page, DataPageState::Staged, DataPageState::NvDirty)
+            .unwrap();
+        pool.commit_data_page_in_owner(page, PageKey::new(77, 78, i), None)
+            .unwrap();
+        let reference = pool.persistent_data_ref(page).unwrap();
+        pool.install_reverse(reference, ReverseExtentRef::new(7, i as usize).unwrap())
+            .unwrap();
+        let lease = pool
+            .pin_for_writeback_seq(page, reference.allocation_seq())
+            .unwrap();
+        pages.push((lease, reference));
+    }
+    let before = backend.stats();
+    pool.reclaim_migrated_pages(pages, None).unwrap();
+    assert_eq!(
+        backend.stats().fence_calls - before.fence_calls,
+        1,
+        "one batch must clear all descriptors before a shared fence"
+    );
+    assert_eq!(pool.stats().free_pages, 16);
+    assert_eq!(pool.stats().pinned_frames, 0);
+}
+
+#[ktest]
+fn descriptor_batch_rejects_stale_duplicate_and_legacy_layout() {
+    use super::{descriptor::NvDescriptor, dram::DramNvImage, persist::PersistEngine};
+    let config = RnvpcConfig::from_bytes(
+        Some(8 * PAGE_SIZE),
+        Some(2 * PAGE_SIZE),
+        Some(6 * PAGE_SIZE),
+        Some(NvSimMode::Model),
+    )
+    .unwrap()
+    .unwrap();
+    let image = DramNvImage::allocate_model(config).unwrap();
+    let backend = Arc::new(image.attach());
+    let engine = PersistEngine::new(backend.clone(), 8).unwrap();
+    engine.format().unwrap();
+    let d = NvDescriptor::for_nv_page(7, 8, 0, 0, 1)
+        .with_allocation_seq(1)
+        .unwrap();
+    engine.commit_frame(0, &d, None).unwrap();
+    let mut changed = d;
+    changed.assign_migration_target(900).unwrap();
+    assert!(
+        engine
+            .update_descriptors(&[(0, changed), (0, changed)], None)
+            .is_err()
+    );
+    assert!(
+        engine
+            .update_descriptors(&[(0, changed.with_allocation_seq(2).unwrap())], None)
+            .is_err()
+    );
+    assert_eq!(engine.read_entry(0).unwrap(), Some(d));
+    // Version 3 used one 80-byte descriptor entry. Reject it without writes.
+    backend.write_control(16, &3u32.to_ne_bytes()).unwrap();
+    backend.persist_control(16, 4).unwrap();
+    backend.fence().unwrap();
+    let before = backend.stats();
+    assert!(engine.read_header().is_err());
+    assert_eq!(backend.stats().persist_calls, before.persist_calls);
+}

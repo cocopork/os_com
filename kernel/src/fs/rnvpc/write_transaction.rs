@@ -910,6 +910,8 @@ where
     F: FnMut(u64, &mut super::frame::StagingDataPage) -> Result<()>,
 {
     let mutation = ExtentMutation::new(pool.clone(), fs_id, inode)?;
+    let pages = range_write_new_pages(&pool, fs_id, inode, request)?;
+    let reservation = pool.reserve_data_pages(pages)?;
     commit_range_write_with_mutation(
         pool,
         fs_id,
@@ -919,7 +921,25 @@ where
         load_ssd_page,
         inode_fault,
         mutation,
+        reservation,
     )
+}
+
+/// Counts new data pages before consuming user bytes or SSD credits.
+/// The caller holds the inode publication guard through reservation and commit.
+pub(crate) fn range_write_new_pages(
+    pool: &Arc<Rnvpc>,
+    fs_id: u64,
+    inode: u64,
+    request: &RangeWriteBatch<'_>,
+) -> Result<usize> {
+    let mut pages = 0;
+    for page in request.pages {
+        if mapped_nv_page_ref(pool, fs_id, inode, page.logical_block)?.is_none() {
+            pages += 1;
+        }
+    }
+    Ok(pages)
 }
 
 pub(crate) fn commit_range_write_with_mutation<F>(
@@ -931,6 +951,7 @@ pub(crate) fn commit_range_write_with_mutation<F>(
     mut load_ssd_page: F,
     inode_fault: Option<FaultPoint>,
     mutation: ExtentMutation,
+    mut reservation: super::frame::CapacityReservation,
 ) -> Result<CommittedRangeWrite>
 where
     F: FnMut(u64, &mut super::frame::StagingDataPage) -> Result<()>,
@@ -1007,7 +1028,6 @@ where
         .iter()
         .filter(|(_, reference)| reference.is_none())
         .count();
-    let mut reservation = pool.reserve_data_pages(new_page_count)?;
     let mut allocation_refs = Vec::new();
     allocation_refs
         .try_reserve_exact(request.allocations.len())
@@ -1841,11 +1861,14 @@ pub(crate) fn migrate_mapped_nv_pages_to_ssd_by_reverse(
     }
     LATENCY_STATS.migration_validate.record_since(started);
     let mut consumed = 0;
+    let mut credits = Vec::new();
     for group in leaves.values() {
         let started = read_ns();
         let updates: Vec<_> = group.iter().map(|(_, update)| *update).collect();
+        let profile_start = super::batch_metrics::now();
         let published =
             ExtentMutation::publish_ssd_extents_locked(pool, fs_id, inode, &updates, fault);
+        super::batch_metrics::elapsed(super::batch_metrics::Phase::LeafPublish, profile_start);
         LATENCY_STATS.migration_leaf.record_since(started);
         let started = read_ns();
         for (index, update) in group {
@@ -1864,17 +1887,32 @@ pub(crate) fn migrate_mapped_nv_pages_to_ssd_by_reverse(
                 {
                     return Ok(false);
                 }
-                // Persist each idempotent phase before returning its runtime credit.
-                pool.mark_migration_credit_released(update.expected)?;
+                // Collect only successfully published pages. Persist this entire
+                // phase before returning any live admission credits.
                 Ok(true)
             })();
             if matches!(release, Ok(true)) {
-                consumed += 1;
+                credits.push((*index, update.expected));
             }
             outcomes[*index] = release;
         }
         LATENCY_STATS.migration_credit.record_since(started);
     }
+    let references: Vec<_> = credits.iter().map(|(_, reference)| *reference).collect();
+    let started = read_ns();
+    let profile_start = super::batch_metrics::now();
+    match pool.mark_migration_credits_released(&references, None) {
+        Ok(()) => consumed = credits.len() as u64,
+        Err(error) => {
+            // Partial publication is recoverable but cannot return live credits.
+            for (index, _) in credits {
+                outcomes[index] = Err(error);
+            }
+        }
+    }
+    super::batch_metrics::elapsed(super::batch_metrics::Phase::CreditPublish, profile_start);
+    super::batch_metrics::count(super::batch_metrics::Event::CreditPages, consumed as usize);
+    LATENCY_STATS.migration_credit.record_since(started);
     if consumed != 0 {
         let started = read_ns();
         if let Err(error) = consume_ssd_capacity_locked(pool, fs_id, inode, consumed) {

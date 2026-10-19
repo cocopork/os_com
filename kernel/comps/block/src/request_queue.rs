@@ -57,7 +57,7 @@ impl BioRequestSingleQueue {
     ///
     /// This method will wake up the waiter if a new `BioRequest` is enqueued.
     pub fn enqueue(&self, bio: SubmittedBio) -> Result<(), BioEnqueueError> {
-        if bio.segments().len() >= self.max_nr_segments_per_bio {
+        if bio.segments().len() > self.max_nr_segments_per_bio {
             return Err(BioEnqueueError::TooBig);
         }
 
@@ -239,6 +239,67 @@ impl From<SubmittedBio> for BioRequest {
                 bios.push_front(bio);
                 bios
             },
+        }
+    }
+}
+
+#[cfg(ktest)]
+mod tests {
+    use ::device_id::{DeviceId, MajorId, MinorId};
+    use io_util::batch::IoBatch;
+    use ostd::prelude::*;
+
+    use super::*;
+    use crate::{
+        BlockDevice, BlockDeviceMeta,
+        bio::{Bio, BioDirection, BioSegment, BioStatus},
+    };
+
+    #[derive(Debug)]
+    struct QueueDevice(BioRequestSingleQueue);
+
+    impl BlockDevice for QueueDevice {
+        fn enqueue(&self, bio: SubmittedBio) -> Result<(), BioEnqueueError> {
+            self.0.enqueue(bio)
+        }
+        fn metadata(&self) -> BlockDeviceMeta {
+            BlockDeviceMeta {
+                max_nr_segments_per_bio: self.0.max_nr_segments_per_bio(),
+                nr_sectors: 4096,
+            }
+        }
+        fn name(&self) -> &str {
+            "queue-limit-test"
+        }
+        fn id(&self) -> DeviceId {
+            DeviceId::new(MajorId::new(1), MinorId::new(0))
+        }
+    }
+
+    #[ktest]
+    fn bio_segment_limit_is_inclusive() {
+        let device = QueueDevice(BioRequestSingleQueue::with_max_nr_segments_per_bio(2));
+        for count in [1, 2, 3] {
+            let segments = (0..count)
+                .map(|_| BioSegment::alloc(1, BioDirection::ToDevice))
+                .collect();
+            let bio = Bio::new(BioType::Write, Sid::new(0), segments, None);
+            let mut batch = IoBatch::new();
+            let result = bio.submit(&device, &mut batch);
+            if count <= 2 {
+                assert!(
+                    result.is_ok(),
+                    "BIO at advertised segment limit must be accepted"
+                );
+                let request = device.0.dequeue();
+                assert_eq!(request.num_segments(), count);
+                for bio in request.into_bios() {
+                    bio.complete(BioStatus::Complete);
+                }
+            } else {
+                assert!(matches!(result, Err(BioEnqueueError::TooBig)));
+                assert_eq!(device.0.num_requests(), 0);
+            }
         }
     }
 }

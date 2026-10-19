@@ -238,6 +238,9 @@ pub struct Ext4 {
     rnvpc_mode: RnvpcModeConfig,
     pub(super) cache_pressure: Arc<super::writeback::CachePressure>,
     pub(super) nv_migration_lock: Mutex<()>,
+    pub(super) nv_migration_trigger: Arc<ostd::sync::WaitQueue>,
+    pub(super) nv_migration_epoch: AtomicUsize,
+    pub(super) nv_capacity_waiters: AtomicUsize,
     pub(super) nv_completion_lock: Mutex<()>,
     pub(super) nv_completion_queue: super::migration::CompletionQueue,
     pub(super) nv_completion_trigger: Arc<ostd::sync::WaitQueue>,
@@ -248,8 +251,9 @@ pub struct Ext4 {
     block_capacity: Arc<Capacity>,
     /// Immutable geometry avoids even a superblock read on allocation.
     allocation_geometry: (Ext4Bid, u32, u64),
-    /// The JBD2 journal, present iff the volume carries the `HAS_JOURNAL` compat
-    /// feature (jbd2 `journal_t`).
+    /// The JBD2 journal for native EXT4 and rNVPC mounts of volumes carrying
+    /// `HAS_JOURNAL` (jbd2 `journal_t`). rNVPCe keeps this absent even when a
+    /// clean, unused journal remains on disk.
     ///
     /// A settable cell, not a plain field, because the journal can only be built
     /// *after* the `Ext4` `Arc` exists: [`journal::load_geometry`] reads the
@@ -294,6 +298,7 @@ impl Ext4 {
     pub(super) fn rnvpc_extend_enabled(&self) -> bool {
         self.rnvpc_mode() == RnvpcMode::RnvpcExtend
     }
+
     pub(super) fn rnvpc_fs_id(&self) -> u64 {
         self.rnvpc_fs_id
     }
@@ -317,6 +322,36 @@ impl Ext4 {
         self.block_capacity.reconcile_rnvpce(outstanding);
         Ok(())
     }
+
+    fn reconcile_rnvpce_migration_targets(&self) -> Result<()> {
+        let pool = crate::fs::rnvpc::pool().ok_or_else(|| Error::new(Errno::EINVAL))?;
+        let targets = pool.pending_migration_targets(self.rnvpc_fs_id)?;
+        let mut groups = BTreeSet::new();
+        for target in targets {
+            let group = self.block_group_index_for_block(target)?;
+            if self.block_groups[group].protect_recovered_block(target)? {
+                groups.insert(group);
+            }
+        }
+        let free_blocks = self.block_groups.iter().try_fold(0u64, |total, group| {
+            total
+                .checked_add(u64::from(group.free_blocks_count()))
+                .ok_or_else(|| Error::new(Errno::EOVERFLOW))
+        })?;
+        let super_changed = self
+            .super_block
+            .write()
+            .reconcile_free_blocks(free_blocks)?;
+        if groups.is_empty() && !super_changed {
+            return Ok(());
+        }
+        self.block_capacity.reset(free_blocks);
+        self.sync_rnvpce_allocation_metadata(&groups)?;
+        if self.block_device.sync()? != BioStatus::Complete {
+            return_errno_with_message!(Errno::EIO, "failed to persist recovered migration targets");
+        }
+        Ok(())
+    }
     /// Mounts an ext4 volume from a block device.
     ///
     /// `data` is the raw `mount(2)` option string; see
@@ -328,6 +363,12 @@ impl Ext4 {
         let rnvpc_mode = mount_options.rnvpc_mode()?;
         if rnvpc_mode.mode() != RnvpcMode::Native && crate::fs::rnvpc::pool().is_none() {
             return_errno_with_message!(Errno::EINVAL, "rNVPC mount requires a configured pool");
+        }
+        if rnvpc_mode.mode() == RnvpcMode::RnvpcExtend && super_block.needs_recovery() {
+            return_errno_with_message!(
+                Errno::EUCLEAN,
+                "rNVPCe requires a clean filesystem; recover with native EXT4 first"
+            );
         }
         let rnvpc_fs_id = u64::from_le_bytes(super_block.uuid()[..8].try_into().unwrap());
         if let Some(pool) = crate::fs::rnvpc::pool() {
@@ -365,6 +406,9 @@ impl Ext4 {
             rnvpc_mode,
             cache_pressure: super::writeback::CachePressure::new(),
             nv_migration_lock: Mutex::new(()),
+            nv_migration_trigger: Arc::new(ostd::sync::WaitQueue::new()),
+            nv_migration_epoch: AtomicUsize::new(0),
+            nv_capacity_waiters: AtomicUsize::new(0),
             nv_completion_lock: Mutex::new(()),
             nv_completion_queue: Arc::new(SpinLock::new(VecDeque::with_capacity(
                 super::migration::MAX_IN_FLIGHT,
@@ -393,7 +437,22 @@ impl Ext4 {
         //
         // For a non-journaled volume `load_geometry` returns `None` and this whole
         // block is a pure no-op — the Phase 1–3 mount path is unchanged.
-        if let Some(geometry) = journal::load_geometry(&ext4)? {
+        let journal_geometry = journal::load_geometry(&ext4)?;
+        if ext4.rnvpc_extend_enabled() {
+            // Keep HAS_JOURNAL and its clean log on disk for native mounts,
+            // but never start JBD2 or stamp RECOVER in the soft-update mode.
+            // Check s_start as well: an inconsistent filesystem may have a
+            // pending log even without the superblock's recovery flag.
+            if journal_geometry
+                .as_ref()
+                .is_some_and(|geometry| geometry.start().is_some())
+            {
+                return_errno_with_message!(
+                    Errno::EUCLEAN,
+                    "rNVPCe cannot skip a pending journal; recover with native EXT4 first"
+                );
+            }
+        } else if let Some(geometry) = journal_geometry {
             let journal = journal::Journal::new(geometry, ext4.block_device().clone());
 
             // Recover a dirty journal (crashed mount) BEFORE any normal operation,
@@ -485,6 +544,7 @@ impl Ext4 {
         }
 
         if ext4.rnvpc_extend_enabled() {
+            ext4.reconcile_rnvpce_migration_targets()?;
             ext4.reconcile_rnvpce_reservations()?;
         }
         ext4.start_nv_migration();
@@ -556,6 +616,14 @@ impl Ext4 {
     #[cfg_attr(not(ktest), expect(dead_code))]
     pub(super) fn block_group(&self, group_idx: usize) -> &BlockGroup {
         &self.block_groups[group_idx]
+    }
+
+    pub(super) fn block_group_index_for_block(&self, block: Ext4Bid) -> Result<usize> {
+        let (first, blocks_per_group, total) = self.allocation_geometry;
+        if block < first || block >= total {
+            return_errno_with_message!(Errno::EINVAL, "block is outside EXT4 allocation geometry");
+        }
+        Ok(((block - first) / blocks_per_group as Ext4Bid) as usize)
     }
 
     pub(super) fn block_device(&self) -> &Arc<dyn BlockDevice> {
@@ -1126,6 +1194,8 @@ impl Ext4 {
                 }
             }
         }
+        self.wake_nv_capacity_waiters();
+        self.request_nv_migration();
         Ok(())
     }
 
@@ -2235,6 +2305,27 @@ impl Ext4 {
             group.sync_metadata()?;
         }
 
+        self.sync_superblock_metadata()
+    }
+
+    /// Writes only allocation groups touched by one rNVPCe migration round.
+    /// Data BIOs are already submitted; the completion worker supplies the
+    /// single device flush after both classes of writes complete.
+    pub(super) fn sync_rnvpce_allocation_metadata(&self, groups: &BTreeSet<usize>) -> Result<()> {
+        self.ensure_not_shutdown()?;
+        if self.journal().is_some() {
+            return_errno_with_message!(Errno::EUCLEAN, "rNVPCe allocation metadata has a journal");
+        }
+        for &group in groups {
+            self.block_groups
+                .get(group)
+                .ok_or_else(|| Error::new(Errno::EINVAL))?
+                .sync_metadata()?;
+        }
+        self.sync_superblock_metadata()
+    }
+
+    fn sync_superblock_metadata(&self) -> Result<()> {
         let mut sb = self.super_block.write();
         if sb.is_dirty() {
             // RMW the on-disk superblock: patch only the free-block and
@@ -2293,9 +2384,13 @@ impl Ext4 {
     /// `metadata.write()` — no inversion.
     pub(super) fn sync_all(&self) -> Result<()> {
         self.ensure_not_shutdown()?;
-        self.export_nv_for_sync()?;
+        self.export_nv_for_sync().inspect_err(|error| {
+            error!("EXT4 NV export failed: {error:?}");
+        })?;
         for group in &self.block_groups {
-            group.sync_inodes()?;
+            group.sync_inodes().inspect_err(|error| {
+                error!("EXT4 inode sync failed: {error:?}");
+            })?;
         }
         self.sync_metadata()
     }
@@ -6374,7 +6469,6 @@ mod nv_mode_tests {
         let both = opts("rnvpc_extend=on,rtio=on").rnvpc_mode().unwrap();
         assert_eq!(both.mode(), RnvpcMode::RnvpcExtend);
         assert!(both.rtio());
-
         // 显式 `off` 也属于"已表态"：只关自己，不牵连另一开关。
         assert_eq!(
             opts("rnvpc=off,rnvpc_extend=on")

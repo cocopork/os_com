@@ -1360,6 +1360,11 @@ impl Inode {
             );
             inner.desc.set_sector_count(state.block_count());
         }
+        // JBD2 used to coalesce these inode/node writes implicitly. In
+        // nojournal mode retain bounded after-images explicitly, rather than
+        // synchronously rewriting the same native metadata for every page.
+        const EXPORT_CHUNK_BLOCKS: usize = 64;
+        let mut chunk = Vec::with_capacity(EXPORT_CHUNK_BLOCKS);
         crate::fs::rnvpc::write_transaction::visit_ssd_extents(
             pool,
             fs.rnvpc_fs_id(),
@@ -1372,17 +1377,40 @@ impl Inode {
                 for delta in 0..extent.length() as u64 {
                     let logical = Iblock::try_from(extent.logical_block() + delta)
                         .map_err(|_| Error::new(Errno::EOVERFLOW))?;
-                    let op = fs.begin_op(fs.write_credits(inner.extent_manager()?.root_depth()))?;
-                    inner.extent_manager()?.install_preallocated_written(
-                        logical,
-                        block + delta,
-                        op.get(),
-                    )?;
-                    inner.write_back_inode_desc_forced(fs, self.ino, op.get())?;
+                    chunk.push((logical, block + delta));
+                    if chunk.len() == EXPORT_CHUNK_BLOCKS {
+                        self.export_rnvpce_extent_chunk(fs, &mut inner, &chunk)?;
+                        chunk.clear();
+                    }
                 }
                 Ok(())
             },
-        )
+        )?;
+        if !chunk.is_empty() {
+            self.export_rnvpce_extent_chunk(fs, &mut inner, &chunk)?;
+        }
+        Ok(())
+    }
+
+    fn export_rnvpce_extent_chunk(
+        &self,
+        fs: &Ext4,
+        inner: &mut InodeInner,
+        mappings: &[(Iblock, Ext4Bid)],
+    ) -> Result<()> {
+        // rNVPCe mount policy guarantees no journal: admission checks still
+        // run, but there is no transaction credit limit across this chunk.
+        let em = inner.extent_manager()?.clone();
+        let op = fs.begin_op(fs.write_credits(em.root_depth()))?;
+        em.with_metadata_batch(|| {
+            for &(logical, physical) in mappings {
+                em.install_preallocated_written(logical, physical, op.get())?;
+            }
+            Ok(())
+        })?;
+        // Publish the native inode root only after its node after-images
+        // were written. Failed after-images remain queued for retry.
+        inner.write_back_inode_desc_forced(fs, self.ino, op.get())
     }
 
     fn read_rnvpce_at(
@@ -1725,127 +1753,159 @@ impl Inode {
         fs.nv_inodes.lock().insert(self.ino);
         let fs_id = fs.rnvpc_fs_id();
         let inode_id = self.ino as u64;
-        let t_lock = read_ns();
-        let mut inner = self.inner.write();
-        LATENCY_STATS.rnvpce_write_inner_wait.record_since(t_lock);
-        let old_size = inner.file_size();
-        let authority = if let Some(authority) =
-            crate::fs::rnvpc::write_transaction::authoritative_inode_state(&pool, fs_id, inode_id)?
-        {
-            authority
-        } else {
-            let snapshot_extents = inner.extent_manager()?.snapshot_ssd_extents()?;
-            let snapshot = crate::fs::rnvpc::write_transaction::AuthoritySnapshot::new(
-                1,
-                &snapshot_extents,
-                old_size as u64,
-                inner.sector_count(),
-                self.type_ as u32 | inner.desc.perm().bits() as u32,
-                inner.desc.flags().bits(),
-            )?;
-            crate::fs::rnvpc::write_transaction::bootstrap_inode_authority(
+        loop {
+            let t_lock = read_ns();
+            let mut inner = self.inner.write();
+            LATENCY_STATS.rnvpce_write_inner_wait.record_since(t_lock);
+            let old_size = inner.file_size();
+            if crate::fs::rnvpc::write_transaction::authoritative_inode_state(
+                &pool, fs_id, inode_id,
+            )?
+            .is_none()
+            {
+                let snapshot_extents = inner.extent_manager()?.snapshot_ssd_extents()?;
+                let snapshot = crate::fs::rnvpc::write_transaction::AuthoritySnapshot::new(
+                    1,
+                    &snapshot_extents,
+                    old_size as u64,
+                    inner.sector_count(),
+                    self.type_ as u32 | inner.desc.perm().bits() as u32,
+                    inner.desc.flags().bits(),
+                )?;
+                crate::fs::rnvpc::write_transaction::bootstrap_inode_authority(
+                    pool.clone(),
+                    fs_id,
+                    inode_id,
+                    &snapshot,
+                    None,
+                )?;
+            }
+            let mutation = crate::fs::rnvpc::extent_mutation::ExtentMutation::new(
                 pool.clone(),
                 fs_id,
                 inode_id,
-                &snapshot,
-                None,
             )?;
-            crate::fs::rnvpc::write_transaction::authoritative_inode_state(&pool, fs_id, inode_id)?
-                .ok_or_else(|| Error::new(Errno::EUCLEAN))?
-        };
-        let mut targets = Vec::new();
-        let first_page = offset / PAGE_SIZE;
-        let last_page = end.div_ceil(PAGE_SIZE);
-        let page_count = last_page - first_page;
-        targets
-            .try_reserve_exact(page_count)
-            .map_err(|_| Error::new(Errno::ENOMEM))?;
-        let mut spans = Vec::new();
-        let mut newly_reserved = 0u64;
-        spans
-            .try_reserve_exact(page_count)
-            .map_err(|_| Error::new(Errno::ENOMEM))?;
-        for page_index in first_page..last_page {
-            let logical_block = page_index as u64;
-            let page_start = page_index * PAGE_SIZE;
-            let copy_start = offset.max(page_start);
-            let copy_end = end.min(page_start + PAGE_SIZE);
-            let page_offset = copy_start - page_start;
-            let len = copy_end - copy_start;
-            let mut newly_allocated = false;
-            if let Some(mapping) = crate::fs::rnvpc::write_transaction::current_page_mapping(
-                &pool,
+            let authority = crate::fs::rnvpc::write_transaction::authoritative_inode_state(
+                &pool, fs_id, inode_id,
+            )?
+            .ok_or_else(|| Error::new(Errno::EUCLEAN))?;
+            let mut targets = Vec::new();
+            let first_page = offset / PAGE_SIZE;
+            let last_page = end.div_ceil(PAGE_SIZE);
+            let page_count = last_page - first_page;
+            targets
+                .try_reserve_exact(page_count)
+                .map_err(|_| Error::new(Errno::ENOMEM))?;
+            let mut spans = Vec::new();
+            let mut newly_reserved = 0u64;
+            spans
+                .try_reserve_exact(page_count)
+                .map_err(|_| Error::new(Errno::ENOMEM))?;
+            for page_index in first_page..last_page {
+                let logical_block = page_index as u64;
+                let page_start = page_index * PAGE_SIZE;
+                let copy_start = offset.max(page_start);
+                let copy_end = end.min(page_start + PAGE_SIZE);
+                let page_offset = copy_start - page_start;
+                let len = copy_end - copy_start;
+                let mut newly_allocated = false;
+                if let Some(mapping) = crate::fs::rnvpc::write_transaction::current_page_mapping(
+                    &pool,
+                    fs_id,
+                    inode_id,
+                    logical_block,
+                )? {
+                    targets.push(mapping.ssd_block());
+                } else {
+                    targets.push(0);
+                    newly_reserved = newly_reserved
+                        .checked_add(1)
+                        .ok_or_else(|| Error::new(Errno::EOVERFLOW))?;
+                    newly_allocated = true;
+                }
+                spans.push(crate::fs::rnvpc::write_transaction::RangeWritePage::new(
+                    logical_block,
+                    *targets.last().unwrap(),
+                    page_offset,
+                    len,
+                    newly_allocated,
+                )?);
+            }
+            let request = crate::fs::rnvpc::write_transaction::RangeWriteBatch::new(
+                authority
+                    .generation()
+                    .checked_add(1)
+                    .ok_or_else(|| Error::new(Errno::EOVERFLOW))?,
+                offset as u64,
+                write_len,
+                &[],
+                &spans,
+                authority.file_size(),
+                authority.block_count(),
+                (BLOCK_SIZE / 512) as u64,
+            )?;
+            let needed = crate::fs::rnvpc::write_transaction::range_write_new_pages(
+                &pool, fs_id, inode_id, &request,
+            )?;
+            let reservation = match pool.reserve_data_pages(needed) {
+                Ok(reservation) => reservation,
+                Err(error) if error.error() == Errno::EAGAIN => {
+                    // Nothing has consumed reader bytes or SSD admission credits yet.
+                    // Completion needs publication exclusion; never sleep with it or
+                    // the inode lock held. Rebuild the plan after capacity changes.
+                    drop(mutation);
+                    drop(inner);
+                    fs.wait_for_nv_capacity(needed)?;
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            fs.reserve_rnvpce_blocks(newly_reserved)?;
+            let result = crate::fs::rnvpc::write_transaction::commit_range_write_with_mutation(
+                pool.clone(),
                 fs_id,
                 inode_id,
-                logical_block,
-            )? {
-                targets.push(mapping.ssd_block());
-            } else {
-                targets.push(0);
-                newly_reserved = newly_reserved
-                    .checked_add(1)
-                    .ok_or_else(|| Error::new(Errno::EOVERFLOW))?;
-                newly_allocated = true;
-            }
-            spans.push(crate::fs::rnvpc::write_transaction::RangeWritePage::new(
-                logical_block,
-                *targets.last().unwrap(),
-                page_offset,
-                len,
-                newly_allocated,
-            )?);
-        }
-        let request = crate::fs::rnvpc::write_transaction::RangeWriteBatch::new(
-            authority
-                .generation()
-                .checked_add(1)
-                .ok_or_else(|| Error::new(Errno::EOVERFLOW))?,
-            offset as u64,
-            write_len,
-            &[],
-            &spans,
-            authority.file_size(),
-            authority.block_count(),
-            (BLOCK_SIZE / 512) as u64,
-        )?;
-        fs.reserve_rnvpce_blocks(newly_reserved)?;
-        let result = crate::fs::rnvpc::write_transaction::commit_range_write(
-            pool.clone(),
-            fs_id,
-            inode_id,
-            &request,
-            reader,
-            |block, staging| {
-                let segment =
-                    BioSegment::new_from_segment(staging.dma_segment()?, BioDirection::FromDevice);
-                let mut batch = IoBatch::new();
-                fs.read_blocks_async(block, segment, None, &mut batch)?;
-                batch.wait_all()?;
-                Ok(())
-            },
-            None,
-        );
-        match result {
-            Ok(committed) => {
-                fs.release_rnvpce_blocks(
-                    newly_reserved.saturating_sub(committed.reserved_blocks()),
-                )?;
-                inner.set_file_size(old_size.max(offset + committed.copied()));
-                let state = crate::fs::rnvpc::write_transaction::authoritative_inode_state(
-                    &pool, fs_id, inode_id,
-                )?
-                .ok_or_else(|| Error::new(Errno::EUCLEAN))?;
-                inner.desc.set_sector_count(state.block_count());
-                Ok(committed.copied())
-            }
-            Err(error) => {
-                // Publication can fail after durable capacity reservation. Rebuild the
-                // admission count from persistent records before admitting more writes.
-                // Keep the admission charge conservatively: a failed persist may
-                // have made the reservation reachable. Mount-time recovery rebuilds
-                // this counter; never reset it over another writer's reservation.
-                Err(error)
-            }
+                &request,
+                reader,
+                |block, staging| {
+                    let segment = BioSegment::new_from_segment(
+                        staging.dma_segment()?,
+                        BioDirection::FromDevice,
+                    );
+                    let mut batch = IoBatch::new();
+                    fs.read_blocks_async(block, segment, None, &mut batch)?;
+                    batch.wait_all()?;
+                    Ok(())
+                },
+                None,
+                mutation,
+                reservation,
+            );
+            return match result {
+                Ok(committed) => {
+                    fs.release_rnvpce_blocks(
+                        newly_reserved.saturating_sub(committed.reserved_blocks()),
+                    )?;
+                    inner.set_file_size(old_size.max(offset + committed.copied()));
+                    let state = crate::fs::rnvpc::write_transaction::authoritative_inode_state(
+                        &pool, fs_id, inode_id,
+                    )?
+                    .ok_or_else(|| Error::new(Errno::EUCLEAN))?;
+                    inner.desc.set_sector_count(state.block_count());
+                    if crate::fs::rnvpc::needs_flush_watermark() {
+                        fs.request_nv_migration();
+                    }
+                    Ok(committed.copied())
+                }
+                Err(error) => {
+                    // Publication can fail after durable capacity reservation. Rebuild the
+                    // admission count from persistent records before admitting more writes.
+                    // Keep the admission charge conservatively: a failed persist may
+                    // have made the reservation reachable. Mount-time recovery rebuilds
+                    // this counter; never reset it over another writer's reservation.
+                    Err(error)
+                }
+            };
         }
     }
 

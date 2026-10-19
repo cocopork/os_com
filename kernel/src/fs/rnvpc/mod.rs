@@ -10,6 +10,7 @@
 use spin::Once;
 
 pub(crate) mod backend;
+pub(crate) mod batch_metrics;
 pub(crate) mod capacity;
 pub(crate) mod config;
 pub(crate) mod cow;

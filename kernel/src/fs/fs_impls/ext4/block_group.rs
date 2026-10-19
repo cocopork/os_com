@@ -450,6 +450,46 @@ impl BlockGroup {
         self.allocation_gate.lock()
     }
 
+    /// Protects one NVM-owned migration target while mounting rNVPCe.
+    /// Returns true when recovery changed the bitmap or its derived count.
+    pub(super) fn protect_recovered_block(&self, block: Ext4Bid) -> Result<bool> {
+        if block < self.first_block || block > self.last_block {
+            return_errno_with_message!(Errno::EINVAL, "recovered block belongs to another group");
+        }
+        let _allocation = self.allocation_gate.lock();
+        let mut metadata = self.metadata.write();
+        let bit =
+            u16::try_from(block - self.first_block).map_err(|_| Error::new(Errno::EOVERFLOW))?;
+        if self.overlaps_system_zone_with(&metadata.desc, block..block + 1) {
+            return_errno_with_message!(Errno::EUCLEAN, "migration target overlaps EXT4 metadata");
+        }
+        let mut changed = false;
+        if !metadata.block_bitmap.is_allocated(bit) {
+            metadata
+                .block_bitmap
+                .alloc_exact_at(bit, 1)
+                .ok_or_else(|| Error::new(Errno::EUCLEAN))?;
+            if metadata.desc.is_block_uninit() {
+                metadata.desc.flags &= !BG_BLOCK_UNINIT;
+            }
+            let BlockGroupMetadata {
+                block_bitmap,
+                free_index,
+                ..
+            } = &mut *metadata;
+            if let Some(index) = free_index {
+                index.refresh(block_bitmap, bit..bit + 1);
+            }
+            changed = true;
+        }
+        let free_blocks = u32::from(metadata.block_bitmap.free_count());
+        if metadata.desc.free_blocks_count() != free_blocks {
+            metadata.desc.free_blocks_count = free_blocks;
+            changed = true;
+        }
+        Ok(changed)
+    }
+
     /// Loads a block group from the descriptor table.
     ///
     /// Reads and decodes the group's descriptor at `gdt_base_offset + group_idx *

@@ -49,6 +49,11 @@ impl IdBitmap {
         self.len
     }
 
+    /// Returns the number of free IDs represented by the valid bitmap range.
+    pub fn free_count(&self) -> u16 {
+        self.bit_slice().count_zeros() as u16
+    }
+
     /// Returns the capacity of the ID bitmap.
     ///
     /// The capacity is the size of the underlying buffer in bits.
