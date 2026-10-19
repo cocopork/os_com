@@ -1,0 +1,21 @@
+import shutil,json,sys,subprocess
+from pathlib import Path
+root=Path('/home/zn/zn/Rust_EXT4/os_com_rnvpc_rebuild')
+base=Path('/home/zn/asterinas-build-env/nvpage-batch-20261018')
+for name in json.loads((base/'final-source/files.json').read_text()):shutil.copy2(base/'final-source'/name,root/name)
+if sys.argv[1]=='restore':print('RESTORED FINAL SOURCE');sys.exit()
+if sys.argv[1]=='before':
+    for f in (base/'baseline/kernel').rglob('*.rs'):shutil.copy2(f,root/f.relative_to(base/'baseline'))
+    p=root/'kernel/src/fs/fs_impls/ext4/migration.rs';s=p.read_text().replace('use crate::fs::rnvpc::{self, frame::EvictingDataPage, metadata::PersistentObjectRef};','use crate::fs::rnvpc::{self, frame::EvictingDataPage, metadata::PersistentObjectRef, batch_metrics::{self, Event, Phase}};')
+    s=s.replace('                let blocks =\n                    self.alloc_blocks_with_intent(1, 0, op.get(), AllocIntent::RnvpceReserved)?;','                let started=batch_metrics::now();\n                let blocks =\n                    self.alloc_blocks_with_intent(1, 0, op.get(), AllocIntent::RnvpceReserved)?;\n                batch_metrics::elapsed(Phase::Allocate,started);\n                batch_metrics::count(Event::AllocatedPages,(blocks.end-blocks.start) as usize);')
+    s=s.replace('                self.persist_nv_allocations()?;\n            }\n            Ok(())','                let started=batch_metrics::now();\n                self.persist_nv_allocations()?;\n                batch_metrics::elapsed(Phase::AllocationBarrier,started);\n            }\n            Ok(())',1)
+    s=s.replace('            if let Err(error) = page.lease.assign_migration_target(', '            let started=batch_metrics::now();\n            if let Err(error) = page.lease.assign_migration_target(',1).replace('            page.target = target;','            batch_metrics::elapsed(Phase::TargetPublish,started);\n            batch_metrics::count(Event::TargetPages,1);\n            page.target = target;',1)
+    s=s.replace('        self.persist_nv_allocations()?;\n        let mut groups:', '        let started=batch_metrics::now();\n        self.persist_nv_allocations()?;\n        batch_metrics::elapsed(Phase::DataBarrier,started);\n        let mut groups:',1)
+    s=s.replace('                        page.lease\n                            .reclaim_after_ssd_publish(page.reference.unwrap(), None)', '                        let started=batch_metrics::now();\n                        let result=page.lease.reclaim_after_ssd_publish(page.reference.unwrap(), None);\n                        batch_metrics::elapsed(Phase::Reclaim,started);\n                        if result.is_ok(){batch_metrics::count(Event::ReclaimedPages,1);}\n                        result',1)
+    s=s.replace('        self.persist_nv_allocations()\n    }\n}', '        self.persist_nv_allocations()?;\n        batch_metrics::dump();\n        Ok(())\n    }\n}',1)
+    assert 'Phase::Allocate' in s and 'Phase::Reclaim' in s;p.write_text(s)
+    p=root/'kernel/src/fs/rnvpc/write_transaction.rs';s=p.read_text();a=s.index('    for group in leaves.values() {',s.index('pub(crate) fn migrate_mapped_nv_pages_to_ssd_by_reverse'))
+    s=s[:a]+s[a:].replace('        let published =','        let profile_start=super::batch_metrics::now();\n        let published =',1).replace('        LATENCY_STATS.migration_leaf.record_since(started);','        super::batch_metrics::elapsed(super::batch_metrics::Phase::LeafPublish,profile_start);\n        LATENCY_STATS.migration_leaf.record_since(started);',1)
+    s=s.replace('                pool.mark_migration_credit_released(update.expected)?;','                let profile_start=super::batch_metrics::now();\n                pool.mark_migration_credit_released(update.expected)?;\n                super::batch_metrics::elapsed(super::batch_metrics::Phase::CreditPublish,profile_start);\n                super::batch_metrics::count(super::batch_metrics::Event::CreditPages,1);',1);p.write_text(s)
+p=root/'kernel/src/fs/rnvpc/batch_metrics.rs';s=p.read_text().replace('pub(crate) const ENABLED: bool = false;','pub(crate) const ENABLED: bool = true;');p.write_text(s)
+print('PROFILE SOURCE:',sys.argv[1])

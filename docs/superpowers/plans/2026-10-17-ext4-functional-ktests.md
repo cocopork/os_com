@@ -24,4 +24,4 @@
 
 ## 完成
 
-上述五步均已执行。最终完整 kernel ktest：289 passed、0 failed、0 filtered out；570 个原 EXT4 场景在日志中恰好各通过一次。独立审查无发现，格式检查通过。详见 [执行记录](../../recovery/EXT4-FUNCTIONAL-KTESTS-2026-10-17.md) 和 [映射清单](../../recovery/EXT4-FUNCTIONAL-KTESTS.json)。
+上述五步均已执行。最终完整 kernel ktest：289 passed、0 failed、0 filtered out；570 个原 EXT4 场景在日志中恰好各通过一次。独立审查无发现，格式检查通过。详见 [执行记录](../../experiments/reports/EXT4-FUNCTIONAL-KTESTS-2026-10-17.md)。

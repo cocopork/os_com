@@ -39,3 +39,18 @@ cachix.list
 
 # temporary configuration file for NixOS tests
 distro/etc_nixos/_config_for_test.nix
+
+# Experiment documentation is an allowlist: reports and reproducibility
+# scripts belong in Git; generated measurements and figures stay external.
+docs/experiments/**
+!docs/experiments/reports/
+!docs/experiments/reports/**/
+!docs/experiments/reports/**/*.md
+!docs/experiments/scripts/
+!docs/experiments/scripts/**/
+!docs/experiments/scripts/**/*.md
+!docs/experiments/scripts/**/*.py
+!docs/experiments/scripts/**/*.sh
+!docs/experiments/scripts/**/*.rs
+!docs/experiments/scripts/**/*.c
+!docs/experiments/scripts/**/*.h

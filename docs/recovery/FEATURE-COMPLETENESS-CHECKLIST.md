@@ -1,6 +1,6 @@
 # 恢复内核功能完备性清单
 
-> 后续更新：原生 EXT4 的 journal/nojournal delalloc 已在工作树实现并通过299项 kernel ktest。下表保留恢复调查时的历史状态，当前实现边界、预留限制及验证见 [EXT4-DELALLOC-2026-10-17.md](EXT4-DELALLOC-2026-10-17.md)。
+> 后续更新：原生 EXT4 的 journal/nojournal delalloc 已在工作树实现并通过299项 kernel ktest。下表保留恢复调查时的历史状态，当前实现边界、预留限制及验证见 [EXT4 delalloc 实验报告](../experiments/reports/EXT4-DELALLOC-2026-10-17.md)。
 
 核对日期：2026-10-17（北京时间）。
 
@@ -19,7 +19,7 @@
 
 ## 一、研究部分：rNVPC
 
-依据：[前台 checkpoint 设计](/home/zn/zn/Rust_EXT4/os_com_implementation/rNVPC-rTIO/rnvpc-foreground-checkpoint-design.md)、[会话来源说明](persistent-wal.md)。
+依据：[前台 checkpoint 设计](../os_com_implementation/rNVPC-rTIO/rnvpc-foreground-checkpoint-design.md)、[会话来源说明](persistent-wal.md)。
 
 | 应支持的功能 | 当前 rebuild | 缺口或限制 |
 |---|---|---|
@@ -36,7 +36,7 @@ WAL 属于 **rNVPC**；rNVPCe 不复用这套日志。
 
 ## 二、研究部分：rNVPCe
 
-依据：[总设计](/home/zn/zn/Rust_EXT4/os_com_implementation/rNVPC-rTIO/design.md)、[当前事务实现](../../kernel/src/fs/rnvpc/write_transaction.rs)。
+依据：[总设计](../os_com_implementation/rNVPC-rTIO/design.md)、[当前事务实现](../../kernel/src/fs/rnvpc/write_transaction.rs)。
 
 | 应支持的功能 | 当前 rebuild | 缺口或限制 |
 |---|---|---|
@@ -56,7 +56,7 @@ WAL 属于 **rNVPC**；rNVPCe 不复用这套日志。
 
 ## 三、研究部分：rTIO
 
-依据：[设计中的迁移流程](/home/zn/zn/Rust_EXT4/os_com_implementation/rNVPC-rTIO/design.md)、[当前迁移代码](../../kernel/src/fs/fs_impls/ext4/migration.rs)。
+依据：[设计中的迁移流程](../os_com_implementation/rNVPC-rTIO/design.md)、[当前迁移代码](../../kernel/src/fs/fs_impls/ext4/migration.rs)。
 
 | 应支持的功能 | 当前 rebuild | 缺口或限制 |
 |---|---|---|
@@ -74,7 +74,7 @@ WAL 属于 **rNVPC**；rNVPCe 不复用这套日志。
 
 不能直接沿用旧文档的“支持”结论。会话片段出现过独立 writeback worker、脏页加在飞页计数和 delalloc reservation，而当前 rebuild 没有对应完整实现。
 
-证据：[历史会话提取片段](/home/zn/zn/recovery_Rust_EXT4/research_recovery_20261016/positioned-views/kernel/src/fs/fs_impls/ext4/fs.rs/unversioned_sed_evidence.rs.partial)、[PageCache 当前写回路径](../../kernel/src/vm/page_cache/vmo/mod.rs)、[历史功能核对](/home/zn/zn/Rust_EXT4/os_com_implementation/ext4-function-check.md)。提取片段存在缺口和版本混杂，不能直接整段覆盖当前源码。
+证据：[历史会话提取片段](/home/zn/zn/recovery_Rust_EXT4/research_recovery_20261016/positioned-views/kernel/src/fs/fs_impls/ext4/fs.rs/unversioned_sed_evidence.rs.partial)、[PageCache 当前写回路径](../../kernel/src/vm/page_cache/vmo/mod.rs)、[历史功能核对](../os_com_implementation/ext4-function-check.md)。提取片段存在缺口和版本混杂，不能直接整段覆盖当前源码。
 
 | 应支持的功能 | 当前 rebuild | 缺口或限制 |
 |---|---|---|
@@ -98,7 +98,7 @@ WAL 属于 **rNVPC**；rNVPCe 不复用这套日志。
 
 ## 五、硬件模拟：NVDIMM、persist、fence
 
-依据：[设计中的模拟边界](/home/zn/zn/Rust_EXT4/os_com_implementation/rNVPC-rTIO/design.md)、[当前 DRAM backend](../../kernel/src/fs/rnvpc/dram.rs)、[持久化协议](../../kernel/src/fs/rnvpc/persist.rs)。
+依据：[设计中的模拟边界](../os_com_implementation/rNVPC-rTIO/design.md)、[当前 DRAM backend](../../kernel/src/fs/rnvpc/dram.rs)、[持久化协议](../../kernel/src/fs/rnvpc/persist.rs)。
 
 | 应支持的功能 | 当前 rebuild | 缺口或边界 |
 |---|---|---|

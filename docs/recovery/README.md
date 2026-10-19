@@ -5,9 +5,11 @@ functionality. Exact reconstruction of the pre-crash source is no longer the
 development goal. Recovered sessions and designs remain evidence of intended
 behavior, not a requirement to reproduce historical code byte for byte.
 
-Read [WAL-EXT4-INTEGRATION.md](WAL-EXT4-INTEGRATION.md) for the current implementation,
-validation, and known limits. Other restoration reports describe intermediate
-snapshots; their pending-build statements are superseded by that report.
+Read [WAL-EXT4-INTEGRATION.md](WAL-EXT4-INTEGRATION.md) for the recovered
+implementation, validation, and known limits. This directory is limited to
+source-recovery provenance, manifests, and reconstruction reviews. Subsequent
+functional and performance work lives under
+[`docs/experiments`](../experiments/reports/README.md).
 
 The checked source manifest matches the snapshot that built a normal kernel ISO
 and passed 56 targeted KVM tests (0 failed, 678 filtered out). This is not a full

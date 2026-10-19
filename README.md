@@ -10,8 +10,9 @@
 
 ## 研究设计与恢复进展
 
-- [设计、实现计划与实验脚本](os_com_implementation/README.md)：与代码共用本仓库和远端。
-- [恢复后的验证与性能报告](docs/recovery/)：当前 rebuild 的实测证据。
+- [设计与实现计划](docs/os_com_implementation/README.md)：与代码共用本仓库和远端。
+- [实验报告与复现脚本](docs/experiments/reports/README.md)：当前 rebuild 的测试结论和可复现实验入口。
+- [代码恢复证据](docs/recovery/)：来源清单、恢复审查和持久化接线记录。
 - [工作区合并说明](docs/recovery/REPOSITORY-CONSOLIDATION-2026-10-18.md)：目录迁移与历史归档位置。
 
 ## 项目目录
@@ -139,7 +140,7 @@ EXT4 是 Linux 中应用广泛的通用文件系统。将其原生实现引入 A
 
 设计的核心是把三个原本容易割裂的问题放在同一条数据路径中处理：ExtentManager 是逻辑块到物理块映射的统一事实来源；PageCache 为 Buffered I/O 与 mmap 提供共享缓存页；JBD2 规定元数据和相关数据的提交顺序，并在重新挂载时完成恢复。内核单元测试、xfstests、崩溃矩阵、数据 oracle 和 Linux 互操作位于架构外侧，对每层实现施加可观察的验证。
 
-![Asterinas EXT4 分层架构与数据布局](./docs/image/architecture-overview-v2.png)
+![Asterinas EXT4 分层架构与数据布局](docs/image/architecture-overview-v2.png)
 
 代码位于 `kernel/src/fs/fs_impls/ext4/`。`fs.rs` 管理挂载后的 EXT4 对象、同步和事务入口；`impl_for_vfs/` 提供 VFS 适配；`inode/` 负责文件、目录、截断和同步；`inode/extent_manager/` 维护 ExtentTree 与缓存；`journal/` 实现 JBD2 的提交、检查点、revoke 与恢复；`super_block.rs`、`block_group.rs`、`feature.rs` 与 `checksum.rs` 负责盘面解析、分配和格式校验。
 
@@ -155,7 +156,7 @@ EXT4 是 Linux 中应用广泛的通用文件系统。将其原生实现引入 A
 
 ExtentTree 是权威映射来源。EsCache 只缓存已经证实的区间状态：`AllWritten` 表示区间被 written Extent 完整覆盖，`AllMapped` 表示存在完整映射但可能含 unwritten 区间，`Unknown` 则要求重新遍历 ExtentTree。NodeCache 缓存热点外部节点，减少树遍历的块读，但不作为映射真值。该划分保证缓存失效最多退化为慢路径，而不会把不确定映射当成正确结果。
 
-![ExtentManager、缓存与块设备交互](./docs/image/extent-manager-design.png)
+![ExtentManager、缓存与块设备交互](docs/image/extent-manager-design.png)
 
 ### 3.4 Buffered I/O、mmap 与 PageCache
 
@@ -175,7 +176,7 @@ O_DIRECT 根据 Extent 映射直接构造 IoBatch/BIO，不传输 PageCache 中�
 
 JBD2 事务经历 Running、Commit、Checkpoint 与 Recovery 四个阶段。Running 阶段由 Handle 在 credits 范围内捕获元数据 after-image，并登记 ordered 数据写回；Commit 阶段由 group commit 汇集运行事务，依次写入 descriptor、metadata payload、revoke 记录和带校验和的 commit block；Checkpoint 阶段以 lazy checkpoint 的方式按事务顺序将已提交元数据写回 home blocks，淘汰已不再需要的 after-image 并释放日志空间。
 
-![EXT4 与 JBD2 事务提交流程](./docs/image/jbd2-commit-flow.png)
+![EXT4 与 JBD2 事务提交流程](docs/image/jbd2-commit-flow.png)
 
 | 日志记录 | 作用 | 恢复语义 |
 | --- | --- | --- |
@@ -189,13 +190,13 @@ JBD2 事务经历 Running、Commit、Checkpoint 与 Recovery 四个阶段。Runn
 
 系统采用 JBD2 ordered 模式：关联数据先完成写回，再写入日志记录；只有 commit block 经 barrier 持久化后，事务才获得可恢复资格。挂载恢复严格执行 `PASS_SCAN`、`PASS_REVOKE` 和 `PASS_REPLAY`：先识别完整提交事务，再收集 revoke 集合，最后只重放未被 revoke 覆盖的 after-image。日志校验和不匹配、journal 结构无效、空间预留错误或设备 I/O 失败时，系统进入 abort/只读降级路径，不继续接受可能破坏盘面的新写操作。
 
-![EXT4 与 JBD2 挂载恢复流程](./docs/image/jbd2-recovery-flow.png)
+![EXT4 与 JBD2 挂载恢复流程](docs/image/jbd2-recovery-flow.png)
 
 运行时锁分别保护 inode 状态、目录命名空间、ExtentTree、block group 和 journal state。多 inode 操作按 inode 号固定顺序加锁，Journal state 作为叶锁最后获取；EsCache 和 NodeCache 的临界区不跨设备 I/O 或日志调用。这样避免 rename、link 等跨 inode 操作形成 ABBA 死锁，也避免提交与前台 I/O 相互等待。
 
 外部电源保护模式面向可靠 UPS 或备用电源场景：运行期间优先完成文件数据写回，日志和部分元数据保留在内存；收到掉电通知后关闭操作入口、停止提交线程、回滚不完整事务，并在备用电源窗口内统一写回可信的数据和元数据。该模式默认关闭，只有掉电通知可靠送达、备用供电足以完成回滚和写回时才能启用。
 
-![外部电源保护模式的内存事务与数据路径](./docs/image/power-protected-memory-mode.png)
+![外部电源保护模式的内存事务与数据路径](docs/image/power-protected-memory-mode.png)
 
 ## 四、测试与评估
 
@@ -242,7 +243,7 @@ JBD2 事务经历 Running、Commit、Checkpoint 与 Recovery 四个阶段。Runn
 
 崩溃矩阵记录单个工作负载产生的块设备写入及 FLUSH 边界，在每个可观察持久化前缀构造掉电镜像。每张镜像均独立重新挂载、执行 JBD2 recovery，再经过严格 `e2fsck`、数据 oracle、accounting、checksum、walcheck 检查，最后汇总为 green/red。该方法覆盖 descriptor、metadata payload、commit block、checkpoint 以及 journal 回绕之间的写序关系。
 
-![崩溃恢复测试的四步验证流程](./docs/image/crash-recovery-test-flow.png)
+![崩溃恢复测试的四步验证流程](docs/image/crash-recovery-test-flow.png)
 
 | 验证项 | 覆盖与检查内容 | 结果 |
 | --- | --- | --- |
