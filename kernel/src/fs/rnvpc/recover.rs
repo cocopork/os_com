@@ -424,6 +424,37 @@ fn trace_extent_tree(
         }
         stats.extent_nodes += 1;
 
+        if let Some(sibling_slot) = node.right_sibling_slot() {
+            let sibling_ref = pool.persistent_metadata_ref_from_slot(sibling_slot)?;
+            if sibling_ref == reference {
+                return_errno_with_message!(Errno::EUCLEAN, "extent node links to itself");
+            }
+            let sibling =
+                pool.read_authoritative_metadata_boxed::<ExtentNodeRecord>(sibling_ref)?;
+            if sibling.header().fs_id() != owner.fs_id
+                || sibling.header().inode() != owner.inode
+                || sibling.level() != node.level()
+            {
+                return_errno_with_message!(Errno::EUCLEAN, "extent sibling identity is corrupt");
+            }
+            let sibling_boundary = sibling
+                .entries()?
+                .first()
+                .map(ExtentRecordEntry::logical_block)
+                .ok_or_else(|| Error::new(Errno::EUCLEAN))?;
+            // Once the parent route is durable, this node's upper bound equals
+            // the sibling boundary and the parent traversal owns that edge.
+            // Before then, the B-link is the sibling's sole reachability path.
+            if upper_bound.is_none_or(|upper| sibling_boundary < upper) {
+                pending.push((
+                    sibling_ref,
+                    Some(node.level()),
+                    Some(sibling_boundary),
+                    upper_bound,
+                ));
+            }
+        }
+
         if node.level() == 0 {
             for (entry_index, entry) in node.entries()?.iter().enumerate() {
                 stats.extent_entries += 1;
@@ -440,6 +471,7 @@ fn trace_extent_tree(
                     );
                 }
                 if let ExtentDataRef::Nv(data_ref) = entry.data_ref()? {
+                    let data_ref = pool.persistent_data_ref_from_slot(data_ref)?;
                     let key = pool.validate_persistent_data_ref(data_ref)?;
                     if key.fs_id != owner.fs_id
                         || key.inode != owner.inode
@@ -494,10 +526,10 @@ fn trace_extent_tree(
                     );
                 }
                 let child = entry
-                    .child_ref()
+                    .child_slot()
                     .ok_or_else(|| Error::new(Errno::EUCLEAN))?;
                 pending.push((
-                    child,
+                    pool.persistent_metadata_ref_from_slot(child)?,
                     Some(node.level() - 1),
                     Some(child_lower),
                     child_upper,

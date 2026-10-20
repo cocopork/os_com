@@ -108,11 +108,25 @@ impl ExtentRuntimeIndex {
         let mut current = *root;
         let mut expected_level = None;
         loop {
-            let node = self.read_node(current)?;
+            let mut node = self.read_node(current)?;
             if let Some(level) = expected_level
                 && node.level() != level
             {
                 return_errno_with_message!(Errno::EUCLEAN, "NV extent child depth mismatch");
+            }
+
+            while let Some(sibling_slot) = node.right_sibling_slot() {
+                let sibling_ref = self.pool.persistent_metadata_ref_from_slot(sibling_slot)?;
+                let sibling = self.read_node(sibling_ref)?;
+                let boundary = sibling
+                    .entries()?
+                    .first()
+                    .map(ExtentRecordEntry::logical_block)
+                    .ok_or_else(|| Error::new(Errno::EUCLEAN))?;
+                if logical_block < boundary {
+                    break;
+                }
+                node = sibling;
             }
 
             let entries = node.entries()?;
@@ -134,17 +148,17 @@ impl ExtentRuntimeIndex {
                 return Ok(found);
             }
 
-            let child = entries
+            let child_slot = entries
                 .iter()
-                .rev()
-                .find(|entry| entry.logical_block() <= logical_block)
+                .filter(|entry| entry.logical_block() <= logical_block)
+                .max_by_key(|entry| entry.logical_block())
                 .or_else(|| entries.first())
-                .and_then(ExtentRecordEntry::child_ref);
-            let Some(child) = child else {
+                .and_then(ExtentRecordEntry::child_slot);
+            let Some(child_slot) = child_slot else {
                 return Ok(None);
             };
             expected_level = Some(node.level() - 1);
-            current = child;
+            current = self.pool.persistent_metadata_ref_from_slot(child_slot)?;
         }
     }
 

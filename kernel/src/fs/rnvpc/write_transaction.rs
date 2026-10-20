@@ -996,6 +996,7 @@ where
         let existing = match entry {
             Some(entry) => match entry.data_ref()? {
                 ExtentDataRef::Nv(reference) => {
+                    let reference = pool.persistent_data_ref_from_slot(reference)?;
                     if pool.persistent_data_ssd_backing(reference)? != page.ssd_block {
                         return_errno_with_message!(Errno::ESTALE, "NVPage SSD target changed");
                     }
@@ -1370,12 +1371,12 @@ pub(crate) fn commit_write_batch(
         let existing =
             match lookup_tree_extent(&pool, fs_id, inode, current_root, page.logical_block)? {
                 Some(entry) => match entry.data_ref()? {
-                    ExtentDataRef::Nv(reference)
-                        if pool.persistent_data_ssd_backing(reference)? == page.ssd_block =>
-                    {
-                        Some(reference)
+                    ExtentDataRef::Nv(reference) => {
+                        let reference = pool.persistent_data_ref_from_slot(reference)?;
+                        (pool.persistent_data_ssd_backing(reference)? == page.ssd_block)
+                            .then_some(reference)
                     }
-                    ExtentDataRef::Nv(_) | ExtentDataRef::Ssd(_) => None,
+                    ExtentDataRef::Ssd(_) => None,
                 },
                 None => None,
             };
@@ -1484,7 +1485,9 @@ fn validate_ssd_targets(
                     ExtentDataRef::Ssd(block) => block
                         .checked_add(page.logical_block - entry.logical_block())
                         .ok_or_else(|| Error::new(Errno::EOVERFLOW))?,
-                    ExtentDataRef::Nv(reference) => pool.persistent_data_ssd_backing(reference)?,
+                    ExtentDataRef::Nv(reference) => pool.persistent_data_ssd_backing(
+                        pool.persistent_data_ref_from_slot(reference)?,
+                    )?,
                 }),
                 None => None,
             };
@@ -1620,6 +1623,7 @@ pub(crate) fn mapped_nv_page_ref(
     };
     match entry.data_ref()? {
         ExtentDataRef::Nv(reference) => {
+            let reference = pool.persistent_data_ref_from_slot(reference)?;
             if pool.validate_persistent_data_ref(reference)?
                 != PageKey::new(fs_id, inode, logical_block)
             {
@@ -1662,13 +1666,24 @@ where
         return Ok(());
     }
     let mut pending = vec![(record.extent_root(), None)];
+    let mut visited_slots = BTreeSet::new();
     while let Some((reference, expected_level)) = pending.pop() {
+        let slot = reference.slot().ok_or_else(|| Error::new(Errno::EUCLEAN))?;
+        if !visited_slots.insert(slot) {
+            continue;
+        }
         let node = pool.read_authoritative_metadata_boxed::<ExtentNodeRecord>(reference)?;
         if node.header().fs_id() != fs_id
             || node.header().inode() != inode
             || expected_level.is_some_and(|level| node.level() != level)
         {
             return_errno_with_message!(Errno::EUCLEAN, "invalid checkpoint extent node");
+        }
+        if let Some(sibling_slot) = node.right_sibling_slot() {
+            pending.push((
+                pool.persistent_metadata_ref_from_slot(sibling_slot)?,
+                Some(node.level()),
+            ));
         }
         for entry in node.entries()?.iter().rev() {
             if node.level() == 0 {
@@ -1677,9 +1692,12 @@ where
                 }
             } else {
                 let child = entry
-                    .child_ref()
+                    .child_slot()
                     .ok_or_else(|| Error::new(Errno::EUCLEAN))?;
-                pending.push((child, Some(node.level() - 1)));
+                pending.push((
+                    pool.persistent_metadata_ref_from_slot(child)?,
+                    Some(node.level() - 1),
+                ));
             }
         }
     }
@@ -1713,7 +1731,9 @@ pub(crate) fn current_page_mapping(
         ExtentDataRef::Ssd(first) => first
             .checked_add(logical_block - entry.logical_block())
             .ok_or_else(|| Error::new(Errno::EOVERFLOW))?,
-        ExtentDataRef::Nv(reference) => pool.persistent_data_ssd_backing(reference)?,
+        ExtentDataRef::Nv(reference) => {
+            pool.persistent_data_ssd_backing(pool.persistent_data_ref_from_slot(reference)?)?
+        }
     };
     Ok(Some(CurrentPageMapping {
         ssd_block,
@@ -1750,7 +1770,7 @@ pub(crate) fn migrate_mapped_nv_page_to_ssd(
         .ok_or_else(|| Error::new(Errno::ESTALE))?;
     if entry.logical_block() != logical_block
         || entry.length() != 1
-        || entry.data_ref()? != ExtentDataRef::Nv(expected)
+        || entry.data_ref()? != ExtentDataRef::Nv(expected.slot_plus_one())
         || pool.validate_persistent_data_ref(expected)? != PageKey::new(fs_id, inode, logical_block)
         || pool.persistent_data_ssd_backing(expected)? != ssd_block
     {
@@ -2054,7 +2074,7 @@ fn locate_tree_extent(
     let mut current = root;
     let mut expected_level = None;
     loop {
-        let node = pool.read_authoritative_metadata_boxed::<ExtentNodeRecord>(current)?;
+        let mut node = pool.read_authoritative_metadata_boxed::<ExtentNodeRecord>(current)?;
         if node.header().fs_id() != fs_id || node.header().inode() != inode {
             return_errno_with_message!(Errno::EUCLEAN, "extent node belongs to another inode");
         }
@@ -2062,6 +2082,21 @@ fn locate_tree_extent(
             && node.level() != level
         {
             return_errno_with_message!(Errno::EUCLEAN, "extent child depth mismatch");
+        }
+        while let Some(sibling_slot) = node.right_sibling_slot() {
+            let sibling_ref = pool.persistent_metadata_ref_from_slot(sibling_slot)?;
+            let sibling =
+                pool.read_authoritative_metadata_boxed::<ExtentNodeRecord>(sibling_ref)?;
+            let boundary = sibling
+                .entries()?
+                .first()
+                .map(ExtentRecordEntry::logical_block)
+                .ok_or_else(|| Error::new(Errno::EUCLEAN))?;
+            if logical_block < boundary {
+                break;
+            }
+            current = sibling_ref;
+            node = sibling;
         }
         let entries = node.entries()?;
         if node.level() == 0 {
@@ -2080,15 +2115,15 @@ fn locate_tree_extent(
                 ReverseExtentRef::new(leaf_slot, entry_index)?,
             )));
         }
-        let Some(child) = entries
+        let Some(child_slot) = entries
             .iter()
-            .rev()
-            .find(|entry| entry.logical_block() <= logical_block)
-            .and_then(ExtentRecordEntry::child_ref)
+            .filter(|entry| entry.logical_block() <= logical_block)
+            .max_by_key(|entry| entry.logical_block())
+            .and_then(ExtentRecordEntry::child_slot)
         else {
             return Ok(None);
         };
         expected_level = Some(node.level() - 1);
-        current = child;
+        current = pool.persistent_metadata_ref_from_slot(child_slot)?;
     }
 }

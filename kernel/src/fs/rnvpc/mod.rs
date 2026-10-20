@@ -20,6 +20,8 @@ pub(crate) mod dram;
 pub(crate) mod extend_cow;
 pub(crate) mod extent_index;
 pub(crate) mod extent_mutation;
+pub(crate) mod extent_state;
+pub(crate) mod extent_target;
 pub(crate) mod fault;
 pub(crate) mod frame;
 pub(crate) mod id;
@@ -470,3 +472,6 @@ pub(crate) fn snapshot() -> RnvpcSnapshot {
 
 #[cfg(ktest)]
 mod persistent_tests;
+
+#[cfg(ktest)]
+mod extent_inplace_tests;

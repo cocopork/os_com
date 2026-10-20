@@ -666,6 +666,53 @@ fn rnvpce_allocation_reclaim_failure_preserves_capacity() {
 }
 
 #[ktest]
+fn rnvpce_slot_reference_pins_owner_and_blocks_reuse() {
+    let pool = test_pool(2, 1, 1, None);
+    let old_key = PageKey::new(91, 7, 3);
+    let (page, seq) = pool.alloc_data_page_seq().unwrap();
+    pool.transition_data_page(page, DataPageState::Staged, DataPageState::NvDirty)
+        .unwrap();
+    pool.replace_data_page_in_owner_at(page, old_key, 0, None)
+        .unwrap();
+    let reference = pool.persistent_data_ref(page).unwrap();
+    let slot_plus_one = reference.slot().unwrap() + 1;
+
+    let reader = pool
+        .pin_persistent_data_slot(slot_plus_one, old_key)
+        .unwrap();
+    assert_eq!(reader.id(), page);
+    assert_eq!(
+        pool.pin_for_writeback_seq(page, seq).unwrap_err().error(),
+        Errno::EBUSY
+    );
+    drop(reader);
+
+    pool.pin_for_writeback_seq(page, seq)
+        .unwrap()
+        .finish(None)
+        .unwrap();
+    assert!(pool.free_data_page_if_seq(page, seq).unwrap());
+
+    let new_key = PageKey::new(92, 8, 4);
+    let (reused, _) = pool.alloc_data_page_seq().unwrap();
+    assert_eq!(reused, page);
+    pool.transition_data_page(reused, DataPageState::Staged, DataPageState::NvDirty)
+        .unwrap();
+    pool.replace_data_page_in_owner_at(reused, new_key, 0, None)
+        .unwrap();
+    assert!(
+        pool.pin_persistent_data_slot(slot_plus_one, old_key)
+            .is_err()
+    );
+    assert_eq!(
+        pool.pin_persistent_data_slot(slot_plus_one, new_key)
+            .unwrap()
+            .id(),
+        reused
+    );
+}
+
+#[ktest]
 fn rnvpce_allocation_parallel_reclaim_preserves_accounting() {
     let pool = test_pool(32, 8, 24, None);
     let mut threads = Vec::new();

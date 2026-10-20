@@ -185,10 +185,10 @@ impl ExtentMutation {
         if leaf.level() != 0 {
             return_errno_with_message!(Errno::ESTALE, "reverse locator is not a leaf");
         }
-        let mut entries = Vec::from(leaf.entries()?);
+        let entries = Vec::from(leaf.entries()?);
         LATENCY_STATS.leaf_detail_entries.record_since(started);
         let started = read_ns();
-        let mut changed = false;
+        let mut replacements = Vec::new();
         let mut seen = [false; EXTENT_NODE_ENTRY_CAPACITY];
         for update in updates {
             if pool.reverse_lookup(update.expected)? != Some(update.locator) {
@@ -212,44 +212,36 @@ impl ExtentMutation {
             }
             match entry.data_ref()? {
                 ExtentDataRef::Ssd(current) if current == update.ssd_block => continue,
-                ExtentDataRef::Nv(current) if current == update.expected => {}
+                ExtentDataRef::Nv(current) if current == update.expected.slot_plus_one() => {}
                 _ => return_errno_with_message!(
                     Errno::ESTALE,
                     "reverse locator forward edge changed"
                 ),
             }
-            entries[index] = ExtentRecordEntry::leaf(
+            let replacement = ExtentRecordEntry::leaf(
                 update.logical_block,
                 1,
                 update.ssd_block,
                 entry.is_unwritten(),
             )?;
-            changed = true;
+            replacements.push((index, entry.target(), replacement.target()));
         }
         LATENCY_STATS.leaf_detail_validate.record_since(started);
-        if !changed {
+        if replacements.is_empty() {
             return Ok(false);
         }
         let started = read_ns();
-        let updated = ExtentNodeRecord::new(
-            fs_id,
-            inode,
-            leaf.header()
-                .generation()
-                .checked_add(1)
-                .ok_or_else(|| Error::new(Errno::EOVERFLOW))?,
-            leaf.node_id(),
-            0,
-            leaf.parent(),
-            leaf.right_sibling(),
-            &entries,
-        )?;
-        LATENCY_STATS.leaf_detail_construct.record_since(started);
-        let started = read_ns();
-        let result =
-            pool.update_authoritative_metadata_with_guard(&guard, leaf_ref, &updated, fault);
+        for (index, expected, replacement) in replacements {
+            pool.persist_extent_target_with_guard(
+                &guard,
+                leaf_ref,
+                index,
+                expected,
+                replacement,
+                fault,
+            )?;
+        }
         LATENCY_STATS.leaf_detail_update.record_since(started);
-        result?;
         LATENCY_STATS.rnvpce_completion_leaf_updates.record_event();
         Ok(true)
     }
@@ -391,7 +383,7 @@ impl ExtentMutation {
         if !replacement_parent
             .entries()?
             .iter()
-            .any(|entry| entry.child_ref() == Some(child.reference))
+            .any(|entry| entry.child_slot() == Some(child.reference.slot_plus_one()))
         {
             return_errno_with_message!(
                 Errno::EINVAL,
@@ -419,6 +411,13 @@ impl ExtentMutation {
             return_errno_with_message!(Errno::EINVAL, "extent node belongs to another inode");
         }
         Ok(())
+    }
+
+    fn right_sibling_ref(&self, node: &ExtentNodeRecord) -> Result<PersistentObjectRef> {
+        node.right_sibling_slot()
+            .map_or(Ok(PersistentObjectRef::NONE), |slot| {
+                self.pool.persistent_metadata_ref_from_slot(slot)
+            })
     }
 
     pub(crate) fn publish_fixed_inode_root(
@@ -459,11 +458,12 @@ impl ExtentMutation {
         // Lookup falls back to slot zero below its stored key, so that key is
         // not a semantic lower bound and may lag a first-child boundary change.
         let old_is_routed = parent_entries.iter().enumerate().any(|(index, entry)| {
-            entry.child_ref() == Some(old_child_ref)
+            entry.child_slot() == Some(old_child_ref.slot_plus_one())
                 && (index == 0 || entry.logical_block() == old_boundary)
         });
         let new_is_routed = parent_entries.iter().any(|entry| {
-            entry.logical_block() == split_logical_block && entry.child_ref() == Some(new_child_ref)
+            entry.logical_block() == split_logical_block
+                && entry.child_slot() == Some(new_child_ref.slot_plus_one())
         });
         if old_child.level() != new_child.level()
             || parent.level() != old_child.level().saturating_add(1)
@@ -555,7 +555,7 @@ impl ExtentMutation {
             || !parent
                 .entries()?
                 .iter()
-                .any(|entry| entry.child_ref() == Some(old_child))
+                .any(|entry| entry.child_slot() == Some(old_child.slot_plus_one()))
             || new
                 .entries()?
                 .first()
@@ -717,10 +717,9 @@ impl ExtentMutation {
                             .current_metadata_ref(parent_key)
                             .ok_or_else(|| Error::new(Errno::ESTALE))?;
                         let parent = self.read_locked_node(current_parent)?;
-                        let parent_has_new_child = parent
-                            .entries()?
-                            .iter()
-                            .any(|entry| entry.child_ref() == Some(record.new_child()));
+                        let parent_has_new_child = parent.entries()?.iter().any(|entry| {
+                            entry.child_slot() == Some(record.new_child().slot_plus_one())
+                        });
                         if !parent_has_new_child {
                             current_parent
                         } else {
@@ -767,7 +766,7 @@ impl ExtentMutation {
                     self.validate_owner(&root)?;
                     let routes_right = root.entries()?.iter().any(|entry| {
                         entry.logical_block() == record.split_logical_block()
-                            && entry.child_ref() == Some(record.new_child())
+                            && entry.child_slot() == Some(record.new_child().slot_plus_one())
                     });
                     if !routes_right {
                         return_errno_with_message!(Errno::EUCLEAN, "new root lost split child");
@@ -897,18 +896,18 @@ impl ExtentMutation {
         let has_repaired = current_parent
             .entries()?
             .iter()
-            .any(|entry| entry.child_ref() == Some(repaired_child_ref));
+            .any(|entry| entry.child_slot() == Some(repaired_child_ref.slot_plus_one()));
         let has_new = current_parent
             .entries()?
             .iter()
-            .any(|entry| entry.child_ref() == Some(record.new_child()));
+            .any(|entry| entry.child_slot() == Some(record.new_child().slot_plus_one()));
         let final_parent_ref = if has_repaired && has_new {
             current_parent_ref
         } else {
             let mut entries = Vec::from(current_parent.entries()?);
             let mut replaced = false;
             for entry in &mut entries {
-                if entry.child_ref() == Some(record.old_child()) {
+                if entry.child_slot() == Some(record.old_child().slot_plus_one()) {
                     *entry = ExtentRecordEntry::child(entry.logical_block(), repaired_child_ref)?;
                     replaced = true;
                     break;
@@ -931,7 +930,7 @@ impl ExtentMutation {
                 current_parent.node_id(),
                 current_parent.level(),
                 current_parent.parent(),
-                current_parent.right_sibling(),
+                self.right_sibling_ref(&current_parent)?,
                 &entries,
             )?;
             self.pool.update_authoritative_metadata_in_place(
@@ -1074,12 +1073,13 @@ impl ExtentMutation {
         let root_reuses_old = new_root
             .entries()?
             .iter()
-            .any(|entry| entry.child_ref() == Some(record.old_child()));
+            .any(|entry| entry.child_slot() == Some(record.old_child().slot_plus_one()));
         if root_reuses_old {
             let old_root = self.read_locked_node(record.old_child())?;
             self.validate_owner(&old_root)?;
             let split = record.split_logical_block();
-            let already_repaired = old_root.right_sibling() == record.new_child()
+            let already_repaired = old_root.right_sibling_slot()
+                == Some(record.new_child().slot_plus_one())
                 && old_root.entries()?.iter().all(|entry| {
                     if old_root.level() == 0 {
                         entry.logical_block().saturating_add(entry.length() as u64) <= split
@@ -1150,6 +1150,7 @@ struct MaterializedNodeSplit {
 struct SplitRightChild {
     boundary: u64,
     reference: PersistentObjectRef,
+    parent_index: usize,
 }
 
 struct RoutedLeaf {
@@ -1169,6 +1170,7 @@ impl ExtentMutation {
     ) -> Result<InitializedExtentNode> {
         extent.data_ref()?;
         if let ExtentDataRef::Nv(reference) = extent.data_ref()? {
+            let reference = self.pool.persistent_data_ref_from_slot(reference)?;
             let key = self.pool.validate_persistent_data_ref(reference)?;
             if key.fs_id != self.fs_id
                 || key.inode != self.inode
@@ -1243,6 +1245,10 @@ impl ExtentMutation {
         let mut cursor = 0usize;
         while cursor < replacements.len() {
             let routed = self.route_leaf(root, replacements[cursor].logical_block())?;
+            if self.try_replace_leaf_extent_in_place(&routed, replacements[cursor], fault)? {
+                cursor += 1;
+                continue;
+            }
             let mut entries = Vec::from(routed.record.entries()?);
             let mut accepted = 0usize;
             let mut previous_logical = None;
@@ -1282,13 +1288,149 @@ impl ExtentMutation {
         self.committed_node(root)
     }
 
+    fn try_replace_leaf_extent_in_place(
+        &self,
+        routed: &RoutedLeaf,
+        replacement: ExtentRecordEntry,
+        fault: Option<FaultPoint>,
+    ) -> Result<bool> {
+        let ExtentDataRef::Nv(_) = replacement.data_ref()? else {
+            return Ok(false);
+        };
+        if replacement.length() != 1 {
+            return Ok(false);
+        }
+        let logical = replacement.logical_block();
+        let Some((old_index, old)) =
+            routed
+                .record
+                .entries()?
+                .iter()
+                .copied()
+                .enumerate()
+                .find(|(_, entry)| {
+                    matches!(entry.data_ref(), Ok(ExtentDataRef::Ssd(_)))
+                        && entry.logical_block() <= logical
+                        && logical < entry.logical_block().saturating_add(entry.length() as u64)
+                })
+        else {
+            return Ok(false);
+        };
+        let ExtentDataRef::Ssd(ssd_start) = old.data_ref()? else {
+            return Ok(false);
+        };
+        let old_end = entry_end(&old)?;
+        let required_slots =
+            usize::from(logical > old.logical_block()) + usize::from(logical + 1 < old_end);
+        if routed.record.entry_count() + required_slots > EXTENT_NODE_ENTRY_CAPACITY {
+            return Ok(false);
+        }
+
+        let guards = self.node_guards.borrow();
+        let guard = guards
+            .iter()
+            .find(|(reference, _)| *reference == routed.reference)
+            .map(|(_, guard)| guard)
+            .ok_or_else(|| Error::new(Errno::EUCLEAN))?;
+        let page_ssd = ssd_start
+            .checked_add(logical - old.logical_block())
+            .ok_or_else(|| Error::new(Errno::EOVERFLOW))?;
+
+        let target_index = if logical == old.logical_block() {
+            if logical + 1 < old_end {
+                self.pool.append_extent_entry_with_guard(
+                    guard,
+                    routed.reference,
+                    ExtentRecordEntry::leaf(
+                        logical + 1,
+                        u32::try_from(old_end - logical - 1)
+                            .map_err(|_| Error::new(Errno::EOVERFLOW))?,
+                        page_ssd + 1,
+                        old.is_unwritten(),
+                    )?,
+                    fault,
+                )?;
+                self.pool.persist_extent_range_with_guard(
+                    guard,
+                    routed.reference,
+                    old_index,
+                    old.range_tail(),
+                    1,
+                    fault,
+                )?;
+            }
+            old_index
+        } else {
+            let page_index = self.pool.append_extent_entry_with_guard(
+                guard,
+                routed.reference,
+                ExtentRecordEntry::leaf(logical, 1, page_ssd, old.is_unwritten())?,
+                fault,
+            )?;
+            if logical + 1 < old_end {
+                self.pool.append_extent_entry_with_guard(
+                    guard,
+                    routed.reference,
+                    ExtentRecordEntry::leaf(
+                        logical + 1,
+                        u32::try_from(old_end - logical - 1)
+                            .map_err(|_| Error::new(Errno::EOVERFLOW))?,
+                        page_ssd + 1,
+                        old.is_unwritten(),
+                    )?,
+                    fault,
+                )?;
+            }
+            self.pool.persist_extent_range_with_guard(
+                guard,
+                routed.reference,
+                old_index,
+                old.range_tail(),
+                logical - old.logical_block(),
+                fault,
+            )?;
+            page_index
+        };
+        let current = self
+            .pool
+            .read_authoritative_metadata_boxed::<ExtentNodeRecord>(routed.reference)?
+            .entry(target_index)?;
+        self.pool.persist_extent_target_with_guard(
+            guard,
+            routed.reference,
+            target_index,
+            current.target(),
+            replacement.target(),
+            fault,
+        )?;
+        drop(guards);
+        self.refresh_leaf_reverse(routed.reference)?;
+        self.pool.note_extent_mutation();
+        Ok(true)
+    }
+
     fn route_leaf(&self, root: PersistentObjectRef, logical_block: u64) -> Result<RoutedLeaf> {
         let mut current = root;
         let mut parent = None;
         let mut upper_bound: Option<u64> = None;
         loop {
-            let node = self.read_locked_node(current)?;
+            let mut node = self.read_locked_node(current)?;
             self.validate_owner(&node)?;
+            while let Some(sibling_slot) = node.right_sibling_slot() {
+                let sibling_ref = self.pool.persistent_metadata_ref_from_slot(sibling_slot)?;
+                let sibling = self.read_locked_node(sibling_ref)?;
+                self.validate_owner(&sibling)?;
+                let boundary = sibling
+                    .entries()?
+                    .first()
+                    .map(ExtentRecordEntry::logical_block)
+                    .ok_or_else(|| Error::new(Errno::EUCLEAN))?;
+                if logical_block < boundary {
+                    break;
+                }
+                current = sibling_ref;
+                node = sibling;
+            }
             if node.level() == 0 {
                 return Ok(RoutedLeaf {
                     reference: current,
@@ -1300,7 +1442,10 @@ impl ExtentMutation {
             let entries = node.entries()?;
             let child_index = entries
                 .iter()
-                .rposition(|entry| entry.logical_block() <= logical_block)
+                .enumerate()
+                .filter(|(_, entry)| entry.logical_block() <= logical_block)
+                .max_by_key(|(_, entry)| entry.logical_block())
+                .map(|(index, _)| index)
                 .unwrap_or(0);
             if let Some(next) = entries.get(child_index + 1) {
                 upper_bound = Some(upper_bound.map_or(next.logical_block(), |bound| {
@@ -1308,10 +1453,10 @@ impl ExtentMutation {
                 }));
             }
             let child = entries[child_index]
-                .child_ref()
+                .child_slot()
                 .ok_or_else(|| Error::new(Errno::EUCLEAN))?;
             parent = Some((current, child_index));
-            current = child;
+            current = self.pool.persistent_metadata_ref_from_slot(child)?;
         }
     }
 
@@ -1325,12 +1470,38 @@ impl ExtentMutation {
         current_root: PersistentObjectRef,
         fault: Option<FaultPoint>,
     ) -> Result<PersistentObjectRef> {
-        let root = self.read_locked_node(current_root)?;
+        let mut root = self.read_locked_node(current_root)?;
         self.validate_owner(&root)?;
         if root.entries()?.len() <= EXTENT_NODE_ENTRY_CAPACITY - 2 {
             return Ok(current_root);
         }
+        if self.normalize_node_for_split(current_root, &root, None, fault)? {
+            root = self.read_locked_node(current_root)?;
+        }
         self.split_root_in_place(current_root, &root, fault)
+    }
+
+    /// FAST inserts publish into the next dense slot, so slot order is not a
+    /// logical ordering. FAIR needs a logical midpoint and a dense left prefix;
+    /// normalize once, through the recoverable rewrite protocol, before split.
+    fn normalize_node_for_split(
+        &self,
+        node_ref: PersistentObjectRef,
+        node: &ExtentNodeRecord,
+        parent: Option<(PersistentObjectRef, usize)>,
+        fault: Option<FaultPoint>,
+    ) -> Result<bool> {
+        let entries = node.entries()?;
+        if entries
+            .windows(2)
+            .all(|pair| pair[0].logical_block() <= pair[1].logical_block())
+        {
+            return Ok(false);
+        }
+        let mut normalized = Vec::from(entries);
+        normalized.sort_unstable_by_key(ExtentRecordEntry::logical_block);
+        self.rewrite_leaf_and_route(node_ref, node, &normalized, parent, fault)?;
+        Ok(true)
     }
 
     fn replace_one_tree_extent_top_down(
@@ -1360,15 +1531,27 @@ impl ExtentMutation {
             let entries = node.entries()?;
             let mut child_index = entries
                 .iter()
-                .rposition(|entry| entry.logical_block() <= replacement.logical_block())
+                .enumerate()
+                .filter(|(_, entry)| entry.logical_block() <= replacement.logical_block())
+                .max_by_key(|(_, entry)| entry.logical_block())
+                .map(|(index, _)| index)
                 .unwrap_or(0);
-            let mut child_ref = entries[child_index]
-                .child_ref()
+            let child_ref = entries[child_index]
+                .child_slot()
                 .ok_or_else(|| Error::new(Errno::EUCLEAN))?;
-            let child = self.read_locked_node(child_ref)?;
+            let mut child_ref = self.pool.persistent_metadata_ref_from_slot(child_ref)?;
+            let mut child = self.read_locked_node(child_ref)?;
             self.validate_owner(&child)?;
 
             if child.entries()?.len() > EXTENT_NODE_ENTRY_CAPACITY - 2 {
+                if self.normalize_node_for_split(
+                    child_ref,
+                    &child,
+                    Some((current, child_index)),
+                    fault,
+                )? {
+                    child = self.read_locked_node(child_ref)?;
+                }
                 let right = self.split_child_in_place(
                     current,
                     &node,
@@ -1378,7 +1561,7 @@ impl ExtentMutation {
                     fault,
                 )?;
                 if replacement.logical_block() >= right.boundary {
-                    child_index += 1;
+                    child_index = right.parent_index;
                     child_ref = right.reference;
                 }
             }
@@ -1423,7 +1606,7 @@ impl ExtentMutation {
             right_key.page_index,
             old_root.level(),
             PersistentObjectRef::NONE,
-            old_root.right_sibling(),
+            self.right_sibling_ref(old_root)?,
             &entries[split_index..],
         )?;
         let right = self.persist_initialized_child(right_key, &right_record, fault)?;
@@ -1446,24 +1629,28 @@ impl ExtentMutation {
             ],
         )?;
         let new_root = self.persist_initialized_child(new_root_key, &new_root_record, fault)?;
-        let repaired_old = ExtentNodeRecord::new(
-            self.fs_id,
-            self.inode,
-            generation,
-            old_root.node_id(),
-            old_root.level(),
-            old_root.parent(),
-            right.reference,
-            &entries[..split_index],
-        )?;
-        self.publish_repairable_root_split(
+        let guards = self.node_guards.borrow();
+        let old_guard = guards
+            .iter()
+            .find(|(reference, _)| *reference == old_root_ref)
+            .map(|(_, guard)| guard)
+            .ok_or_else(|| Error::new(Errno::EUCLEAN))?;
+        self.pool.persist_extent_sibling_with_guard(
+            old_guard,
             old_root_ref,
-            &repaired_old,
-            &new_root,
-            &right,
-            split,
+            old_root.right_sibling_slot(),
+            right.reference,
             fault,
         )?;
+        self.pool.shrink_extent_entry_count_with_guard(
+            old_guard,
+            old_root_ref,
+            entries.len(),
+            split_index,
+            fault,
+        )?;
+        drop(guards);
+        self.publish_repairable_root_split(old_root_ref, &new_root, &right, split, fault)?;
         self.refresh_leaf_reverse(old_root_ref)?;
         self.refresh_leaf_reverse(right.reference)?;
         Ok(new_root.reference)
@@ -1473,7 +1660,7 @@ impl ExtentMutation {
         &self,
         parent_ref: PersistentObjectRef,
         parent: &ExtentNodeRecord,
-        child_index: usize,
+        _child_index: usize,
         child_ref: PersistentObjectRef,
         child: &ExtentNodeRecord,
         fault: Option<FaultPoint>,
@@ -1511,50 +1698,50 @@ impl ExtentMutation {
             right_key.page_index,
             child.level(),
             parent_ref,
-            child.right_sibling(),
+            self.right_sibling_ref(child)?,
             &child_entries[split_index..],
         )?;
         let right = self.persist_initialized_child(right_key, &right_record, fault)?;
 
-        let mut parent_entries = Vec::from(parent.entries()?);
-        parent_entries.insert(
-            child_index + 1,
-            ExtentRecordEntry::child(split, right.reference)?,
-        );
-        let repaired_parent = ExtentNodeRecord::new(
-            self.fs_id,
-            self.inode,
-            generation,
-            parent.node_id(),
-            parent.level(),
-            parent.parent(),
-            parent.right_sibling(),
-            &parent_entries,
-        )?;
-        let repaired_child = ExtentNodeRecord::new(
-            self.fs_id,
-            self.inode,
-            generation,
-            child.node_id(),
-            child.level(),
-            child.parent(),
-            right.reference,
-            &child_entries[..split_index],
-        )?;
-        self.publish_repairable_node_split(
-            parent_ref,
-            &repaired_parent,
+        let guards = self.node_guards.borrow();
+        let child_guard = guards
+            .iter()
+            .find(|(reference, _)| *reference == child_ref)
+            .map(|(_, guard)| guard)
+            .ok_or_else(|| Error::new(Errno::EUCLEAN))?;
+        self.pool.persist_extent_sibling_with_guard(
+            child_guard,
             child_ref,
-            &repaired_child,
-            &right,
-            split,
+            child.right_sibling_slot(),
+            right.reference,
             fault,
         )?;
+        self.pool.shrink_extent_entry_count_with_guard(
+            child_guard,
+            child_ref,
+            child_entries.len(),
+            split_index,
+            fault,
+        )?;
+        let parent_guard = guards
+            .iter()
+            .find(|(reference, _)| *reference == parent_ref)
+            .map(|(_, guard)| guard)
+            .ok_or_else(|| Error::new(Errno::EUCLEAN))?;
+        let parent_index = self.pool.append_extent_entry_with_guard(
+            parent_guard,
+            parent_ref,
+            ExtentRecordEntry::child(split, right.reference)?,
+            fault,
+        )?;
+        drop(guards);
+        self.pool.note_extent_mutation();
         self.refresh_leaf_reverse(child_ref)?;
         self.refresh_leaf_reverse(right.reference)?;
         Ok(SplitRightChild {
             boundary: split,
             reference: right.reference,
+            parent_index,
         })
     }
 
@@ -1578,7 +1765,7 @@ impl ExtentMutation {
             leaf.node_id(),
             leaf.level(),
             leaf.parent(),
-            leaf.right_sibling(),
+            self.right_sibling_ref(leaf)?,
             entries,
         )?;
         let new_boundary = entries
@@ -1592,7 +1779,7 @@ impl ExtentMutation {
             let routed = parent_entries
                 .get_mut(child_index)
                 .ok_or_else(|| Error::new(Errno::EUCLEAN))?;
-            if routed.child_ref() != Some(leaf_ref) {
+            if routed.child_slot() != Some(leaf_ref.slot_plus_one()) {
                 return_errno_with_message!(Errno::EUCLEAN, "extent parent route changed");
             }
             if routed.logical_block() == new_boundary {
@@ -1613,7 +1800,7 @@ impl ExtentMutation {
                         parent_record.node_id(),
                         parent_record.level(),
                         parent_record.parent(),
-                        parent_record.right_sibling(),
+                        self.right_sibling_ref(&parent_record)?,
                         &parent_entries,
                     )?,
                 ))
@@ -1834,13 +2021,11 @@ impl ExtentMutation {
     fn publish_repairable_root_split(
         &self,
         old_root_ref: PersistentObjectRef,
-        repaired_old_root: &ExtentNodeRecord,
         new_root: &InitializedExtentNode,
         right: &InitializedExtentNode,
         split: u64,
         fault: Option<FaultPoint>,
     ) -> Result<()> {
-        let root_image = self.persist_repair_image(old_root_ref, repaired_old_root, fault)?;
         let inode_ref = self
             .pool
             .fixed_inode_ref(self.fs_id, self.inode)?
@@ -1857,8 +2042,7 @@ impl ExtentMutation {
             old_root_ref,
             right.reference,
             split,
-        )?
-        .with_repair_refs(PersistentObjectRef::NONE, root_image.reference)?;
+        )?;
         let mark_ref = self.pool.persist_authoritative_metadata(
             PageKey::new(
                 self.fs_id,
@@ -1878,17 +2062,9 @@ impl ExtentMutation {
             ExtentMutationPhase::ParentPublished,
         )?;
         inject(fault, FaultPoint::AfterExtentPhasePersist)?;
-        self.pool.repair_metadata_from_image::<ExtentNodeRecord>(
-            &self.publication,
-            root_image.reference,
-            old_root_ref,
-        )?;
-        inject(fault, FaultPoint::AfterExtentChildPersist)?;
-        inject(fault, FaultPoint::AfterContentPersist)?;
         self.verify_split_completion(new_root.reference, old_root_ref, right.reference, split)?;
         self.clear_pending_mark(fault)?;
         self.pool.note_extent_mutation();
-        self.clear_temporary_metadata(root_image.reference)?;
         Ok(())
     }
 
@@ -1961,7 +2137,7 @@ impl ExtentMutation {
             right_key.page_index,
             0,
             PersistentObjectRef::NONE,
-            old_root.right_sibling(),
+            self.right_sibling_ref(&old_root)?,
             &split.right_entries,
         )?;
         let right = self.persist_initialized_child(right_key, &right, fault)?;
@@ -2154,11 +2330,15 @@ impl ExtentMutation {
         }
         let child_index = entries
             .iter()
-            .rposition(|entry| entry.logical_block() <= replacement.logical_block())
+            .enumerate()
+            .filter(|(_, entry)| entry.logical_block() <= replacement.logical_block())
+            .max_by_key(|(_, entry)| entry.logical_block())
+            .map(|(index, _)| index)
             .unwrap_or(0);
-        let child_ref = entries[child_index].child_ref().ok_or_else(|| {
+        let child_slot = entries[child_index].child_slot().ok_or_else(|| {
             Error::with_message(Errno::EUCLEAN, "extent index entry is not a child")
         })?;
+        let child_ref = self.pool.persistent_metadata_ref_from_slot(child_slot)?;
         match self.replace_one_tree_extent(child_ref, replacement, fault)? {
             TreeExtentUpdate::Replaced(child) => {
                 self.replace_index_child(current, &node, entries, child_index, child, fault)
@@ -2210,7 +2390,7 @@ impl ExtentMutation {
             child_key.page_index,
             old_child.level(),
             current,
-            old_child.right_sibling(),
+            self.right_sibling_ref(&old_child)?,
             &split.right_entries,
         )?;
         let initialized = self.persist_initialized_child(child_key, &right, fault)?;
@@ -2237,7 +2417,7 @@ impl ExtentMutation {
             node.node_id(),
             node.level(),
             node.parent(),
-            node.right_sibling(),
+            self.right_sibling_ref(&node)?,
             &entries,
         )?;
         let (_, published) = self.publish_parent_reference_for_split(
@@ -2270,7 +2450,7 @@ impl ExtentMutation {
                 Error::with_message(Errno::EUCLEAN, "replacement extent child is empty")
             })?;
         if entries[child_index].logical_block() == child_boundary
-            && entries[child_index].child_ref() == Some(child.reference)
+            && entries[child_index].child_slot() == Some(child.reference.slot_plus_one())
         {
             return self.committed_node(current).map(TreeExtentUpdate::Replaced);
         }
@@ -2285,7 +2465,7 @@ impl ExtentMutation {
             node.node_id(),
             node.level(),
             node.parent(),
-            node.right_sibling(),
+            self.right_sibling_ref(&node)?,
             &entries,
         )?;
         let reference =
@@ -2319,7 +2499,7 @@ impl ExtentMutation {
             right_key.page_index,
             0,
             old_leaf.parent(),
-            old_leaf.right_sibling(),
+            self.right_sibling_ref(&old_leaf)?,
             &split.right_entries,
         )?;
         let right = self.persist_initialized_child(right_key, &right, fault)?;
@@ -2379,7 +2559,7 @@ impl ExtentMutation {
             node.node_id(),
             node.level(),
             node.parent(),
-            node.right_sibling(),
+            self.right_sibling_ref(&node)?,
             &entries,
         )?;
         let reference =
@@ -2413,7 +2593,7 @@ impl ExtentMutation {
             right_key.page_index,
             node.level(),
             node.parent(),
-            node.right_sibling(),
+            self.right_sibling_ref(node)?,
             &entries[split_index..],
         )?;
         let right = self.persist_initialized_child(right_key, &right, fault)?;
@@ -2493,10 +2673,9 @@ impl ExtentMutation {
                 }
                 ExtentDataRef::Nv(reference) => {
                     debug_assert_eq!(entry.length(), 1);
-                    entries.push(ExtentRecordEntry::nv_leaf(
+                    entries.push(ExtentRecordEntry::nv_leaf_slot(
                         entry.logical_block(),
                         reference,
-                        false,
                     )?);
                 }
             }
@@ -2619,6 +2798,7 @@ impl ExtentMutation {
 
     fn validate_data_extent(&self, extent: &ExtentRecordEntry) -> Result<()> {
         if let ExtentDataRef::Nv(reference) = extent.data_ref()? {
+            let reference = self.pool.persistent_data_ref_from_slot(reference)?;
             let key = self.pool.validate_persistent_data_ref(reference)?;
             if key.fs_id != self.fs_id
                 || key.inode != self.inode
@@ -2665,7 +2845,7 @@ impl ExtentMutation {
             leaf.node_id(),
             0,
             leaf.parent(),
-            leaf.right_sibling(),
+            self.right_sibling_ref(leaf)?,
             entries,
         )?;
         let boundary = entries
@@ -2685,6 +2865,7 @@ impl ExtentMutation {
         let leaf_slot = leaf_ref.slot().ok_or_else(|| Error::new(Errno::EUCLEAN))?;
         for (entry_index, entry) in leaf.entries()?.iter().enumerate() {
             if let ExtentDataRef::Nv(reference) = entry.data_ref()? {
+                let reference = self.pool.persistent_data_ref_from_slot(reference)?;
                 self.pool
                     .replace_reverse(reference, ReverseExtentRef::new(leaf_slot, entry_index)?)?;
             }
@@ -2751,7 +2932,7 @@ fn slice_extent(entry: &ExtentRecordEntry, start: u64, end: u64) -> Result<Exten
         ExtentDataRef::Nv(reference)
             if start == entry.logical_block() && end == entry_end(entry)? =>
         {
-            ExtentRecordEntry::nv_leaf(start, reference, entry.is_unwritten())
+            ExtentRecordEntry::nv_leaf_slot(start, reference)
         }
         ExtentDataRef::Nv(_) => {
             return_errno_with_message!(Errno::EINVAL, "cannot split a single-page NV extent")

@@ -19,6 +19,7 @@ use super::{
     config::RnvpcConfig,
     data_page::DataPageState,
     descriptor::{NvDescriptor, NvObjectKind, NvObjectState},
+    extent_target::ExtentTarget,
     fault::{FaultPoint, inject},
     id::{NvFrameId, NvPageId},
     index::{
@@ -26,11 +27,14 @@ use super::{
         RuntimeHandle,
     },
     metadata::{
-        AuthoritativeMetadataRecord, ExtentDataRef, ExtentMutationPhase, ExtentNodeRecord,
-        INODE_BLOCK_COUNT_OFFSET, INODE_EXTENT_ROOT_OFFSET, INODE_FILE_SIZE_OFFSET,
-        INODE_GENERATION_OFFSET, InodeRecord, PENDING_EXTENT_MUTATION_STATE_OFFSET,
-        PendingExtentMutationRecord, PersistentMetadataHeader, PersistentMetadataKind,
-        PersistentMetadataRecord, PersistentObjectRef,
+        AuthoritativeMetadataRecord, EXTENT_ENTRY_LOGICAL_OFFSET, EXTENT_ENTRY_RANGE_OFFSET,
+        EXTENT_ENTRY_TARGET_OFFSET, EXTENT_NODE_ENTRY_CAPACITY,
+        EXTENT_NODE_LEVEL_COUNT_FLAGS_OFFSET, EXTENT_NODE_RIGHT_SIBLING_OFFSET, ExtentDataRef,
+        ExtentMutationPhase, ExtentNodeRecord, ExtentRecordEntry, INODE_BLOCK_COUNT_OFFSET,
+        INODE_EXTENT_ROOT_OFFSET, INODE_FILE_SIZE_OFFSET, INODE_GENERATION_OFFSET, InodeRecord,
+        PENDING_EXTENT_MUTATION_STATE_OFFSET, PendingExtentMutationRecord,
+        PersistentMetadataHeader, PersistentMetadataKind, PersistentMetadataRecord,
+        PersistentObjectRef, extent_entry_field_offset,
     },
     persist::PersistEngine,
     recover,
@@ -1402,6 +1406,47 @@ impl Rnvpc {
         })
     }
 
+    /// Resolves an extent's generation-free slot reference and pins its owner.
+    ///
+    /// The owner check and pin acquisition share the object-table lock, so a
+    /// stale extent cannot race slot retirement and accidentally pin a reused
+    /// object belonging to another logical page.
+    pub(crate) fn pin_persistent_data_slot(
+        self: &Arc<Self>,
+        slot_plus_one: u64,
+        expected: PageKey,
+    ) -> Result<PinnedDataPage> {
+        let slot = slot_plus_one
+            .checked_sub(1)
+            .and_then(|slot| usize::try_from(slot).ok())
+            .ok_or_else(|| Error::new(Errno::EINVAL))?;
+        let id = NvPageId::try_from(slot).map_err(|_| Error::new(Errno::EINVAL))?;
+        let mut state = self.objects.lock_checked(slot)?;
+        let record = state
+            .records
+            .get(slot)
+            .ok_or_else(|| Error::new(Errno::EINVAL))?;
+        if !record.committed
+            || !matches!(record.kind, ObjectKind::Data(_))
+            || record.key != Some(expected)
+        {
+            return_errno_with_message!(Errno::ESTALE, "stale persistent data slot reference");
+        }
+        if record.persisting {
+            return_errno_with_message!(Errno::EBUSY, "NV data page persistence is in progress");
+        }
+        let pins = record
+            .pins
+            .checked_add(1)
+            .ok_or_else(|| Error::new(Errno::EOVERFLOW))?;
+        self.account_pin()?;
+        state.records[slot].pins = pins;
+        Ok(PinnedDataPage {
+            pool: self.clone(),
+            id,
+        })
+    }
+
     /// Exclusively claims a committed NVPage for a foreground in-place update.
     /// The same `persisting` bit is used by rTIO, so migration and mutation
     /// cannot observe or modify the page concurrently.
@@ -2070,6 +2115,28 @@ impl Rnvpc {
         PersistentObjectRef::new(page.index() as u64, record.alloc_seq)
     }
 
+    pub(crate) fn persistent_metadata_ref_from_slot(
+        &self,
+        slot_plus_one: u64,
+    ) -> Result<PersistentObjectRef> {
+        let slot = slot_plus_one
+            .checked_sub(1)
+            .and_then(|slot| usize::try_from(slot).ok())
+            .ok_or_else(|| Error::new(Errno::EINVAL))?;
+        self.persistent_metadata_ref(NvFrameId::try_from(slot)?)
+    }
+
+    pub(crate) fn persistent_data_ref_from_slot(
+        &self,
+        slot_plus_one: u64,
+    ) -> Result<PersistentObjectRef> {
+        let slot = slot_plus_one
+            .checked_sub(1)
+            .and_then(|slot| usize::try_from(slot).ok())
+            .ok_or_else(|| Error::new(Errno::EINVAL))?;
+        self.persistent_data_ref(NvPageId::try_from(slot)?)
+    }
+
     pub(crate) fn validate_persistent_data_ref(
         &self,
         reference: PersistentObjectRef,
@@ -2262,7 +2329,7 @@ impl Rnvpc {
             let node = self.read_authoritative_metadata::<ExtentNodeRecord>(reference)?;
             if node.level() == 0
                 && node.entries()?.iter().any(|entry| {
-                    matches!(entry.data_ref(), Ok(ExtentDataRef::Nv(reference)) if reference == target)
+                    matches!(entry.data_ref(), Ok(ExtentDataRef::Nv(reference)) if reference == target.slot_plus_one())
                 })
             {
                 return Ok(true);
@@ -3084,6 +3151,195 @@ impl Rnvpc {
             LATENCY_STATS.leaf_update_validate.record_since(started);
         }
         self.update_authoritative_metadata_in_place_inner(frame, current, record, fault, None)
+    }
+
+    /// Commits one extent target with a single aligned 8-byte persistent store.
+    pub(crate) fn persist_extent_target_with_guard(
+        self: &Arc<Self>,
+        guard: &MetadataMutationGuard,
+        current: PersistentObjectRef,
+        entry_index: usize,
+        expected: ExtentTarget,
+        replacement: ExtentTarget,
+        fault: Option<FaultPoint>,
+    ) -> Result<PersistentObjectRef> {
+        if !replacement.is_published() {
+            return_errno_with_message!(Errno::EINVAL, "replacement extent target is unpublished");
+        }
+        let (_, key) = self.metadata_identity(current)?;
+        let frame = self.validate_metadata_mutation_guard(guard, current, key)?;
+        self.begin_exclusive_metadata_update(frame, current.allocation_seq())?;
+
+        let result = (|| {
+            let node = self.read_metadata_page_unchecked::<ExtentNodeRecord>(frame)?;
+            if node.entry(entry_index)?.target() != expected {
+                return_errno_with_message!(Errno::ESTALE, "extent target changed");
+            }
+            let offset = extent_entry_field_offset(entry_index, EXTENT_ENTRY_TARGET_OFFSET)?;
+            inject(fault, FaultPoint::BeforeContentPersist)?;
+            self.persist_page_u64(frame, offset, replacement.raw())?;
+            inject(fault, FaultPoint::AfterVisibilityPersist)
+        })();
+
+        let mut state = self.objects.lock(frame.index());
+        state.records[frame.index()].pins -= 1;
+        state.records[frame.index()].persisting = false;
+        self.account_unpin();
+        drop(state);
+        note_metadata_pin_change();
+        result.map(|_| current)
+    }
+
+    /// Publishes one prepared extent entry in the next free dense slot.
+    pub(crate) fn append_extent_entry_with_guard(
+        self: &Arc<Self>,
+        guard: &MetadataMutationGuard,
+        current: PersistentObjectRef,
+        entry: ExtentRecordEntry,
+        fault: Option<FaultPoint>,
+    ) -> Result<usize> {
+        let (_, key) = self.metadata_identity(current)?;
+        let frame = self.validate_metadata_mutation_guard(guard, current, key)?;
+        self.begin_exclusive_metadata_update(frame, current.allocation_seq())?;
+        let result = (|| {
+            let node = self.read_metadata_page_unchecked::<ExtentNodeRecord>(frame)?;
+            if node.entry_count() >= EXTENT_NODE_ENTRY_CAPACITY {
+                return_errno_with_message!(Errno::ENOSPC, "extent leaf has no free entry slot");
+            }
+            entry.validate_for_level(node.level())?;
+            let index = node.entry_count();
+            let logical_offset = extent_entry_field_offset(index, EXTENT_ENTRY_LOGICAL_OFFSET)?;
+            let range_offset = extent_entry_field_offset(index, EXTENT_ENTRY_RANGE_OFFSET)?;
+            let target_offset = extent_entry_field_offset(index, EXTENT_ENTRY_TARGET_OFFSET)?;
+            self.persist_page_u64(frame, logical_offset, entry.logical_block())?;
+            inject(fault, FaultPoint::AfterExtentPreparedPersist)?;
+            self.persist_page_u64(frame, range_offset, entry.range_tail())?;
+            inject(fault, FaultPoint::AfterDependencyPersist)?;
+            self.persist_page_u64(frame, target_offset, entry.target().raw())?;
+            inject(fault, FaultPoint::AfterVisibilityPersist)?;
+            let count = u16::try_from(index + 1).map_err(|_| Error::new(Errno::EOVERFLOW))?;
+            self.persist_page_u64(
+                frame,
+                EXTENT_NODE_LEVEL_COUNT_FLAGS_OFFSET,
+                node.level_count_flags_word(count),
+            )?;
+            inject(fault, FaultPoint::AfterContentPersist)?;
+            Ok(index)
+        })();
+        let mut state = self.objects.lock(frame.index());
+        state.records[frame.index()].pins -= 1;
+        state.records[frame.index()].persisting = false;
+        self.account_unpin();
+        drop(state);
+        note_metadata_pin_change();
+        result
+    }
+
+    /// Shrinks one SSD range after its equivalent fragments are durable.
+    pub(crate) fn persist_extent_range_with_guard(
+        self: &Arc<Self>,
+        guard: &MetadataMutationGuard,
+        current: PersistentObjectRef,
+        entry_index: usize,
+        expected: u64,
+        replacement: u64,
+        fault: Option<FaultPoint>,
+    ) -> Result<PersistentObjectRef> {
+        if replacement == 0 || replacement >> 32 != 0 {
+            return_errno_with_message!(Errno::EINVAL, "invalid extent range word");
+        }
+        let (_, key) = self.metadata_identity(current)?;
+        let frame = self.validate_metadata_mutation_guard(guard, current, key)?;
+        self.begin_exclusive_metadata_update(frame, current.allocation_seq())?;
+        let result = (|| {
+            let node = self.read_metadata_page_unchecked::<ExtentNodeRecord>(frame)?;
+            let entry = node.entry(entry_index)?;
+            if entry.range_tail() != expected || !matches!(entry.data_ref()?, ExtentDataRef::Ssd(_))
+            {
+                return_errno_with_message!(Errno::ESTALE, "extent range changed");
+            }
+            let offset = extent_entry_field_offset(entry_index, EXTENT_ENTRY_RANGE_OFFSET)?;
+            self.persist_page_u64(frame, offset, replacement)?;
+            inject(fault, FaultPoint::AfterExtentChildPersist)
+        })();
+        let mut state = self.objects.lock(frame.index());
+        state.records[frame.index()].pins -= 1;
+        state.records[frame.index()].persisting = false;
+        self.account_unpin();
+        drop(state);
+        note_metadata_pin_change();
+        result.map(|_| current)
+    }
+
+    /// Publishes a fully initialized FAIR sibling with one atomic slot word.
+    pub(crate) fn persist_extent_sibling_with_guard(
+        self: &Arc<Self>,
+        guard: &MetadataMutationGuard,
+        current: PersistentObjectRef,
+        expected_slot: Option<u64>,
+        sibling: PersistentObjectRef,
+        fault: Option<FaultPoint>,
+    ) -> Result<PersistentObjectRef> {
+        let replacement = sibling.slot_plus_one();
+        if replacement == 0 {
+            return_errno_with_message!(Errno::EINVAL, "FAIR sibling is null");
+        }
+        let (_, key) = self.metadata_identity(current)?;
+        let frame = self.validate_metadata_mutation_guard(guard, current, key)?;
+        self.begin_exclusive_metadata_update(frame, current.allocation_seq())?;
+        let result = (|| {
+            let node = self.read_metadata_page_unchecked::<ExtentNodeRecord>(frame)?;
+            if node.right_sibling_slot() != expected_slot {
+                return_errno_with_message!(Errno::ESTALE, "extent sibling changed");
+            }
+            inject(fault, FaultPoint::BeforeContentPersist)?;
+            self.persist_page_u64(frame, EXTENT_NODE_RIGHT_SIBLING_OFFSET, replacement)?;
+            inject(fault, FaultPoint::AfterExtentChildPersist)
+        })();
+        let mut state = self.objects.lock(frame.index());
+        state.records[frame.index()].pins -= 1;
+        state.records[frame.index()].persisting = false;
+        self.account_unpin();
+        drop(state);
+        note_metadata_pin_change();
+        result.map(|_| current)
+    }
+
+    /// Hides the copied right half only after the sibling link is durable.
+    pub(crate) fn shrink_extent_entry_count_with_guard(
+        self: &Arc<Self>,
+        guard: &MetadataMutationGuard,
+        current: PersistentObjectRef,
+        expected: usize,
+        replacement: usize,
+        fault: Option<FaultPoint>,
+    ) -> Result<PersistentObjectRef> {
+        if replacement == 0 || replacement >= expected {
+            return_errno_with_message!(Errno::EINVAL, "invalid FAIR extent count shrink");
+        }
+        let (_, key) = self.metadata_identity(current)?;
+        let frame = self.validate_metadata_mutation_guard(guard, current, key)?;
+        self.begin_exclusive_metadata_update(frame, current.allocation_seq())?;
+        let result = (|| {
+            let node = self.read_metadata_page_unchecked::<ExtentNodeRecord>(frame)?;
+            if node.entry_count() != expected || node.right_sibling_slot().is_none() {
+                return_errno_with_message!(Errno::ESTALE, "FAIR split state changed");
+            }
+            let count = u16::try_from(replacement).map_err(|_| Error::new(Errno::EOVERFLOW))?;
+            self.persist_page_u64(
+                frame,
+                EXTENT_NODE_LEVEL_COUNT_FLAGS_OFFSET,
+                node.level_count_flags_word(count),
+            )?;
+            inject(fault, FaultPoint::AfterContentPersist)
+        })();
+        let mut state = self.objects.lock(frame.index());
+        state.records[frame.index()].pins -= 1;
+        state.records[frame.index()].persisting = false;
+        self.account_unpin();
+        drop(state);
+        note_metadata_pin_change();
+        result.map(|_| current)
     }
 
     fn update_authoritative_metadata_in_place_inner<T>(

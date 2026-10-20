@@ -4,10 +4,11 @@
 
 use core::ops::Deref;
 
+use super::extent_target::{ExtentTarget, ExtentTargetKind};
 use crate::prelude::*;
 
 const PERSISTENT_METADATA_MAGIC: u64 = 0x524e_5650_434d_4431;
-const PERSISTENT_METADATA_VERSION: u16 = 1;
+const PERSISTENT_METADATA_VERSION: u16 = 2;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u16)]
@@ -162,6 +163,10 @@ impl PersistentObjectRef {
 
     pub(crate) const fn allocation_seq(&self) -> u64 {
         self.allocation_seq
+    }
+
+    pub(crate) const fn slot_plus_one(&self) -> u64 {
+        self.slot_plus_one
     }
 
     fn validate(&self) -> Result<()> {
@@ -348,26 +353,18 @@ const _: () = {
     assert!(align_of::<AllocationRecord>() == 8);
 };
 
-const EXTENT_ENTRY_UNWRITTEN: u32 = 1 << 0;
-const EXTENT_ENTRY_CHILD: u32 = 1 << 1;
-const EXTENT_ENTRY_NV_DATA: u32 = 1 << 2;
-const EXTENT_ENTRY_VALID_FLAGS: u32 =
-    EXTENT_ENTRY_UNWRITTEN | EXTENT_ENTRY_CHILD | EXTENT_ENTRY_NV_DATA;
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ExtentDataRef {
     Ssd(u64),
-    Nv(PersistentObjectRef),
+    Nv(u64),
 }
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Pod)]
 pub(crate) struct ExtentRecordEntry {
     logical_block: u64,
-    value: u64,
-    allocation_seq: u64,
-    length: u32,
-    flags: u32,
+    range_tail: u64,
+    target: ExtentTarget,
 }
 
 impl ExtentRecordEntry {
@@ -388,28 +385,28 @@ impl ExtentRecordEntry {
             .ok_or_else(|| Error::new(Errno::EOVERFLOW))?;
         Ok(Self {
             logical_block,
-            value: physical_block,
-            allocation_seq: 0,
-            length,
-            flags: if unwritten { EXTENT_ENTRY_UNWRITTEN } else { 0 },
+            range_tail: u64::from(length),
+            target: ExtentTarget::ssd(physical_block, unwritten)?,
         })
     }
 
     pub(crate) fn nv_leaf(
         logical_block: u64,
         data: PersistentObjectRef,
-        unwritten: bool,
+        _unwritten: bool,
     ) -> Result<Self> {
         data.validate()?;
         if data.is_none() {
             return_errno_with_message!(Errno::EINVAL, "NV extent data reference is null");
         }
+        Self::nv_leaf_slot(logical_block, data.slot_plus_one)
+    }
+
+    pub(crate) fn nv_leaf_slot(logical_block: u64, slot_plus_one: u64) -> Result<Self> {
         Ok(Self {
             logical_block,
-            value: data.slot_plus_one,
-            allocation_seq: data.allocation_seq,
-            length: 1,
-            flags: EXTENT_ENTRY_NV_DATA | if unwritten { EXTENT_ENTRY_UNWRITTEN } else { 0 },
+            range_tail: 1,
+            target: ExtentTarget::nv_page(slot_plus_one)?,
         })
     }
 
@@ -420,10 +417,8 @@ impl ExtentRecordEntry {
         }
         Ok(Self {
             logical_block,
-            value: child.slot_plus_one,
-            allocation_seq: child.allocation_seq,
-            length: 0,
-            flags: EXTENT_ENTRY_CHILD,
+            range_tail: 0,
+            target: ExtentTarget::child(child.slot_plus_one)?,
         })
     }
 
@@ -432,7 +427,7 @@ impl ExtentRecordEntry {
     }
 
     pub(crate) const fn length(&self) -> u32 {
-        self.length
+        self.range_tail as u32
     }
 
     pub(crate) fn ssd_block(&self) -> Result<u64> {
@@ -444,16 +439,16 @@ impl ExtentRecordEntry {
         }
     }
 
-    pub(crate) const fn is_unwritten(&self) -> bool {
-        self.flags & EXTENT_ENTRY_UNWRITTEN != 0
+    pub(crate) fn is_unwritten(&self) -> bool {
+        matches!(self.target.kind(), Ok(ExtentTargetKind::SsdUnwritten))
     }
 
-    pub(crate) const fn is_child(&self) -> bool {
-        self.flags & EXTENT_ENTRY_CHILD != 0
+    pub(crate) fn is_child(&self) -> bool {
+        matches!(self.target.kind(), Ok(ExtentTargetKind::Child))
     }
 
-    pub(crate) const fn is_nv_data(&self) -> bool {
-        self.flags & EXTENT_ENTRY_NV_DATA != 0
+    pub(crate) fn is_nv_data(&self) -> bool {
+        matches!(self.target.kind(), Ok(ExtentTargetKind::NvPage))
     }
 
     pub(crate) fn data_ref(&self) -> Result<ExtentDataRef> {
@@ -461,37 +456,44 @@ impl ExtentRecordEntry {
             return_errno_with_message!(Errno::EINVAL, "extent index is not a data mapping");
         }
         if self.is_nv_data() {
-            let reference = PersistentObjectRef {
-                slot_plus_one: self.value,
-                allocation_seq: self.allocation_seq,
-            };
-            reference.validate()?;
-            Ok(ExtentDataRef::Nv(reference))
+            Ok(ExtentDataRef::Nv(self.target.payload()?))
         } else {
-            Ok(ExtentDataRef::Ssd(self.value))
+            match self.target.kind()? {
+                ExtentTargetKind::SsdWritten | ExtentTargetKind::SsdUnwritten => {
+                    Ok(ExtentDataRef::Ssd(self.target.payload()?))
+                }
+                _ => return_errno_with_message!(Errno::EINVAL, "invalid extent data target"),
+            }
         }
     }
 
-    pub(crate) fn child_ref(&self) -> Option<PersistentObjectRef> {
-        self.is_child().then_some(PersistentObjectRef {
-            slot_plus_one: self.value,
-            allocation_seq: self.allocation_seq,
-        })
+    pub(crate) fn child_slot(&self) -> Option<u64> {
+        self.is_child()
+            .then(|| self.target.payload().ok())
+            .flatten()
     }
 
-    fn validate_for_level(&self, level: u16) -> Result<()> {
-        if self.flags & !EXTENT_ENTRY_VALID_FLAGS != 0 {
-            return_errno_with_message!(Errno::EINVAL, "unknown persistent extent flags");
+    pub(crate) const fn target(&self) -> ExtentTarget {
+        self.target
+    }
+
+    pub(crate) const fn range_tail(&self) -> u64 {
+        self.range_tail
+    }
+
+    pub(crate) fn validate_for_level(&self, level: u16) -> Result<()> {
+        if self.range_tail >> 32 != 0 || !self.target.is_published() {
+            return_errno_with_message!(Errno::EINVAL, "invalid persistent extent entry");
         }
         if level == 0 {
-            if self.is_child() || self.length == 0 {
+            if self.is_child() || self.length() == 0 {
                 return_errno_with_message!(Errno::EINVAL, "invalid persistent leaf extent");
             }
             self.logical_block
-                .checked_add(self.length as u64)
+                .checked_add(self.length() as u64)
                 .ok_or_else(|| Error::new(Errno::EOVERFLOW))?;
             if self.is_nv_data() {
-                if self.length != 1 {
+                if self.length() != 1 {
                     return_errno_with_message!(
                         Errno::EINVAL,
                         "NV extent entries map exactly one NVPage"
@@ -499,34 +501,27 @@ impl ExtentRecordEntry {
                 }
                 self.data_ref()?;
             } else {
-                if self.allocation_seq != 0 {
-                    return_errno_with_message!(
-                        Errno::EINVAL,
-                        "SSD extent carries an allocation generation"
-                    );
-                }
-                self.value
-                    .checked_add(self.length as u64)
+                self.target
+                    .payload()?
+                    .checked_add(self.length() as u64)
                     .ok_or_else(|| Error::new(Errno::EOVERFLOW))?;
             }
         } else {
-            if !self.is_child() || self.is_nv_data() || self.is_unwritten() || self.length != 0 {
+            if !self.is_child() || self.length() != 0 {
                 return_errno_with_message!(Errno::EINVAL, "invalid persistent extent index");
             }
-            self.child_ref()
-                .ok_or_else(|| Error::new(Errno::EINVAL))?
-                .validate()?;
+            self.target.payload()?;
         }
         Ok(())
     }
 }
 
 const _: () = {
-    assert!(size_of::<ExtentRecordEntry>() == 32);
+    assert!(size_of::<ExtentRecordEntry>() == 24);
     assert!(align_of::<ExtentRecordEntry>() == 8);
 };
 
-pub(crate) const EXTENT_NODE_ENTRY_CAPACITY: usize = 124;
+pub(crate) const EXTENT_NODE_ENTRY_CAPACITY: usize = 165;
 
 pub(crate) struct BoxedExtentNodeRecord {
     bytes: Box<[u8]>,
@@ -547,12 +542,12 @@ pub(crate) struct ExtentNodeRecord {
     header: PersistentMetadataHeader,
     node_id: u64,
     parent: PersistentObjectRef,
-    right_sibling: PersistentObjectRef,
+    right_sibling_slot_plus_one: u64,
     level: u16,
     entry_count: u16,
     flags: u32,
     entries: [ExtentRecordEntry; EXTENT_NODE_ENTRY_CAPACITY],
-    reserved: [u8; 16],
+    reserved: [u8; 32],
 }
 
 impl Default for ExtentNodeRecord {
@@ -561,12 +556,12 @@ impl Default for ExtentNodeRecord {
             header: PersistentMetadataHeader::default(),
             node_id: 0,
             parent: PersistentObjectRef::NONE,
-            right_sibling: PersistentObjectRef::NONE,
+            right_sibling_slot_plus_one: 0,
             level: 0,
             entry_count: 0,
             flags: 0,
             entries: [ExtentRecordEntry::default(); EXTENT_NODE_ENTRY_CAPACITY],
-            reserved: [0; 16],
+            reserved: [0; 32],
         }
     }
 }
@@ -598,12 +593,12 @@ impl ExtentNodeRecord {
             )?,
             node_id,
             parent,
-            right_sibling,
+            right_sibling_slot_plus_one: right_sibling.slot_plus_one(),
             level,
             entry_count: entries.len() as u16,
             flags: 0,
             entries: [ExtentRecordEntry::default(); EXTENT_NODE_ENTRY_CAPACITY],
-            reserved: [0; 16],
+            reserved: [0; 32],
         };
         record.entries[..entries.len()].copy_from_slice(entries);
         record.validate()?;
@@ -643,7 +638,7 @@ impl ExtentNodeRecord {
         record.header = header;
         record.node_id = node_id;
         record.parent = parent;
-        record.right_sibling = right_sibling;
+        record.right_sibling_slot_plus_one = right_sibling.slot_plus_one();
         record.level = level;
         record.entry_count = entries.len() as u16;
         record.flags = 0;
@@ -672,29 +667,26 @@ impl ExtentNodeRecord {
         let count = self.entry_count as usize;
         if count > EXTENT_NODE_ENTRY_CAPACITY
             || (count == 0
-                && (self.level != 0 || !self.parent.is_none() || !self.right_sibling.is_none()))
+                && (self.level != 0
+                    || !self.parent.is_none()
+                    || self.right_sibling_slot_plus_one != 0))
         {
             return_errno_with_message!(Errno::EINVAL, "invalid persistent extent entry count");
         }
-        let mut previous_end = None;
         for entry in &self.entries[..count] {
             entry.validate_for_level(self.level)?;
-            if let Some(end) = previous_end
-                && entry.logical_block() < end
-            {
-                return_errno_with_message!(Errno::EINVAL, "persistent extents overlap");
-            }
-            previous_end = Some(if self.level == 0 {
-                entry.logical_block() + entry.length() as u64
-            } else {
-                entry.logical_block()
-            });
         }
-        if self.entries[count..]
-            .iter()
-            .any(|entry| *entry != ExtentRecordEntry::default())
-        {
-            return_errno_with_message!(Errno::EINVAL, "unused persistent extent slots are dirty");
+        if self.level == 0 {
+            validate_leaf_overlaps(&self.entries[..count])?;
+        } else {
+            for (index, entry) in self.entries[..count].iter().enumerate() {
+                if self.entries[index + 1..count]
+                    .iter()
+                    .any(|other| other.logical_block() == entry.logical_block())
+                {
+                    return_errno_with_message!(Errno::EINVAL, "duplicate persistent extent route");
+                }
+            }
         }
         Ok(())
     }
@@ -715,14 +707,82 @@ impl ExtentNodeRecord {
         self.parent
     }
 
-    pub(crate) const fn right_sibling(&self) -> PersistentObjectRef {
-        self.right_sibling
+    pub(crate) const fn right_sibling_slot(&self) -> Option<u64> {
+        if self.right_sibling_slot_plus_one == 0 {
+            None
+        } else {
+            Some(self.right_sibling_slot_plus_one)
+        }
+    }
+
+    pub(crate) const fn entry_count(&self) -> usize {
+        self.entry_count as usize
+    }
+
+    pub(crate) const fn level_count_flags_word(&self, entry_count: u16) -> u64 {
+        (self.level as u64) | ((entry_count as u64) << 16) | ((self.flags as u64) << 32)
     }
 
     pub(crate) fn entries(&self) -> Result<&[ExtentRecordEntry]> {
         self.validate()?;
         Ok(&self.entries[..self.entry_count as usize])
     }
+
+    pub(crate) fn entry(&self, index: usize) -> Result<ExtentRecordEntry> {
+        self.entries()?
+            .get(index)
+            .copied()
+            .ok_or_else(|| Error::new(Errno::EINVAL))
+    }
+}
+
+fn validate_leaf_overlaps(entries: &[ExtentRecordEntry]) -> Result<()> {
+    for (index, left) in entries.iter().enumerate() {
+        let left_end = left.logical_block() + left.length() as u64;
+        for right in &entries[index + 1..] {
+            let right_end = right.logical_block() + right.length() as u64;
+            let start = left.logical_block().max(right.logical_block());
+            let end = left_end.min(right_end);
+            if start >= end {
+                continue;
+            }
+            let (ExtentDataRef::Ssd(left_block), ExtentDataRef::Ssd(right_block)) =
+                (left.data_ref()?, right.data_ref()?)
+            else {
+                return_errno_with_message!(Errno::EINVAL, "persistent extents conflict");
+            };
+            if left.is_unwritten() != right.is_unwritten()
+                || left_block + (start - left.logical_block())
+                    != right_block + (start - right.logical_block())
+            {
+                return_errno_with_message!(Errno::EINVAL, "persistent extents conflict");
+            }
+        }
+    }
+    Ok(())
+}
+
+pub(crate) const EXTENT_NODE_ENTRIES_OFFSET: usize =
+    core::mem::offset_of!(ExtentNodeRecord, entries);
+pub(crate) const EXTENT_NODE_LEVEL_COUNT_FLAGS_OFFSET: usize =
+    core::mem::offset_of!(ExtentNodeRecord, level);
+pub(crate) const EXTENT_NODE_RIGHT_SIBLING_OFFSET: usize =
+    core::mem::offset_of!(ExtentNodeRecord, right_sibling_slot_plus_one);
+pub(crate) const EXTENT_ENTRY_LOGICAL_OFFSET: usize =
+    core::mem::offset_of!(ExtentRecordEntry, logical_block);
+pub(crate) const EXTENT_ENTRY_RANGE_OFFSET: usize =
+    core::mem::offset_of!(ExtentRecordEntry, range_tail);
+pub(crate) const EXTENT_ENTRY_TARGET_OFFSET: usize =
+    core::mem::offset_of!(ExtentRecordEntry, target);
+
+pub(crate) fn extent_entry_field_offset(index: usize, field: usize) -> Result<usize> {
+    if index >= EXTENT_NODE_ENTRY_CAPACITY || field >= size_of::<ExtentRecordEntry>() {
+        return_errno_with_message!(Errno::EINVAL, "extent entry field is out of bounds");
+    }
+    EXTENT_NODE_ENTRIES_OFFSET
+        .checked_add(index * size_of::<ExtentRecordEntry>())
+        .and_then(|offset| offset.checked_add(field))
+        .ok_or_else(|| Error::new(Errno::EOVERFLOW))
 }
 
 const _: () = {
@@ -1300,7 +1360,8 @@ mod recovery_tests {
         assert_eq!(size_of::<PersistentObjectRef>(), 16);
         assert_eq!(size_of::<SpaceReservationRecord>(), 128);
         assert_eq!(size_of::<AllocationRecord>(), 128);
-        assert_eq!(size_of::<ExtentRecordEntry>(), 32);
+        assert_eq!(size_of::<ExtentRecordEntry>(), 24);
+        assert_eq!(EXTENT_NODE_ENTRY_CAPACITY, 165);
         assert_eq!(size_of::<ExtentNodeRecord>(), 4096);
         assert_eq!(size_of::<InodeRecord>(), 128);
         assert_eq!(size_of::<PendingExtentMutationRecord>(), 208);
@@ -1377,7 +1438,7 @@ mod recovery_tests {
 
     #[cfg_attr(ktest, ostd::prelude::ktest)]
     #[cfg_attr(not(ktest), test)]
-    fn recovered_extent_node_rejects_overlaps_and_unknown_flags() {
+    fn recovered_extent_node_rejects_overlaps_and_invalid_range_words() {
         let a = ExtentRecordEntry::leaf(0, 2, 10, false).unwrap();
         let b = ExtentRecordEntry::leaf(1, 1, 20, false).unwrap();
         assert!(
@@ -1404,7 +1465,7 @@ mod recovery_tests {
             &[a],
         )
         .unwrap();
-        record.entries[0].flags |= 1 << 31;
+        record.entries[0].range_tail |= 1 << 63;
         assert!(record.validate().is_err());
         assert!(ExtentRecordEntry::nv_leaf(0, PersistentObjectRef::NONE, false).is_err());
         assert!(ExtentRecordEntry::child(0, PersistentObjectRef::NONE).is_err());

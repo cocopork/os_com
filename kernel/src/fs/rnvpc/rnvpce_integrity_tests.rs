@@ -13,12 +13,13 @@ use super::{
     data_page::DataPageState,
     dram::{DramNvBackend, DramNvImage},
     extent_mutation::ExtentMutation,
+    fault::FaultPoint,
     frame::Rnvpc,
     id::{NvFrameId, NvPageId},
     index::PageKey,
     metadata::{
-        ExtentMutationPhase, ExtentNodeRecord, PENDING_EXTENT_MUTATION_LOGICAL_INDEX,
-        PendingExtentMutationRecord, PersistentObjectRef,
+        ExtentDataRef, ExtentMutationPhase, ExtentNodeRecord, ExtentRecordEntry, InodeRecord,
+        PENDING_EXTENT_MUTATION_LOGICAL_INDEX, PendingExtentMutationRecord, PersistentObjectRef,
     },
     write_transaction::{
         AuthoritySnapshot, RangeWriteBatch, RangeWritePage, SsdMigrationPage,
@@ -47,6 +48,576 @@ fn test_pool(
     let backend: Arc<dyn NvMemoryBackend> =
         Arc::new(DramNvBackend::allocate_with_chunk_pages(config, 2).unwrap());
     Arc::new(Rnvpc::new(backend, config, wake).unwrap())
+}
+
+#[ktest]
+fn extent_target_word_crash_is_always_old_or_new() {
+    const FS_ID: u64 = 0xf401;
+    const INODE: u64 = 17;
+    for (fault, expected_block) in [
+        (FaultPoint::BeforeContentPersist, 100),
+        (FaultPoint::AfterVisibilityPersist, 200),
+    ] {
+        let (image, config, pool) = restartable_pool(8);
+        let mutation = ExtentMutation::new(pool.clone(), FS_ID, INODE).unwrap();
+        let old = ExtentRecordEntry::leaf(0, 1, 100, false).unwrap();
+        let node = ExtentNodeRecord::new(
+            FS_ID,
+            INODE,
+            1,
+            1,
+            0,
+            PersistentObjectRef::NONE,
+            PersistentObjectRef::NONE,
+            &[old],
+        )
+        .unwrap();
+        let initialized = mutation
+            .persist_initialized_child(PageKey::new(FS_ID, INODE, 0x8000), &node, None)
+            .unwrap();
+        let reference = initialized.reference();
+        let inode = InodeRecord::new(
+            FS_ID,
+            INODE,
+            1,
+            reference,
+            PAGE_SIZE as u64,
+            (PAGE_SIZE / 512) as u64,
+            0o100644,
+            0,
+        )
+        .unwrap();
+        pool.create_fixed_inode(&inode, None).unwrap();
+        let guard = pool.lock_metadata_mutation(reference).unwrap();
+        let replacement = ExtentRecordEntry::leaf(0, 1, 200, false).unwrap();
+        assert!(
+            pool.persist_extent_target_with_guard(
+                &guard,
+                reference,
+                0,
+                old.target(),
+                replacement.target(),
+                Some(fault),
+            )
+            .is_err()
+        );
+        drop(guard);
+        drop(mutation);
+        drop(pool);
+
+        image.simulate_crash();
+        let backend = image.attach();
+        let slot = usize::try_from(reference.slot().unwrap()).unwrap();
+        let mut bytes = [0u8; PAGE_SIZE];
+        backend
+            .read_page(NvPageId::try_from(slot).unwrap(), &mut bytes)
+            .unwrap();
+        let recovered = ExtentNodeRecord::decode(&bytes).unwrap();
+        assert_eq!(
+            recovered.entry(0).unwrap().data_ref().unwrap(),
+            ExtentDataRef::Ssd(expected_block)
+        );
+        drop(backend);
+        let recovered = Arc::new(Rnvpc::recover(Arc::new(image.attach()), config, None).unwrap());
+        assert_eq!(
+            current_page_mapping(&recovered, FS_ID, INODE, 0)
+                .unwrap()
+                .unwrap()
+                .ssd_block(),
+            expected_block
+        );
+    }
+}
+
+#[ktest]
+fn logical_extent_split_survives_every_persist_boundary() {
+    const FS_ID: u64 = 0xf402;
+    const INODE: u64 = 18;
+    const LOGICAL: u64 = 4;
+    for stage in 0..=11 {
+        let (image, config, pool) = restartable_pool(12);
+        let mut reservation = pool.reserve_data_pages(1).unwrap();
+        let page = pool
+            .stage_reserved_data_page(&mut reservation, &[0x6d; PAGE_SIZE])
+            .unwrap();
+        pool.transition_data_page(page, DataPageState::Staged, DataPageState::NvDirty)
+            .unwrap();
+        pool.replace_data_page_in_owner_at(page, PageKey::new(FS_ID, INODE, LOGICAL), 104, None)
+            .unwrap();
+        let data_ref = pool.persistent_data_ref(page).unwrap();
+
+        let mutation = ExtentMutation::new(pool.clone(), FS_ID, INODE).unwrap();
+        let old = ExtentRecordEntry::leaf(0, 8, 100, false).unwrap();
+        let node = ExtentNodeRecord::new(
+            FS_ID,
+            INODE,
+            1,
+            2,
+            0,
+            PersistentObjectRef::NONE,
+            PersistentObjectRef::NONE,
+            &[old],
+        )
+        .unwrap();
+        let initialized = mutation
+            .persist_initialized_child(PageKey::new(FS_ID, INODE, 0x8001), &node, None)
+            .unwrap();
+        let node_ref = initialized.reference();
+        let inode = InodeRecord::new(
+            FS_ID,
+            INODE,
+            1,
+            node_ref,
+            8 * PAGE_SIZE as u64,
+            (8 * PAGE_SIZE / 512) as u64,
+            0o100644,
+            0,
+        )
+        .unwrap();
+        pool.create_fixed_inode(&inode, None).unwrap();
+        let guard = pool.lock_metadata_mutation(node_ref).unwrap();
+        let page_ssd = ExtentRecordEntry::leaf(LOGICAL, 1, 104, false).unwrap();
+        let right = ExtentRecordEntry::leaf(LOGICAL + 1, 3, 105, false).unwrap();
+
+        let first_fault = match stage {
+            1 => Some(FaultPoint::AfterExtentPreparedPersist),
+            2 => Some(FaultPoint::AfterDependencyPersist),
+            3 => Some(FaultPoint::AfterVisibilityPersist),
+            4 => Some(FaultPoint::AfterContentPersist),
+            _ => None,
+        };
+        if stage >= 1 {
+            let result =
+                pool.append_extent_entry_with_guard(&guard, node_ref, page_ssd, first_fault);
+            if (1..=4).contains(&stage) {
+                assert!(result.is_err());
+            } else {
+                result.unwrap();
+            }
+        }
+        if stage >= 5 {
+            let second_fault = match stage {
+                5 => Some(FaultPoint::AfterExtentPreparedPersist),
+                6 => Some(FaultPoint::AfterDependencyPersist),
+                7 => Some(FaultPoint::AfterVisibilityPersist),
+                8 => Some(FaultPoint::AfterContentPersist),
+                _ => None,
+            };
+            let result = pool.append_extent_entry_with_guard(&guard, node_ref, right, second_fault);
+            if (5..=8).contains(&stage) {
+                assert!(result.is_err());
+            } else {
+                result.unwrap();
+            }
+        }
+        if stage >= 9 {
+            let result = pool.persist_extent_range_with_guard(
+                &guard,
+                node_ref,
+                0,
+                old.range_tail(),
+                4,
+                (stage == 9).then_some(FaultPoint::AfterExtentChildPersist),
+            );
+            if stage == 9 {
+                assert!(result.is_err());
+            } else {
+                result.unwrap();
+            }
+        }
+        if stage >= 10 {
+            let result = pool.persist_extent_target_with_guard(
+                &guard,
+                node_ref,
+                1,
+                page_ssd.target(),
+                ExtentRecordEntry::nv_leaf(LOGICAL, data_ref, false)
+                    .unwrap()
+                    .target(),
+                Some(if stage == 10 {
+                    FaultPoint::BeforeContentPersist
+                } else {
+                    FaultPoint::AfterVisibilityPersist
+                }),
+            );
+            assert!(result.is_err());
+        }
+        drop(guard);
+        drop(mutation);
+        drop(pool);
+
+        image.simulate_crash();
+        let backend = image.attach();
+        let node_slot = usize::try_from(node_ref.slot().unwrap()).unwrap();
+        let mut bytes = [0u8; PAGE_SIZE];
+        backend
+            .read_page(NvPageId::try_from(node_slot).unwrap(), &mut bytes)
+            .unwrap();
+        let recovered = ExtentNodeRecord::decode(&bytes).unwrap();
+        for logical in 0..8 {
+            let mut found = None;
+            for entry in recovered.entries().unwrap() {
+                if entry.logical_block() > logical
+                    || logical >= entry.logical_block() + entry.length() as u64
+                {
+                    continue;
+                }
+                let value = match entry.data_ref().unwrap() {
+                    ExtentDataRef::Ssd(block) => (0, block + logical - entry.logical_block()),
+                    ExtentDataRef::Nv(slot) => (1, slot),
+                };
+                assert!(found.is_none_or(|previous| previous == value));
+                found = Some(value);
+            }
+            let expected = if stage == 11 && logical == LOGICAL {
+                (1, data_ref.slot_plus_one())
+            } else {
+                (0, 100 + logical)
+            };
+            assert_eq!(found, Some(expected), "stage={stage}, logical={logical}");
+        }
+        if stage == 11 {
+            let mut data = [0u8; PAGE_SIZE];
+            backend.read_page(page, &mut data).unwrap();
+            assert_eq!(data, [0x6d; PAGE_SIZE]);
+        }
+        drop(backend);
+
+        let recovered = Arc::new(Rnvpc::recover(Arc::new(image.attach()), config, None).unwrap());
+        for logical in 0..8 {
+            let mapping = current_page_mapping(&recovered, FS_ID, INODE, logical)
+                .unwrap()
+                .unwrap();
+            assert_eq!(mapping.ssd_block(), 100 + logical, "stage={stage}");
+        }
+        if stage == 11 {
+            let reference = mapped_nv_page_ref(&recovered, FS_ID, INODE, LOGICAL)
+                .unwrap()
+                .unwrap();
+            let page = NvPageId::try_from(reference.slot().unwrap() as usize).unwrap();
+            let pin = recovered.pin_data_page(page).unwrap();
+            let mut data = [0u8; PAGE_SIZE];
+            pin.read(&mut data).unwrap();
+            assert_eq!(data, [0x6d; PAGE_SIZE]);
+        }
+    }
+}
+
+#[ktest]
+fn fair_node_split_survives_every_persist_boundary() {
+    const FS_ID: u64 = 0xf403;
+    const INODE: u64 = 19;
+    for stage in 0..=7 {
+        let (image, config, pool) = restartable_pool(16);
+        let mutation = ExtentMutation::new(pool.clone(), FS_ID, INODE).unwrap();
+        let entries = [
+            ExtentRecordEntry::leaf(0, 2, 100, false).unwrap(),
+            ExtentRecordEntry::leaf(2, 2, 102, false).unwrap(),
+            ExtentRecordEntry::leaf(4, 2, 104, false).unwrap(),
+            ExtentRecordEntry::leaf(6, 2, 106, false).unwrap(),
+        ];
+        let left_record = ExtentNodeRecord::new(
+            FS_ID,
+            INODE,
+            1,
+            10,
+            0,
+            PersistentObjectRef::NONE,
+            PersistentObjectRef::NONE,
+            &entries,
+        )
+        .unwrap();
+        let left = mutation
+            .persist_initialized_child(PageKey::new(FS_ID, INODE, 0x8100), &left_record, None)
+            .unwrap()
+            .reference();
+        let right_record = ExtentNodeRecord::new(
+            FS_ID,
+            INODE,
+            2,
+            11,
+            0,
+            PersistentObjectRef::NONE,
+            PersistentObjectRef::NONE,
+            &entries[2..],
+        )
+        .unwrap();
+        let right = mutation
+            .persist_initialized_child(PageKey::new(FS_ID, INODE, 0x8101), &right_record, None)
+            .unwrap()
+            .reference();
+        let parent_record = ExtentNodeRecord::new(
+            FS_ID,
+            INODE,
+            1,
+            12,
+            1,
+            PersistentObjectRef::NONE,
+            PersistentObjectRef::NONE,
+            &[ExtentRecordEntry::child(0, left).unwrap()],
+        )
+        .unwrap();
+        let parent_node = mutation
+            .persist_initialized_child(PageKey::new(FS_ID, INODE, 0x8102), &parent_record, None)
+            .unwrap();
+        let parent = parent_node.reference();
+        let inode_record = InodeRecord::new(
+            FS_ID,
+            INODE,
+            1,
+            parent,
+            8 * PAGE_SIZE as u64,
+            (8 * PAGE_SIZE / 512) as u64,
+            0o100644,
+            0,
+        )
+        .unwrap();
+        pool.create_fixed_inode(&inode_record, None).unwrap();
+        let left_guard = pool.lock_metadata_mutation(left).unwrap();
+        let parent_guard = pool.lock_metadata_mutation(parent).unwrap();
+
+        if stage >= 1 {
+            let result = pool.persist_extent_sibling_with_guard(
+                &left_guard,
+                left,
+                None,
+                right,
+                Some(if stage == 1 {
+                    FaultPoint::BeforeContentPersist
+                } else {
+                    FaultPoint::AfterExtentChildPersist
+                }),
+            );
+            assert!(result.is_err());
+        }
+        if stage >= 3 {
+            let result = pool.shrink_extent_entry_count_with_guard(
+                &left_guard,
+                left,
+                4,
+                2,
+                (stage == 3).then_some(FaultPoint::AfterContentPersist),
+            );
+            if stage == 3 {
+                assert!(result.is_err());
+            } else {
+                result.unwrap();
+            }
+        }
+        if stage >= 4 {
+            let fault = match stage {
+                4 => FaultPoint::AfterExtentPreparedPersist,
+                5 => FaultPoint::AfterDependencyPersist,
+                6 => FaultPoint::AfterVisibilityPersist,
+                _ => FaultPoint::AfterContentPersist,
+            };
+            assert!(
+                pool.append_extent_entry_with_guard(
+                    &parent_guard,
+                    parent,
+                    ExtentRecordEntry::child(4, right).unwrap(),
+                    Some(fault),
+                )
+                .is_err()
+            );
+        }
+        drop(parent_guard);
+        drop(left_guard);
+        drop(mutation);
+        drop(pool);
+
+        image.simulate_crash();
+        let backend = image.attach();
+        let read_node = |reference: PersistentObjectRef| {
+            let mut bytes = [0u8; PAGE_SIZE];
+            backend
+                .read_page(
+                    NvPageId::try_from(usize::try_from(reference.slot().unwrap()).unwrap())
+                        .unwrap(),
+                    &mut bytes,
+                )
+                .unwrap();
+            ExtentNodeRecord::decode(&bytes).unwrap()
+        };
+        let parent_node = read_node(parent);
+        let left_node = read_node(left);
+        let right_node = read_node(right);
+        if let Some(slot) = left_node.right_sibling_slot() {
+            assert_eq!(slot, right.slot_plus_one());
+        }
+        for logical in 0..8 {
+            let route = parent_node
+                .entries()
+                .unwrap()
+                .iter()
+                .filter(|entry| entry.logical_block() <= logical)
+                .max_by_key(|entry| entry.logical_block())
+                .unwrap()
+                .child_slot()
+                .unwrap();
+            let node = if route == right.slot_plus_one()
+                || (route == left.slot_plus_one()
+                    && left_node.right_sibling_slot() == Some(right.slot_plus_one())
+                    && logical >= 4)
+            {
+                &right_node
+            } else {
+                assert_eq!(route, left.slot_plus_one());
+                &left_node
+            };
+            let entry = node
+                .entries()
+                .unwrap()
+                .iter()
+                .find(|entry| {
+                    entry.logical_block() <= logical
+                        && logical < entry.logical_block() + entry.length() as u64
+                })
+                .unwrap();
+            let ExtentDataRef::Ssd(block) = entry.data_ref().unwrap() else {
+                panic!("FAIR test contains only SSD leaves");
+            };
+            assert_eq!(block + logical - entry.logical_block(), 100 + logical);
+        }
+        drop(backend);
+
+        let recovered = Arc::new(Rnvpc::recover(Arc::new(image.attach()), config, None).unwrap());
+        for logical in 0..8 {
+            let mapping = current_page_mapping(&recovered, FS_ID, INODE, logical)
+                .unwrap()
+                .unwrap();
+            assert_eq!(mapping.ssd_block(), 100 + logical, "stage={stage}");
+        }
+    }
+}
+
+#[ktest]
+fn rnvpce_random_overwrites_split_an_inplace_leaf() {
+    const FS_ID: u64 = 0xf404;
+    const INODE: u64 = 20;
+    const FILE_PAGES: u64 = 512;
+    const SSD_START: u64 = 50_000;
+    let (_image, _config, pool) = restartable_pool(512);
+    let initial = [ExtentRecordEntry::leaf(0, FILE_PAGES as u32, SSD_START, false).unwrap()];
+    let snapshot = AuthoritySnapshot::new(
+        1,
+        &initial,
+        FILE_PAGES * PAGE_SIZE as u64,
+        FILE_PAGES * (PAGE_SIZE / 512) as u64,
+        0o100644,
+        0,
+    )
+    .unwrap();
+    bootstrap_inode_authority(pool.clone(), FS_ID, INODE, &snapshot, None).unwrap();
+
+    for iteration in 0..100u64 {
+        let logical = iteration * 197 % FILE_PAGES;
+        let pages =
+            [RangeWritePage::new(logical, SSD_START + logical, 0, PAGE_SIZE, false).unwrap()];
+        let request = RangeWriteBatch::new(
+            iteration + 2,
+            logical * PAGE_SIZE as u64,
+            PAGE_SIZE,
+            &[],
+            &pages,
+            FILE_PAGES * PAGE_SIZE as u64,
+            FILE_PAGES * (PAGE_SIZE / 512) as u64,
+            (PAGE_SIZE / 512) as u64,
+        )
+        .unwrap();
+        let input = [iteration as u8; PAGE_SIZE];
+        commit_range_write(
+            pool.clone(),
+            FS_ID,
+            INODE,
+            &request,
+            &mut VmReader::from(input.as_slice()).to_fallible(),
+            |_block, _staging| panic!("full-page overwrite must not read SSD"),
+            None,
+        )
+        .unwrap_or_else(|error| panic!("random overwrite {iteration} failed: {error:?}"));
+        assert!(
+            mapped_nv_page_ref(&pool, FS_ID, INODE, logical)
+                .unwrap()
+                .is_some(),
+            "random overwrite {iteration} lost logical page {logical}"
+        );
+        for prior in 0..=iteration {
+            let page = prior * 197 % FILE_PAGES;
+            assert_eq!(
+                current_page_mapping(&pool, FS_ID, INODE, page)
+                    .unwrap()
+                    .unwrap()
+                    .ssd_block(),
+                SSD_START + page,
+                "random overwrite {iteration} misrouted logical page {page}",
+            );
+        }
+    }
+}
+
+#[ktest]
+fn fair_split_normalizes_fast_slot_order() {
+    const FS_ID: u64 = 0xf405;
+    const INODE: u64 = 21;
+    const SSD_START: u64 = 50_000;
+    let (_image, _config, pool) = restartable_pool(512);
+    let initial = [ExtentRecordEntry::leaf(0, 300, SSD_START, false).unwrap()];
+    let snapshot = AuthoritySnapshot::new(
+        1,
+        &initial,
+        300 * PAGE_SIZE as u64,
+        300 * (PAGE_SIZE / 512) as u64,
+        0o100644,
+        0,
+    )
+    .unwrap();
+    bootstrap_inode_authority(pool.clone(), FS_ID, INODE, &snapshot, None).unwrap();
+
+    let mut logicals: Vec<u64> = (2..=162).step_by(2).collect();
+    logicals.extend([1, 164]);
+    for (iteration, logical) in logicals.iter().copied().enumerate() {
+        let pages =
+            [RangeWritePage::new(logical, SSD_START + logical, 0, PAGE_SIZE, false).unwrap()];
+        let request = RangeWriteBatch::new(
+            iteration as u64 + 2,
+            logical * PAGE_SIZE as u64,
+            PAGE_SIZE,
+            &[],
+            &pages,
+            300 * PAGE_SIZE as u64,
+            300 * (PAGE_SIZE / 512) as u64,
+            (PAGE_SIZE / 512) as u64,
+        )
+        .unwrap();
+        let input = [iteration as u8; PAGE_SIZE];
+        commit_range_write(
+            pool.clone(),
+            FS_ID,
+            INODE,
+            &request,
+            &mut VmReader::from(input.as_slice()).to_fallible(),
+            |_block, _staging| panic!("full-page overwrite must not read SSD"),
+            None,
+        )
+        .unwrap_or_else(|error| panic!("FAST overwrite {iteration} failed: {error:?}"));
+    }
+
+    for page in 0..300 {
+        assert_eq!(
+            current_page_mapping(&pool, FS_ID, INODE, page)
+                .unwrap()
+                .unwrap()
+                .ssd_block(),
+            SSD_START + page,
+            "FAIR normalization misrouted logical page {page}",
+        );
+    }
+    assert!(
+        mapped_nv_page_ref(&pool, FS_ID, INODE, 164)
+            .unwrap()
+            .is_some()
+    );
 }
 
 fn restartable_pool(total: usize) -> (DramNvImage, RnvpcConfig, Arc<Rnvpc>) {
@@ -308,7 +879,7 @@ fn rnvpce_foreground_batch_updates_each_leaf_once() {
 }
 
 #[ktest]
-fn rnvpce_batch_migration_updates_each_leaf_once() {
+fn rnvpce_batch_migration_updates_leaf_targets_in_place() {
     const FS_ID: u64 = 0x9921;
     const INODE: u64 = 31;
     let (_image, _config, pool) = restartable_pool(32);
@@ -387,9 +958,8 @@ fn rnvpce_batch_migration_updates_each_leaf_once() {
         .header()
         .generation();
     assert_eq!(
-        after,
-        before + 1,
-        "one leaf must be persisted once for the whole group"
+        after, before,
+        "target-word updates must not rewrite the leaf"
     );
     assert_eq!(
         space_reservation(&pool, FS_ID, INODE)
