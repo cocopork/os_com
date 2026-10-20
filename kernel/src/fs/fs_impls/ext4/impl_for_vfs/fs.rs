@@ -68,6 +68,7 @@ impl FileSystem for Ext4 {
             return_errno_with_message!(Errno::EIO, "failed to flush block device");
         }
         dump_latency_stats_once();
+        super::super::pipeline_profile::dump_snapshot();
         super::super::fs::dump_nvpage_profile();
         Ok(())
     }

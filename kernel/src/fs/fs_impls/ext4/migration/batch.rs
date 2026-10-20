@@ -2,12 +2,12 @@
 
 //! Runtime-only completion gate for one orderless migration round.
 
-use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use ostd::sync::LocalIrqDisabled;
 
 use super::{CompletionJob, CompletionQueue};
-use crate::prelude::*;
+use crate::{fs::fs_impls::ext4::pipeline_profile as pp, prelude::*};
 
 pub(crate) struct MigrationBatch {
     remaining_data: AtomicUsize,
@@ -15,6 +15,8 @@ pub(crate) struct MigrationBatch {
     metadata_failed: AtomicBool,
     queued: AtomicBool,
     page_count: usize,
+    created_at_ns: u64,
+    ready_at_ns: AtomicU64,
     jobs: SpinLock<Vec<CompletionJob>, LocalIrqDisabled>,
 }
 
@@ -27,12 +29,23 @@ impl MigrationBatch {
             metadata_failed: AtomicBool::new(false),
             queued: AtomicBool::new(false),
             page_count,
+            created_at_ns: pp::now(),
+            ready_at_ns: AtomicU64::new(0),
             jobs: SpinLock::new(Vec::with_capacity(data_requests)),
         })
     }
 
     pub(super) const fn page_count(&self) -> usize {
         self.page_count
+    }
+
+    pub(super) fn completion_started(&self) -> u64 {
+        let started = pp::now();
+        let ready = self.ready_at_ns.load(Ordering::Acquire);
+        if ready != 0 {
+            pp::NV_COMPLETION_QUEUE_WAIT.record_since(ready, self.page_count);
+        }
+        started
     }
 
     pub(super) fn complete_data(
@@ -71,6 +84,9 @@ impl MigrationBatch {
         {
             return;
         }
+        let ready_at = pp::now();
+        pp::NV_ASYNC_READY_WAIT.record_since(self.created_at_ns, self.page_count);
+        self.ready_at_ns.store(ready_at, Ordering::Release);
         queue.lock().push_back(self.clone());
         trigger.wake_one();
     }

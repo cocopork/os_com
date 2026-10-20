@@ -41,6 +41,7 @@ use super::{
     fs::{Ext4, InodeCaptureOutcome, OrphanLink, SpliceEpoch},
     journal,
     journal::Tid,
+    pipeline_profile as pp,
     prelude::*,
     stats::{LATENCY_STATS, read_ns},
 };
@@ -1861,6 +1862,7 @@ impl Inode {
                 Err(error) => return Err(error),
             };
             fs.reserve_rnvpce_blocks(newly_reserved)?;
+            let persist_started = pp::now();
             let result = crate::fs::rnvpc::write_transaction::commit_range_write_with_mutation(
                 pool.clone(),
                 fs_id,
@@ -1880,6 +1882,10 @@ impl Inode {
                 None,
                 mutation,
                 reservation,
+            );
+            pp::NV_FOREGROUND_PERSIST.record_since(
+                persist_started,
+                result.as_ref().map_or(0, |committed| committed.copied()),
             );
             return match result {
                 Ok(committed) => {
@@ -1918,7 +1924,12 @@ impl Inode {
         }
         let fs = self.fs()?;
         if self.type_ == InodeType::File && fs.rnvpc_extend_enabled() {
-            return self.write_rnvpce_at(&fs, offset, reader);
+            let started = pp::now();
+            let result = self.write_rnvpce_at(&fs, offset, reader);
+            if let Ok(written) = &result {
+                pp::NV_FOREGROUND_TOTAL.record_since(started, *written);
+            }
+            return result;
         }
         if self.type_ == InodeType::File
             && fs.rnvpc_mode() == crate::fs::rnvpc::mode::RnvpcMode::Rnvpc
@@ -1928,6 +1939,7 @@ impl Inode {
         offset
             .checked_add(reader.remain())
             .ok_or_else(|| Error::new(Errno::EINVAL))?;
+        let started = pp::now();
         let mut done = 0;
         while reader.remain() != 0 {
             let amount = reader.remain().min(super::writeback::IO_CHUNK);
@@ -1941,7 +1953,10 @@ impl Inode {
             };
             let mut chunk = reader.clone();
             chunk.limit(amount);
+            let body_started = pp::now();
             let result = self.write_native_chunk(&fs, offset + done, &mut chunk);
+            pp::NATIVE_FOREGROUND_BODY
+                .record_since(body_started, result.as_ref().copied().unwrap_or(0));
             // Preserve reader consumption on a short/faulting copy, as before.
             reader.skip(amount - chunk.remain());
             match result {
@@ -1954,6 +1969,7 @@ impl Inode {
                 Err(error) => return if done != 0 { Ok(done) } else { Err(error) },
             }
         }
+        pp::NATIVE_FOREGROUND_TOTAL.record_since(started, done);
         Ok(done)
     }
 
@@ -3822,9 +3838,12 @@ impl Inode {
         }
         let fs = self.fs()?;
         let mut inner = self.inner.write();
+        let started = pp::now();
         self.resolve_delalloc_locked(&fs, &mut inner, limit)?;
+        pp::NATIVE_DELALLOC.record_since(started, 0);
         let written = inner.page_cache()?.flush_some_pages(limit)?;
         if written != 0 || inner.is_dirty() {
+            let started = pp::now();
             if fs.journal().is_none() {
                 fs.sync_metadata()?;
             }
@@ -3839,6 +3858,7 @@ impl Inode {
             }
             inner.write_back_inode_desc(&fs, self.ino, op.get())?;
             inner.stamp_datasync_tid(op.get());
+            pp::NATIVE_METADATA_FINISH.record_since(started, written);
         }
         Ok(written)
     }

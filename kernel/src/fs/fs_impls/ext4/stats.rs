@@ -281,7 +281,10 @@ pub(crate) static LATENCY_STATS: LatencyStats = LatencyStats {
 };
 static LATENCY_DUMPED: AtomicBool = AtomicBool::new(false);
 pub(crate) fn dump_latency_stats_once() {
-    if LATENCY_ENABLED && !LATENCY_DUMPED.swap(true, Ordering::Relaxed) {
+    if LATENCY_ENABLED
+        && LATENCY_STATS.fg_body.count.load(Ordering::Relaxed) != 0
+        && !LATENCY_DUMPED.swap(true, Ordering::Relaxed)
+    {
         dump_latency_stats();
     }
 }
@@ -289,19 +292,19 @@ pub(crate) fn dump_latency_stats() {
     if !LATENCY_ENABLED {
         return;
     }
-    ostd::info!(
+    ostd::error!(
         "[LATENCY] extend_commit count={} sum_ns={} max_ns={}",
         LATENCY_STATS.extend_commit.count.load(Ordering::Relaxed),
         LATENCY_STATS.extend_commit.sum_ns.load(Ordering::Relaxed),
         LATENCY_STATS.extend_commit.max_ns.load(Ordering::Relaxed)
     );
-    ostd::info!(
+    ostd::error!(
         "[LATENCY] extend_complete count={} sum_ns={} max_ns={}",
         LATENCY_STATS.extend_complete.count.load(Ordering::Relaxed),
         LATENCY_STATS.extend_complete.sum_ns.load(Ordering::Relaxed),
         LATENCY_STATS.extend_complete.max_ns.load(Ordering::Relaxed)
     );
-    ostd::info!(
+    ostd::error!(
         "[LATENCY] extend_data_wait count={} sum_ns={} max_ns={}",
         LATENCY_STATS.extend_data_wait.count.load(Ordering::Relaxed),
         LATENCY_STATS
@@ -313,7 +316,7 @@ pub(crate) fn dump_latency_stats() {
             .max_ns
             .load(Ordering::Relaxed)
     );
-    ostd::info!(
+    ostd::error!(
         "[LATENCY] extend_in_flight_wait count={} sum_ns={} max_ns={}",
         LATENCY_STATS
             .extend_in_flight_wait
@@ -328,7 +331,7 @@ pub(crate) fn dump_latency_stats() {
             .max_ns
             .load(Ordering::Relaxed)
     );
-    ostd::info!(
+    ostd::error!(
         "[LATENCY] extend_meta_wait count={} sum_ns={} max_ns={}",
         LATENCY_STATS.extend_meta_wait.count.load(Ordering::Relaxed),
         LATENCY_STATS
@@ -340,7 +343,7 @@ pub(crate) fn dump_latency_stats() {
             .max_ns
             .load(Ordering::Relaxed)
     );
-    ostd::info!(
+    ostd::error!(
         "[LATENCY] extend_retire_total count={} sum_ns={} max_ns={}",
         LATENCY_STATS
             .extend_retire_total
@@ -355,37 +358,37 @@ pub(crate) fn dump_latency_stats() {
             .max_ns
             .load(Ordering::Relaxed)
     );
-    ostd::info!(
+    ostd::error!(
         "[LATENCY] fg_allocate count={} sum_ns={} max_ns={}",
         LATENCY_STATS.fg_allocate.count.load(Ordering::Relaxed),
         LATENCY_STATS.fg_allocate.sum_ns.load(Ordering::Relaxed),
         LATENCY_STATS.fg_allocate.max_ns.load(Ordering::Relaxed)
     );
-    ostd::info!(
+    ostd::error!(
         "[LATENCY] fg_body count={} sum_ns={} max_ns={}",
         LATENCY_STATS.fg_body.count.load(Ordering::Relaxed),
         LATENCY_STATS.fg_body.sum_ns.load(Ordering::Relaxed),
         LATENCY_STATS.fg_body.max_ns.load(Ordering::Relaxed)
     );
-    ostd::info!(
+    ostd::error!(
         "[LATENCY] fg_copy count={} sum_ns={} max_ns={}",
         LATENCY_STATS.fg_copy.count.load(Ordering::Relaxed),
         LATENCY_STATS.fg_copy.sum_ns.load(Ordering::Relaxed),
         LATENCY_STATS.fg_copy.max_ns.load(Ordering::Relaxed)
     );
-    ostd::info!(
+    ostd::error!(
         "[LATENCY] fg_data count={} sum_ns={} max_ns={}",
         LATENCY_STATS.fg_data.count.load(Ordering::Relaxed),
         LATENCY_STATS.fg_data.sum_ns.load(Ordering::Relaxed),
         LATENCY_STATS.fg_data.max_ns.load(Ordering::Relaxed)
     );
-    ostd::info!(
+    ostd::error!(
         "[LATENCY] fg_data_init count={} sum_ns={} max_ns={}",
         LATENCY_STATS.fg_data_init.count.load(Ordering::Relaxed),
         LATENCY_STATS.fg_data_init.sum_ns.load(Ordering::Relaxed),
         LATENCY_STATS.fg_data_init.max_ns.load(Ordering::Relaxed)
     );
-    ostd::info!(
+    ostd::error!(
         "[LATENCY] fg_data_register count={} sum_ns={} max_ns={}",
         LATENCY_STATS.fg_data_register.count.load(Ordering::Relaxed),
         LATENCY_STATS
@@ -397,19 +400,19 @@ pub(crate) fn dump_latency_stats() {
             .max_ns
             .load(Ordering::Relaxed)
     );
-    ostd::info!(
+    ostd::error!(
         "[LATENCY] fg_enqueue count={} sum_ns={} max_ns={}",
         LATENCY_STATS.fg_enqueue.count.load(Ordering::Relaxed),
         LATENCY_STATS.fg_enqueue.sum_ns.load(Ordering::Relaxed),
         LATENCY_STATS.fg_enqueue.max_ns.load(Ordering::Relaxed)
     );
-    ostd::info!(
+    ostd::error!(
         "[LATENCY] fg_extent count={} sum_ns={} max_ns={}",
         LATENCY_STATS.fg_extent.count.load(Ordering::Relaxed),
         LATENCY_STATS.fg_extent.sum_ns.load(Ordering::Relaxed),
         LATENCY_STATS.fg_extent.max_ns.load(Ordering::Relaxed)
     );
-    ostd::info!(
+    ostd::error!(
         "[LATENCY] fg_inode_publish count={} sum_ns={} max_ns={}",
         LATENCY_STATS.fg_inode_publish.count.load(Ordering::Relaxed),
         LATENCY_STATS
@@ -421,25 +424,25 @@ pub(crate) fn dump_latency_stats() {
             .max_ns
             .load(Ordering::Relaxed)
     );
-    ostd::info!(
+    ostd::error!(
         "[LATENCY] fg_inode_read count={} sum_ns={} max_ns={}",
         LATENCY_STATS.fg_inode_read.count.load(Ordering::Relaxed),
         LATENCY_STATS.fg_inode_read.sum_ns.load(Ordering::Relaxed),
         LATENCY_STATS.fg_inode_read.max_ns.load(Ordering::Relaxed)
     );
-    ostd::info!(
+    ostd::error!(
         "[LATENCY] fg_lookup count={} sum_ns={} max_ns={}",
         LATENCY_STATS.fg_lookup.count.load(Ordering::Relaxed),
         LATENCY_STATS.fg_lookup.sum_ns.load(Ordering::Relaxed),
         LATENCY_STATS.fg_lookup.max_ns.load(Ordering::Relaxed)
     );
-    ostd::info!(
+    ostd::error!(
         "[LATENCY] fg_repair_apply count={} sum_ns={} max_ns={}",
         LATENCY_STATS.fg_repair_apply.count.load(Ordering::Relaxed),
         LATENCY_STATS.fg_repair_apply.sum_ns.load(Ordering::Relaxed),
         LATENCY_STATS.fg_repair_apply.max_ns.load(Ordering::Relaxed)
     );
-    ostd::info!(
+    ostd::error!(
         "[LATENCY] fg_repair_cleanup count={} sum_ns={} max_ns={}",
         LATENCY_STATS
             .fg_repair_cleanup
@@ -454,19 +457,19 @@ pub(crate) fn dump_latency_stats() {
             .max_ns
             .load(Ordering::Relaxed)
     );
-    ostd::info!(
+    ostd::error!(
         "[LATENCY] fg_repair_image count={} sum_ns={} max_ns={}",
         LATENCY_STATS.fg_repair_image.count.load(Ordering::Relaxed),
         LATENCY_STATS.fg_repair_image.sum_ns.load(Ordering::Relaxed),
         LATENCY_STATS.fg_repair_image.max_ns.load(Ordering::Relaxed)
     );
-    ostd::info!(
+    ostd::error!(
         "[LATENCY] fg_repair_mark count={} sum_ns={} max_ns={}",
         LATENCY_STATS.fg_repair_mark.count.load(Ordering::Relaxed),
         LATENCY_STATS.fg_repair_mark.sum_ns.load(Ordering::Relaxed),
         LATENCY_STATS.fg_repair_mark.max_ns.load(Ordering::Relaxed)
     );
-    ostd::info!(
+    ostd::error!(
         "[LATENCY] fg_repair_verify count={} sum_ns={} max_ns={}",
         LATENCY_STATS.fg_repair_verify.count.load(Ordering::Relaxed),
         LATENCY_STATS
@@ -478,13 +481,13 @@ pub(crate) fn dump_latency_stats() {
             .max_ns
             .load(Ordering::Relaxed)
     );
-    ostd::info!(
+    ostd::error!(
         "[LATENCY] fg_reserve count={} sum_ns={} max_ns={}",
         LATENCY_STATS.fg_reserve.count.load(Ordering::Relaxed),
         LATENCY_STATS.fg_reserve.sum_ns.load(Ordering::Relaxed),
         LATENCY_STATS.fg_reserve.max_ns.load(Ordering::Relaxed)
     );
-    ostd::info!(
+    ostd::error!(
         "[LATENCY] fg_reserve_lookup count={} sum_ns={} max_ns={}",
         LATENCY_STATS
             .fg_reserve_lookup
@@ -499,7 +502,7 @@ pub(crate) fn dump_latency_stats() {
             .max_ns
             .load(Ordering::Relaxed)
     );
-    ostd::info!(
+    ostd::error!(
         "[LATENCY] fg_reserve_update count={} sum_ns={} max_ns={}",
         LATENCY_STATS
             .fg_reserve_update
@@ -514,7 +517,7 @@ pub(crate) fn dump_latency_stats() {
             .max_ns
             .load(Ordering::Relaxed)
     );
-    ostd::info!(
+    ostd::error!(
         "[LATENCY] fg_reverse_refresh count={} sum_ns={} max_ns={}",
         LATENCY_STATS
             .fg_reverse_refresh
@@ -529,13 +532,13 @@ pub(crate) fn dump_latency_stats() {
             .max_ns
             .load(Ordering::Relaxed)
     );
-    ostd::info!(
+    ostd::error!(
         "[LATENCY] fg_ssd_read count={} sum_ns={} max_ns={}",
         LATENCY_STATS.fg_ssd_read.count.load(Ordering::Relaxed),
         LATENCY_STATS.fg_ssd_read.sum_ns.load(Ordering::Relaxed),
         LATENCY_STATS.fg_ssd_read.max_ns.load(Ordering::Relaxed)
     );
-    ostd::info!(
+    ostd::error!(
         "[LATENCY] leaf_detail_construct count={} sum_ns={} max_ns={}",
         LATENCY_STATS
             .leaf_detail_construct
@@ -550,7 +553,7 @@ pub(crate) fn dump_latency_stats() {
             .max_ns
             .load(Ordering::Relaxed)
     );
-    ostd::info!(
+    ostd::error!(
         "[LATENCY] leaf_detail_entries count={} sum_ns={} max_ns={}",
         LATENCY_STATS
             .leaf_detail_entries
@@ -565,7 +568,7 @@ pub(crate) fn dump_latency_stats() {
             .max_ns
             .load(Ordering::Relaxed)
     );
-    ostd::info!(
+    ostd::error!(
         "[LATENCY] leaf_detail_identity count={} sum_ns={} max_ns={}",
         LATENCY_STATS
             .leaf_detail_identity
@@ -580,7 +583,7 @@ pub(crate) fn dump_latency_stats() {
             .max_ns
             .load(Ordering::Relaxed)
     );
-    ostd::info!(
+    ostd::error!(
         "[LATENCY] leaf_detail_pending count={} sum_ns={} max_ns={}",
         LATENCY_STATS
             .leaf_detail_pending
@@ -595,7 +598,7 @@ pub(crate) fn dump_latency_stats() {
             .max_ns
             .load(Ordering::Relaxed)
     );
-    ostd::info!(
+    ostd::error!(
         "[LATENCY] leaf_detail_read count={} sum_ns={} max_ns={}",
         LATENCY_STATS.leaf_detail_read.count.load(Ordering::Relaxed),
         LATENCY_STATS
@@ -607,7 +610,7 @@ pub(crate) fn dump_latency_stats() {
             .max_ns
             .load(Ordering::Relaxed)
     );
-    ostd::info!(
+    ostd::error!(
         "[LATENCY] leaf_detail_total count={} sum_ns={} max_ns={}",
         LATENCY_STATS
             .leaf_detail_total
@@ -622,7 +625,7 @@ pub(crate) fn dump_latency_stats() {
             .max_ns
             .load(Ordering::Relaxed)
     );
-    ostd::info!(
+    ostd::error!(
         "[LATENCY] leaf_detail_update count={} sum_ns={} max_ns={}",
         LATENCY_STATS
             .leaf_detail_update
@@ -637,7 +640,7 @@ pub(crate) fn dump_latency_stats() {
             .max_ns
             .load(Ordering::Relaxed)
     );
-    ostd::info!(
+    ostd::error!(
         "[LATENCY] leaf_detail_validate count={} sum_ns={} max_ns={}",
         LATENCY_STATS
             .leaf_detail_validate
@@ -652,7 +655,7 @@ pub(crate) fn dump_latency_stats() {
             .max_ns
             .load(Ordering::Relaxed)
     );
-    ostd::info!(
+    ostd::error!(
         "[LATENCY] leaf_pending_index_hold count={} sum_ns={} max_ns={}",
         LATENCY_STATS
             .leaf_pending_index_hold
@@ -667,7 +670,7 @@ pub(crate) fn dump_latency_stats() {
             .max_ns
             .load(Ordering::Relaxed)
     );
-    ostd::info!(
+    ostd::error!(
         "[LATENCY] leaf_pending_index_wait count={} sum_ns={} max_ns={}",
         LATENCY_STATS
             .leaf_pending_index_wait
@@ -682,7 +685,7 @@ pub(crate) fn dump_latency_stats() {
             .max_ns
             .load(Ordering::Relaxed)
     );
-    ostd::info!(
+    ostd::error!(
         "[LATENCY] leaf_pending_read count={} sum_ns={} max_ns={}",
         LATENCY_STATS
             .leaf_pending_read
@@ -697,7 +700,7 @@ pub(crate) fn dump_latency_stats() {
             .max_ns
             .load(Ordering::Relaxed)
     );
-    ostd::info!(
+    ostd::error!(
         "[LATENCY] leaf_pending_retry count={} sum_ns={} max_ns={}",
         LATENCY_STATS
             .leaf_pending_retry
@@ -712,7 +715,7 @@ pub(crate) fn dump_latency_stats() {
             .max_ns
             .load(Ordering::Relaxed)
     );
-    ostd::info!(
+    ostd::error!(
         "[LATENCY] leaf_pending_slot_wait count={} sum_ns={} max_ns={}",
         LATENCY_STATS
             .leaf_pending_slot_wait
@@ -727,7 +730,7 @@ pub(crate) fn dump_latency_stats() {
             .max_ns
             .load(Ordering::Relaxed)
     );
-    ostd::info!(
+    ostd::error!(
         "[LATENCY] leaf_update_buffers count={} sum_ns={} max_ns={}",
         LATENCY_STATS
             .leaf_update_buffers
@@ -742,7 +745,7 @@ pub(crate) fn dump_latency_stats() {
             .max_ns
             .load(Ordering::Relaxed)
     );
-    ostd::info!(
+    ostd::error!(
         "[LATENCY] leaf_update_copy count={} sum_ns={} max_ns={}",
         LATENCY_STATS.leaf_update_copy.count.load(Ordering::Relaxed),
         LATENCY_STATS
@@ -754,7 +757,7 @@ pub(crate) fn dump_latency_stats() {
             .max_ns
             .load(Ordering::Relaxed)
     );
-    ostd::info!(
+    ostd::error!(
         "[LATENCY] leaf_update_exclusive count={} sum_ns={} max_ns={}",
         LATENCY_STATS
             .leaf_update_exclusive
@@ -769,7 +772,7 @@ pub(crate) fn dump_latency_stats() {
             .max_ns
             .load(Ordering::Relaxed)
     );
-    ostd::info!(
+    ostd::error!(
         "[LATENCY] leaf_update_finalize count={} sum_ns={} max_ns={}",
         LATENCY_STATS
             .leaf_update_finalize
@@ -784,7 +787,7 @@ pub(crate) fn dump_latency_stats() {
             .max_ns
             .load(Ordering::Relaxed)
     );
-    ostd::info!(
+    ostd::error!(
         "[LATENCY] leaf_update_notify count={} sum_ns={} max_ns={}",
         LATENCY_STATS
             .leaf_update_notify
@@ -799,7 +802,7 @@ pub(crate) fn dump_latency_stats() {
             .max_ns
             .load(Ordering::Relaxed)
     );
-    ostd::info!(
+    ostd::error!(
         "[LATENCY] leaf_update_old_read count={} sum_ns={} max_ns={}",
         LATENCY_STATS
             .leaf_update_old_read
@@ -814,7 +817,7 @@ pub(crate) fn dump_latency_stats() {
             .max_ns
             .load(Ordering::Relaxed)
     );
-    ostd::info!(
+    ostd::error!(
         "[LATENCY] leaf_update_old_validate count={} sum_ns={} max_ns={}",
         LATENCY_STATS
             .leaf_update_old_validate
@@ -829,7 +832,7 @@ pub(crate) fn dump_latency_stats() {
             .max_ns
             .load(Ordering::Relaxed)
     );
-    ostd::info!(
+    ostd::error!(
         "[LATENCY] leaf_update_persist count={} sum_ns={} max_ns={}",
         LATENCY_STATS
             .leaf_update_persist
@@ -844,7 +847,7 @@ pub(crate) fn dump_latency_stats() {
             .max_ns
             .load(Ordering::Relaxed)
     );
-    ostd::info!(
+    ostd::error!(
         "[LATENCY] leaf_update_validate count={} sum_ns={} max_ns={}",
         LATENCY_STATS
             .leaf_update_validate
@@ -859,7 +862,7 @@ pub(crate) fn dump_latency_stats() {
             .max_ns
             .load(Ordering::Relaxed)
     );
-    ostd::info!(
+    ostd::error!(
         "[LATENCY] leaf_update_write count={} sum_ns={} max_ns={}",
         LATENCY_STATS
             .leaf_update_write
@@ -874,7 +877,7 @@ pub(crate) fn dump_latency_stats() {
             .max_ns
             .load(Ordering::Relaxed)
     );
-    ostd::info!(
+    ostd::error!(
         "[LATENCY] migration_busy_completion count={} sum_ns={} max_ns={}",
         LATENCY_STATS
             .migration_busy_completion
@@ -889,7 +892,7 @@ pub(crate) fn dump_latency_stats() {
             .max_ns
             .load(Ordering::Relaxed)
     );
-    ostd::info!(
+    ostd::error!(
         "[LATENCY] migration_busy_foreground count={} sum_ns={} max_ns={}",
         LATENCY_STATS
             .migration_busy_foreground
@@ -904,7 +907,7 @@ pub(crate) fn dump_latency_stats() {
             .max_ns
             .load(Ordering::Relaxed)
     );
-    ostd::info!(
+    ostd::error!(
         "[LATENCY] migration_credit count={} sum_ns={} max_ns={}",
         LATENCY_STATS.migration_credit.count.load(Ordering::Relaxed),
         LATENCY_STATS
@@ -916,13 +919,13 @@ pub(crate) fn dump_latency_stats() {
             .max_ns
             .load(Ordering::Relaxed)
     );
-    ostd::info!(
+    ostd::error!(
         "[LATENCY] migration_leaf count={} sum_ns={} max_ns={}",
         LATENCY_STATS.migration_leaf.count.load(Ordering::Relaxed),
         LATENCY_STATS.migration_leaf.sum_ns.load(Ordering::Relaxed),
         LATENCY_STATS.migration_leaf.max_ns.load(Ordering::Relaxed)
     );
-    ostd::info!(
+    ostd::error!(
         "[LATENCY] migration_leaf_exclusive count={} sum_ns={} max_ns={}",
         LATENCY_STATS
             .migration_leaf_exclusive
@@ -937,7 +940,7 @@ pub(crate) fn dump_latency_stats() {
             .max_ns
             .load(Ordering::Relaxed)
     );
-    ostd::info!(
+    ostd::error!(
         "[LATENCY] migration_leaf_lock_wait count={} sum_ns={} max_ns={}",
         LATENCY_STATS
             .migration_leaf_lock_wait
@@ -952,7 +955,7 @@ pub(crate) fn dump_latency_stats() {
             .max_ns
             .load(Ordering::Relaxed)
     );
-    ostd::info!(
+    ostd::error!(
         "[LATENCY] migration_owner_lock_wait count={} sum_ns={} max_ns={}",
         LATENCY_STATS
             .migration_owner_lock_wait
@@ -967,7 +970,7 @@ pub(crate) fn dump_latency_stats() {
             .max_ns
             .load(Ordering::Relaxed)
     );
-    ostd::info!(
+    ostd::error!(
         "[LATENCY] migration_reservation count={} sum_ns={} max_ns={}",
         LATENCY_STATS
             .migration_reservation
@@ -982,7 +985,7 @@ pub(crate) fn dump_latency_stats() {
             .max_ns
             .load(Ordering::Relaxed)
     );
-    ostd::info!(
+    ostd::error!(
         "[LATENCY] migration_reservation_exclusive count={} sum_ns={} max_ns={}",
         LATENCY_STATS
             .migration_reservation_exclusive
@@ -997,7 +1000,7 @@ pub(crate) fn dump_latency_stats() {
             .max_ns
             .load(Ordering::Relaxed)
     );
-    ostd::info!(
+    ostd::error!(
         "[LATENCY] migration_reservation_lock_wait count={} sum_ns={} max_ns={}",
         LATENCY_STATS
             .migration_reservation_lock_wait
@@ -1012,7 +1015,7 @@ pub(crate) fn dump_latency_stats() {
             .max_ns
             .load(Ordering::Relaxed)
     );
-    ostd::info!(
+    ostd::error!(
         "[LATENCY] migration_reservation_lookup count={} sum_ns={} max_ns={}",
         LATENCY_STATS
             .migration_reservation_lookup
@@ -1027,7 +1030,7 @@ pub(crate) fn dump_latency_stats() {
             .max_ns
             .load(Ordering::Relaxed)
     );
-    ostd::info!(
+    ostd::error!(
         "[LATENCY] migration_reservation_update count={} sum_ns={} max_ns={}",
         LATENCY_STATS
             .migration_reservation_update
@@ -1042,7 +1045,7 @@ pub(crate) fn dump_latency_stats() {
             .max_ns
             .load(Ordering::Relaxed)
     );
-    ostd::info!(
+    ostd::error!(
         "[LATENCY] migration_slot_wait count={} sum_ns={} max_ns={}",
         LATENCY_STATS
             .migration_slot_wait
@@ -1057,7 +1060,7 @@ pub(crate) fn dump_latency_stats() {
             .max_ns
             .load(Ordering::Relaxed)
     );
-    ostd::info!(
+    ostd::error!(
         "[LATENCY] migration_validate count={} sum_ns={} max_ns={}",
         LATENCY_STATS
             .migration_validate
@@ -1072,25 +1075,25 @@ pub(crate) fn dump_latency_stats() {
             .max_ns
             .load(Ordering::Relaxed)
     );
-    ostd::info!(
+    ostd::error!(
         "[LATENCY] nvpc_alloc_nvbh count={} sum_ns={} max_ns={}",
         LATENCY_STATS.nvpc_alloc_nvbh.count.load(Ordering::Relaxed),
         LATENCY_STATS.nvpc_alloc_nvbh.sum_ns.load(Ordering::Relaxed),
         LATENCY_STATS.nvpc_alloc_nvbh.max_ns.load(Ordering::Relaxed)
     );
-    ostd::info!(
+    ostd::error!(
         "[LATENCY] nvpc_dirty_mark count={} sum_ns={} max_ns={}",
         LATENCY_STATS.nvpc_dirty_mark.count.load(Ordering::Relaxed),
         LATENCY_STATS.nvpc_dirty_mark.sum_ns.load(Ordering::Relaxed),
         LATENCY_STATS.nvpc_dirty_mark.max_ns.load(Ordering::Relaxed)
     );
-    ostd::info!(
+    ostd::error!(
         "[LATENCY] nvpc_eagain count={} sum_ns={} max_ns={}",
         LATENCY_STATS.nvpc_eagain.count.load(Ordering::Relaxed),
         LATENCY_STATS.nvpc_eagain.sum_ns.load(Ordering::Relaxed),
         LATENCY_STATS.nvpc_eagain.max_ns.load(Ordering::Relaxed)
     );
-    ostd::info!(
+    ostd::error!(
         "[LATENCY] nvpc_extend_publish count={} sum_ns={} max_ns={}",
         LATENCY_STATS
             .nvpc_extend_publish
@@ -1105,7 +1108,7 @@ pub(crate) fn dump_latency_stats() {
             .max_ns
             .load(Ordering::Relaxed)
     );
-    ostd::info!(
+    ostd::error!(
         "[LATENCY] nvpc_finish_clear_descriptor count={} sum_ns={} max_ns={}",
         LATENCY_STATS
             .nvpc_finish_clear_descriptor
@@ -1120,7 +1123,7 @@ pub(crate) fn dump_latency_stats() {
             .max_ns
             .load(Ordering::Relaxed)
     );
-    ostd::info!(
+    ostd::error!(
         "[LATENCY] nvpc_finish_finalize_lock count={} sum_ns={} max_ns={}",
         LATENCY_STATS
             .nvpc_finish_finalize_lock
@@ -1135,7 +1138,7 @@ pub(crate) fn dump_latency_stats() {
             .max_ns
             .load(Ordering::Relaxed)
     );
-    ostd::info!(
+    ostd::error!(
         "[LATENCY] nvpc_finish_lease_wake count={} sum_ns={} max_ns={}",
         LATENCY_STATS
             .nvpc_finish_lease_wake
@@ -1150,7 +1153,7 @@ pub(crate) fn dump_latency_stats() {
             .max_ns
             .load(Ordering::Relaxed)
     );
-    ostd::info!(
+    ostd::error!(
         "[LATENCY] nvpc_finish_validate_lock count={} sum_ns={} max_ns={}",
         LATENCY_STATS
             .nvpc_finish_validate_lock
@@ -1165,25 +1168,25 @@ pub(crate) fn dump_latency_stats() {
             .max_ns
             .load(Ordering::Relaxed)
     );
-    ostd::info!(
+    ostd::error!(
         "[LATENCY] nvpc_index count={} sum_ns={} max_ns={}",
         LATENCY_STATS.nvpc_index.count.load(Ordering::Relaxed),
         LATENCY_STATS.nvpc_index.sum_ns.load(Ordering::Relaxed),
         LATENCY_STATS.nvpc_index.max_ns.load(Ordering::Relaxed)
     );
-    ostd::info!(
+    ostd::error!(
         "[LATENCY] nvpc_old_read count={} sum_ns={} max_ns={}",
         LATENCY_STATS.nvpc_old_read.count.load(Ordering::Relaxed),
         LATENCY_STATS.nvpc_old_read.sum_ns.load(Ordering::Relaxed),
         LATENCY_STATS.nvpc_old_read.max_ns.load(Ordering::Relaxed)
     );
-    ostd::info!(
+    ostd::error!(
         "[LATENCY] nvpc_publish count={} sum_ns={} max_ns={}",
         LATENCY_STATS.nvpc_publish.count.load(Ordering::Relaxed),
         LATENCY_STATS.nvpc_publish.sum_ns.load(Ordering::Relaxed),
         LATENCY_STATS.nvpc_publish.max_ns.load(Ordering::Relaxed)
     );
-    ostd::info!(
+    ostd::error!(
         "[LATENCY] nvpc_retire_lock count={} sum_ns={} max_ns={}",
         LATENCY_STATS.nvpc_retire_lock.count.load(Ordering::Relaxed),
         LATENCY_STATS
@@ -1195,7 +1198,7 @@ pub(crate) fn dump_latency_stats() {
             .max_ns
             .load(Ordering::Relaxed)
     );
-    ostd::info!(
+    ostd::error!(
         "[LATENCY] nvpc_retire_total count={} sum_ns={} max_ns={}",
         LATENCY_STATS
             .nvpc_retire_total
@@ -1210,31 +1213,31 @@ pub(crate) fn dump_latency_stats() {
             .max_ns
             .load(Ordering::Relaxed)
     );
-    ostd::info!(
+    ostd::error!(
         "[LATENCY] nvpc_stage count={} sum_ns={} max_ns={}",
         LATENCY_STATS.nvpc_stage.count.load(Ordering::Relaxed),
         LATENCY_STATS.nvpc_stage.sum_ns.load(Ordering::Relaxed),
         LATENCY_STATS.nvpc_stage.max_ns.load(Ordering::Relaxed)
     );
-    ostd::info!(
+    ostd::error!(
         "[LATENCY] nvpc_transition count={} sum_ns={} max_ns={}",
         LATENCY_STATS.nvpc_transition.count.load(Ordering::Relaxed),
         LATENCY_STATS.nvpc_transition.sum_ns.load(Ordering::Relaxed),
         LATENCY_STATS.nvpc_transition.max_ns.load(Ordering::Relaxed)
     );
-    ostd::info!(
+    ostd::error!(
         "[LATENCY] nvpc_wal count={} sum_ns={} max_ns={}",
         LATENCY_STATS.nvpc_wal.count.load(Ordering::Relaxed),
         LATENCY_STATS.nvpc_wal.sum_ns.load(Ordering::Relaxed),
         LATENCY_STATS.nvpc_wal.max_ns.load(Ordering::Relaxed)
     );
-    ostd::info!(
+    ostd::error!(
         "[LATENCY] nvpc_wal_append count={} sum_ns={} max_ns={}",
         LATENCY_STATS.nvpc_wal_append.count.load(Ordering::Relaxed),
         LATENCY_STATS.nvpc_wal_append.sum_ns.load(Ordering::Relaxed),
         LATENCY_STATS.nvpc_wal_append.max_ns.load(Ordering::Relaxed)
     );
-    ostd::info!(
+    ostd::error!(
         "[LATENCY] reclaim_allocation_wait count={} sum_ns={} max_ns={}",
         LATENCY_STATS
             .reclaim_allocation_wait
@@ -1249,7 +1252,7 @@ pub(crate) fn dump_latency_stats() {
             .max_ns
             .load(Ordering::Relaxed)
     );
-    ostd::info!(
+    ostd::error!(
         "[LATENCY] reclaim_capacity count={} sum_ns={} max_ns={}",
         LATENCY_STATS.reclaim_capacity.count.load(Ordering::Relaxed),
         LATENCY_STATS
@@ -1261,13 +1264,13 @@ pub(crate) fn dump_latency_stats() {
             .max_ns
             .load(Ordering::Relaxed)
     );
-    ostd::info!(
+    ostd::error!(
         "[LATENCY] reclaim_reset count={} sum_ns={} max_ns={}",
         LATENCY_STATS.reclaim_reset.count.load(Ordering::Relaxed),
         LATENCY_STATS.reclaim_reset.sum_ns.load(Ordering::Relaxed),
         LATENCY_STATS.reclaim_reset.max_ns.load(Ordering::Relaxed)
     );
-    ostd::info!(
+    ostd::error!(
         "[LATENCY] reclaim_slot_wait count={} sum_ns={} max_ns={}",
         LATENCY_STATS
             .reclaim_slot_wait
@@ -1282,19 +1285,19 @@ pub(crate) fn dump_latency_stats() {
             .max_ns
             .load(Ordering::Relaxed)
     );
-    ostd::info!(
+    ostd::error!(
         "[LATENCY] reclaim_unlock count={} sum_ns={} max_ns={}",
         LATENCY_STATS.reclaim_unlock.count.load(Ordering::Relaxed),
         LATENCY_STATS.reclaim_unlock.sum_ns.load(Ordering::Relaxed),
         LATENCY_STATS.reclaim_unlock.max_ns.load(Ordering::Relaxed)
     );
-    ostd::info!(
+    ostd::error!(
         "[LATENCY] reclaim_unpin count={} sum_ns={} max_ns={}",
         LATENCY_STATS.reclaim_unpin.count.load(Ordering::Relaxed),
         LATENCY_STATS.reclaim_unpin.sum_ns.load(Ordering::Relaxed),
         LATENCY_STATS.reclaim_unpin.max_ns.load(Ordering::Relaxed)
     );
-    ostd::info!(
+    ostd::error!(
         "[LATENCY] reservation_index_wait_all count={} sum_ns={} max_ns={}",
         LATENCY_STATS
             .reservation_index_wait_all
@@ -1309,7 +1312,7 @@ pub(crate) fn dump_latency_stats() {
             .max_ns
             .load(Ordering::Relaxed)
     );
-    ostd::info!(
+    ostd::error!(
         "[LATENCY] reservation_slot_wait_all count={} sum_ns={} max_ns={}",
         LATENCY_STATS
             .reservation_slot_wait_all
@@ -1324,7 +1327,7 @@ pub(crate) fn dump_latency_stats() {
             .max_ns
             .load(Ordering::Relaxed)
     );
-    ostd::info!(
+    ostd::error!(
         "[LATENCY] rnvpce_completion_inner_hold count={} sum_ns={} max_ns={}",
         LATENCY_STATS
             .rnvpce_completion_inner_hold
@@ -1339,7 +1342,7 @@ pub(crate) fn dump_latency_stats() {
             .max_ns
             .load(Ordering::Relaxed)
     );
-    ostd::info!(
+    ostd::error!(
         "[LATENCY] rnvpce_completion_inner_wait count={} sum_ns={} max_ns={}",
         LATENCY_STATS
             .rnvpce_completion_inner_wait
@@ -1354,7 +1357,7 @@ pub(crate) fn dump_latency_stats() {
             .max_ns
             .load(Ordering::Relaxed)
     );
-    ostd::info!(
+    ostd::error!(
         "[LATENCY] rnvpce_completion_leaf_updates count={} sum_ns={} max_ns={}",
         LATENCY_STATS
             .rnvpce_completion_leaf_updates
@@ -1369,7 +1372,7 @@ pub(crate) fn dump_latency_stats() {
             .max_ns
             .load(Ordering::Relaxed)
     );
-    ostd::info!(
+    ostd::error!(
         "[LATENCY] rnvpce_metadata_reader_wait count={} sum_ns={} max_ns={}",
         LATENCY_STATS
             .rnvpce_metadata_reader_wait
@@ -1384,7 +1387,7 @@ pub(crate) fn dump_latency_stats() {
             .max_ns
             .load(Ordering::Relaxed)
     );
-    ostd::info!(
+    ostd::error!(
         "[LATENCY] rnvpce_publication_hold count={} sum_ns={} max_ns={}",
         LATENCY_STATS
             .rnvpce_publication_hold
@@ -1399,7 +1402,7 @@ pub(crate) fn dump_latency_stats() {
             .max_ns
             .load(Ordering::Relaxed)
     );
-    ostd::info!(
+    ostd::error!(
         "[LATENCY] rnvpce_publication_wait count={} sum_ns={} max_ns={}",
         LATENCY_STATS
             .rnvpce_publication_wait
@@ -1414,7 +1417,7 @@ pub(crate) fn dump_latency_stats() {
             .max_ns
             .load(Ordering::Relaxed)
     );
-    ostd::info!(
+    ostd::error!(
         "[LATENCY] rnvpce_reclaim_state_lock count={} sum_ns={} max_ns={}",
         LATENCY_STATS
             .rnvpce_reclaim_state_lock
@@ -1429,7 +1432,7 @@ pub(crate) fn dump_latency_stats() {
             .max_ns
             .load(Ordering::Relaxed)
     );
-    ostd::info!(
+    ostd::error!(
         "[LATENCY] rnvpce_write_inner_wait count={} sum_ns={} max_ns={}",
         LATENCY_STATS
             .rnvpce_write_inner_wait

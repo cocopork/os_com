@@ -9,6 +9,7 @@ pub mod thread_info;
 pub mod utils;
 pub mod vfs;
 
+pub(crate) use fs_impls::ext4::pipeline_profile;
 pub use fs_impls::{
     cgroupfs, configfs, devpts, exfat, ext2, procfs, pseudofs, ramfs, sysfs, tmpfs,
 };

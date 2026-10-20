@@ -9,6 +9,7 @@ use ostd::sync::LocalIrqDisabled;
 
 use super::{
     fs::{AllocIntent, Ext4},
+    pipeline_profile as pp,
     prelude::*,
 };
 use crate::fs::rnvpc::{
@@ -22,7 +23,7 @@ mod batch;
 
 use batch::MigrationBatch;
 
-pub(super) const MAX_IN_FLIGHT: usize = 128;
+const MIGRATION_BATCH_PAGES: usize = super::writeback::WRITEBACK_BATCH;
 pub(super) type CompletionQueue = Arc<SpinLock<VecDeque<Arc<MigrationBatch>>, LocalIrqDisabled>>;
 pub(super) struct CompletionJob {
     status: BioStatus,
@@ -59,7 +60,7 @@ impl Ext4 {
                     if rnvpc::needs_flush_watermark()
                         || fs.nv_capacity_waiters.load(Ordering::Acquire) != 0
                     {
-                        match fs.migrate_nv_round(MAX_IN_FLIGHT) {
+                        match fs.migrate_nv_round(MIGRATION_BATCH_PAGES) {
                             // Keep the pipeline full while work and credits exist.
                             Ok(submitted) if submitted != 0 => continue,
                             Ok(_) => {}
@@ -139,11 +140,13 @@ impl Ext4 {
         }
         self.nv_capacity_waiters.fetch_add(1, Ordering::AcqRel);
         self.request_nv_migration();
+        let wait_started = pp::now();
         if let Some(pool) = rnvpc::pool() {
             pool.wait_for_data_capacity(pages, || {
                 self.is_shutdown() || self.nv_migration_failed.load(Ordering::Acquire)
             });
         }
+        pp::NV_CAPACITY_WAIT.record_since(wait_started, pages);
         self.nv_capacity_waiters.fetch_sub(1, Ordering::AcqRel);
         if self.is_shutdown() || self.nv_migration_failed.load(Ordering::Acquire) {
             return_errno_with_message!(Errno::EIO, "NV migration cannot reclaim capacity");
@@ -152,18 +155,19 @@ impl Ext4 {
     }
 
     pub(super) fn migrate_nv_round(&self, budget: usize) -> Result<usize> {
+        let profile_started = pp::now();
         let _serial = self.nv_migration_lock.lock();
         if self.nv_migration_failed.load(Ordering::Acquire) {
             return_errno_with_message!(Errno::EIO, "ambiguous migration target requires recovery");
         }
-        let budget =
-            budget.min(MAX_IN_FLIGHT.saturating_sub(self.nv_in_flight.load(Ordering::Acquire)));
+        let budget = budget.min(MIGRATION_BATCH_PAGES);
         if budget == 0 {
             return Ok(0);
         }
         let Some(pool) = rnvpc::pool() else {
             return Ok(0);
         };
+        let candidate_started = pp::now();
         let mut pages = Vec::new();
         if self.rnvpc_extend_enabled() {
             for candidate in rnvpc::rnvpce_flush_candidates(self.rnvpc_fs_id(), budget) {
@@ -209,22 +213,25 @@ impl Ext4 {
                 }
             }
         }
+        pp::NV_CANDIDATE_SELECT.record_since(candidate_started, pages.len());
+        let target_started = pp::now();
         let metadata_groups = if self.rnvpc_extend_enabled() {
             self.prepare_nv_targets(&mut pages)?
         } else {
             BTreeSet::new()
         };
+        pp::NV_TARGET_PREPARE.record_since(target_started, pages.len());
         let submitted = pages.len();
         if submitted == 0 {
             return Ok(0);
         }
+        let data_submit_started = pp::now();
         pages.sort_by_key(|page| page.target);
         let max_segments = self
             .block_device()
             .metadata()
             .max_nr_segments_per_bio
-            .max(1)
-            .min(MAX_IN_FLIGHT);
+            .max(1);
         let mut pending = pages.into_iter().peekable();
         let mut submissions = Vec::new();
         while let Some(first) = pending.next() {
@@ -285,6 +292,8 @@ impl Ext4 {
                 submit_error = Some(error);
             }
         }
+        pp::NV_DATA_SUBMIT.record_since(data_submit_started, submitted);
+        let metadata_started = pp::now();
         let metadata_result = if self.rnvpc_extend_enabled() {
             // Data BIOs are already in flight. These nojournal metadata writes
             // may complete in either order and become durable together at the
@@ -293,6 +302,7 @@ impl Ext4 {
         } else {
             Ok(())
         };
+        pp::NV_METADATA_SUBMIT.record_since(metadata_started, submitted);
         batch.complete_metadata(
             metadata_result.is_ok() && submit_error.is_none(),
             &self.nv_completion_queue,
@@ -302,6 +312,7 @@ impl Ext4 {
             return Err(error.into());
         }
         metadata_result?;
+        pp::NV_FLUSH_TOTAL.record_since(profile_started, submitted);
         Ok(submitted)
     }
 
@@ -377,10 +388,13 @@ impl Ext4 {
             .collect();
         let pool = rnvpc::pool().ok_or_else(|| Error::new(Errno::EINVAL))?;
         let started = batch_metrics::now();
-        if let Err(error) = pool.assign_migration_targets(&targets?, None) {
-            // Some selectors may already be durable: never free possibly named blocks.
-            self.fail_nv_migration();
-            return Err(error);
+        let targets = targets?;
+        for targets in targets.chunks(rnvpc::write_transaction::SSD_MIGRATION_BATCH_PAGES) {
+            if let Err(error) = pool.assign_migration_targets(targets, None) {
+                // Some selectors may already be durable: never free possibly named blocks.
+                self.fail_nv_migration();
+                return Err(error);
+            }
         }
         batch_metrics::elapsed(Phase::TargetPublish, started);
         batch_metrics::count(Event::TargetPages, allocated.len());
@@ -398,7 +412,7 @@ impl Ext4 {
         let _serial = self.nv_completion_lock.lock();
         // Move the whole backing queue to process context without allocating
         // or releasing object leases while holding its IRQ-safe spinlock.
-        let mut drained = VecDeque::with_capacity(MAX_IN_FLIGHT);
+        let mut drained = VecDeque::new();
         core::mem::swap(&mut *self.nv_completion_queue.lock(), &mut drained);
         if drained.is_empty() {
             return Ok(0);
@@ -424,12 +438,15 @@ impl Ext4 {
     }
 
     fn finish_nv_completion_batch(&self, batch: Arc<MigrationBatch>) -> Result<()> {
+        let completion_started = batch.completion_started();
+        let page_count = batch.page_count();
         let pool = rnvpc::pool().ok_or_else(|| Error::new(Errno::EINVAL))?;
         let (jobs, metadata_failed) = batch.take_jobs();
         if metadata_failed || jobs.iter().any(|job| job.status != BioStatus::Complete) {
             return_errno_with_message!(Errno::EIO, "orderless migration batch I/O failed");
         }
         let started = batch_metrics::now();
+        let device_flush_started = pp::now();
         if self.rnvpc_extend_enabled() {
             if self.block_device().sync()? != BioStatus::Complete {
                 return_errno!(Errno::EIO);
@@ -437,6 +454,7 @@ impl Ext4 {
         } else {
             self.persist_nv_allocations()?;
         }
+        pp::NV_DEVICE_FLUSH.record_since(device_flush_started, page_count);
         batch_metrics::elapsed(Phase::DataBarrier, started);
         let mut groups: BTreeMap<u64, Vec<PendingPage>> = BTreeMap::new();
         let mut failure = None;
@@ -447,43 +465,59 @@ impl Ext4 {
         }
         for (inode_id, pages) in groups {
             if self.rnvpc_extend_enabled() {
-                let updates: Vec<_> = pages
-                    .iter()
-                    .map(|page| rnvpc::write_transaction::SsdMigrationPage {
-                        logical_block: page.index,
-                        reference: page.reference.unwrap(),
-                        ssd_block: page.target,
-                    })
-                    .collect();
-                let results = rnvpc::write_transaction::migrate_mapped_nv_pages_to_ssd_by_reverse(
-                    pool,
-                    self.rnvpc_fs_id(),
-                    inode_id,
-                    &updates,
-                    None,
-                )?;
-                let mut reclaim = Vec::with_capacity(pages.len());
-                let mut released = 0;
-                for (page, result) in pages.into_iter().zip(results) {
-                    match result {
-                        Ok(consumed) => {
-                            released += usize::from(consumed);
-                            reclaim.push((page.lease, page.reference.unwrap()));
-                        }
-                        Err(error) => failure = Some(error),
+                let mut pages = pages.into_iter();
+                loop {
+                    let pages: Vec<_> = pages
+                        .by_ref()
+                        .take(rnvpc::write_transaction::SSD_MIGRATION_BATCH_PAGES)
+                        .collect();
+                    if pages.is_empty() {
+                        break;
                     }
+                    let updates: Vec<_> = pages
+                        .iter()
+                        .map(|page| rnvpc::write_transaction::SsdMigrationPage {
+                            logical_block: page.index,
+                            reference: page.reference.unwrap(),
+                            ssd_block: page.target,
+                        })
+                        .collect();
+                    let publish_started = pp::now();
+                    let results =
+                        rnvpc::write_transaction::migrate_mapped_nv_pages_to_ssd_by_reverse(
+                            pool,
+                            self.rnvpc_fs_id(),
+                            inode_id,
+                            &updates,
+                            None,
+                        );
+                    pp::NV_EXTENT_PUBLISH.record_since(publish_started, pages.len());
+                    let results = results?;
+                    let mut reclaim = Vec::with_capacity(pages.len());
+                    let mut released = 0;
+                    for (page, result) in pages.into_iter().zip(results) {
+                        match result {
+                            Ok(consumed) => {
+                                released += usize::from(consumed);
+                                reclaim.push((page.lease, page.reference.unwrap()));
+                            }
+                            Err(error) => failure = Some(error),
+                        }
+                    }
+                    if released != 0 {
+                        self.release_rnvpce_blocks(released as u64)?;
+                    }
+                    let started = batch_metrics::now();
+                    let reclaim_started = pp::now();
+                    let reclaimed = reclaim.len();
+                    if let Err(error) = pool.reclaim_migrated_pages(reclaim, None) {
+                        failure = Some(error);
+                    } else {
+                        batch_metrics::count(Event::ReclaimedPages, reclaimed);
+                    }
+                    pp::NV_RECLAIM.record_since(reclaim_started, reclaimed);
+                    batch_metrics::elapsed(Phase::Reclaim, started);
                 }
-                if released != 0 {
-                    self.release_rnvpce_blocks(released as u64)?;
-                }
-                let started = batch_metrics::now();
-                let reclaimed = reclaim.len();
-                if let Err(error) = pool.reclaim_migrated_pages(reclaim, None) {
-                    failure = Some(error);
-                } else {
-                    batch_metrics::count(Event::ReclaimedPages, reclaimed);
-                }
-                batch_metrics::elapsed(Phase::Reclaim, started);
             } else {
                 for page in pages {
                     let result = (|| {
@@ -520,6 +554,7 @@ impl Ext4 {
         if let Some(error) = failure {
             return Err(error);
         }
+        pp::NV_COMPLETION_TOTAL.record_since(completion_started, page_count);
         Ok(())
     }
 
@@ -561,7 +596,7 @@ impl Ext4 {
             return Ok(());
         }
         loop {
-            let submitted = self.migrate_nv_round(MAX_IN_FLIGHT)?;
+            let submitted = self.migrate_nv_round(MIGRATION_BATCH_PAGES)?;
             self.drain_nv_in_flight()?;
             if submitted == 0 {
                 break;

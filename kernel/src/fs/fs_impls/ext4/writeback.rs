@@ -6,11 +6,11 @@ use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use ostd::sync::WaitQueue;
 
-use super::{fs::Ext4, inode::Inode, prelude::*};
+use super::{fs::Ext4, inode::Inode, pipeline_profile as pp, prelude::*};
 use crate::vm::page_cache::PageCacheAccounting;
 
 pub(super) const IO_CHUNK: usize = 256 * 1024;
-const WRITEBACK_BATCH: usize = 1024;
+pub(super) const WRITEBACK_BATCH: usize = 1024;
 const RECLAIM_BATCH: usize = 4096;
 
 // Selects the worker's retry interval after one bounded round.
@@ -105,6 +105,7 @@ impl CachePressure {
             return_errno!(Errno::ENOMEM);
         }
         let mut waiting = false;
+        let mut wait_started = 0;
         let result = loop {
             if fs.is_shutdown() || self.failed.load(Ordering::Acquire) {
                 break Err(Error::with_message(
@@ -133,6 +134,7 @@ impl CachePressure {
             }
             drop(reserved);
             if !waiting {
+                wait_started = pp::now();
                 self.waiting.fetch_add(1, Ordering::AcqRel);
                 self.throttles.fetch_add(1, Ordering::Relaxed);
                 waiting = true;
@@ -159,6 +161,7 @@ impl CachePressure {
         };
         if waiting {
             self.waiting.fetch_sub(1, Ordering::Release);
+            pp::NATIVE_PRESSURE_WAIT.record_since(wait_started, pages);
         }
         result
     }
@@ -251,6 +254,7 @@ impl Ext4 {
     }
 
     pub(super) fn writeback_cache_round(&self) -> Result<bool> {
+        let profile_started = pp::now();
         self.ensure_not_shutdown()?;
         let pressure = &self.cache_pressure;
         let start = pressure.next_inode.load(Ordering::Relaxed) as Ext4Ino;
@@ -304,6 +308,7 @@ impl Ext4 {
         }
         pressure.progress_epoch.fetch_add(1, Ordering::Release);
         pressure.progress.wake_all();
+        pp::NATIVE_FLUSH_TOTAL.record_since(profile_started, written);
         Ok(written != 0 || reclaimed != 0)
     }
 }

@@ -22,6 +22,7 @@ fn ext4_research_routes() {
         nv_route_rnvpce_batch_allocation_durability,
         nv_route_rnvpce_recovers_unflushed_target_bitmap,
         nv_route_rnvpce_fragmented_batch_and_partial_rollback,
+        nv_route_rnvpce_round_budget_is_independent_of_global_in_flight,
         nv_route_rnvpce_capacity_wait_releases_inode_lock,
         nv_route_rnvpce_direct_partial_write_and_deferred_export,
         nv_route_rnvpc_wal_and_native_paths_remain_distinct,
@@ -29,6 +30,41 @@ fn ext4_research_routes() {
         nv_route_rnvpc_failed_allocation_flush_does_not_append_wal,
         nv_route_mount_rejects_switching_persistent_authority,
     );
+}
+
+fn nv_route_rnvpce_round_budget_is_independent_of_global_in_flight() {
+    use core::sync::atomic::Ordering;
+
+    crate::fs::rnvpc::init_for_ext4_tests();
+    crate::time::clocks::init_for_ktest();
+    let fixture = Ext4FixtureBuilder::new(2048, 256, 2048)
+        .with_block_bitmap_metadata_marked()
+        .with_uuid([0xb2; 16])
+        .with_mount_options("rnvpce=on,rtio=off")
+        .build()
+        .unwrap();
+    fixture.write_raw_inode(11, &make_empty_file_inode());
+    let inode = fixture.ext4.read_inode(11).unwrap();
+    let bytes = vec![0x47; 2 * PAGE_SIZE];
+    inode
+        .write_at(3, &mut VmReader::from(bytes.as_slice()).to_fallible())
+        .unwrap();
+
+    let prior_in_flight = usize::MAX / 2;
+    fixture
+        .ext4
+        .nv_in_flight
+        .store(prior_in_flight, Ordering::Release);
+    let submitted = fixture.ext4.migrate_nv_round(64).unwrap();
+    fixture
+        .ext4
+        .nv_in_flight
+        .fetch_sub(prior_in_flight, Ordering::AcqRel);
+    assert!(
+        submitted > 0,
+        "a migration round must not consume a global in-flight budget"
+    );
+    fixture.ext4.drain_nv_in_flight().unwrap();
 }
 
 fn nv_route_rnvpce_clean_journal_is_unused() {

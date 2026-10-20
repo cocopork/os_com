@@ -74,6 +74,18 @@ impl CapacityState {
         Ok(())
     }
 
+    pub(super) fn before_allocate_many(&mut self, class: PoolClass, pages: usize) -> Result<()> {
+        if pages > self.total_pages.saturating_sub(self.used_pages()) {
+            return_errno_with_message!(Errno::ENOSPC, "RNVPC capacity is exhausted");
+        }
+        if class == PoolClass::Data && pages > self.data_limit_pages.saturating_sub(self.data_pages)
+        {
+            self.backpressure_events += 1;
+            return_errno_with_message!(Errno::EAGAIN, "RNVPC data hard limit reached");
+        }
+        Ok(())
+    }
+
     pub(super) fn account_allocate(&mut self, class: PoolClass) -> bool {
         match class {
             PoolClass::Metadata => self.metadata_pages += 1,

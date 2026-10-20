@@ -800,6 +800,56 @@ fn descriptor_update_keeps_old_committed_copy_on_crash() {
 }
 
 #[ktest]
+fn data_frame_batch_commit_uses_two_fences_and_recovers() {
+    use super::{descriptor::NvDescriptor, dram::DramNvImage, persist::PersistEngine};
+    let config = RnvpcConfig::from_bytes(
+        Some(8 * PAGE_SIZE),
+        Some(2 * PAGE_SIZE),
+        Some(6 * PAGE_SIZE),
+        Some(NvSimMode::Model),
+    )
+    .unwrap()
+    .unwrap();
+    let image = DramNvImage::allocate_model(config).unwrap();
+    let backend = Arc::new(image.attach());
+    let engine = PersistEngine::new(backend.clone(), 8).unwrap();
+    engine.format().unwrap();
+    let updates: Vec<_> = (0..3)
+        .map(|slot| {
+            backend
+                .write_page(
+                    NvPageId::try_from(slot).unwrap(),
+                    &[slot as u8 + 1; PAGE_SIZE],
+                )
+                .unwrap();
+            (
+                slot,
+                NvDescriptor::for_nv_page(81, 82, slot as u64, 0, 1)
+                    .with_allocation_seq(slot as u64 + 1)
+                    .unwrap(),
+            )
+        })
+        .collect();
+    let before = backend.stats();
+    engine.commit_frames(&updates, None).unwrap();
+    let after = backend.stats();
+    assert_eq!(after.fence_calls - before.fence_calls, 2);
+    assert_eq!(after.persist_calls - before.persist_calls, 9);
+
+    image.simulate_crash();
+    let backend = Arc::new(image.attach());
+    let recovered = PersistEngine::new(backend.clone(), 8).unwrap();
+    for (slot, descriptor) in updates {
+        assert_eq!(recovered.read_entry(slot).unwrap(), Some(descriptor));
+        let mut data = [0; PAGE_SIZE];
+        backend
+            .read_page(NvPageId::try_from(slot).unwrap(), &mut data)
+            .unwrap();
+        assert_eq!(data, [slot as u8 + 1; PAGE_SIZE]);
+    }
+}
+
+#[ktest]
 fn descriptor_batch_publication_and_clear_survive_partial_crash() {
     use super::{descriptor::NvDescriptor, dram::DramNvImage, persist::PersistEngine};
     for fault in [

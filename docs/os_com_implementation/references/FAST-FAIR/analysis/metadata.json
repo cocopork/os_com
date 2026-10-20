@@ -1,0 +1,25 @@
+{
+  "title": "Endurable Transient Inconsistency in Byte-Addressable Persistent B+-Tree",
+  "authors": [
+    "Deukyeon Hwang",
+    "Wook-Hee Kim",
+    "Youjip Won",
+    "Beomseok Nam"
+  ],
+  "venue": "16th USENIX Conference on File and Storage Technologies (FAST 2018)",
+  "year": 2018,
+  "pages": "187–200",
+  "pdf_pages": 15,
+  "source": "E:\\GGBoy\\HSSL\\Project\\Ant\\AchillesFS\\relate_works\\FAST&FAIR.pdf",
+  "paper_url": "https://www.usenix.org/conference/fast18/presentation/hwang",
+  "figure_count": 8,
+  "table_count": 0,
+  "reference_count": 49,
+  "extracted_at": "2026-10-20",
+  "notes": [
+    "PDF includes a cover page.",
+    "Column extraction can split wide figure captions; full-page text and rendered pages are retained.",
+    "Analysis is based on the supplied PDF, not an external literature survey."
+  ],
+  "abstract": "With the emergence of byte-addressable persistent\nmemory (PM), a cache line, instead of a page, is expected\nto be the unit of data transfer between volatile and non-\nvolatile devices, but the failure-atomicity of write oper-\nations is guaranteed in the granularity of 8 bytes rather\nthan cache lines. This granularity mismatch problem has\ngenerated interest in redesigning block-based data struc-\ntures such as B+-trees. However, various methods of\nmodifying B+-trees for PM degrade the efﬁciency of B+-\ntrees, and attempts have been made to use in-memory\ndata structures for PM.\n  In  this  study, we  develop  Failure-Atomic  ShifT\n(FAST) and Failure-Atomic In-place Rebalance (FAIR)\nalgorithms to resolve the granularity mismatch problem.\nEvery 8-byte store instruction used in the FAST and\nFAIR algorithms transforms a B+-tree into another con-\nsistent state or a transient inconsistent state that read op-\nerations can tolerate. By making read operations tolerate\ntransient inconsistency, we can avoid expensive copy-on-\nwrite, logging, and even the necessity of read latches so\nthat read transactions can be non-blocking. Our experi-\nmental results show that legacy B+-trees with FAST and\nFAIR schemes outperform the state-of-the-art persistent\nindexing structures by a large margin."
+}

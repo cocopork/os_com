@@ -26,15 +26,20 @@ def main():
     parser.add_argument('--skip-format', action='store_true')
     parser.add_argument('--variant', choices=['ext4', 'rnvpce'], required=True)
     parser.add_argument('--rw', choices=['randwrite', 'write'], required=True)
-    parser.add_argument('--jobs', type=int, choices=[1,16], required=True)
+    parser.add_argument('--jobs', type=int, required=True)
+    parser.add_argument('--bs', choices=['4k', '16k', '64k', '128k'])
     parser.add_argument('--total-mib', type=int, default=2048)
     parser.add_argument('--runtime', type=int, default=60)
     args = parser.parse_args()
+    if not 1 <= args.jobs <= 32:
+        parser.error('jobs must be between 1 and 32')
     if not 1 <= args.runtime <= 600:
         parser.error('runtime must be between 1 and 600 seconds')
     if args.total_mib not in [16,32,2048]:
         parser.error('Supported total sizes: 16,32,2048 MiB')
-    case = f'{args.variant}-{args.rw}-j{args.jobs}-{args.total_mib}m'
+    bs = args.bs or ('4k' if args.rw == 'randwrite' else '128k')
+    workload = args.rw if args.bs is None else f'{args.rw}{bs}'
+    case = f'{args.variant}-{workload}-j{args.jobs}-{args.total_mib}m'
     if not args.format_authorized:
         parser.error('Requires prior user authorization and --format-authorized')
     target = ALLOWED[args.device]
@@ -52,7 +57,8 @@ def main():
         'iso_sha256': hashlib.sha256((art / 'selected.iso').read_bytes()).hexdigest(),
         'cpus': 64, 'memory': '8G', 'queue_depth': 1024,
         'direct': 0, 'engine': 'psync', 'fsync': 0, 'total_mib': args.total_mib,
-        'variant': args.variant, 'rw': args.rw, 'jobs': args.jobs, 'runtime_cap_seconds': args.runtime,
+        'variant': args.variant, 'rw': args.rw, 'bs': bs, 'jobs': args.jobs,
+        'runtime_cap_seconds': args.runtime,
         'kernel_diff_sha256': hashlib.sha256(subprocess.check_output(['git', '-C', str(ROOT), 'diff', '--binary', '--', 'kernel'])).hexdigest(),
         'pool_mib':128, 'metadata_reserve_mib':64, 'data_limit_mib':64,
         'size_policy': 'total_mib/jobs MiB per independent inode; runtime cap per runtime_cap_seconds; partial writes retained',
@@ -64,7 +70,7 @@ def main():
             'extent,filetype,^metadata_csum,^dir_index,^64bit,^flex_bg,^inline_data,^orphan_file,has_journal', '/dev/benchmark-target'])
     guest = Path(__file__).with_name('guest.sh')
     cfg = art / 'case.cfg'
-    cfg.write_text(f'CASE={case}\nVARIANT={args.variant}\nRW={args.rw}\nBS={"4k" if args.rw == "randwrite" else "128k"}\nJOBS={args.jobs}\nTOTAL_MB={args.total_mib}\nRUNTIME={args.runtime}\n')
+    cfg.write_text(f'CASE={case}\nVARIANT={args.variant}\nRW={args.rw}\nBS={bs}\nJOBS={args.jobs}\nTOTAL_MB={args.total_mib}\nRUNTIME={args.runtime}\n')
     for command in ['rm /rebuild-fio.cfg', f'write {cfg} /rebuild-fio.cfg']:
         subprocess.run(['debugfs', '-w', '-R', command, str(art / 'ext2.img')], check=True, capture_output=True)
     for command in ['rm /rebuild-fio.sh', f'write {guest} /rebuild-fio.sh']:

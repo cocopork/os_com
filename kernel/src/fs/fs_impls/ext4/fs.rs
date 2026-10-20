@@ -410,9 +410,7 @@ impl Ext4 {
             nv_migration_epoch: AtomicUsize::new(0),
             nv_capacity_waiters: AtomicUsize::new(0),
             nv_completion_lock: Mutex::new(()),
-            nv_completion_queue: Arc::new(SpinLock::new(VecDeque::with_capacity(
-                super::migration::MAX_IN_FLIGHT,
-            ))),
+            nv_completion_queue: Arc::new(SpinLock::new(VecDeque::new())),
             nv_completion_trigger: Arc::new(ostd::sync::WaitQueue::new()),
             nv_in_flight: AtomicUsize::new(0),
             nv_migration_failed: AtomicBool::new(false),

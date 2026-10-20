@@ -1152,6 +1152,13 @@ struct SplitRightChild {
     reference: PersistentObjectRef,
 }
 
+struct RoutedLeaf {
+    reference: PersistentObjectRef,
+    record: BoxedMetadataRecord<ExtentNodeRecord>,
+    parent: Option<(PersistentObjectRef, usize)>,
+    upper_bound: Option<u64>,
+}
+
 impl ExtentMutation {
     /// Inserts one mapping into a persistent leaf and coalesces compatible SSD runs.
     pub(crate) fn insert_leaf_extent(
@@ -1229,13 +1236,83 @@ impl ExtentMutation {
         if replacements.is_empty() {
             return_errno_with_message!(Errno::EINVAL, "extent replacement set is empty");
         }
-        let mut root = current_root;
         for replacement in replacements {
             self.validate_data_extent(replacement)?;
-            root = self.prepare_root_for_local_update(root, fault)?;
-            self.replace_one_tree_extent_top_down(root, *replacement, fault)?;
+        }
+        let mut root = current_root;
+        let mut cursor = 0usize;
+        while cursor < replacements.len() {
+            let routed = self.route_leaf(root, replacements[cursor].logical_block())?;
+            let mut entries = Vec::from(routed.record.entries()?);
+            let mut accepted = 0usize;
+            let mut previous_logical = None;
+            for replacement in &replacements[cursor..] {
+                if previous_logical.is_some_and(|previous| replacement.logical_block() < previous)
+                    || routed
+                        .upper_bound
+                        .is_some_and(|upper| replacement.logical_block() >= upper)
+                {
+                    break;
+                }
+                let mut candidate = entries.clone();
+                replace_leaf_entry(&mut candidate, *replacement)?;
+                merge_leaf_entries(&mut candidate)?;
+                if candidate.len() > EXTENT_NODE_ENTRY_CAPACITY {
+                    break;
+                }
+                entries = candidate;
+                previous_logical = Some(replacement.logical_block());
+                accepted += 1;
+            }
+            if accepted == 0 {
+                root = self.prepare_root_for_local_update(root, fault)?;
+                self.replace_one_tree_extent_top_down(root, replacements[cursor], fault)?;
+                cursor += 1;
+                continue;
+            }
+            self.rewrite_leaf_and_route(
+                routed.reference,
+                &routed.record,
+                &entries,
+                routed.parent,
+                fault,
+            )?;
+            cursor += accepted;
         }
         self.committed_node(root)
+    }
+
+    fn route_leaf(&self, root: PersistentObjectRef, logical_block: u64) -> Result<RoutedLeaf> {
+        let mut current = root;
+        let mut parent = None;
+        let mut upper_bound: Option<u64> = None;
+        loop {
+            let node = self.read_locked_node(current)?;
+            self.validate_owner(&node)?;
+            if node.level() == 0 {
+                return Ok(RoutedLeaf {
+                    reference: current,
+                    record: node,
+                    parent,
+                    upper_bound,
+                });
+            }
+            let entries = node.entries()?;
+            let child_index = entries
+                .iter()
+                .rposition(|entry| entry.logical_block() <= logical_block)
+                .unwrap_or(0);
+            if let Some(next) = entries.get(child_index + 1) {
+                upper_bound = Some(upper_bound.map_or(next.logical_block(), |bound| {
+                    bound.min(next.logical_block())
+                }));
+            }
+            let child = entries[child_index]
+                .child_ref()
+                .ok_or_else(|| Error::new(Errno::EUCLEAN))?;
+            parent = Some((current, child_index));
+            current = child;
+        }
     }
 
     /// Keeps two free slots on every node along the insertion path. Replacing

@@ -1020,14 +1020,70 @@ impl Rnvpc {
             .pages
             .try_reserve_exact(pages)
             .map_err(|_| Error::with_message(Errno::ENOMEM, "RNVPC reservation allocation"))?;
-        for _ in 0..pages {
-            match self.alloc_data_page() {
-                Ok(page) => reservation.pages.push(page),
-                Err(error) => {
-                    // 守卫析构会归还已经拿到的页；这里原样把错误抛给调用方重试。
-                    return Err(error);
+        loop {
+            let needs_repair_drain = {
+                let mut allocation = self.allocation.lock();
+                let stats = allocation.capacity.stats();
+                if pages
+                    > self
+                        .config
+                        .data_limit_pages()
+                        .saturating_sub(stats.data_pages)
+                {
+                    allocation
+                        .capacity
+                        .before_allocate_many(PoolClass::Data, pages)?;
                 }
+                pages > stats.free_pages || pages > allocation.free_ids.len()
+            };
+            if !needs_repair_drain {
+                break;
             }
+            let Some(frame) = self.repair_workspace.lock().drain_one() else {
+                break;
+            };
+            self.free_frame(frame)?;
+        }
+        let mut wake = false;
+        {
+            let mut allocation = self.allocation.lock();
+            allocation
+                .capacity
+                .before_allocate_many(PoolClass::Data, pages)?;
+            if pages > allocation.free_ids.len() {
+                return_errno_with_message!(Errno::ENOSPC, "RNVPC capacity is exhausted");
+            }
+            let pages_u64 = u64::try_from(pages).map_err(|_| Error::new(Errno::EOVERFLOW))?;
+            allocation
+                .next_alloc_seq
+                .checked_add(pages_u64)
+                .ok_or_else(|| Error::new(Errno::EOVERFLOW))?;
+            for index in allocation.free_ids.iter().rev().take(pages) {
+                NvPageId::try_from(*index).map_err(|_| Error::new(Errno::EOVERFLOW))?;
+            }
+            for _ in 0..pages {
+                allocation.capacity.before_allocate(PoolClass::Data)?;
+                let index = allocation
+                    .free_ids
+                    .pop()
+                    .ok_or_else(|| Error::new(Errno::ENOSPC))?;
+                let mut objects = self.objects.lock(index);
+                let record = &mut objects.records[index];
+                debug_assert_eq!(record.kind, ObjectKind::Free);
+                record.kind = ObjectKind::Data(DataPageState::Staged);
+                record.persisting = false;
+                record.committed = false;
+                record.key = None;
+                record.version = 0;
+                record.alloc_seq = allocation.next_alloc_seq;
+                allocation.next_alloc_seq += 1;
+                objects.reverse = None;
+                wake |= allocation.capacity.account_allocate(PoolClass::Data);
+                reservation.pages.push(NvPageId::try_from(index).unwrap());
+            }
+        }
+        if wake {
+            self.wake_high_water();
         }
         Ok(reservation)
     }
@@ -1419,6 +1475,45 @@ impl Rnvpc {
             allocation_seq,
         });
         Ok(true)
+    }
+
+    pub(crate) fn enqueue_dirty_nvrefs(&self, references: &[PersistentObjectRef]) -> Result<usize> {
+        let mut state = self.state.lock();
+        let mut inserted = 0usize;
+        for reference in references {
+            let slot = usize::try_from(reference.slot().ok_or_else(|| Error::new(Errno::EINVAL))?)
+                .map_err(|_| Error::new(Errno::EOVERFLOW))?;
+            let page = NvPageId::try_from(slot).map_err(|_| Error::new(Errno::EOVERFLOW))?;
+            let mut objects = self.objects.lock_checked(slot)?;
+            let record = objects
+                .records
+                .get(slot)
+                .ok_or_else(|| Error::new(Errno::EINVAL))?;
+            if !record.committed
+                || record.alloc_seq != reference.allocation_seq()
+                || record.kind != ObjectKind::Data(DataPageState::NvDirty)
+            {
+                return_errno_with_message!(Errno::ESTALE, "dirty NVPage generation is stale");
+            }
+            if objects.reverse.is_none() {
+                return_errno_with_message!(
+                    Errno::EUCLEAN,
+                    "published NV extent has no reverse locator"
+                );
+            }
+            let identity = (slot, reference.allocation_seq());
+            if LATENCY_ENABLED {
+                objects.records[slot].profile_commit_ns = read_ns();
+            }
+            if state.dirty_members.insert(identity) {
+                state.dirty_queue.push_back(DirtyNvPage {
+                    page,
+                    allocation_seq: reference.allocation_seq(),
+                });
+                inserted += 1;
+            }
+        }
+        Ok(inserted)
     }
 
     pub(crate) fn collect_dirty_nvpages(&self, budget: usize) -> Vec<DirtyNvPage> {
@@ -3436,6 +3531,125 @@ impl Rnvpc {
         fault: Option<FaultPoint>,
     ) -> Result<Option<NvPageId>> {
         self.commit_data_page_with_key(id, key, fault, true, Some(ssd_backing_block))
+    }
+
+    pub(crate) fn replace_data_pages_in_owner_at(
+        &self,
+        pages: &[(NvPageId, PageKey, u64)],
+        fault: Option<FaultPoint>,
+    ) -> Result<Vec<Option<NvPageId>>> {
+        if pages.is_empty() {
+            return Ok(Vec::new());
+        }
+        if pages.len() > 128 {
+            return_errno_with_message!(Errno::EINVAL, "NVPage commit batch exceeds 128 pages");
+        }
+        let mut prepared = Vec::new();
+        prepared
+            .try_reserve_exact(pages.len())
+            .map_err(|_| Error::new(Errno::ENOMEM))?;
+        let preparation = (|| -> Result<()> {
+            let state = self.state.lock();
+            let mut ids = BTreeSet::new();
+            let mut keys = BTreeSet::new();
+            for (id, key, ssd_backing_block) in pages {
+                if !ids.insert(id.index()) || !keys.insert(*key) {
+                    return_errno_with_message!(Errno::EINVAL, "duplicate NVPage commit target");
+                }
+                if self
+                    .objects
+                    .get(id.index())
+                    .is_some_and(|record| record.committed)
+                {
+                    return_errno_with_message!(Errno::EBUSY, "RNVPC object is already committed");
+                }
+                let old = self.committed_version_of_key(&state, id.index(), *key);
+                let version = old
+                    .map(|(_, previous_version)| {
+                        previous_version
+                            .checked_add(1)
+                            .ok_or_else(|| Error::new(Errno::EOVERFLOW))
+                    })
+                    .transpose()?
+                    .unwrap_or(1);
+                let mut objects = self.objects.lock(id.index());
+                self.pin_persistent_update(
+                    &mut objects,
+                    id.index(),
+                    ObjectKind::Data(DataPageState::NvDirty),
+                )?;
+                prepared.push((
+                    *id,
+                    *key,
+                    *ssd_backing_block,
+                    version,
+                    old.map(|(index, _)| index),
+                ));
+            }
+            Ok(())
+        })();
+        if let Err(error) = preparation {
+            self.abort_data_commit_batch(&prepared);
+            return Err(error);
+        }
+        let mut updates = Vec::new();
+        if updates.try_reserve_exact(prepared.len()).is_err() {
+            self.abort_data_commit_batch(&prepared);
+            return_errno!(Errno::ENOMEM);
+        }
+        for (id, key, ssd_backing_block, version, _) in &prepared {
+            let descriptor = match self.descriptor_for(
+                PoolClass::Data,
+                *key,
+                *version,
+                id.index(),
+                Some(*ssd_backing_block),
+            ) {
+                Ok(descriptor) => descriptor,
+                Err(error) => {
+                    self.abort_data_commit_batch(&prepared);
+                    return Err(error);
+                }
+            };
+            updates.push((id.index(), descriptor));
+        }
+        let result = self.persist.commit_frames(&updates, fault);
+        let mut state = self.state.lock();
+        for (id, key, ssd_backing_block, version, _) in &prepared {
+            let mut objects = self.objects.lock(id.index());
+            objects.records[id.index()].pins -= 1;
+            objects.records[id.index()].persisting = false;
+            self.account_unpin();
+            if result.is_ok() {
+                objects.records[id.index()].committed = true;
+                objects.records[id.index()].key = Some(*key);
+                objects.records[id.index()].version = *version;
+                state.index.insert(
+                    *key,
+                    PageEntry {
+                        residency: Residency::Nv,
+                        handle: Some(RuntimeHandle::Nv(*id)),
+                        ssd_backing_block: *ssd_backing_block,
+                        state: NvObjectState::NvDirty,
+                    },
+                );
+            }
+        }
+        result.map(|_| {
+            prepared
+                .into_iter()
+                .map(|(_, _, _, _, old)| old.and_then(|index| NvPageId::try_from(index).ok()))
+                .collect()
+        })
+    }
+
+    fn abort_data_commit_batch(&self, prepared: &[(NvPageId, PageKey, u64, u64, Option<usize>)]) {
+        for (id, _, _, _, _) in prepared {
+            let mut objects = self.objects.lock(id.index());
+            objects.records[id.index()].pins -= 1;
+            objects.records[id.index()].persisting = false;
+            self.account_unpin();
+        }
     }
 
     fn commit_data_page_inner(

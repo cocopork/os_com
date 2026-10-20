@@ -30,6 +30,7 @@ use ostd::{
 use xarray::{Cursor, LockedXArray, XArray};
 
 use crate::{
+    fs::pipeline_profile as pp,
     prelude::*,
     vm::page_cache::{CachePage, CachePageExt, PageCacheAccounting, PageCacheBackend},
 };
@@ -805,6 +806,7 @@ impl<'a> BackedVmo<'a> {
         if limit == 0 {
             return Ok(0);
         }
+        let scan_started = pp::now();
         let mut pages = Vec::with_capacity(limit);
         {
             let locked = self.pages.lock();
@@ -821,9 +823,14 @@ impl<'a> BackedVmo<'a> {
             }
         }
         let count = pages.len();
+        pp::NATIVE_DIRTY_SCAN.record_since(scan_started, count);
         let mut batch = IoBatch::with_capacity(count);
+        let submit_started = pp::now();
         let submitted = self.backend.write_pages_async_batch(pages, &mut batch);
+        pp::NATIVE_DATA_SUBMIT.record_since(submit_started, count);
+        let wait_started = pp::now();
         let completed = batch.wait_all().map_err(Into::into);
+        pp::NATIVE_COMPLETION_WAIT.record_since(wait_started, count);
         submitted.and(completed)?;
         Ok(count)
     }

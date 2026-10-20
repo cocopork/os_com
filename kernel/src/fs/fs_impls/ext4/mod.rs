@@ -52,6 +52,7 @@ pub(super) fn init() {
 }
 
 mod migration;
+pub(crate) mod pipeline_profile;
 mod stats;
 mod writeback;
 pub(crate) use stats::*;

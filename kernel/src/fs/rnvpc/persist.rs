@@ -107,6 +107,27 @@ impl PersistEngine {
         self.publish_descriptors(&[(index, *descriptor)], fault)
     }
 
+    /// Persists a set of independent data frames before publishing their
+    /// descriptors with one pair of ordering fences.
+    pub(super) fn commit_frames(
+        &self,
+        updates: &[(usize, NvDescriptor)],
+        fault: Option<FaultPoint>,
+    ) -> Result<()> {
+        self.ensure_writable()?;
+        if updates.len() > 128 {
+            return_errno!(Errno::EINVAL);
+        }
+        for (index, descriptor) in updates {
+            self.check_descriptor(*index, descriptor)?;
+        }
+        inject(fault, FaultPoint::BeforeContentPersist)?;
+        for (index, _) in updates {
+            self.backend.persist(index * PAGE_SIZE, PAGE_SIZE)?;
+        }
+        self.publish_descriptors(updates, fault)
+    }
+
     /// Updates already committed descriptors without persisting unchanged data.
     /// The caller owns an exclusive mutation/eviction lease for every entry.
     pub(super) fn update_descriptors(

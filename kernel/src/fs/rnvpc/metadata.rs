@@ -669,7 +669,6 @@ impl ExtentNodeRecord {
             size_of::<Self>() - size_of::<PersistentMetadataHeader>(),
         )?;
         self.parent.validate()?;
-        self.right_sibling.validate()?;
         let count = self.entry_count as usize;
         if count > EXTENT_NODE_ENTRY_CAPACITY
             || (count == 0

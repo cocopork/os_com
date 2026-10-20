@@ -256,6 +256,58 @@ fn rnvpce_migration_credit_release_survives_persistent_ledger_failure() {
 }
 
 #[ktest]
+fn rnvpce_foreground_batch_updates_each_leaf_once() {
+    const FS_ID: u64 = 0x9920;
+    const INODE: u64 = 30;
+    let (_image, _config, pool) = restartable_pool(32);
+    let snapshot = AuthoritySnapshot::new(1, &[], 0, 0, 0o100644, 0).unwrap();
+    bootstrap_inode_authority(pool.clone(), FS_ID, INODE, &snapshot, None).unwrap();
+    let pages = [
+        RangeWritePage::new(0, 0, 0, PAGE_SIZE, true).unwrap(),
+        RangeWritePage::new(1, 0, 0, PAGE_SIZE, true).unwrap(),
+    ];
+    let request = RangeWriteBatch::new(
+        2,
+        0,
+        2 * PAGE_SIZE,
+        &[],
+        &pages,
+        0,
+        0,
+        (PAGE_SIZE / 512) as u64,
+    )
+    .unwrap();
+    let input = [0x64u8; 2 * PAGE_SIZE];
+    commit_range_write(
+        pool.clone(),
+        FS_ID,
+        INODE,
+        &request,
+        &mut VmReader::from(&input[..]).to_fallible(),
+        |_block, _staging| panic!("full-page write must not load SSD"),
+        None,
+    )
+    .unwrap();
+
+    let first = mapped_nv_page_ref(&pool, FS_ID, INODE, 0).unwrap().unwrap();
+    let second = mapped_nv_page_ref(&pool, FS_ID, INODE, 1).unwrap().unwrap();
+    let first_reverse = pool.reverse_lookup(first).unwrap().unwrap();
+    let second_reverse = pool.reverse_lookup(second).unwrap().unwrap();
+    assert_eq!(first_reverse.leaf_slot(), second_reverse.leaf_slot());
+    let leaf_ref = pool
+        .persistent_metadata_ref(NvFrameId::try_from(first_reverse.leaf_slot() as usize).unwrap())
+        .unwrap();
+    let leaf = pool
+        .read_authoritative_metadata::<ExtentNodeRecord>(leaf_ref)
+        .unwrap();
+    assert_eq!(
+        leaf.header().generation(),
+        2,
+        "one foreground batch must persist a shared leaf once"
+    );
+}
+
+#[ktest]
 fn rnvpce_batch_migration_updates_each_leaf_once() {
     const FS_ID: u64 = 0x9921;
     const INODE: u64 = 31;

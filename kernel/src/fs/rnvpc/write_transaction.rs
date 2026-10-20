@@ -14,7 +14,6 @@ use super::{
     extent_mutation::{ExtentMutation, SsdExtentUpdate},
     fault::FaultPoint,
     frame::Rnvpc,
-    id::NvPageId,
     index::{PageKey, ReverseExtentRef},
     metadata::{
         AllocationRecord, AuthoritativeMetadataRecord, EXTENT_NODE_ENTRY_CAPACITY, ExtentDataRef,
@@ -1063,8 +1062,12 @@ where
     committed_pages
         .try_reserve_exact(request.pages.len())
         .map_err(|_| Error::new(Errno::ENOMEM))?;
+    let mut pending_new_pages = Vec::new();
+    pending_new_pages
+        .try_reserve_exact(new_page_count)
+        .map_err(|_| Error::new(Errno::ENOMEM))?;
     for (page, (old_entry, existing)) in request.pages.iter().zip(existing_refs) {
-        let page_result = (|| -> Result<(usize, PersistentObjectRef)> {
+        let page_result = (|| -> Result<(usize, Option<PersistentObjectRef>)> {
             if let Some(reference) = existing {
                 if pool.validate_persistent_data_ref(reference)?
                     != PageKey::new(fs_id, inode, page.logical_block)
@@ -1079,7 +1082,7 @@ where
                 let amount = data.copy_from_reader(page.page_offset, reader, page.len, None)?;
                 LATENCY_STATS.fg_copy.record_since(t_copy);
                 data.finish();
-                Ok((amount, reference))
+                Ok((amount, Some(reference)))
             } else {
                 let t_init = read_ns();
                 let mut staging = pool.begin_reserved_data_page(&mut reservation)?;
@@ -1101,28 +1104,19 @@ where
                 if amount == 0 {
                     return_errno_with_message!(Errno::EFAULT, "write copied no user bytes");
                 }
-                let t_register = read_ns();
                 let id = staging.finish()?;
                 pool.transition_data_page(id, DataPageState::Staged, DataPageState::NvDirty)?;
-                pool.replace_data_page_in_owner_at(
+                pending_new_pages.push((
                     id,
                     PageKey::new(fs_id, inode, page.logical_block),
                     page.ssd_block,
-                    None,
-                )?;
-                let reference = pool.persistent_data_ref(id)?;
-                LATENCY_STATS.fg_data_register.record_since(t_register);
-                replacements.push(ExtentRecordEntry::nv_leaf(
-                    page.logical_block,
-                    reference,
-                    false,
-                )?);
+                ));
                 if page.newly_allocated {
                     newly_mapped = newly_mapped
                         .checked_add(1)
                         .ok_or_else(|| Error::new(Errno::EOVERFLOW))?;
                 }
-                Ok((amount, reference))
+                Ok((amount, None))
             }
         })();
         let (page_copied, reference) = match page_result {
@@ -1130,7 +1124,9 @@ where
             Err(_) if copied != 0 => break,
             Err(error) => return Err(error),
         };
-        committed_pages.push((page.logical_block, reference));
+        if let Some(reference) = reference {
+            committed_pages.push(reference);
+        }
         copied = copied
             .checked_add(page_copied)
             .ok_or_else(|| Error::new(Errno::EOVERFLOW))?;
@@ -1138,6 +1134,20 @@ where
             break;
         }
     }
+    let t_register = read_ns();
+    for batch in pending_new_pages.chunks(128) {
+        pool.replace_data_pages_in_owner_at(batch, None)?;
+    }
+    for (id, key, _) in &pending_new_pages {
+        let reference = pool.persistent_data_ref(*id)?;
+        replacements.push(ExtentRecordEntry::nv_leaf(
+            key.page_index,
+            reference,
+            false,
+        )?);
+        committed_pages.push(reference);
+    }
+    LATENCY_STATS.fg_data_register.record_since(t_register);
     if copied == 0 {
         return_errno_with_message!(Errno::EFAULT, "write copied no user bytes");
     }
@@ -1190,22 +1200,10 @@ where
     )?;
     LATENCY_STATS.fg_inode_publish.record_since(started);
     let started = read_ns();
-    for (_logical_block, reference) in committed_pages {
-        // Local extent mutation installs or retargets the reverse locator
-        // while holding the same per-inode publication exclusion. Do not walk
-        // the tree again per page merely to rediscover that leaf slot.
-        if pool.reverse_lookup(reference)?.is_none() {
-            return_errno_with_message!(
-                Errno::EUCLEAN,
-                "published NV extent has no reverse locator"
-            );
-        }
-        let page = NvPageId::try_from(
-            usize::try_from(reference.slot().ok_or_else(|| Error::new(Errno::EUCLEAN))?)
-                .map_err(|_| Error::new(Errno::EOVERFLOW))?,
-        )?;
-        let _ = pool.enqueue_dirty_nvpage(page, reference.allocation_seq())?;
-    }
+    // Local extent mutation installs the reverse locators under the same
+    // publication exclusion. Validate and queue the whole copied prefix while
+    // holding the pool control lock once.
+    pool.enqueue_dirty_nvrefs(&committed_pages)?;
     LATENCY_STATS.fg_enqueue.record_since(started);
     LATENCY_STATS.fg_body.record_since(body_started);
     Ok(CommittedRangeWrite {
