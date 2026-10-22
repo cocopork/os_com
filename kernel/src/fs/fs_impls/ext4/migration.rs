@@ -16,6 +16,7 @@ use crate::fs::rnvpc::{
     self,
     batch_metrics::{self, Event, Phase},
     frame::EvictingDataPage,
+    index::ReverseExtentRef,
     metadata::PersistentObjectRef,
 };
 
@@ -36,6 +37,7 @@ struct PendingPage {
     generation: u64,
     target: u64,
     reference: Option<PersistentObjectRef>,
+    reverse: Option<ReverseExtentRef>,
     lease: EvictingDataPage,
 }
 
@@ -170,7 +172,10 @@ impl Ext4 {
         let candidate_started = pp::now();
         let mut pages = Vec::new();
         if self.rnvpc_extend_enabled() {
-            for candidate in rnvpc::rnvpce_flush_candidates(self.rnvpc_fs_id(), budget) {
+            let candidates = rnvpc::rnvpce_flush_candidates(self.rnvpc_fs_id(), budget);
+            let mut claimed = Vec::new();
+            let mut group_counts = BTreeMap::new();
+            for candidate in candidates {
                 let lease = match pool
                     .pin_for_writeback_seq(candidate.page, candidate.reference.allocation_seq())
                 {
@@ -183,6 +188,25 @@ impl Ext4 {
                         continue;
                     }
                 };
+                *group_counts
+                    .entry((
+                        candidate.reverse.leaf_slot(),
+                        candidate.reverse.entry_index(),
+                    ))
+                    .or_insert(0usize) += 1;
+                claimed.push((candidate, lease));
+            }
+            for (candidate, lease) in claimed {
+                let complete = group_counts.get(&(
+                    candidate.reverse.leaf_slot(),
+                    candidate.reverse.entry_index(),
+                )) == Some(&candidate.extent_pages);
+                if !complete {
+                    let _ = pool
+                        .enqueue_dirty_nvpage(candidate.page, candidate.reference.allocation_seq());
+                    drop(lease);
+                    continue;
+                }
                 pages.push(PendingPage {
                     inode: candidate.inode,
                     index: candidate.page_index,
@@ -190,6 +214,7 @@ impl Ext4 {
                     generation: candidate.reference.allocation_seq(),
                     target: candidate.target,
                     reference: Some(candidate.reference),
+                    reverse: Some(candidate.reverse),
                     lease,
                 });
             }
@@ -208,18 +233,72 @@ impl Ext4 {
                         generation,
                         target,
                         reference: None,
+                        reverse: None,
                         lease,
                     });
                 }
             }
         }
         pp::NV_CANDIDATE_SELECT.record_since(candidate_started, pages.len());
+        let mut publication_guards = Vec::new();
+        if self.rnvpc_extend_enabled() && !pages.is_empty() {
+            let inodes: BTreeSet<_> = pages.iter().map(|page| page.inode).collect();
+            for inode in inodes {
+                publication_guards
+                    .push(pool.begin_completion_publication_for(self.rnvpc_fs_id(), inode)?);
+            }
+
+            // Candidate discovery runs without the inode publication gate. A
+            // foreground overwrite may therefore reshape or move an entry
+            // before this round claims the gate. Revalidate the complete
+            // extent now; the guards keep its locator and range stable until
+            // all migration target identities have been published below.
+            let mut group_counts = BTreeMap::new();
+            for page in &pages {
+                let reverse = page.reverse.ok_or_else(|| Error::new(Errno::EUCLEAN))?;
+                *group_counts
+                    .entry((page.inode, reverse.leaf_slot(), reverse.entry_index()))
+                    .or_insert(0usize) += 1;
+            }
+            let stable = pages.iter().all(|page| {
+                let Some(reference) = page.reference else {
+                    return false;
+                };
+                let Some(reverse) = page.reverse else {
+                    return false;
+                };
+                pool.reverse_lookup(reference).ok().flatten() == Some(reverse)
+                    && pool
+                        .migration_extent_length(
+                            reference,
+                            rnvpc::index::PageKey::new(self.rnvpc_fs_id(), page.inode, page.index),
+                            reverse,
+                        )
+                        .ok()
+                        == group_counts
+                            .get(&(page.inode, reverse.leaf_slot(), reverse.entry_index()))
+                            .copied()
+            });
+            if !stable {
+                for page in &pages {
+                    if let Some(reference) = page.reference {
+                        let _ = pool.enqueue_dirty_nvpage(page.page, reference.allocation_seq());
+                    }
+                }
+                return Ok(0);
+            }
+        }
         let target_started = pp::now();
         let metadata_groups = if self.rnvpc_extend_enabled() {
             self.prepare_nv_targets(&mut pages)?
         } else {
             BTreeSet::new()
         };
+        // Target identities were published while the candidate extent shape
+        // was stable. Leaf entries may move after this point; completion
+        // resolves every page's current locator and regroups the whole inode
+        // batch before publishing SSD targets.
+        drop(publication_guards);
         pp::NV_TARGET_PREPARE.record_since(target_started, pages.len());
         let submitted = pages.len();
         if submitted == 0 {
@@ -465,34 +544,75 @@ impl Ext4 {
         }
         for (inode_id, pages) in groups {
             if self.rnvpc_extend_enabled() {
-                let mut pages = pages.into_iter();
-                loop {
-                    let pages: Vec<_> = pages
-                        .by_ref()
-                        .take(rnvpc::write_transaction::SSD_MIGRATION_BATCH_PAGES)
-                        .collect();
-                    if pages.is_empty() {
-                        break;
+                let publish_started = pp::now();
+                let completed_batches = {
+                    // A foreground repairable rewrite persists the leaf before
+                    // refreshing its volatile reverse locators. Serialize the
+                    // revalidation and target switch with that short publish
+                    // sequence, after data I/O and the device barrier.
+                    let _publication =
+                        pool.begin_completion_publication_for(self.rnvpc_fs_id(), inode_id)?;
+                    let mut current_extents: BTreeMap<(u64, usize), Vec<PendingPage>> =
+                        BTreeMap::new();
+                    for page in pages {
+                        let reference = page.reference.ok_or_else(|| Error::new(Errno::EUCLEAN))?;
+                        let locator = pool.validate_migration_and_reverse(
+                            reference,
+                            rnvpc::index::PageKey::new(self.rnvpc_fs_id(), inode_id, page.index),
+                            page.target,
+                        )?;
+                        current_extents
+                            .entry((locator.leaf_slot(), locator.entry_index()))
+                            .or_default()
+                            .push(page);
                     }
-                    let updates: Vec<_> = pages
-                        .iter()
-                        .map(|page| rnvpc::write_transaction::SsdMigrationPage {
-                            logical_block: page.index,
-                            reference: page.reference.unwrap(),
-                            ssd_block: page.target,
-                        })
-                        .collect();
-                    let publish_started = pp::now();
-                    let results =
-                        rnvpc::write_transaction::migrate_mapped_nv_pages_to_ssd_by_reverse(
-                            pool,
-                            self.rnvpc_fs_id(),
-                            inode_id,
-                            &updates,
-                            None,
-                        );
-                    pp::NV_EXTENT_PUBLISH.record_since(publish_started, pages.len());
-                    let results = results?;
+
+                    let mut batches = Vec::new();
+                    let mut batch = Vec::new();
+                    for mut extent in current_extents.into_values() {
+                        if extent.len() > rnvpc::write_transaction::SSD_MIGRATION_BATCH_PAGES {
+                            return_errno_with_message!(
+                                Errno::EUCLEAN,
+                                "NV extent exceeds completion transaction bound"
+                            );
+                        }
+                        if batch.len() + extent.len()
+                            > rnvpc::write_transaction::SSD_MIGRATION_BATCH_PAGES
+                        {
+                            batches.push(core::mem::take(&mut batch));
+                        }
+                        batch.append(&mut extent);
+                    }
+                    if !batch.is_empty() {
+                        batches.push(batch);
+                    }
+
+                    let mut completed = Vec::with_capacity(batches.len());
+                    for mut pages in batches {
+                        pages.sort_by_key(|page| page.index);
+                        let updates: Vec<_> = pages
+                            .iter()
+                            .map(|page| rnvpc::write_transaction::SsdMigrationPage {
+                                logical_block: page.index,
+                                reference: page.reference.unwrap(),
+                                ssd_block: page.target,
+                            })
+                            .collect();
+                        let results =
+                            rnvpc::write_transaction::migrate_mapped_nv_pages_to_ssd_by_reverse(
+                                pool,
+                                self.rnvpc_fs_id(),
+                                inode_id,
+                                &updates,
+                                None,
+                            )?;
+                        completed.push((pages, results));
+                    }
+                    completed
+                };
+                let published_pages = completed_batches.iter().map(|(pages, _)| pages.len()).sum();
+                pp::NV_EXTENT_PUBLISH.record_since(publish_started, published_pages);
+                for (pages, results) in completed_batches {
                     let mut reclaim = Vec::with_capacity(pages.len());
                     let mut released = 0;
                     for (page, result) in pages.into_iter().zip(results) {

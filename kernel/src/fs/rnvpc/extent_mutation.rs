@@ -188,59 +188,76 @@ impl ExtentMutation {
         let entries = Vec::from(leaf.entries()?);
         LATENCY_STATS.leaf_detail_entries.record_since(started);
         let started = read_ns();
-        let mut replacements = Vec::new();
-        let mut seen = [false; EXTENT_NODE_ENTRY_CAPACITY];
-        for update in updates {
+        let index = locator.entry_index();
+        if index >= EXTENT_NODE_ENTRY_CAPACITY
+            || updates
+                .iter()
+                .any(|update| update.locator != locator || update.ssd_block == 0)
+        {
+            return_errno_with_message!(Errno::EINVAL, "invalid extent migration group");
+        }
+        let entry = entries
+            .get(index)
+            .copied()
+            .ok_or_else(|| Error::new(Errno::ESTALE))?;
+        if updates.len() != entry.length() as usize {
+            warn!(
+                "incomplete NV extent migration: leaf={} entry={} logical={} length={} updates={}",
+                locator.leaf_slot(),
+                index,
+                entry.logical_block(),
+                entry.length(),
+                updates.len()
+            );
+            return_errno_with_message!(Errno::EAGAIN, "incomplete NV extent migration");
+        }
+        let mut ordered = Vec::from(updates);
+        ordered.sort_unstable_by_key(|update| update.logical_block);
+        let first_ssd = ordered[0].ssd_block;
+        for (offset, update) in ordered.iter().enumerate() {
             if pool.reverse_lookup(update.expected)? != Some(update.locator) {
                 return_errno_with_message!(Errno::ESTALE, "reverse locator moved");
             }
-            let index = update.locator.entry_index();
-            if update.locator.leaf_slot() != locator.leaf_slot()
-                || index >= seen.len()
-                || seen[index]
-                || update.ssd_block == 0
-            {
-                return_errno_with_message!(Errno::EINVAL, "invalid or duplicate leaf update");
-            }
-            seen[index] = true;
-            let entry = entries
-                .get(index)
-                .copied()
-                .ok_or_else(|| Error::new(Errno::ESTALE))?;
-            if entry.logical_block() != update.logical_block || entry.length() != 1 {
+            let offset = u64::try_from(offset).map_err(|_| Error::new(Errno::EOVERFLOW))?;
+            let logical_block = entry
+                .logical_block()
+                .checked_add(offset)
+                .ok_or_else(|| Error::new(Errno::EOVERFLOW))?;
+            let ssd_block = first_ssd
+                .checked_add(offset)
+                .ok_or_else(|| Error::new(Errno::EOVERFLOW))?;
+            if update.logical_block != logical_block || update.ssd_block != ssd_block {
                 return_errno_with_message!(Errno::ESTALE, "reverse locator forward edge changed");
             }
             match entry.data_ref()? {
-                ExtentDataRef::Ssd(current) if current == update.ssd_block => continue,
-                ExtentDataRef::Nv(current) if current == update.expected.slot_plus_one() => {}
+                ExtentDataRef::Ssd(current) if current == first_ssd => continue,
+                ExtentDataRef::Nv(_)
+                    if entry.nv_slot_at(logical_block)? == update.expected.slot_plus_one() => {}
                 _ => return_errno_with_message!(
                     Errno::ESTALE,
                     "reverse locator forward edge changed"
                 ),
             }
-            let replacement = ExtentRecordEntry::leaf(
-                update.logical_block,
-                1,
-                update.ssd_block,
-                entry.is_unwritten(),
-            )?;
-            replacements.push((index, entry.target(), replacement.target()));
         }
         LATENCY_STATS.leaf_detail_validate.record_since(started);
-        if replacements.is_empty() {
+        if matches!(entry.data_ref()?, ExtentDataRef::Ssd(current) if current == first_ssd) {
             return Ok(false);
         }
+        let replacement = ExtentRecordEntry::leaf(
+            entry.logical_block(),
+            entry.length(),
+            first_ssd,
+            entry.is_unwritten(),
+        )?;
         let started = read_ns();
-        for (index, expected, replacement) in replacements {
-            pool.persist_extent_target_with_guard(
-                &guard,
-                leaf_ref,
-                index,
-                expected,
-                replacement,
-                fault,
-            )?;
-        }
+        pool.persist_extent_target_with_guard(
+            &guard,
+            leaf_ref,
+            index,
+            entry.target(),
+            replacement.target(),
+            fault,
+        )?;
         LATENCY_STATS.leaf_detail_update.record_since(started);
         LATENCY_STATS.rnvpce_completion_leaf_updates.record_event();
         Ok(true)
@@ -1169,19 +1186,7 @@ impl ExtentMutation {
         fault: Option<FaultPoint>,
     ) -> Result<InitializedExtentNode> {
         extent.data_ref()?;
-        if let ExtentDataRef::Nv(reference) = extent.data_ref()? {
-            let reference = self.pool.persistent_data_ref_from_slot(reference)?;
-            let key = self.pool.validate_persistent_data_ref(reference)?;
-            if key.fs_id != self.fs_id
-                || key.inode != self.inode
-                || key.page_index != extent.logical_block()
-            {
-                return_errno_with_message!(
-                    Errno::EINVAL,
-                    "NV extent data belongs to another inode"
-                );
-            }
-        }
+        self.validate_data_extent(&extent)?;
         let leaf = self.read_leaf(current_leaf)?;
         let mut entries = Vec::from(leaf.entries()?);
         let position =
@@ -1297,10 +1302,8 @@ impl ExtentMutation {
         let ExtentDataRef::Nv(_) = replacement.data_ref()? else {
             return Ok(false);
         };
-        if replacement.length() != 1 {
-            return Ok(false);
-        }
         let logical = replacement.logical_block();
+        let replacement_end = entry_end(&replacement)?;
         let Some((old_index, old)) =
             routed
                 .record
@@ -1314,14 +1317,40 @@ impl ExtentMutation {
                         && logical < entry.logical_block().saturating_add(entry.length() as u64)
                 })
         else {
-            return Ok(false);
+            let entries = routed.record.entries()?;
+            if routed.record.entry_count() >= EXTENT_NODE_ENTRY_CAPACITY
+                || entries
+                    .last()
+                    .is_some_and(|last| entry_end(last).map_or(true, |end| logical < end))
+            {
+                return Ok(false);
+            }
+            let guards = self.node_guards.borrow();
+            let guard = guards
+                .iter()
+                .find(|(reference, _)| *reference == routed.reference)
+                .map(|(_, guard)| guard)
+                .ok_or_else(|| Error::new(Errno::EUCLEAN))?;
+            self.pool.append_extent_entry_with_guard(
+                guard,
+                routed.reference,
+                replacement,
+                fault,
+            )?;
+            drop(guards);
+            self.refresh_leaf_reverse(routed.reference)?;
+            self.pool.note_extent_mutation();
+            return Ok(true);
         };
         let ExtentDataRef::Ssd(ssd_start) = old.data_ref()? else {
             return Ok(false);
         };
         let old_end = entry_end(&old)?;
+        if replacement_end > old_end {
+            return Ok(false);
+        }
         let required_slots =
-            usize::from(logical > old.logical_block()) + usize::from(logical + 1 < old_end);
+            usize::from(logical > old.logical_block()) + usize::from(replacement_end < old_end);
         if routed.record.entry_count() + required_slots > EXTENT_NODE_ENTRY_CAPACITY {
             return Ok(false);
         }
@@ -1337,15 +1366,15 @@ impl ExtentMutation {
             .ok_or_else(|| Error::new(Errno::EOVERFLOW))?;
 
         let target_index = if logical == old.logical_block() {
-            if logical + 1 < old_end {
+            if replacement_end < old_end {
                 self.pool.append_extent_entry_with_guard(
                     guard,
                     routed.reference,
                     ExtentRecordEntry::leaf(
-                        logical + 1,
-                        u32::try_from(old_end - logical - 1)
+                        replacement_end,
+                        u32::try_from(old_end - replacement_end)
                             .map_err(|_| Error::new(Errno::EOVERFLOW))?,
-                        page_ssd + 1,
+                        page_ssd + u64::from(replacement.length()),
                         old.is_unwritten(),
                     )?,
                     fault,
@@ -1355,7 +1384,7 @@ impl ExtentMutation {
                     routed.reference,
                     old_index,
                     old.range_tail(),
-                    1,
+                    u64::from(replacement.length()),
                     fault,
                 )?;
             }
@@ -1364,18 +1393,23 @@ impl ExtentMutation {
             let page_index = self.pool.append_extent_entry_with_guard(
                 guard,
                 routed.reference,
-                ExtentRecordEntry::leaf(logical, 1, page_ssd, old.is_unwritten())?,
+                ExtentRecordEntry::leaf(
+                    logical,
+                    replacement.length(),
+                    page_ssd,
+                    old.is_unwritten(),
+                )?,
                 fault,
             )?;
-            if logical + 1 < old_end {
+            if replacement_end < old_end {
                 self.pool.append_extent_entry_with_guard(
                     guard,
                     routed.reference,
                     ExtentRecordEntry::leaf(
-                        logical + 1,
-                        u32::try_from(old_end - logical - 1)
+                        replacement_end,
+                        u32::try_from(old_end - replacement_end)
                             .map_err(|_| Error::new(Errno::EOVERFLOW))?,
-                        page_ssd + 1,
+                        page_ssd + u64::from(replacement.length()),
                         old.is_unwritten(),
                     )?,
                     fault,
@@ -2671,13 +2705,11 @@ impl ExtentMutation {
                         )?);
                     }
                 }
-                ExtentDataRef::Nv(reference) => {
-                    debug_assert_eq!(entry.length(), 1);
-                    entries.push(ExtentRecordEntry::nv_leaf_slot(
-                        entry.logical_block(),
-                        reference,
-                    )?);
-                }
+                ExtentDataRef::Nv(reference) => entries.push(ExtentRecordEntry::nv_leaf_range(
+                    entry.logical_block(),
+                    entry.length(),
+                    reference,
+                )?),
             }
         }
         if !changed {
@@ -2797,17 +2829,25 @@ impl ExtentMutation {
     }
 
     fn validate_data_extent(&self, extent: &ExtentRecordEntry) -> Result<()> {
-        if let ExtentDataRef::Nv(reference) = extent.data_ref()? {
-            let reference = self.pool.persistent_data_ref_from_slot(reference)?;
-            let key = self.pool.validate_persistent_data_ref(reference)?;
-            if key.fs_id != self.fs_id
-                || key.inode != self.inode
-                || key.page_index != extent.logical_block()
-            {
-                return_errno_with_message!(
-                    Errno::EINVAL,
-                    "NV extent data belongs to another inode"
-                );
+        if matches!(extent.data_ref()?, ExtentDataRef::Nv(_)) {
+            for offset in 0..u64::from(extent.length()) {
+                let logical_block = extent
+                    .logical_block()
+                    .checked_add(offset)
+                    .ok_or_else(|| Error::new(Errno::EOVERFLOW))?;
+                let reference = self
+                    .pool
+                    .persistent_data_ref_from_slot(extent.nv_slot_at(logical_block)?)?;
+                let key = self.pool.validate_persistent_data_ref(reference)?;
+                if key.fs_id != self.fs_id
+                    || key.inode != self.inode
+                    || key.page_index != logical_block
+                {
+                    return_errno_with_message!(
+                        Errno::EINVAL,
+                        "NV extent data belongs to another inode"
+                    );
+                }
             }
         }
         Ok(())
@@ -2864,10 +2904,18 @@ impl ExtentMutation {
         }
         let leaf_slot = leaf_ref.slot().ok_or_else(|| Error::new(Errno::EUCLEAN))?;
         for (entry_index, entry) in leaf.entries()?.iter().enumerate() {
-            if let ExtentDataRef::Nv(reference) = entry.data_ref()? {
-                let reference = self.pool.persistent_data_ref_from_slot(reference)?;
-                self.pool
-                    .replace_reverse(reference, ReverseExtentRef::new(leaf_slot, entry_index)?)?;
+            if matches!(entry.data_ref()?, ExtentDataRef::Nv(_)) {
+                let locator = ReverseExtentRef::new(leaf_slot, entry_index)?;
+                for offset in 0..u64::from(entry.length()) {
+                    let logical_block = entry
+                        .logical_block()
+                        .checked_add(offset)
+                        .ok_or_else(|| Error::new(Errno::EOVERFLOW))?;
+                    let reference = self
+                        .pool
+                        .persistent_data_ref_from_slot(entry.nv_slot_at(logical_block)?)?;
+                    self.pool.replace_reverse(reference, locator)?;
+                }
             }
         }
         Ok(())
@@ -2929,13 +2977,8 @@ fn slice_extent(entry: &ExtentRecordEntry, start: u64, end: u64) -> Result<Exten
                 .ok_or_else(|| Error::new(Errno::EOVERFLOW))?,
             entry.is_unwritten(),
         ),
-        ExtentDataRef::Nv(reference)
-            if start == entry.logical_block() && end == entry_end(entry)? =>
-        {
-            ExtentRecordEntry::nv_leaf_slot(start, reference)
-        }
         ExtentDataRef::Nv(_) => {
-            return_errno_with_message!(Errno::EINVAL, "cannot split a single-page NV extent")
+            ExtentRecordEntry::nv_leaf_range(start, length, entry.nv_slot_at(start)?)
         }
     }
 }

@@ -264,7 +264,7 @@ fn logical_extent_split_survives_every_persist_boundary() {
                 }
                 let value = match entry.data_ref().unwrap() {
                     ExtentDataRef::Ssd(block) => (0, block + logical - entry.logical_block()),
-                    ExtentDataRef::Nv(slot) => (1, slot),
+                    ExtentDataRef::Nv(_) => (1, entry.nv_slot_at(logical).unwrap()),
                 };
                 assert!(found.is_none_or(|previous| previous == value));
                 found = Some(value);
@@ -871,10 +871,15 @@ fn rnvpce_foreground_batch_updates_each_leaf_once() {
     let leaf = pool
         .read_authoritative_metadata::<ExtentNodeRecord>(leaf_ref)
         .unwrap();
+    let entries = leaf.entries().unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].logical_block(), 0);
+    assert_eq!(entries[0].length(), 2);
+    assert_eq!(first_reverse.entry_index(), second_reverse.entry_index());
     assert_eq!(
         leaf.header().generation(),
-        2,
-        "one foreground batch must persist a shared leaf once"
+        1,
+        "FAST range append must not rewrite the leaf"
     );
 }
 
@@ -947,6 +952,21 @@ fn rnvpce_batch_migration_updates_leaf_targets_in_place() {
         .unwrap()
         .header()
         .generation();
+    let partial =
+        migrate_mapped_nv_pages_to_ssd_by_reverse(&pool, FS_ID, INODE, &updates[..1], None)
+            .unwrap();
+    assert_eq!(partial.len(), 1);
+    assert_eq!(partial[0].as_ref().unwrap_err().error(), Errno::EAGAIN);
+    assert!(
+        mapped_nv_page_ref(&pool, FS_ID, INODE, 0)
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        mapped_nv_page_ref(&pool, FS_ID, INODE, 1)
+            .unwrap()
+            .is_some()
+    );
     let foreground = ExtentMutation::new(pool.clone(), FS_ID, INODE).unwrap();
     let outcomes =
         migrate_mapped_nv_pages_to_ssd_by_reverse(&pool, FS_ID, INODE, &updates, None).unwrap();
@@ -961,6 +981,13 @@ fn rnvpce_batch_migration_updates_leaf_targets_in_place() {
         after, before,
         "target-word updates must not rewrite the leaf"
     );
+    let migrated = pool
+        .read_authoritative_metadata::<ExtentNodeRecord>(leaf_ref)
+        .unwrap();
+    let entries = migrated.entries().unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].length(), 2);
+    assert_eq!(entries[0].data_ref().unwrap(), ExtentDataRef::Ssd(45_000));
     assert_eq!(
         space_reservation(&pool, FS_ID, INODE)
             .unwrap()

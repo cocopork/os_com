@@ -333,6 +333,7 @@ pub(crate) struct RnvpceFlushCandidate {
     pub(crate) target: u64,
     pub(crate) reference: metadata::PersistentObjectRef,
     pub(crate) reverse: index::ReverseExtentRef,
+    pub(crate) extent_pages: usize,
     pub(crate) owns_ssd_allocation: bool,
 }
 
@@ -370,6 +371,10 @@ pub(crate) fn rnvpce_flush_candidates(fs_id: u64, budget: usize) -> Vec<RnvpceFl
             let _ = pool.enqueue_dirty_nvpage(candidate.page, candidate.allocation_seq);
             continue;
         };
+        let Ok(extent_pages) = pool.migration_extent_length(reference, key, reverse) else {
+            let _ = pool.enqueue_dirty_nvpage(candidate.page, candidate.allocation_seq);
+            continue;
+        };
         let Ok(target) = pool.persistent_data_ssd_backing(reference) else {
             continue;
         };
@@ -384,6 +389,7 @@ pub(crate) fn rnvpce_flush_candidates(fs_id: u64, budget: usize) -> Vec<RnvpceFl
             target,
             reference,
             reverse,
+            extent_pages,
             owns_ssd_allocation,
         });
     }

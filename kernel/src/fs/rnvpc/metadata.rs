@@ -399,15 +399,45 @@ impl ExtentRecordEntry {
         if data.is_none() {
             return_errno_with_message!(Errno::EINVAL, "NV extent data reference is null");
         }
-        Self::nv_leaf_slot(logical_block, data.slot_plus_one)
+        Self::nv_leaf_range(logical_block, 1, data.slot_plus_one)
     }
 
     pub(crate) fn nv_leaf_slot(logical_block: u64, slot_plus_one: u64) -> Result<Self> {
+        Self::nv_leaf_range(logical_block, 1, slot_plus_one)
+    }
+
+    pub(crate) fn nv_leaf_range(
+        logical_block: u64,
+        length: u32,
+        slot_plus_one: u64,
+    ) -> Result<Self> {
+        if length == 0 {
+            return_errno_with_message!(Errno::EINVAL, "persistent NV extent is empty");
+        }
+        logical_block
+            .checked_add(length as u64)
+            .ok_or_else(|| Error::new(Errno::EOVERFLOW))?;
+        slot_plus_one
+            .checked_add(u64::from(length) - 1)
+            .ok_or_else(|| Error::new(Errno::EOVERFLOW))?;
         Ok(Self {
             logical_block,
-            range_tail: 1,
+            range_tail: u64::from(length),
             target: ExtentTarget::nv_page(slot_plus_one)?,
         })
+    }
+
+    pub(crate) fn nv_slot_at(&self, logical_block: u64) -> Result<u64> {
+        let ExtentDataRef::Nv(base_slot_plus_one) = self.data_ref()? else {
+            return_errno_with_message!(Errno::EINVAL, "extent does not reference NV data");
+        };
+        let offset = logical_block
+            .checked_sub(self.logical_block)
+            .filter(|offset| *offset < u64::from(self.length()))
+            .ok_or_else(|| Error::new(Errno::EINVAL))?;
+        base_slot_plus_one
+            .checked_add(offset)
+            .ok_or_else(|| Error::new(Errno::EOVERFLOW))
     }
 
     pub(crate) fn child(logical_block: u64, child: PersistentObjectRef) -> Result<Self> {
@@ -493,13 +523,7 @@ impl ExtentRecordEntry {
                 .checked_add(self.length() as u64)
                 .ok_or_else(|| Error::new(Errno::EOVERFLOW))?;
             if self.is_nv_data() {
-                if self.length() != 1 {
-                    return_errno_with_message!(
-                        Errno::EINVAL,
-                        "NV extent entries map exactly one NVPage"
-                    );
-                }
-                self.data_ref()?;
+                self.nv_slot_at(self.logical_block + u64::from(self.length()) - 1)?;
             } else {
                 self.target
                     .payload()?
@@ -1469,5 +1493,18 @@ mod recovery_tests {
         assert!(record.validate().is_err());
         assert!(ExtentRecordEntry::nv_leaf(0, PersistentObjectRef::NONE, false).is_err());
         assert!(ExtentRecordEntry::child(0, PersistentObjectRef::NONE).is_err());
+    }
+
+    #[cfg_attr(ktest, ostd::prelude::ktest)]
+    #[cfg_attr(not(ktest), test)]
+    fn nv_extent_range_resolves_each_contiguous_slot() {
+        let entry = ExtentRecordEntry::nv_leaf_range(100, 32, 401).unwrap();
+        assert_eq!(entry.length(), 32);
+        assert_eq!(entry.nv_slot_at(100).unwrap(), 401);
+        assert_eq!(entry.nv_slot_at(115).unwrap(), 416);
+        assert_eq!(entry.nv_slot_at(131).unwrap(), 432);
+        assert!(entry.nv_slot_at(99).is_err());
+        assert!(entry.nv_slot_at(132).is_err());
+        entry.validate_for_level(0).unwrap();
     }
 }

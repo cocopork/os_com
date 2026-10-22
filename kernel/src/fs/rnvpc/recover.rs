@@ -470,41 +470,48 @@ fn trace_extent_tree(
                         "extent leaf escapes its parent route"
                     );
                 }
-                if let ExtentDataRef::Nv(data_ref) = entry.data_ref()? {
-                    let data_ref = pool.persistent_data_ref_from_slot(data_ref)?;
-                    let key = pool.validate_persistent_data_ref(data_ref)?;
-                    if key.fs_id != owner.fs_id
-                        || key.inode != owner.inode
-                        || key.page_index != entry.logical_block()
-                    {
-                        return_errno_with_message!(
-                            Errno::EUCLEAN,
-                            "NV extent data identity is corrupt"
-                        );
+                if matches!(entry.data_ref()?, ExtentDataRef::Nv(_)) {
+                    for offset in 0..u64::from(entry.length()) {
+                        let logical_block = entry
+                            .logical_block()
+                            .checked_add(offset)
+                            .ok_or_else(|| Error::new(Errno::EOVERFLOW))?;
+                        let data_ref =
+                            pool.persistent_data_ref_from_slot(entry.nv_slot_at(logical_block)?)?;
+                        let key = pool.validate_persistent_data_ref(data_ref)?;
+                        if key.fs_id != owner.fs_id
+                            || key.inode != owner.inode
+                            || key.page_index != logical_block
+                        {
+                            return_errno_with_message!(
+                                Errno::EUCLEAN,
+                                "NV extent data identity is corrupt"
+                            );
+                        }
+                        let identity = ObjectIdentity::from_ref(data_ref)?;
+                        if reachable_data_keys
+                            .get(&key)
+                            .is_some_and(|existing| *existing != identity)
+                        {
+                            return_errno_with_message!(
+                                Errno::EUCLEAN,
+                                "multiple reachable NV generations map one logical page"
+                            );
+                        }
+                        reachable_data_keys.insert(key, identity);
+                        if live.insert(identity) {
+                            reachable_data.push(data_ref);
+                        }
+                        reverse_candidates.push((
+                            data_ref,
+                            ReverseExtentRef::new(
+                                reference.slot().ok_or_else(|| Error::new(Errno::EUCLEAN))?,
+                                entry_index,
+                            )?,
+                        ));
+                        reachable_ssd_blocks
+                            .insert((owner, pool.persistent_data_ssd_backing(data_ref)?));
                     }
-                    let identity = ObjectIdentity::from_ref(data_ref)?;
-                    if reachable_data_keys
-                        .get(&key)
-                        .is_some_and(|existing| *existing != identity)
-                    {
-                        return_errno_with_message!(
-                            Errno::EUCLEAN,
-                            "multiple reachable NV generations map one logical page"
-                        );
-                    }
-                    reachable_data_keys.insert(key, identity);
-                    if live.insert(identity) {
-                        reachable_data.push(data_ref);
-                    }
-                    reverse_candidates.push((
-                        data_ref,
-                        ReverseExtentRef::new(
-                            reference.slot().ok_or_else(|| Error::new(Errno::EUCLEAN))?,
-                            entry_index,
-                        )?,
-                    ));
-                    reachable_ssd_blocks
-                        .insert((owner, pool.persistent_data_ssd_backing(data_ref)?));
                 }
             }
         } else {

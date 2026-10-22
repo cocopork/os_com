@@ -1062,15 +1062,32 @@ impl Rnvpc {
                 .next_alloc_seq
                 .checked_add(pages_u64)
                 .ok_or_else(|| Error::new(Errno::EOVERFLOW))?;
-            for index in allocation.free_ids.iter().rev().take(pages) {
+            // Keep a large write physically contiguous whenever the free space
+            // contains a suitable run. The reservation remains authoritative:
+            // callers still coalesce the slots they actually receive.
+            let selected = if pages == 1 {
+                vec![allocation.free_ids.pop().unwrap()]
+            } else {
+                allocation
+                    .free_ids
+                    .sort_unstable_by(|left, right| right.cmp(left));
+                let contiguous_start = allocation.free_ids.windows(pages).position(|window| {
+                    window
+                        .windows(2)
+                        .all(|pair| pair[0].checked_sub(1) == Some(pair[1]))
+                });
+                if let Some(start) = contiguous_start {
+                    allocation.free_ids.drain(start..start + pages).collect()
+                } else {
+                    let split_at = allocation.free_ids.len() - pages;
+                    allocation.free_ids.split_off(split_at)
+                }
+            };
+            for index in &selected {
                 NvPageId::try_from(*index).map_err(|_| Error::new(Errno::EOVERFLOW))?;
             }
-            for _ in 0..pages {
+            for index in selected {
                 allocation.capacity.before_allocate(PoolClass::Data)?;
-                let index = allocation
-                    .free_ids
-                    .pop()
-                    .ok_or_else(|| Error::new(Errno::ENOSPC))?;
                 let mut objects = self.objects.lock(index);
                 let record = &mut objects.records[index];
                 debug_assert_eq!(record.kind, ObjectKind::Free);
@@ -1209,6 +1226,14 @@ impl Rnvpc {
         inode: u64,
     ) -> Result<PublicationGuard> {
         self.begin_publication_for_role(fs_id, inode, PublicationRole::Foreground)
+    }
+
+    pub(crate) fn begin_completion_publication_for(
+        self: &Arc<Self>,
+        fs_id: u64,
+        inode: u64,
+    ) -> Result<PublicationGuard> {
+        self.begin_publication_for_role(fs_id, inode, PublicationRole::Completion)
     }
 
     pub(crate) fn begin_publication_for_role(
@@ -2176,7 +2201,7 @@ impl Rnvpc {
     /// The caller holds inode publication and the page's migration lease.
     /// Snapshot identity and reverse together; read descriptor bytes outside the spinlock.
     pub(crate) fn validate_migration_and_reverse(
-        &self,
+        self: &Arc<Self>,
         reference: PersistentObjectRef,
         expected_key: PageKey,
         ssd_block: u64,
@@ -2207,7 +2232,53 @@ impl Rnvpc {
         {
             return_errno_with_message!(Errno::ESTALE, "rTIO migration target changed");
         }
+        let frame = NvFrameId::try_from(
+            usize::try_from(locator.leaf_slot()).map_err(|_| Error::new(Errno::EOVERFLOW))?,
+        )?;
+        let leaf_ref = self.persistent_metadata_ref(frame)?;
+        let leaf = self.read_authoritative_metadata::<ExtentNodeRecord>(leaf_ref)?;
+        let entry = leaf.entry(locator.entry_index())?;
+        let forward_matches = match entry.data_ref()? {
+            ExtentDataRef::Nv(_) => {
+                entry.nv_slot_at(expected_key.page_index)? == reference.slot_plus_one()
+            }
+            ExtentDataRef::Ssd(base) => {
+                entry.logical_block() <= expected_key.page_index
+                    && entry
+                        .logical_block()
+                        .checked_add(u64::from(entry.length()))
+                        .is_some_and(|end| expected_key.page_index < end)
+                    && base.checked_add(expected_key.page_index - entry.logical_block())
+                        == Some(ssd_block)
+            }
+        };
+        if leaf.level() != 0 || !forward_matches {
+            return_errno_with_message!(Errno::ESTALE, "reverse locator forward edge changed");
+        }
         Ok(locator)
+    }
+
+    pub(crate) fn migration_extent_length(
+        self: &Arc<Self>,
+        reference: PersistentObjectRef,
+        expected_key: PageKey,
+        locator: ReverseExtentRef,
+    ) -> Result<usize> {
+        if self.validate_persistent_data_ref(reference)? != expected_key {
+            return_errno_with_message!(Errno::ESTALE, "rTIO migration identity changed");
+        }
+        let frame = NvFrameId::try_from(
+            usize::try_from(locator.leaf_slot()).map_err(|_| Error::new(Errno::EOVERFLOW))?,
+        )?;
+        let leaf_ref = self.persistent_metadata_ref(frame)?;
+        let leaf = self.read_authoritative_metadata::<ExtentNodeRecord>(leaf_ref)?;
+        let entry = leaf.entry(locator.entry_index())?;
+        if leaf.level() != 0
+            || entry.nv_slot_at(expected_key.page_index)? != reference.slot_plus_one()
+        {
+            return_errno_with_message!(Errno::ESTALE, "reverse locator forward edge changed");
+        }
+        usize::try_from(entry.length()).map_err(|_| Error::new(Errno::EOVERFLOW))
     }
 
     pub(crate) fn persistent_data_has_migration_target(
@@ -2329,7 +2400,14 @@ impl Rnvpc {
             let node = self.read_authoritative_metadata::<ExtentNodeRecord>(reference)?;
             if node.level() == 0
                 && node.entries()?.iter().any(|entry| {
-                    matches!(entry.data_ref(), Ok(ExtentDataRef::Nv(reference)) if reference == target.slot_plus_one())
+                    matches!(entry.data_ref(), Ok(ExtentDataRef::Nv(_)))
+                        && (0..u64::from(entry.length())).any(|offset| {
+                            entry
+                                .logical_block()
+                                .checked_add(offset)
+                                .and_then(|logical| entry.nv_slot_at(logical).ok())
+                                == Some(target.slot_plus_one())
+                        })
                 })
             {
                 return Ok(true);

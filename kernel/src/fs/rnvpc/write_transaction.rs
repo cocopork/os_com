@@ -471,11 +471,11 @@ pub(crate) fn commit_initial_write_batch(
     // All fallible DRAM allocations and NV data capacity reservation happen
     // before any persistent object is changed.
     let mut data_refs = Vec::new();
-    let mut extent_entries = Vec::new();
+    let mut new_mappings = Vec::new();
     data_refs
         .try_reserve_exact(request.pages.len())
         .map_err(|_| Error::new(Errno::ENOMEM))?;
-    extent_entries
+    new_mappings
         .try_reserve_exact(request.pages.len())
         .map_err(|_| Error::new(Errno::ENOMEM))?;
     let mut reservation = pool.reserve_data_pages(request.pages.len())?;
@@ -501,12 +501,9 @@ pub(crate) fn commit_initial_write_batch(
         )?;
         let reference = pool.persistent_data_ref(id)?;
         data_refs.push(reference);
-        extent_entries.push(ExtentRecordEntry::nv_leaf(
-            page.logical_block,
-            reference,
-            false,
-        )?);
+        new_mappings.push((page.logical_block, reference));
     }
+    let extent_entries = coalesce_nv_extent_entries(&new_mappings)?;
 
     let extent = ExtentNodeRecord::new(
         fs_id,
@@ -995,8 +992,9 @@ where
         let entry = lookup_tree_extent(&pool, fs_id, inode, current_root, page.logical_block)?;
         let existing = match entry {
             Some(entry) => match entry.data_ref()? {
-                ExtentDataRef::Nv(reference) => {
-                    let reference = pool.persistent_data_ref_from_slot(reference)?;
+                ExtentDataRef::Nv(_) => {
+                    let reference =
+                        pool.persistent_data_ref_from_slot(entry.nv_slot_at(page.logical_block)?)?;
                     if pool.persistent_data_ssd_backing(reference)? != page.ssd_block {
                         return_errno_with_message!(Errno::ESTALE, "NVPage SSD target changed");
                     }
@@ -1053,10 +1051,6 @@ where
 
     LATENCY_STATS.fg_allocate.record_since(started);
     let started = read_ns();
-    let mut replacements = Vec::new();
-    replacements
-        .try_reserve_exact(new_page_count)
-        .map_err(|_| Error::new(Errno::ENOMEM))?;
     let mut copied = 0usize;
     let mut newly_mapped = 0u64;
     let mut committed_pages = Vec::new();
@@ -1139,15 +1133,16 @@ where
     for batch in pending_new_pages.chunks(128) {
         pool.replace_data_pages_in_owner_at(batch, None)?;
     }
+    let mut new_mappings = Vec::new();
+    new_mappings
+        .try_reserve_exact(pending_new_pages.len())
+        .map_err(|_| Error::new(Errno::ENOMEM))?;
     for (id, key, _) in &pending_new_pages {
         let reference = pool.persistent_data_ref(*id)?;
-        replacements.push(ExtentRecordEntry::nv_leaf(
-            key.page_index,
-            reference,
-            false,
-        )?);
+        new_mappings.push((key.page_index, reference));
         committed_pages.push(reference);
     }
+    let replacements = coalesce_nv_extent_entries(&new_mappings)?;
     LATENCY_STATS.fg_data_register.record_since(t_register);
     if copied == 0 {
         return_errno_with_message!(Errno::EFAULT, "write copied no user bytes");
@@ -1371,8 +1366,9 @@ pub(crate) fn commit_write_batch(
         let existing =
             match lookup_tree_extent(&pool, fs_id, inode, current_root, page.logical_block)? {
                 Some(entry) => match entry.data_ref()? {
-                    ExtentDataRef::Nv(reference) => {
-                        let reference = pool.persistent_data_ref_from_slot(reference)?;
+                    ExtentDataRef::Nv(_) => {
+                        let reference = pool
+                            .persistent_data_ref_from_slot(entry.nv_slot_at(page.logical_block)?)?;
                         (pool.persistent_data_ssd_backing(reference)? == page.ssd_block)
                             .then_some(reference)
                     }
@@ -1387,6 +1383,10 @@ pub(crate) fn commit_write_batch(
         .filter(|entry| entry.is_none())
         .count();
     let mut reservation = pool.reserve_data_pages(new_page_count)?;
+    let mut new_mappings = Vec::new();
+    new_mappings
+        .try_reserve_exact(new_page_count)
+        .map_err(|_| Error::new(Errno::ENOMEM))?;
 
     for (index, allocation) in request.allocations.iter().enumerate() {
         let record = AllocationRecord::new(
@@ -1428,13 +1428,10 @@ pub(crate) fn commit_write_batch(
         };
         data_refs.push(reference);
         if !keeps_extent_reference {
-            replacements.push(ExtentRecordEntry::nv_leaf(
-                page.logical_block,
-                reference,
-                false,
-            )?);
+            new_mappings.push((page.logical_block, reference));
         }
     }
+    replacements.extend(coalesce_nv_extent_entries(&new_mappings)?);
     let new_root = if replacements.is_empty() {
         mutation.committed_node(current_root)?
     } else {
@@ -1465,6 +1462,46 @@ fn update_allocation_logical_index(generation: u64, index: usize) -> Result<u64>
     Ok(UPDATE_ALLOCATION_LOGICAL_INDEX_TAG | (generation << 16) | ordinal)
 }
 
+fn coalesce_nv_extent_entries(
+    mappings: &[(u64, PersistentObjectRef)],
+) -> Result<Vec<ExtentRecordEntry>> {
+    let mut entries = Vec::new();
+    entries
+        .try_reserve_exact(mappings.len())
+        .map_err(|_| Error::new(Errno::ENOMEM))?;
+    let mut start = 0;
+    while start < mappings.len() {
+        let (logical_start, base) = mappings[start];
+        if base.is_none() {
+            return_errno_with_message!(Errno::EINVAL, "NV extent base reference is null");
+        }
+        let mut end = start + 1;
+        while end < mappings.len() && end - start < SSD_MIGRATION_BATCH_PAGES {
+            let offset = u64::try_from(end - start).map_err(|_| Error::new(Errno::EOVERFLOW))?;
+            if mappings[end].0
+                != logical_start
+                    .checked_add(offset)
+                    .ok_or_else(|| Error::new(Errno::EOVERFLOW))?
+                || mappings[end].1.slot_plus_one()
+                    != base
+                        .slot_plus_one()
+                        .checked_add(offset)
+                        .ok_or_else(|| Error::new(Errno::EOVERFLOW))?
+            {
+                break;
+            }
+            end += 1;
+        }
+        entries.push(ExtentRecordEntry::nv_leaf_range(
+            logical_start,
+            u32::try_from(end - start).map_err(|_| Error::new(Errno::EOVERFLOW))?,
+            base.slot_plus_one(),
+        )?);
+        start = end;
+    }
+    Ok(entries)
+}
+
 fn validate_ssd_targets(
     pool: &Arc<Rnvpc>,
     fs_id: u64,
@@ -1485,8 +1522,8 @@ fn validate_ssd_targets(
                     ExtentDataRef::Ssd(block) => block
                         .checked_add(page.logical_block - entry.logical_block())
                         .ok_or_else(|| Error::new(Errno::EOVERFLOW))?,
-                    ExtentDataRef::Nv(reference) => pool.persistent_data_ssd_backing(
-                        pool.persistent_data_ref_from_slot(reference)?,
+                    ExtentDataRef::Nv(_) => pool.persistent_data_ssd_backing(
+                        pool.persistent_data_ref_from_slot(entry.nv_slot_at(page.logical_block)?)?,
                     )?,
                 }),
                 None => None,
@@ -1622,8 +1659,8 @@ pub(crate) fn mapped_nv_page_ref(
         return Ok(None);
     };
     match entry.data_ref()? {
-        ExtentDataRef::Nv(reference) => {
-            let reference = pool.persistent_data_ref_from_slot(reference)?;
+        ExtentDataRef::Nv(_) => {
+            let reference = pool.persistent_data_ref_from_slot(entry.nv_slot_at(logical_block)?)?;
             if pool.validate_persistent_data_ref(reference)?
                 != PageKey::new(fs_id, inode, logical_block)
             {
@@ -1731,9 +1768,9 @@ pub(crate) fn current_page_mapping(
         ExtentDataRef::Ssd(first) => first
             .checked_add(logical_block - entry.logical_block())
             .ok_or_else(|| Error::new(Errno::EOVERFLOW))?,
-        ExtentDataRef::Nv(reference) => {
-            pool.persistent_data_ssd_backing(pool.persistent_data_ref_from_slot(reference)?)?
-        }
+        ExtentDataRef::Nv(_) => pool.persistent_data_ssd_backing(
+            pool.persistent_data_ref_from_slot(entry.nv_slot_at(logical_block)?)?,
+        )?,
     };
     Ok(Some(CurrentPageMapping {
         ssd_block,
@@ -1846,7 +1883,7 @@ pub(crate) fn migrate_mapped_nv_pages_to_ssd_by_reverse(
         .iter()
         .map(|_| Err(Error::new(Errno::ESTALE)))
         .collect();
-    let mut leaves: BTreeMap<u64, Vec<(usize, SsdExtentUpdate)>> = BTreeMap::new();
+    let mut extents: BTreeMap<(u64, usize), Vec<(usize, SsdExtentUpdate)>> = BTreeMap::new();
     let mut identities = BTreeSet::new();
     let started = read_ns();
     for (index, page) in pages.iter().enumerate() {
@@ -1865,22 +1902,25 @@ pub(crate) fn migrate_mapped_nv_pages_to_ssd_by_reverse(
             )
         })();
         match validated {
-            Ok(locator) => leaves.entry(locator.leaf_slot()).or_default().push((
-                index,
-                SsdExtentUpdate {
-                    locator,
-                    expected: page.reference,
-                    logical_block: page.logical_block,
-                    ssd_block: page.ssd_block,
-                },
-            )),
+            Ok(locator) => extents
+                .entry((locator.leaf_slot(), locator.entry_index()))
+                .or_default()
+                .push((
+                    index,
+                    SsdExtentUpdate {
+                        locator,
+                        expected: page.reference,
+                        logical_block: page.logical_block,
+                        ssd_block: page.ssd_block,
+                    },
+                )),
             Err(error) => outcomes[index] = Err(error),
         }
     }
     LATENCY_STATS.migration_validate.record_since(started);
     let mut consumed = 0;
     let mut credits = Vec::new();
-    for group in leaves.values() {
+    for group in extents.values() {
         let started = read_ns();
         let updates: Vec<_> = group.iter().map(|(_, update)| *update).collect();
         let profile_start = super::batch_metrics::now();
