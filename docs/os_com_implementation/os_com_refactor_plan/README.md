@@ -31,3 +31,9 @@ Status values are intentionally limited to `Complete`, `Partial`, `Planned`, `Su
 ## 2026-10-21 新增设计
 
 - [015：连续 NV extent 与整段迁移](015-contiguous-nv-extents/README.md)：Implementing。连续 NVPage 由一个范围 entry 表示；前台批量发布描述符，completion 只在完整 extent 及连续 SSD 目标均验证通过后切换一次 target 并批量回收。dirty extent 内存索引留作后续优化。
+
+## 2026-10-22 新增设计
+
+- [016：Extent 级迁移 lease 与写入准入](016-extent-migration-lease/README.md)：Superseded。跨 SSD I/O 保留 leaf guard 和 inode 范围 gate 的实现已删除；当前乐观迁移只在完整 NV extent 的 claim 和 completion publication 临界区短暂持锁，I/O 期间允许同 inode 前台写并发。见[替代设计](../../superpowers/specs/2026-10-22-optimistic-extent-migration-design.md)和[验证报告](../../experiments/reports/OPTIMISTIC-EXTENT-MIGRATION-2026-10-22.md)。
+
+- [017：NVPage 并行回收](017-nvpage-parallel-reclaim/README.md)：Planned。completion 在 data/metadata I/O 和批次设备 flush 完成后只发布完整 extent 的 `SsdDurable` reclaim ticket；需要容量的前台线程在进入自身 inode/extent 修改前并行帮助完成 8B SSD target 发布、descriptor 清除和 slot 回收。free slots 以连续 run 进入 per-CPU cache，并通过分片共享池批量 refill/drain；后台 worker 使用同一 helper 保证空闲期、fsync 和卸载进展。
