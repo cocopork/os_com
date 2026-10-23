@@ -984,20 +984,22 @@ fn nv_route_rnvpce_fragmented_batch_and_partial_rollback() {
         assert_eq!(pool.persistent_data_ssd_backing(reference).unwrap(), 0);
     }
     assert_eq!(fixture.ext4.migrate_nv_round(64).unwrap(), 8);
-    fixture.ext4.drain_nv_in_flight().unwrap();
-    fixture.ext4.sync_all().unwrap();
-    let mut blocks = BTreeSet::new();
+    assert_eq!(
+        fixture.ext4.drain_nv_in_flight().unwrap_err().error(),
+        Errno::EAGAIN,
+        "a complete NV extent cannot publish a fragmented SSD target run"
+    );
     for logical in 0..8 {
-        let block = inode.data_block_of(logical).unwrap();
-        assert!(blocks.insert(block));
-        assert!(held.contains(&block));
-        assert_eq!((block - held.start) % 2, 0);
-        let mut data = [0; PAGE_SIZE];
-        fixture
-            .disk
-            .segment()
-            .read_bytes(block as usize * PAGE_SIZE, &mut data)
-            .unwrap();
-        assert_eq!(data, [0x30 + logical as u8; PAGE_SIZE]);
+        assert!(
+            crate::fs::rnvpc::write_transaction::mapped_nv_page_ref(
+                pool,
+                fixture.ext4.rnvpc_fs_id(),
+                11,
+                logical as u64,
+            )
+            .unwrap()
+            .is_some(),
+            "fragmented completion must retain the complete NV authority"
+        );
     }
 }

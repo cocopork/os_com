@@ -1799,6 +1799,8 @@ impl Inode {
                 .map_err(|_| Error::new(Errno::ENOMEM))?;
             let mut spans = Vec::new();
             let mut newly_reserved = 0u64;
+            let mut has_in_flight = false;
+            let lease_epoch = pool.data_page_lease_epoch();
             spans
                 .try_reserve_exact(page_count)
                 .map_err(|_| Error::new(Errno::ENOMEM))?;
@@ -1817,6 +1819,7 @@ impl Inode {
                     logical_block,
                 )? {
                     targets.push(mapping.ssd_block());
+                    has_in_flight |= mapping.is_in_flight();
                 } else {
                     targets.push(0);
                     newly_reserved = newly_reserved
@@ -1845,6 +1848,15 @@ impl Inode {
                 authority.block_count(),
                 (BLOCK_SIZE / 512) as u64,
             )?;
+            if has_in_flight {
+                // No capacity or user bytes have been consumed. Completion
+                // needs this publication guard, so wait after dropping both
+                // metadata coordination layers.
+                drop(mutation);
+                drop(inner);
+                pool.wait_for_data_page_lease_change(lease_epoch);
+                continue;
+            }
             let needed = crate::fs::rnvpc::write_transaction::range_write_new_pages(
                 &pool, fs_id, inode_id, &request,
             )?;

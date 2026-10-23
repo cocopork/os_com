@@ -425,6 +425,105 @@ fn rnvpce_dirty_queue_deduplicates_and_returns_reverse_locator() {
     assert!(!pool.migration_is_frozen(key));
 }
 
+fn install_claimable_nv_extent(
+    pool: &Arc<Rnvpc>,
+    fs_id: u64,
+    inode: u64,
+    logical_start: u64,
+    pages: usize,
+) -> (Vec<PersistentObjectRef>, ReverseExtentRef) {
+    let mut reservation = pool.reserve_data_pages(pages).unwrap();
+    let mut references = Vec::new();
+    for offset in 0..pages {
+        let page = pool
+            .stage_reserved_data_page(&mut reservation, &[offset as u8; PAGE_SIZE])
+            .unwrap();
+        pool.transition_data_page(page, DataPageState::Staged, DataPageState::NvDirty)
+            .unwrap();
+        pool.replace_data_page_in_owner_at(
+            page,
+            PageKey::new(fs_id, inode, logical_start + offset as u64),
+            0,
+            None,
+        )
+        .unwrap();
+        references.push(pool.persistent_data_ref(page).unwrap());
+    }
+    references.sort_by_key(|reference| reference.slot());
+    let entry = ExtentRecordEntry::nv_leaf_range(
+        logical_start,
+        pages as u32,
+        references[0].slot_plus_one(),
+    )
+    .unwrap();
+    let key = PageKey::new(fs_id, inode, logical_start);
+    let leaf = ExtentNodeRecord::new(
+        fs_id,
+        inode,
+        1,
+        logical_start,
+        0,
+        PersistentObjectRef::NONE,
+        PersistentObjectRef::NONE,
+        &[entry],
+    )
+    .unwrap();
+    let leaf_ref = pool
+        .persist_authoritative_metadata(key, &leaf, None)
+        .unwrap();
+    let locator = ReverseExtentRef::new(leaf_ref.slot().unwrap(), 0).unwrap();
+    for reference in &references {
+        pool.install_reverse(*reference, locator).unwrap();
+    }
+    (references, locator)
+}
+
+#[ktest]
+fn rnvpce_optimistic_extent_claim_releases_metadata_coordination_before_io() {
+    const FS_ID: u64 = 0x9913;
+    const INODE: u64 = 25;
+    const LOGICAL_START: u64 = 64;
+    let pool = test_pool(48, 16, 32, None);
+    let (references, locator) = install_claimable_nv_extent(&pool, FS_ID, INODE, LOGICAL_START, 4);
+
+    let claimed = pool.claim_migration_extent(references[0], locator).unwrap();
+    assert_eq!(claimed.logical_range(), LOGICAL_START..LOGICAL_START + 4);
+    assert_eq!(claimed.len(), 4);
+    assert!(!pool.migration_is_frozen(PageKey::new(FS_ID, INODE, LOGICAL_START)));
+    let foreground = pool.begin_publication_for(FS_ID, INODE).unwrap();
+    drop(foreground);
+    for reference in &references {
+        let page = NvPageId::try_from(reference.slot().unwrap() as usize).unwrap();
+        assert_eq!(pool.data_page_state(page).unwrap(), DataPageState::InFlight);
+    }
+
+    drop(claimed);
+    for reference in references {
+        let page = NvPageId::try_from(reference.slot().unwrap() as usize).unwrap();
+        assert_eq!(pool.data_page_state(page).unwrap(), DataPageState::NvDirty);
+    }
+}
+
+#[ktest]
+fn rnvpce_optimistic_extent_claim_rolls_back_every_member_on_stale_identity() {
+    const FS_ID: u64 = 0x9914;
+    const INODE: u64 = 26;
+    const LOGICAL_START: u64 = 96;
+    let pool = test_pool(48, 16, 32, None);
+    let (references, locator) = install_claimable_nv_extent(&pool, FS_ID, INODE, LOGICAL_START, 4);
+    pool.install_reverse(
+        references[2],
+        ReverseExtentRef::new(locator.leaf_slot(), 1).unwrap(),
+    )
+    .unwrap();
+
+    assert!(pool.claim_migration_extent(references[0], locator).is_err());
+    for reference in references {
+        let page = NvPageId::try_from(reference.slot().unwrap() as usize).unwrap();
+        assert_eq!(pool.data_page_state(page).unwrap(), DataPageState::NvDirty);
+    }
+}
+
 #[ktest]
 fn rnvpce_extent_node_update_waits_for_a_transient_reader() {
     const FS_ID: u64 = 0x55aa;

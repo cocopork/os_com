@@ -13,7 +13,7 @@ use super::{
     data_page::DataPageState,
     extent_mutation::{ExtentMutation, SsdExtentUpdate},
     fault::FaultPoint,
-    frame::Rnvpc,
+    frame::{MigrationExtentIdentity, Rnvpc},
     index::{PageKey, ReverseExtentRef},
     metadata::{
         AllocationRecord, AuthoritativeMetadataRecord, EXTENT_NODE_ENTRY_CAPACITY, ExtentDataRef,
@@ -1605,6 +1605,7 @@ impl AuthoritativeInodeState {
 pub(crate) struct CurrentPageMapping {
     ssd_block: u64,
     written: bool,
+    in_flight: bool,
 }
 
 impl CurrentPageMapping {
@@ -1614,6 +1615,10 @@ impl CurrentPageMapping {
 
     pub(crate) const fn is_written(&self) -> bool {
         self.written
+    }
+
+    pub(crate) const fn is_in_flight(&self) -> bool {
+        self.in_flight
     }
 }
 
@@ -1764,17 +1769,29 @@ pub(crate) fn current_page_mapping(
     else {
         return Ok(None);
     };
-    let ssd_block = match entry.data_ref()? {
-        ExtentDataRef::Ssd(first) => first
-            .checked_add(logical_block - entry.logical_block())
-            .ok_or_else(|| Error::new(Errno::EOVERFLOW))?,
-        ExtentDataRef::Nv(_) => pool.persistent_data_ssd_backing(
-            pool.persistent_data_ref_from_slot(entry.nv_slot_at(logical_block)?)?,
-        )?,
+    let (ssd_block, in_flight) = match entry.data_ref()? {
+        ExtentDataRef::Ssd(first) => (
+            first
+                .checked_add(logical_block - entry.logical_block())
+                .ok_or_else(|| Error::new(Errno::EOVERFLOW))?,
+            false,
+        ),
+        ExtentDataRef::Nv(_) => {
+            let reference = pool.persistent_data_ref_from_slot(entry.nv_slot_at(logical_block)?)?;
+            let slot = usize::try_from(reference.slot().ok_or_else(|| Error::new(Errno::EUCLEAN))?)
+                .map_err(|_| Error::new(Errno::EOVERFLOW))?;
+            let page =
+                super::id::NvPageId::try_from(slot).map_err(|_| Error::new(Errno::EOVERFLOW))?;
+            (
+                pool.persistent_data_ssd_backing(reference)?,
+                pool.data_page_state(page)? == DataPageState::InFlight,
+            )
+        }
     };
     Ok(Some(CurrentPageMapping {
         ssd_block,
         written: !entry.is_unwritten(),
+        in_flight,
     }))
 }
 
@@ -1867,8 +1884,93 @@ pub(crate) struct SsdMigrationPage {
     pub(crate) ssd_block: u64,
 }
 
+/// Completes one claimed contiguous NV extent as a single authority change.
+pub(crate) fn migrate_claimed_nv_extent_to_ssd(
+    pool: &Arc<Rnvpc>,
+    identity: &MigrationExtentIdentity,
+    pages: &[SsdMigrationPage],
+    fault: Option<FaultPoint>,
+) -> Result<Vec<Result<bool>>> {
+    if pages.is_empty()
+        || pages.len() > SSD_MIGRATION_BATCH_PAGES
+        || pages.len() != identity.length() as usize
+    {
+        return_errno_with_message!(Errno::EINVAL, "invalid claimed extent completion size");
+    }
+    let mutation =
+        ExtentMutation::new_completion(pool.clone(), identity.fs_id(), identity.inode())?;
+    let inode_ref = authoritative_inode_ref(pool, identity.fs_id(), identity.inode())?
+        .ok_or_else(|| Error::new(Errno::ESTALE))?;
+    let inode = pool.read_authoritative_metadata::<InodeRecord>(inode_ref)?;
+    let root = inode.extent_root();
+    if root.is_none() {
+        return_errno_with_message!(Errno::ESTALE, "claimed extent inode has no tree");
+    }
+
+    let mut updates = Vec::with_capacity(pages.len());
+    let mut identities = BTreeSet::new();
+    for page in pages {
+        if page.reference.is_none()
+            || !identities.insert((page.reference.slot(), page.reference.allocation_seq()))
+            || pool.validate_persistent_data_ref(page.reference)?
+                != PageKey::new(identity.fs_id(), identity.inode(), page.logical_block)
+            || pool.persistent_data_ssd_backing(page.reference)? != page.ssd_block
+        {
+            return_errno_with_message!(Errno::ESTALE, "claimed extent member changed");
+        }
+        updates.push(SsdExtentUpdate {
+            locator: identity.locator_hint(),
+            expected: page.reference,
+            logical_block: page.logical_block,
+            ssd_block: page.ssd_block,
+        });
+    }
+    let started = read_ns();
+    let published = mutation.publish_claimed_ssd_extent(
+        root,
+        identity.logical_start(),
+        identity.length(),
+        identity.nv_base_slot_plus_one(),
+        &updates,
+        fault,
+    )?;
+    LATENCY_STATS.migration_leaf.record_since(started);
+
+    let references: Vec<_> = pages.iter().map(|page| page.reference).collect();
+    let mut outcomes: Vec<Result<bool>> = references.iter().map(|_| Ok(false)).collect();
+    let releasable: Result<Vec<_>> = references
+        .iter()
+        .copied()
+        .filter_map(|reference| {
+            match (
+                pool.persistent_data_has_migration_target(reference),
+                pool.persistent_data_migration_credit_released(reference),
+            ) {
+                (Ok(true), Ok(false)) => Some(Ok(reference)),
+                (Ok(_), Ok(_)) => None,
+                (Err(error), _) | (_, Err(error)) => Some(Err(error)),
+            }
+        })
+        .collect();
+    let releasable = releasable?;
+    pool.mark_migration_credits_released(&releasable, None)?;
+    for (index, reference) in references.iter().enumerate() {
+        outcomes[index] = Ok(releasable.contains(reference));
+    }
+    let consumed = releasable.len() as u64;
+    if consumed != 0
+        && let Err(error) =
+            consume_ssd_capacity_locked(pool, identity.fs_id(), identity.inode(), consumed)
+    {
+        warn!("rNVPCe batch reservation ledger update deferred to recovery: {error:?}");
+    }
+    let _ = published;
+    Ok(outcomes)
+}
+
 /// Holds one leaf modification right at a time and persists each touched leaf once.
 /// Per-page results allow successful leaves to reclaim even if another fails.
+#[cfg(ktest)]
 pub(crate) fn migrate_mapped_nv_pages_to_ssd_by_reverse(
     pool: &Arc<Rnvpc>,
     fs_id: u64,
@@ -1982,6 +2084,7 @@ pub(crate) fn migrate_mapped_nv_pages_to_ssd_by_reverse(
     Ok(outcomes)
 }
 
+#[cfg(ktest)]
 fn publish_relocated_ssd_extent(
     pool: &Arc<Rnvpc>,
     fs_id: u64,

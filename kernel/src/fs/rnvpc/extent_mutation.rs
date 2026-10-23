@@ -106,6 +106,81 @@ impl ExtentMutation {
         })
     }
 
+    /// Re-resolves one claimed NV extent and publishes its contiguous SSD run.
+    /// Tree routing and leaf validation happen under this mutation's short-lived
+    /// publication/metadata guards; no guard is retained across device I/O.
+    pub(crate) fn publish_claimed_ssd_extent(
+        &self,
+        root: PersistentObjectRef,
+        logical_start: u64,
+        length: u32,
+        nv_base_slot_plus_one: u64,
+        updates: &[SsdExtentUpdate],
+        fault: Option<FaultPoint>,
+    ) -> Result<bool> {
+        if length == 0 || updates.len() != length as usize {
+            return_errno_with_message!(Errno::EAGAIN, "incomplete NV extent migration");
+        }
+        let routed = self.route_leaf(root, logical_start)?;
+        let (entry_index, entry) = routed
+            .record
+            .entries()?
+            .iter()
+            .copied()
+            .enumerate()
+            .find(|(_, entry)| {
+                entry.logical_block() <= logical_start
+                    && logical_start
+                        < entry
+                            .logical_block()
+                            .saturating_add(u64::from(entry.length()))
+            })
+            .ok_or_else(|| Error::new(Errno::ESTALE))?;
+        if entry.logical_block() != logical_start || entry.length() != length {
+            return_errno_with_message!(Errno::ESTALE, "claimed NV extent range changed");
+        }
+
+        let mut ordered = Vec::from(updates);
+        ordered.sort_unstable_by_key(|update| update.logical_block);
+        let first_ssd = ordered[0].ssd_block;
+        if first_ssd == 0 {
+            return_errno_with_message!(Errno::EAGAIN, "NV extent has no SSD target");
+        }
+        for (offset, update) in ordered.iter().enumerate() {
+            let offset = u64::try_from(offset).map_err(|_| Error::new(Errno::EOVERFLOW))?;
+            if update.logical_block != logical_start.saturating_add(offset)
+                || update.expected.slot_plus_one() != nv_base_slot_plus_one.saturating_add(offset)
+                || update.ssd_block != first_ssd.saturating_add(offset)
+            {
+                return_errno_with_message!(Errno::EAGAIN, "fragmented or stale extent targets");
+            }
+        }
+
+        match entry.data_ref()? {
+            ExtentDataRef::Ssd(current) if current == first_ssd => return Ok(false),
+            ExtentDataRef::Nv(current) if current == nv_base_slot_plus_one => {}
+            _ => return_errno_with_message!(Errno::ESTALE, "claimed NV extent identity changed"),
+        }
+        let replacement =
+            ExtentRecordEntry::leaf(logical_start, length, first_ssd, entry.is_unwritten())?;
+        let guards = self.node_guards.borrow();
+        let guard = guards
+            .iter()
+            .find(|(reference, _)| *reference == routed.reference)
+            .map(|(_, guard)| guard)
+            .ok_or_else(|| Error::new(Errno::EUCLEAN))?;
+        self.pool.persist_extent_target_with_guard(
+            guard,
+            routed.reference,
+            entry_index,
+            entry.target(),
+            replacement.target(),
+            fault,
+        )?;
+        LATENCY_STATS.rnvpce_completion_leaf_updates.record_event();
+        Ok(true)
+    }
+
     /// Creates an inode-owned control record or updates its existing NVBH.
     pub(crate) fn persist_or_update_control<T>(
         &self,

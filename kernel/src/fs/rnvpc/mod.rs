@@ -326,15 +326,9 @@ pub(crate) fn flush_candidates(
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct RnvpceFlushCandidate {
-    pub(crate) fs_id: u64,
-    pub(crate) inode: u64,
-    pub(crate) page_index: u64,
     pub(crate) page: NvPageId,
-    pub(crate) target: u64,
     pub(crate) reference: metadata::PersistentObjectRef,
     pub(crate) reverse: index::ReverseExtentRef,
-    pub(crate) extent_pages: usize,
-    pub(crate) owns_ssd_allocation: bool,
 }
 
 /// rNVPCe candidates come from the duplicate-suppressed physical dirty queue.
@@ -346,6 +340,7 @@ pub(crate) fn rnvpce_flush_candidates(fs_id: u64, budget: usize) -> Vec<RnvpceFl
         return Vec::new();
     };
     let mut out = Vec::new();
+    let mut seen = BTreeSet::new();
     for candidate in pool.collect_dirty_nvpages(budget) {
         let Ok(reference) = pool.persistent_data_ref(candidate.page) else {
             continue;
@@ -371,26 +366,13 @@ pub(crate) fn rnvpce_flush_candidates(fs_id: u64, budget: usize) -> Vec<RnvpceFl
             let _ = pool.enqueue_dirty_nvpage(candidate.page, candidate.allocation_seq);
             continue;
         };
-        let Ok(extent_pages) = pool.migration_extent_length(reference, key, reverse) else {
-            let _ = pool.enqueue_dirty_nvpage(candidate.page, candidate.allocation_seq);
+        if !seen.insert((key.inode, reverse.leaf_slot(), reverse.entry_index())) {
             continue;
-        };
-        let Ok(target) = pool.persistent_data_ssd_backing(reference) else {
-            continue;
-        };
-        let Ok(owns_ssd_allocation) = pool.persistent_data_has_migration_target(reference) else {
-            continue;
-        };
+        }
         out.push(RnvpceFlushCandidate {
-            fs_id: key.fs_id,
-            inode: key.inode,
-            page_index: key.page_index,
             page: candidate.page,
-            target,
             reference,
             reverse,
-            extent_pages,
-            owns_ssd_allocation,
         });
     }
     out

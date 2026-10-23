@@ -40,11 +40,7 @@ use super::{
     recover,
 };
 use crate::{
-    fs::fs_impls::ext4::{
-        COMPLETION_FINISH_CLEAR_DESCRIPTOR, COMPLETION_FINISH_FINALIZE_LOCK,
-        COMPLETION_FINISH_LEASE_WAKE, COMPLETION_FINISH_VALIDATE_LOCK, LATENCY_ENABLED,
-        LATENCY_STATS, clear_completion_stage, read_ns, set_completion_stage,
-    },
+    fs::fs_impls::ext4::{LATENCY_ENABLED, LATENCY_STATS, read_ns},
     prelude::*,
 };
 
@@ -365,6 +361,72 @@ pub(crate) struct ExtentRangeFreeze {
     owner: (u64, u64),
     range: Range<u64>,
     active: bool,
+}
+
+#[derive(Debug)]
+pub(crate) struct MigrationExtentIdentity {
+    fs_id: u64,
+    inode: u64,
+    logical_start: u64,
+    length: u32,
+    nv_base_slot_plus_one: u64,
+    locator_hint: ReverseExtentRef,
+}
+
+pub(crate) struct ClaimedMigrationExtent {
+    identity: Arc<MigrationExtentIdentity>,
+    pages: Vec<ClaimedMigrationPage>,
+}
+
+pub(crate) struct ClaimedMigrationPage {
+    pub(crate) key: PageKey,
+    pub(crate) reference: PersistentObjectRef,
+    pub(crate) ssd_block: u64,
+    pub(crate) eviction: EvictingDataPage,
+}
+
+impl MigrationExtentIdentity {
+    pub(crate) fn fs_id(&self) -> u64 {
+        self.fs_id
+    }
+
+    pub(crate) fn inode(&self) -> u64 {
+        self.inode
+    }
+
+    pub(crate) fn logical_range(&self) -> Range<u64> {
+        self.logical_start..self.logical_start + u64::from(self.length)
+    }
+
+    pub(crate) fn logical_start(&self) -> u64 {
+        self.logical_start
+    }
+
+    pub(crate) fn length(&self) -> u32 {
+        self.length
+    }
+
+    pub(crate) fn nv_base_slot_plus_one(&self) -> u64 {
+        self.nv_base_slot_plus_one
+    }
+
+    pub(crate) fn locator_hint(&self) -> ReverseExtentRef {
+        self.locator_hint
+    }
+}
+
+impl ClaimedMigrationExtent {
+    pub(crate) fn logical_range(&self) -> Range<u64> {
+        self.identity.logical_range()
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.pages.len()
+    }
+
+    pub(crate) fn into_parts(self) -> (Arc<MigrationExtentIdentity>, Vec<ClaimedMigrationPage>) {
+        (self.identity, self.pages)
+    }
 }
 
 impl Drop for ExtentRangeFreeze {
@@ -2279,6 +2341,79 @@ impl Rnvpc {
             return_errno_with_message!(Errno::ESTALE, "reverse locator forward edge changed");
         }
         usize::try_from(entry.length()).map_err(|_| Error::new(Errno::EOVERFLOW))
+    }
+
+    /// Claims one complete NV extent while retaining no metadata coordination
+    /// after this function returns. Exact page generations remain pinned until
+    /// completion publishes the SSD target or the claim is dropped.
+    pub(crate) fn claim_migration_extent(
+        self: &Arc<Self>,
+        seed: PersistentObjectRef,
+        locator: ReverseExtentRef,
+    ) -> Result<ClaimedMigrationExtent> {
+        let seed_key = self.validate_persistent_data_ref(seed)?;
+        let _publication = self.begin_completion_publication_for(seed_key.fs_id, seed_key.inode)?;
+        if self.reverse_lookup(seed)? != Some(locator) {
+            return_errno_with_message!(Errno::ESTALE, "migration seed reverse locator moved");
+        }
+        let frame = NvFrameId::try_from(
+            usize::try_from(locator.leaf_slot()).map_err(|_| Error::new(Errno::EOVERFLOW))?,
+        )?;
+        let leaf_ref = self.persistent_metadata_ref(frame)?;
+        let leaf = self.read_authoritative_metadata_boxed::<ExtentNodeRecord>(leaf_ref)?;
+        if leaf.level() != 0
+            || leaf.header().fs_id() != seed_key.fs_id
+            || leaf.header().inode() != seed_key.inode
+        {
+            return_errno_with_message!(Errno::ESTALE, "migration locator is not an owned leaf");
+        }
+        let entry = leaf.entry(locator.entry_index())?;
+        if !matches!(entry.data_ref()?, ExtentDataRef::Nv(_))
+            || entry.nv_slot_at(seed_key.page_index)? != seed.slot_plus_one()
+        {
+            return_errno_with_message!(Errno::ESTALE, "migration seed forward edge changed");
+        }
+        let range_end = entry
+            .logical_block()
+            .checked_add(u64::from(entry.length()))
+            .ok_or_else(|| Error::new(Errno::EOVERFLOW))?;
+        let mut pages = Vec::new();
+        pages
+            .try_reserve_exact(entry.length() as usize)
+            .map_err(|_| Error::new(Errno::ENOMEM))?;
+        for logical_block in entry.logical_block()..range_end {
+            let reference = self.persistent_data_ref_from_slot(entry.nv_slot_at(logical_block)?)?;
+            let key = PageKey::new(seed_key.fs_id, seed_key.inode, logical_block);
+            if self.validate_persistent_data_ref(reference)? != key
+                || self.reverse_lookup(reference)? != Some(locator)
+            {
+                return_errno_with_message!(Errno::ESTALE, "migration extent member changed");
+            }
+            let page = NvPageId::try_from(
+                usize::try_from(reference.slot().ok_or_else(|| Error::new(Errno::EINVAL))?)
+                    .map_err(|_| Error::new(Errno::EOVERFLOW))?,
+            )?;
+            let ssd_block = self.persistent_data_ssd_backing(reference)?;
+            let eviction =
+                self.begin_data_page_eviction_if_seq(page, reference.allocation_seq())?;
+            pages.push(ClaimedMigrationPage {
+                key,
+                reference,
+                ssd_block,
+                eviction,
+            });
+        }
+        Ok(ClaimedMigrationExtent {
+            identity: Arc::new(MigrationExtentIdentity {
+                fs_id: seed_key.fs_id,
+                inode: seed_key.inode,
+                logical_start: entry.logical_block(),
+                length: entry.length(),
+                nv_base_slot_plus_one: entry.nv_slot_at(entry.logical_block())?,
+                locator_hint: locator,
+            }),
+            pages,
+        })
     }
 
     pub(crate) fn persistent_data_has_migration_target(
