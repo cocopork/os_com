@@ -6,6 +6,8 @@
     "rust-analyzer.check.overrideCommand": [
         "cargo",
         "check",
+        "--target-dir",
+        ".rust-analyzer-target",
         "--quiet",
         "--message-format=json",
         "--manifest-path",
@@ -33,5 +35,6 @@
         "**/.svn": false,
         "**/CVS": false,
         "**/Thumbs.db": false
-    }
+    },
+    "rust-analyzer.cargo.targetDir": ".rust-analyzer-target"
 }
