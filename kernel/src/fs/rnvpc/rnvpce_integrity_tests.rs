@@ -3,7 +3,7 @@
 //! Recovered and adapted soft-update integration regressions.
 //! See docs/recovery/rnvpce-integrity.md for provenance and validation limits.
 
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use ostd::prelude::ktest;
 
@@ -778,6 +778,193 @@ fn persist_recovery_descriptor(image: &DramNvImage, slot: usize, descriptor: NvD
         .persist_control(commit_offset, size_of::<u64>())
         .unwrap();
     backend.fence().unwrap();
+}
+
+fn staged_redirect_page(pool: &Arc<Rnvpc>, fill: u8) -> NvPageId {
+    let page = pool.stage_data_page(&[fill; PAGE_SIZE]).unwrap();
+    pool.transition_data_page(page, DataPageState::Staged, DataPageState::NvDirty)
+        .unwrap();
+    page
+}
+
+#[ktest]
+fn rnvpce_redirect_publish_survives_every_selector_boundary() {
+    const KEY: PageKey = PageKey::new(0xa101, 31, 7);
+    for (fault, selected, retained) in [
+        (FaultPoint::BeforeContentPersist, false, false),
+        (FaultPoint::AfterContentPersist, false, false),
+        (FaultPoint::AfterCommitStore, false, true),
+        (FaultPoint::AfterCommitPersist, true, true),
+        (FaultPoint::AfterCommitFence, true, true),
+    ] {
+        let (image, config, pool) = restartable_pool(8);
+        let page = staged_redirect_page(&pool, 0x51);
+        assert!(
+            pool.publish_redirect_batch(&[(page, KEY, 9007)], Some(fault))
+                .is_err()
+        );
+        assert_eq!(
+            pool.data_page_state(page).unwrap() != DataPageState::Free,
+            retained,
+            "a possibly selected slot must not be reused after {fault:?}",
+        );
+        drop(pool);
+        image.simulate_crash();
+        let recovered = Arc::new(Rnvpc::recover(Arc::new(image.attach()), config, None).unwrap());
+        assert_eq!(recovered.redirect_lookup(KEY).is_some(), selected);
+    }
+}
+
+#[ktest]
+fn rnvpce_concurrent_publishers_get_distinct_logical_versions() {
+    const KEY: PageKey = PageKey::new(0xa102, 32, 8);
+    let pool = test_pool(16, 1, 15, None);
+    let first = staged_redirect_page(&pool, 0x61);
+    let second = staged_redirect_page(&pool, 0x62);
+    let versions = Arc::new([AtomicU64::new(0), AtomicU64::new(0)]);
+    let ready = Arc::new(AtomicUsize::new(0));
+    let go = Arc::new(AtomicUsize::new(0));
+    let mut threads = Vec::new();
+    for (worker, page) in [first, second].into_iter().enumerate() {
+        let pool = pool.clone();
+        let versions = versions.clone();
+        let ready = ready.clone();
+        let go = go.clone();
+        threads.push(
+            crate::thread::kernel_thread::ThreadOptions::new(move || {
+                ready.fetch_add(1, Ordering::AcqRel);
+                while go.load(Ordering::Acquire) == 0 {
+                    crate::thread::Thread::yield_now();
+                }
+                let handle = pool
+                    .publish_redirect_batch(&[(page, KEY, 9008)], None)
+                    .unwrap()[0];
+                versions[worker].store(handle.logical_version, Ordering::Release);
+            })
+            .spawn(),
+        );
+    }
+    while ready.load(Ordering::Acquire) != 2 {
+        crate::thread::Thread::yield_now();
+    }
+    go.store(1, Ordering::Release);
+    for thread in threads {
+        thread.join();
+    }
+    let mut versions = versions
+        .iter()
+        .map(|version| version.load(Ordering::Acquire))
+        .collect::<Vec<_>>();
+    versions.sort_unstable();
+    assert_eq!(versions, vec![1, 2]);
+    assert_eq!(pool.redirect_lookup(KEY).unwrap().logical_version, 2);
+}
+
+#[ktest]
+fn rnvpce_logical_version_overflow_rejects_publication() {
+    const KEY: PageKey = PageKey::new(0xa103, 33, 9);
+    let pool = test_pool(8, 1, 7, None);
+    let existing = staged_redirect_page(&pool, 0x71);
+    let reference = PersistentObjectRef::new(existing.index() as u64, 1).unwrap();
+    pool.install_redirect_for_test(
+        KEY,
+        DescriptorHandle {
+            reference,
+            logical_version: u64::MAX,
+            state: NvObjectState::NvDirty,
+            ssd_target: 9009,
+        },
+    )
+    .unwrap();
+    let page = staged_redirect_page(&pool, 0x72);
+    assert_eq!(
+        pool.publish_redirect_batch(&[(page, KEY, 9009)], None)
+            .unwrap_err()
+            .error(),
+        Errno::EOVERFLOW
+    );
+}
+
+#[ktest]
+fn rnvpce_slot_reuse_rejects_old_allocation_generation() {
+    const KEY: PageKey = PageKey::new(0xa104, 34, 10);
+    let pool = test_pool(8, 1, 7, None);
+    let page = staged_redirect_page(&pool, 0x81);
+    let old = pool
+        .publish_redirect_batch(&[(page, KEY, 9010)], None)
+        .unwrap()[0];
+    let reclaimed = pool.clear_redirects_exact(&[(KEY, old)], None).unwrap();
+    assert_eq!(reclaimed, vec![page]);
+    pool.free_data_page(page).unwrap();
+    let reused = staged_redirect_page(&pool, 0x82);
+    assert_eq!(reused, page);
+    match pool.pin_redirect(KEY, old) {
+        Err(error) => assert_eq!(error.error(), Errno::ESTALE),
+        Ok(_) => panic!("stale allocation generation was pinned"),
+    }
+}
+
+#[ktest]
+fn rnvpce_failed_publish_aborts_only_its_pending_token() {
+    const KEY: PageKey = PageKey::new(0xa105, 35, 11);
+    let pool = test_pool(8, 1, 7, None);
+    let failed = staged_redirect_page(&pool, 0x91);
+    assert!(
+        pool.publish_redirect_batch(
+            &[(failed, KEY, 9011)],
+            Some(FaultPoint::BeforeContentPersist),
+        )
+        .is_err()
+    );
+    let committed = staged_redirect_page(&pool, 0x92);
+    let handle = pool
+        .publish_redirect_batch(&[(committed, KEY, 9011)], None)
+        .unwrap()[0];
+    assert_eq!(handle.logical_version, 1);
+}
+
+#[ktest]
+fn rnvpce_uncertain_selector_latches_recovery_required() {
+    let pool = test_pool(8, 1, 7, None);
+    let first = staged_redirect_page(&pool, 0xa1);
+    assert!(
+        pool.publish_redirect_batch(
+            &[(first, PageKey::new(0xa106, 36, 12), 9012)],
+            Some(FaultPoint::AfterCommitStore),
+        )
+        .is_err()
+    );
+    let second = staged_redirect_page(&pool, 0xa2);
+    assert_eq!(
+        pool.publish_redirect_batch(&[(second, PageKey::new(0xa106, 36, 13), 9013)], None,)
+            .unwrap_err()
+            .error(),
+        Errno::EUCLEAN
+    );
+}
+
+#[ktest]
+fn rnvpce_clearing_old_descriptor_keeps_new_redirect() {
+    const KEY: PageKey = PageKey::new(0xa107, 37, 14);
+    let pool = test_pool(8, 1, 7, None);
+    let old_page = staged_redirect_page(&pool, 0xb1);
+    let old = pool
+        .publish_redirect_batch(&[(old_page, KEY, 9014)], None)
+        .unwrap()[0];
+    let new_page = staged_redirect_page(&pool, 0xb2);
+    let new = pool
+        .publish_redirect_batch(&[(new_page, KEY, 9014)], None)
+        .unwrap()[0];
+
+    assert_eq!(
+        pool.clear_redirects_exact(&[(KEY, old)], None).unwrap(),
+        vec![old_page]
+    );
+    assert_eq!(pool.redirect_lookup(KEY), Some(new));
+    let pin = pool.pin_redirect(KEY, new).unwrap();
+    let mut bytes = [0; PAGE_SIZE];
+    pin.read(&mut bytes).unwrap();
+    assert_eq!(bytes, [0xb2; PAGE_SIZE]);
 }
 
 fn recovery_descriptor(

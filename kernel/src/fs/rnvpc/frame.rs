@@ -55,6 +55,7 @@ mod pcache;
 pub(crate) use pcache::{PersistentDataRef, PersistentFrameUpdate};
 mod migration;
 mod object_table;
+mod redirect;
 use object_table::ObjectTable;
 mod publication;
 pub(crate) use publication::InodePublication;
@@ -1495,6 +1496,15 @@ impl Rnvpc {
 
     pub(crate) fn redirect_lookup(&self, key: PageKey) -> Option<DescriptorHandle> {
         self.redirects.lookup(key)
+    }
+
+    #[cfg(ktest)]
+    pub(crate) fn install_redirect_for_test(
+        &self,
+        key: PageKey,
+        handle: DescriptorHandle,
+    ) -> Result<bool> {
+        self.redirects.install_committed(key, handle)
     }
 
     /// Resolves and pins the current committed NV version of `key` atomically.
@@ -4578,9 +4588,15 @@ impl Rnvpc {
             let key = objects.records[index].key;
             let reference =
                 PersistentObjectRef::new(index as u64, objects.records[index].alloc_seq).ok();
+            let version = objects.records[index].version;
             if let Some(key) = key {
                 if matches!(objects.records[index].kind, ObjectKind::Data(_)) {
-                    state.index.remove(key);
+                    if state.index.lookup(key).is_some_and(|entry| {
+                        entry.reference == reference.unwrap_or(PersistentObjectRef::NONE)
+                            && entry.logical_version == version
+                    }) {
+                        state.index.remove(key);
+                    }
                 } else if state.metadata_index.get(&key) == Some(&index) {
                     state.metadata_index.remove(&key);
                 }
@@ -4592,12 +4608,19 @@ impl Rnvpc {
                 objects.records[index].kind = next;
             }
             key.zip(reference)
+                .map(|(key, reference)| (key, reference, version))
         } else {
             None
         };
         drop(objects);
         drop(state);
-        if let Some((key, reference)) = cleared {
+        if let Some((key, reference, version)) = cleared {
+            if let Some(handle) = self.redirects.lookup(key)
+                && handle.reference == reference
+                && handle.logical_version == version
+            {
+                self.redirects.compare_remove(key, handle);
+            }
             self.remove_pending_extent_index(key, reference);
         }
         if expected == ObjectKind::Metadata {

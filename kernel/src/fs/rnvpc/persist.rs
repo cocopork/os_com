@@ -204,7 +204,13 @@ impl PersistEngine {
             self.publication_uncertain.store(true, Ordering::Release);
             return Err(error);
         }
-        inject(fault, FaultPoint::AfterCommitFence)
+        if let Err(error) = inject(fault, FaultPoint::AfterCommitFence) {
+            // The selector is already durable. The caller cannot safely treat
+            // this as an unpublished object or reuse its slot before recovery.
+            self.publication_uncertain.store(true, Ordering::Release);
+            return Err(error);
+        }
+        Ok(())
     }
 
     pub(super) fn clear_frame(&self, index: usize, fault: Option<FaultPoint>) -> Result<()> {
@@ -243,6 +249,10 @@ impl PersistEngine {
             return_errno_with_message!(Errno::EUCLEAN, "NV selector publication requires recovery");
         }
         Ok(())
+    }
+
+    pub(super) fn publication_uncertain(&self) -> bool {
+        self.publication_uncertain.load(Ordering::Acquire)
     }
 
     fn check_descriptor(&self, index: usize, descriptor: &NvDescriptor) -> Result<()> {

@@ -224,10 +224,7 @@ impl RedirectDirectory {
             {
                 state.committed.insert(*key, handle);
                 Self::set_dirty(state, *key, handle.state);
-                state.epoch = state
-                    .epoch
-                    .checked_add(1)
-                    .ok_or_else(|| Error::new(Errno::EOVERFLOW))?;
+                state.epoch = state.epoch.wrapping_add(1);
             }
         }
         Ok(())
@@ -248,11 +245,29 @@ impl RedirectDirectory {
         }
         state.committed.insert(key, handle);
         Self::set_dirty(&mut state, key, handle.state);
-        state.epoch = state
-            .epoch
-            .checked_add(1)
-            .ok_or_else(|| Error::new(Errno::EOVERFLOW))?;
+        state.epoch = state.epoch.wrapping_add(1);
         Ok(true)
+    }
+
+    pub(crate) fn compare_update(
+        &self,
+        key: PageKey,
+        expected: DescriptorHandle,
+        replacement: DescriptorHandle,
+    ) -> bool {
+        if expected.reference != replacement.reference
+            || expected.logical_version != replacement.logical_version
+        {
+            return false;
+        }
+        let mut state = self.shards[self.shard_index(key)].lock();
+        if state.committed.get(&key) != Some(&expected) {
+            return false;
+        }
+        state.committed.insert(key, replacement);
+        Self::set_dirty(&mut state, key, replacement.state);
+        state.epoch = state.epoch.wrapping_add(1);
+        true
     }
 
     pub(crate) fn compare_remove(&self, key: PageKey, expected: DescriptorHandle) -> bool {
