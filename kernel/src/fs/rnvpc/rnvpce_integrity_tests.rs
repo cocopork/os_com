@@ -14,7 +14,7 @@ use super::{
     dram::{DramNvBackend, DramNvImage},
     extent_mutation::ExtentMutation,
     fault::FaultPoint,
-    frame::Rnvpc,
+    frame::{EvictingDataPage, MigrationExtentIdentity, Rnvpc},
     id::{NvFrameId, NvPageId},
     index::PageKey,
     metadata::{
@@ -22,11 +22,12 @@ use super::{
         PENDING_EXTENT_MUTATION_LOGICAL_INDEX, PendingExtentMutationRecord, PersistentObjectRef,
     },
     write_transaction::{
-        AuthoritySnapshot, RangeWriteBatch, RangeWritePage, SsdMigrationPage,
-        authoritative_inode_state, bootstrap_inode_authority, commit_range_write,
+        AuthoritySnapshot, ClaimedSsdMigrationExtent, RangeWriteBatch, RangeWritePage,
+        SsdMigrationPage, authoritative_inode_state, bootstrap_inode_authority, commit_range_write,
         consume_ssd_capacity_locked, current_page_mapping, mapped_nv_page_ref,
-        migrate_claimed_nv_extent_to_ssd, migrate_mapped_nv_pages_to_ssd_by_reverse,
-        reserve_ssd_capacity, space_reservation, test_release_migration_credit_with,
+        migrate_claimed_nv_extent_to_ssd, migrate_claimed_nv_extents_to_ssd,
+        migrate_mapped_nv_pages_to_ssd_by_reverse, reserve_ssd_capacity, space_reservation,
+        test_release_migration_credit_with,
     },
 };
 use crate::prelude::*;
@@ -127,6 +128,48 @@ fn extent_target_word_crash_is_always_old_or_new() {
             expected_block
         );
     }
+}
+
+#[ktest]
+fn extent_target_update_does_not_read_full_metadata_page() {
+    const FS_ID: u64 = 0xf405;
+    const INODE: u64 = 21;
+    let (image, _config, pool) = restartable_pool(8);
+    let mutation = ExtentMutation::new(pool.clone(), FS_ID, INODE).unwrap();
+    let old = ExtentRecordEntry::leaf(0, 1, 100, false).unwrap();
+    let node = ExtentNodeRecord::new(
+        FS_ID,
+        INODE,
+        1,
+        1,
+        0,
+        PersistentObjectRef::NONE,
+        PersistentObjectRef::NONE,
+        &[old],
+    )
+    .unwrap();
+    let initialized = mutation
+        .persist_initialized_child(PageKey::new(FS_ID, INODE, 0x8004), &node, None)
+        .unwrap();
+    let reference = initialized.reference();
+    let guard = pool.lock_metadata_mutation(reference).unwrap();
+    let replacement = ExtentRecordEntry::leaf(0, 1, 200, false).unwrap();
+    let observer = image.attach();
+    let before = observer.stats();
+
+    pool.persist_extent_target_with_guard(
+        &guard,
+        reference,
+        0,
+        old.target(),
+        replacement.target(),
+        None,
+    )
+    .unwrap();
+
+    let after = observer.stats();
+    assert_eq!(after.full_page_reads - before.full_page_reads, 0);
+    assert_eq!(after.range_reads - before.range_reads, 1);
 }
 
 #[ktest]
@@ -492,6 +535,50 @@ fn fair_node_split_survives_every_persist_boundary() {
 }
 
 #[ktest]
+fn fair_sibling_relink_accepts_existing_slot_plus_one() {
+    const FS_ID: u64 = 0xf406;
+    const INODE: u64 = 22;
+    let (_image, _config, pool) = restartable_pool(12);
+    let mutation = ExtentMutation::new(pool.clone(), FS_ID, INODE).unwrap();
+    let entry = [ExtentRecordEntry::leaf(0, 1, 100, false).unwrap()];
+    let persist_node = |logical_index, right_sibling| {
+        let record = ExtentNodeRecord::new(
+            FS_ID,
+            INODE,
+            1,
+            logical_index,
+            0,
+            PersistentObjectRef::NONE,
+            right_sibling,
+            &entry,
+        )
+        .unwrap();
+        mutation
+            .persist_initialized_child(PageKey::new(FS_ID, INODE, logical_index), &record, None)
+            .unwrap()
+            .reference()
+    };
+    let old_right = persist_node(0x8200, PersistentObjectRef::NONE);
+    let left = persist_node(0x8201, old_right);
+    let new_right = persist_node(0x8202, old_right);
+    let guard = pool.lock_metadata_mutation(left).unwrap();
+
+    pool.persist_extent_sibling_with_guard(
+        &guard,
+        left,
+        Some(old_right.slot_plus_one()),
+        new_right,
+        None,
+    )
+    .expect("a FAIR split must relink a node that already has a right sibling");
+
+    let left = pool
+        .read_authoritative_metadata::<ExtentNodeRecord>(left)
+        .unwrap();
+    assert_eq!(left.right_sibling_slot(), Some(new_right.slot_plus_one()));
+}
+
+#[ktest]
 fn rnvpce_random_overwrites_split_an_inplace_leaf() {
     const FS_ID: u64 = 0xf404;
     const INODE: u64 = 20;
@@ -510,7 +597,7 @@ fn rnvpce_random_overwrites_split_an_inplace_leaf() {
     .unwrap();
     bootstrap_inode_authority(pool.clone(), FS_ID, INODE, &snapshot, None).unwrap();
 
-    for iteration in 0..100u64 {
+    for iteration in 0..300u64 {
         let logical = iteration * 197 % FILE_PAGES;
         let pages =
             [RangeWritePage::new(logical, SSD_START + logical, 0, PAGE_SIZE, false).unwrap()];
@@ -552,6 +639,41 @@ fn rnvpce_random_overwrites_split_an_inplace_leaf() {
                 SSD_START + page,
                 "random overwrite {iteration} misrouted logical page {page}",
             );
+        }
+
+        let reference = mapped_nv_page_ref(&pool, FS_ID, INODE, logical)
+            .unwrap()
+            .unwrap();
+        let reverse = pool.reverse_lookup(reference).unwrap().unwrap();
+        let (identity, claimed_pages) = pool
+            .claim_migration_extent(reference, reverse)
+            .unwrap()
+            .into_parts();
+        let mut updates = Vec::new();
+        let mut evictions = Vec::new();
+        for claimed in claimed_pages {
+            let target = SSD_START + claimed.key.page_index;
+            claimed
+                .eviction
+                .assign_migration_target(claimed.reference, target)
+                .unwrap();
+            updates.push(SsdMigrationPage {
+                logical_block: claimed.key.page_index,
+                reference: claimed.reference,
+                ssd_block: target,
+            });
+            evictions.push(claimed.eviction);
+        }
+        assert!(
+            migrate_claimed_nv_extent_to_ssd(&pool, &identity, &updates, None)
+                .unwrap()
+                .into_iter()
+                .all(|result| result.unwrap())
+        );
+        for (update, eviction) in updates.iter().zip(evictions) {
+            eviction
+                .reclaim_after_ssd_publish(update.reference, None)
+                .unwrap();
         }
     }
 }
@@ -634,6 +756,143 @@ fn restartable_pool(total: usize) -> (DramNvImage, RnvpcConfig, Arc<Rnvpc>) {
         Rnvpc::format(Arc::new(image.attach()), config, None).expect("fresh image should format"),
     );
     (image, config, pool)
+}
+
+struct ClaimedExtentFixture {
+    pool: Arc<Rnvpc>,
+    identity: Arc<MigrationExtentIdentity>,
+    updates: Vec<SsdMigrationPage>,
+    evictions: Vec<EvictingDataPage>,
+    leaf_ref: PersistentObjectRef,
+}
+
+fn claimed_extent_fixture(fs_id: u64, inode: u64, target: u64) -> ClaimedExtentFixture {
+    let (_image, _config, pool) = restartable_pool(16);
+    let snapshot = AuthoritySnapshot::new(1, &[], 0, 0, 0o100644, 0).unwrap();
+    bootstrap_inode_authority(pool.clone(), fs_id, inode, &snapshot, None).unwrap();
+    let pages = [RangeWritePage::new(0, 0, 0, PAGE_SIZE, true).unwrap()];
+    let request =
+        RangeWriteBatch::new(2, 0, PAGE_SIZE, &[], &pages, 0, 0, (PAGE_SIZE / 512) as u64).unwrap();
+    commit_range_write(
+        pool.clone(),
+        fs_id,
+        inode,
+        &request,
+        &mut VmReader::from(&[0x5au8; PAGE_SIZE][..]).to_fallible(),
+        |_block, _staging| panic!("full-page write must not load SSD"),
+        None,
+    )
+    .unwrap();
+    let reference = mapped_nv_page_ref(&pool, fs_id, inode, 0).unwrap().unwrap();
+    let locator = pool.reverse_lookup(reference).unwrap().unwrap();
+    let leaf_ref = pool
+        .persistent_metadata_ref(NvFrameId::try_from(locator.leaf_slot() as usize).unwrap())
+        .unwrap();
+    let (identity, claimed_pages) = pool
+        .claim_migration_extent(reference, locator)
+        .unwrap()
+        .into_parts();
+    let mut updates = Vec::new();
+    let mut evictions = Vec::new();
+    for claimed in claimed_pages {
+        claimed
+            .eviction
+            .assign_migration_target(claimed.reference, target + claimed.key.page_index)
+            .unwrap();
+        updates.push(SsdMigrationPage {
+            logical_block: claimed.key.page_index,
+            reference: claimed.reference,
+            ssd_block: target + claimed.key.page_index,
+        });
+        evictions.push(claimed.eviction);
+    }
+    ClaimedExtentFixture {
+        pool,
+        identity,
+        updates,
+        evictions,
+        leaf_ref,
+    }
+}
+
+#[ktest]
+fn rnvpce_extent_completion_does_not_wait_for_inode_publication() {
+    const FS_ID: u64 = 0x9931;
+    const INODE: u64 = 41;
+    let mut fixture = claimed_extent_fixture(FS_ID, INODE, 51_000);
+    let publication = fixture.pool.begin_publication_for(FS_ID, INODE).unwrap();
+    let state = Arc::new(AtomicUsize::new(0));
+    let thread_pool = fixture.pool.clone();
+    let thread_identity = fixture.identity.clone();
+    let thread_updates = fixture.updates.clone();
+    let thread_state = state.clone();
+    let completion = crate::thread::kernel_thread::ThreadOptions::new(move || {
+        thread_state.store(1, Ordering::Release);
+        migrate_claimed_nv_extent_to_ssd(&thread_pool, &thread_identity, &thread_updates, None)
+            .unwrap();
+        thread_state.store(2, Ordering::Release);
+    })
+    .spawn();
+    while state.load(Ordering::Acquire) == 0 {
+        crate::thread::Thread::yield_now();
+    }
+    for _ in 0..128 {
+        crate::thread::Thread::yield_now();
+    }
+    let completed_while_publication_was_held = state.load(Ordering::Acquire) == 2;
+    drop(publication);
+    completion.join();
+    assert!(
+        completed_while_publication_was_held,
+        "completion must not acquire the foreground inode publication guard"
+    );
+    let update = fixture.updates[0];
+    fixture
+        .evictions
+        .pop()
+        .unwrap()
+        .reclaim_after_ssd_publish(update.reference, None)
+        .unwrap();
+}
+
+#[ktest]
+fn rnvpce_extent_completion_waits_for_its_leaf_guard() {
+    const FS_ID: u64 = 0x9932;
+    const INODE: u64 = 42;
+    let mut fixture = claimed_extent_fixture(FS_ID, INODE, 52_000);
+    let leaf_guard = fixture
+        .pool
+        .lock_metadata_mutation(fixture.leaf_ref)
+        .unwrap();
+    let state = Arc::new(AtomicUsize::new(0));
+    let thread_pool = fixture.pool.clone();
+    let thread_identity = fixture.identity.clone();
+    let thread_updates = fixture.updates.clone();
+    let thread_state = state.clone();
+    let completion = crate::thread::kernel_thread::ThreadOptions::new(move || {
+        thread_state.store(1, Ordering::Release);
+        migrate_claimed_nv_extent_to_ssd(&thread_pool, &thread_identity, &thread_updates, None)
+            .unwrap();
+        thread_state.store(2, Ordering::Release);
+    })
+    .spawn();
+    while state.load(Ordering::Acquire) == 0 {
+        crate::thread::Thread::yield_now();
+    }
+    for _ in 0..128 {
+        crate::thread::Thread::yield_now();
+    }
+    assert_eq!(state.load(Ordering::Acquire), 1);
+    drop(leaf_guard);
+    completion.join();
+    assert_eq!(state.load(Ordering::Acquire), 2);
+    let update = fixture.updates[0];
+    fixture
+        .evictions
+        .pop()
+        .unwrap()
+        .reclaim_after_ssd_publish(update.reference, None)
+        .unwrap();
 }
 
 #[ktest]
@@ -884,6 +1143,75 @@ fn rnvpce_foreground_batch_updates_each_leaf_once() {
 }
 
 #[ktest]
+fn rnvpce_inplace_extent_split_uses_one_field_update_session() {
+    const FS_ID: u64 = 0x9925;
+    const INODE: u64 = 35;
+    const FILE_PAGES: u64 = 8;
+    const SSD_START: u64 = 70_000;
+    let (_image, _config, pool) = restartable_pool(32);
+    let initial = [ExtentRecordEntry::leaf(0, FILE_PAGES as u32, SSD_START, false).unwrap()];
+    let snapshot = AuthoritySnapshot::new(
+        1,
+        &initial,
+        FILE_PAGES * PAGE_SIZE as u64,
+        FILE_PAGES * (PAGE_SIZE / 512) as u64,
+        0o100644,
+        0,
+    )
+    .unwrap();
+    bootstrap_inode_authority(pool.clone(), FS_ID, INODE, &snapshot, None).unwrap();
+
+    let pages = [
+        RangeWritePage::new(2, SSD_START + 2, 0, PAGE_SIZE, false).unwrap(),
+        RangeWritePage::new(3, SSD_START + 3, 0, PAGE_SIZE, false).unwrap(),
+    ];
+    let request = RangeWriteBatch::new(
+        2,
+        2 * PAGE_SIZE as u64,
+        2 * PAGE_SIZE,
+        &[],
+        &pages,
+        FILE_PAGES * PAGE_SIZE as u64,
+        FILE_PAGES * (PAGE_SIZE / 512) as u64,
+        2 * (PAGE_SIZE / 512) as u64,
+    )
+    .unwrap();
+    let input = [0x66u8; 2 * PAGE_SIZE];
+    let before = pool.extent_field_update_sessions();
+    commit_range_write(
+        pool.clone(),
+        FS_ID,
+        INODE,
+        &request,
+        &mut VmReader::from(input.as_slice()).to_fallible(),
+        |_block, _staging| panic!("full-page overwrite must not read SSD"),
+        None,
+    )
+    .unwrap();
+
+    assert_eq!(pool.extent_field_update_sessions() - before, 1);
+    assert!(
+        mapped_nv_page_ref(&pool, FS_ID, INODE, 2)
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        mapped_nv_page_ref(&pool, FS_ID, INODE, 3)
+            .unwrap()
+            .is_some()
+    );
+    for logical in [0, 1, 4, 7] {
+        assert_eq!(
+            current_page_mapping(&pool, FS_ID, INODE, logical)
+                .unwrap()
+                .unwrap()
+                .ssd_block(),
+            SSD_START + logical,
+        );
+    }
+}
+
+#[ktest]
 fn rnvpce_batch_migration_updates_leaf_targets_in_place() {
     const FS_ID: u64 = 0x9921;
     const INODE: u64 = 31;
@@ -990,8 +1318,14 @@ fn rnvpce_batch_migration_updates_leaf_targets_in_place() {
             .error(),
         Errno::ESTALE
     );
+    let routes_before_completion = pool.extent_tree_routes();
     let outcomes = migrate_claimed_nv_extent_to_ssd(&pool, &identity, &updates, None).unwrap();
     assert!(outcomes.into_iter().all(|result| result.unwrap()));
+    assert_eq!(
+        pool.extent_tree_routes(),
+        routes_before_completion,
+        "claimed extent completion must use its reverse locator instead of routing from root"
+    );
     let after = pool
         .read_authoritative_metadata::<ExtentNodeRecord>(leaf_ref)
         .unwrap()
@@ -1035,6 +1369,35 @@ fn rnvpce_batch_migration_updates_leaf_targets_in_place() {
             update.ssd_block
         );
     }
+
+    let overwrite = [RangeWritePage::new(0, 45_000, 0, PAGE_SIZE, false).unwrap()];
+    let request = RangeWriteBatch::new(
+        3,
+        0,
+        PAGE_SIZE,
+        &[],
+        &overwrite,
+        2 * PAGE_SIZE as u64,
+        2 * (PAGE_SIZE / 512) as u64,
+        (PAGE_SIZE / 512) as u64,
+    )
+    .unwrap();
+    let input = [0x91u8; PAGE_SIZE];
+    commit_range_write(
+        pool.clone(),
+        FS_ID,
+        INODE,
+        &request,
+        &mut VmReader::from(&input[..]).to_fallible(),
+        |_block, _staging| panic!("full-page overwrite must not load SSD"),
+        None,
+    )
+    .expect("a migrated and reclaimed logical page must remain overwritable");
+    assert!(
+        mapped_nv_page_ref(&pool, FS_ID, INODE, 0)
+            .unwrap()
+            .is_some()
+    );
 }
 
 #[ktest]
@@ -1106,6 +1469,135 @@ fn rnvpce_extent_completion_rejects_fragmented_targets_as_one_unit() {
         );
     }
     drop(evictions);
+}
+
+#[ktest]
+fn rnvpce_completion_batches_credit_and_ledger_across_extents() {
+    const FS_ID: u64 = 0x9933;
+    const INODE: u64 = 43;
+    let (_image, _config, pool) = restartable_pool(32);
+    let snapshot = AuthoritySnapshot::new(1, &[], 0, 0, 0o100644, 0).unwrap();
+    bootstrap_inode_authority(pool.clone(), FS_ID, INODE, &snapshot, None).unwrap();
+
+    for (generation, logical) in [(2, 0), (3, 2)] {
+        let pages = [RangeWritePage::new(logical, 0, 0, PAGE_SIZE, true).unwrap()];
+        let request = RangeWriteBatch::new(
+            generation,
+            logical * PAGE_SIZE as u64,
+            PAGE_SIZE,
+            &[],
+            &pages,
+            logical * PAGE_SIZE as u64,
+            logical * (PAGE_SIZE / 512) as u64,
+            (PAGE_SIZE / 512) as u64,
+        )
+        .unwrap();
+        commit_range_write(
+            pool.clone(),
+            FS_ID,
+            INODE,
+            &request,
+            &mut VmReader::from(&[generation as u8; PAGE_SIZE][..]).to_fallible(),
+            |_block, _staging| panic!("full-page write must not load SSD"),
+            None,
+        )
+        .unwrap();
+    }
+
+    let mut batch = Vec::new();
+    let mut evictions = Vec::new();
+    for logical in [0, 2] {
+        let reference = mapped_nv_page_ref(&pool, FS_ID, INODE, logical)
+            .unwrap()
+            .unwrap();
+        let locator = pool.reverse_lookup(reference).unwrap().unwrap();
+        let (identity, claimed_pages) = pool
+            .claim_migration_extent(reference, locator)
+            .unwrap()
+            .into_parts();
+        let mut updates = Vec::new();
+        for claimed in claimed_pages {
+            let target = 53_000 + claimed.key.page_index;
+            claimed
+                .eviction
+                .assign_migration_target(claimed.reference, target)
+                .unwrap();
+            updates.push(SsdMigrationPage {
+                logical_block: claimed.key.page_index,
+                reference: claimed.reference,
+                ssd_block: target,
+            });
+            evictions.push(claimed.eviction);
+        }
+        batch.push(ClaimedSsdMigrationExtent { identity, updates });
+    }
+    let before = space_reservation(&pool, FS_ID, INODE).unwrap().unwrap();
+
+    let outcomes = migrate_claimed_nv_extents_to_ssd(&pool, FS_ID, INODE, &batch, None).unwrap();
+
+    assert!(outcomes.into_iter().flatten().all(|result| result.unwrap()));
+    let after = space_reservation(&pool, FS_ID, INODE).unwrap().unwrap();
+    assert_eq!(
+        after.header().generation(),
+        before.header().generation() + 1
+    );
+    assert_eq!(after.outstanding_blocks(), 0);
+    for (extent, eviction) in batch.iter().zip(evictions) {
+        eviction
+            .reclaim_after_ssd_publish(extent.updates[0].reference, None)
+            .unwrap();
+    }
+}
+
+#[ktest]
+fn rnvpce_candidate_claim_reads_shared_leaf_once() {
+    const FS_ID: u64 = 0x9934;
+    const INODE: u64 = 44;
+    let (_image, _config, pool) = restartable_pool(32);
+    let snapshot = AuthoritySnapshot::new(1, &[], 0, 0, 0o100644, 0).unwrap();
+    bootstrap_inode_authority(pool.clone(), FS_ID, INODE, &snapshot, None).unwrap();
+
+    for (generation, logical) in [(2, 0), (3, 2)] {
+        let pages = [RangeWritePage::new(logical, 0, 0, PAGE_SIZE, true).unwrap()];
+        let request = RangeWriteBatch::new(
+            generation,
+            logical * PAGE_SIZE as u64,
+            PAGE_SIZE,
+            &[],
+            &pages,
+            logical * PAGE_SIZE as u64,
+            logical * (PAGE_SIZE / 512) as u64,
+            (PAGE_SIZE / 512) as u64,
+        )
+        .unwrap();
+        commit_range_write(
+            pool.clone(),
+            FS_ID,
+            INODE,
+            &request,
+            &mut VmReader::from(&[generation as u8; PAGE_SIZE][..]).to_fallible(),
+            |_block, _staging| panic!("full-page write must not load SSD"),
+            None,
+        )
+        .unwrap();
+    }
+    let seeds: Vec<_> = [0, 2]
+        .into_iter()
+        .map(|logical| {
+            let reference = mapped_nv_page_ref(&pool, FS_ID, INODE, logical)
+                .unwrap()
+                .unwrap();
+            let locator = pool.reverse_lookup(reference).unwrap().unwrap();
+            (reference, locator)
+        })
+        .collect();
+    assert_eq!(seeds[0].1.leaf_slot(), seeds[1].1.leaf_slot());
+    let before = pool.migration_claim_leaf_reads();
+
+    let claimed = pool.claim_migration_extents(&seeds, 128).unwrap();
+
+    assert_eq!(claimed.len(), 2);
+    assert_eq!(pool.migration_claim_leaf_reads() - before, 1);
 }
 
 #[ktest]

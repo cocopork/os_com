@@ -16,6 +16,9 @@ pub(crate) trait NvMemoryBackend: Send + Sync {
 
     fn read_page(&self, id: NvPageId, output: &mut [u8]) -> Result<()>;
 
+    /// Copies one range from an NV page without materializing the other bytes.
+    fn read_page_range(&self, id: NvPageId, offset: usize, output: &mut [u8]) -> Result<()>;
+
     /// Copies one NV-page range directly into the caller's destination.
     fn copy_to_writer(
         &self,

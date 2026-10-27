@@ -353,6 +353,12 @@ pub(crate) struct Rnvpc {
     // Diagnostic total only. Admission/freeing uses the slot-protected pins.
     pinned_frames: AtomicUsize,
     extent_mutation_epoch: AtomicU64,
+    #[cfg(ktest)]
+    extent_field_update_sessions: AtomicU64,
+    #[cfg(ktest)]
+    extent_tree_routes: AtomicU64,
+    #[cfg(ktest)]
+    migration_claim_leaf_reads: AtomicU64,
     high_water_wake: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
@@ -370,7 +376,6 @@ pub(crate) struct MigrationExtentIdentity {
     logical_start: u64,
     length: u32,
     nv_base_slot_plus_one: u64,
-    locator_hint: ReverseExtentRef,
 }
 
 pub(crate) struct ClaimedMigrationExtent {
@@ -408,10 +413,6 @@ impl MigrationExtentIdentity {
 
     pub(crate) fn nv_base_slot_plus_one(&self) -> u64 {
         self.nv_base_slot_plus_one
-    }
-
-    pub(crate) fn locator_hint(&self) -> ReverseExtentRef {
-        self.locator_hint
     }
 }
 
@@ -539,6 +540,12 @@ impl Rnvpc {
                 migration_freezes: BTreeMap::new(),
             }),
             extent_mutation_epoch: AtomicU64::new(0),
+            #[cfg(ktest)]
+            extent_field_update_sessions: AtomicU64::new(0),
+            #[cfg(ktest)]
+            extent_tree_routes: AtomicU64::new(0),
+            #[cfg(ktest)]
+            migration_claim_leaf_reads: AtomicU64::new(0),
             high_water_wake,
         })
     }
@@ -549,6 +556,32 @@ impl Rnvpc {
 
     pub(crate) fn note_extent_mutation(&self) {
         self.extent_mutation_epoch.fetch_add(1, Ordering::AcqRel);
+    }
+
+    #[cfg(ktest)]
+    pub(crate) fn extent_field_update_sessions(&self) -> u64 {
+        self.extent_field_update_sessions.load(Ordering::Acquire)
+    }
+
+    #[cfg(ktest)]
+    fn note_extent_field_update_session(&self) {
+        self.extent_field_update_sessions
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[cfg(ktest)]
+    pub(crate) fn extent_tree_routes(&self) -> u64 {
+        self.extent_tree_routes.load(Ordering::Acquire)
+    }
+
+    #[cfg(ktest)]
+    pub(crate) fn note_extent_tree_route(&self) {
+        self.extent_tree_routes.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[cfg(ktest)]
+    pub(crate) fn migration_claim_leaf_reads(&self) -> u64 {
+        self.migration_claim_leaf_reads.load(Ordering::Acquire)
     }
 
     pub(crate) fn format(
@@ -2351,69 +2384,109 @@ impl Rnvpc {
         seed: PersistentObjectRef,
         locator: ReverseExtentRef,
     ) -> Result<ClaimedMigrationExtent> {
-        let seed_key = self.validate_persistent_data_ref(seed)?;
-        let _publication = self.begin_completion_publication_for(seed_key.fs_id, seed_key.inode)?;
-        if self.reverse_lookup(seed)? != Some(locator) {
-            return_errno_with_message!(Errno::ESTALE, "migration seed reverse locator moved");
+        self.claim_migration_extents(&[(seed, locator)], usize::MAX)?
+            .pop()
+            .ok_or_else(|| Error::new(Errno::EAGAIN))
+    }
+
+    /// Claims complete NV extents from one leaf under one short publication
+    /// section. No metadata coordination is retained after this function.
+    pub(crate) fn claim_migration_extents(
+        self: &Arc<Self>,
+        seeds: &[(PersistentObjectRef, ReverseExtentRef)],
+        page_budget: usize,
+    ) -> Result<Vec<ClaimedMigrationExtent>> {
+        let Some((first_seed, first_locator)) = seeds.first().copied() else {
+            return Ok(Vec::new());
+        };
+        if page_budget == 0 {
+            return Ok(Vec::new());
         }
+        let first_key = self.validate_persistent_data_ref(first_seed)?;
+        let _publication =
+            self.begin_completion_publication_for(first_key.fs_id, first_key.inode)?;
         let frame = NvFrameId::try_from(
-            usize::try_from(locator.leaf_slot()).map_err(|_| Error::new(Errno::EOVERFLOW))?,
+            usize::try_from(first_locator.leaf_slot()).map_err(|_| Error::new(Errno::EOVERFLOW))?,
         )?;
         let leaf_ref = self.persistent_metadata_ref(frame)?;
         let leaf = self.read_authoritative_metadata_boxed::<ExtentNodeRecord>(leaf_ref)?;
+        #[cfg(ktest)]
+        self.migration_claim_leaf_reads
+            .fetch_add(1, Ordering::Relaxed);
         if leaf.level() != 0
-            || leaf.header().fs_id() != seed_key.fs_id
-            || leaf.header().inode() != seed_key.inode
+            || leaf.header().fs_id() != first_key.fs_id
+            || leaf.header().inode() != first_key.inode
         {
             return_errno_with_message!(Errno::ESTALE, "migration locator is not an owned leaf");
         }
-        let entry = leaf.entry(locator.entry_index())?;
-        if !matches!(entry.data_ref()?, ExtentDataRef::Nv(_))
-            || entry.nv_slot_at(seed_key.page_index)? != seed.slot_plus_one()
-        {
-            return_errno_with_message!(Errno::ESTALE, "migration seed forward edge changed");
-        }
-        let range_end = entry
-            .logical_block()
-            .checked_add(u64::from(entry.length()))
-            .ok_or_else(|| Error::new(Errno::EOVERFLOW))?;
-        let mut pages = Vec::new();
-        pages
-            .try_reserve_exact(entry.length() as usize)
-            .map_err(|_| Error::new(Errno::ENOMEM))?;
-        for logical_block in entry.logical_block()..range_end {
-            let reference = self.persistent_data_ref_from_slot(entry.nv_slot_at(logical_block)?)?;
-            let key = PageKey::new(seed_key.fs_id, seed_key.inode, logical_block);
-            if self.validate_persistent_data_ref(reference)? != key
-                || self.reverse_lookup(reference)? != Some(locator)
+        let mut claimed = Vec::new();
+        let mut claimed_pages = 0usize;
+        let mut seen_entries = BTreeSet::new();
+        for (seed, locator) in seeds.iter().copied() {
+            let seed_key = self.validate_persistent_data_ref(seed)?;
+            if (seed_key.fs_id, seed_key.inode) != (first_key.fs_id, first_key.inode)
+                || locator.leaf_slot() != first_locator.leaf_slot()
+                || self.reverse_lookup(seed)? != Some(locator)
             {
-                return_errno_with_message!(Errno::ESTALE, "migration extent member changed");
+                return_errno_with_message!(Errno::ESTALE, "migration seed group changed");
             }
-            let page = NvPageId::try_from(
-                usize::try_from(reference.slot().ok_or_else(|| Error::new(Errno::EINVAL))?)
-                    .map_err(|_| Error::new(Errno::EOVERFLOW))?,
-            )?;
-            let ssd_block = self.persistent_data_ssd_backing(reference)?;
-            let eviction =
-                self.begin_data_page_eviction_if_seq(page, reference.allocation_seq())?;
-            pages.push(ClaimedMigrationPage {
-                key,
-                reference,
-                ssd_block,
-                eviction,
+            if !seen_entries.insert(locator.entry_index()) {
+                continue;
+            }
+            let entry = leaf.entry(locator.entry_index())?;
+            if !matches!(entry.data_ref()?, ExtentDataRef::Nv(_))
+                || entry.nv_slot_at(seed_key.page_index)? != seed.slot_plus_one()
+            {
+                return_errno_with_message!(Errno::ESTALE, "migration seed forward edge changed");
+            }
+            let extent_len = entry.length() as usize;
+            if claimed_pages.saturating_add(extent_len) > page_budget {
+                break;
+            }
+            let range_end = entry
+                .logical_block()
+                .checked_add(u64::from(entry.length()))
+                .ok_or_else(|| Error::new(Errno::EOVERFLOW))?;
+            let mut pages = Vec::new();
+            pages
+                .try_reserve_exact(extent_len)
+                .map_err(|_| Error::new(Errno::ENOMEM))?;
+            for logical_block in entry.logical_block()..range_end {
+                let reference =
+                    self.persistent_data_ref_from_slot(entry.nv_slot_at(logical_block)?)?;
+                let key = PageKey::new(seed_key.fs_id, seed_key.inode, logical_block);
+                if self.validate_persistent_data_ref(reference)? != key
+                    || self.reverse_lookup(reference)? != Some(locator)
+                {
+                    return_errno_with_message!(Errno::ESTALE, "migration extent member changed");
+                }
+                let page = NvPageId::try_from(
+                    usize::try_from(reference.slot().ok_or_else(|| Error::new(Errno::EINVAL))?)
+                        .map_err(|_| Error::new(Errno::EOVERFLOW))?,
+                )?;
+                let ssd_block = self.persistent_data_ssd_backing(reference)?;
+                let eviction =
+                    self.begin_data_page_eviction_if_seq(page, reference.allocation_seq())?;
+                pages.push(ClaimedMigrationPage {
+                    key,
+                    reference,
+                    ssd_block,
+                    eviction,
+                });
+            }
+            claimed_pages += extent_len;
+            claimed.push(ClaimedMigrationExtent {
+                identity: Arc::new(MigrationExtentIdentity {
+                    fs_id: seed_key.fs_id,
+                    inode: seed_key.inode,
+                    logical_start: entry.logical_block(),
+                    length: entry.length(),
+                    nv_base_slot_plus_one: entry.nv_slot_at(entry.logical_block())?,
+                }),
+                pages,
             });
         }
-        Ok(ClaimedMigrationExtent {
-            identity: Arc::new(MigrationExtentIdentity {
-                fs_id: seed_key.fs_id,
-                inode: seed_key.inode,
-                logical_start: entry.logical_block(),
-                length: entry.length(),
-                nv_base_slot_plus_one: entry.nv_slot_at(entry.logical_block())?,
-                locator_hint: locator,
-            }),
-            pages,
-        })
+        Ok(claimed)
     }
 
     pub(crate) fn persistent_data_has_migration_target(
@@ -3078,6 +3151,26 @@ impl Rnvpc {
         T::decode_record(&page[..size_of::<T>()])
     }
 
+    fn read_metadata_page_value<T: Pod>(&self, frame: NvFrameId, offset: usize) -> Result<T> {
+        let end = offset
+            .checked_add(size_of::<T>())
+            .ok_or_else(|| Error::new(Errno::EOVERFLOW))?;
+        if end > PAGE_SIZE {
+            return_errno_with_message!(Errno::EINVAL, "metadata value is outside its NV page");
+        }
+        let mut value = T::new_zeroed();
+        self.backend
+            .read_page_range(self.page_id(frame), offset, value.as_mut_bytes())?;
+        Ok(value)
+    }
+
+    fn read_extent_entry(&self, frame: NvFrameId, entry_index: usize) -> Result<ExtentRecordEntry> {
+        self.read_metadata_page_value(
+            frame,
+            extent_entry_field_offset(entry_index, EXTENT_ENTRY_LOGICAL_OFFSET)?,
+        )
+    }
+
     fn persist_page_u64(&self, frame: NvFrameId, offset: usize, value: u64) -> Result<()> {
         self.backend
             .store_page_u64(self.page_id(frame), offset, value)?;
@@ -3382,10 +3475,13 @@ impl Rnvpc {
         let (_, key) = self.metadata_identity(current)?;
         let frame = self.validate_metadata_mutation_guard(guard, current, key)?;
         self.begin_exclusive_metadata_update(frame, current.allocation_seq())?;
+        #[cfg(ktest)]
+        self.note_extent_field_update_session();
 
         let result = (|| {
-            let node = self.read_metadata_page_unchecked::<ExtentNodeRecord>(frame)?;
-            if node.entry(entry_index)?.target() != expected {
+            let entry = self.read_extent_entry(frame, entry_index)?;
+            entry.validate_for_level(0)?;
+            if entry.target() != expected {
                 return_errno_with_message!(Errno::ESTALE, "extent target changed");
             }
             let offset = extent_entry_field_offset(entry_index, EXTENT_ENTRY_TARGET_OFFSET)?;
@@ -3414,13 +3510,17 @@ impl Rnvpc {
         let (_, key) = self.metadata_identity(current)?;
         let frame = self.validate_metadata_mutation_guard(guard, current, key)?;
         self.begin_exclusive_metadata_update(frame, current.allocation_seq())?;
+        #[cfg(ktest)]
+        self.note_extent_field_update_session();
         let result = (|| {
-            let node = self.read_metadata_page_unchecked::<ExtentNodeRecord>(frame)?;
-            if node.entry_count() >= EXTENT_NODE_ENTRY_CAPACITY {
+            let level_count_flags =
+                self.read_metadata_page_value::<u64>(frame, EXTENT_NODE_LEVEL_COUNT_FLAGS_OFFSET)?;
+            let level = level_count_flags as u16;
+            let index = usize::from((level_count_flags >> 16) as u16);
+            if index >= EXTENT_NODE_ENTRY_CAPACITY {
                 return_errno_with_message!(Errno::ENOSPC, "extent leaf has no free entry slot");
             }
-            entry.validate_for_level(node.level())?;
-            let index = node.entry_count();
+            entry.validate_for_level(level)?;
             let logical_offset = extent_entry_field_offset(index, EXTENT_ENTRY_LOGICAL_OFFSET)?;
             let range_offset = extent_entry_field_offset(index, EXTENT_ENTRY_RANGE_OFFSET)?;
             let target_offset = extent_entry_field_offset(index, EXTENT_ENTRY_TARGET_OFFSET)?;
@@ -3434,7 +3534,7 @@ impl Rnvpc {
             self.persist_page_u64(
                 frame,
                 EXTENT_NODE_LEVEL_COUNT_FLAGS_OFFSET,
-                node.level_count_flags_word(count),
+                (level_count_flags & !(u64::from(u16::MAX) << 16)) | (u64::from(count) << 16),
             )?;
             inject(fault, FaultPoint::AfterContentPersist)?;
             Ok(index)
@@ -3464,9 +3564,11 @@ impl Rnvpc {
         let (_, key) = self.metadata_identity(current)?;
         let frame = self.validate_metadata_mutation_guard(guard, current, key)?;
         self.begin_exclusive_metadata_update(frame, current.allocation_seq())?;
+        #[cfg(ktest)]
+        self.note_extent_field_update_session();
         let result = (|| {
-            let node = self.read_metadata_page_unchecked::<ExtentNodeRecord>(frame)?;
-            let entry = node.entry(entry_index)?;
+            let entry = self.read_extent_entry(frame, entry_index)?;
+            entry.validate_for_level(0)?;
             if entry.range_tail() != expected || !matches!(entry.data_ref()?, ExtentDataRef::Ssd(_))
             {
                 return_errno_with_message!(Errno::ESTALE, "extent range changed");
@@ -3484,12 +3586,103 @@ impl Rnvpc {
         result.map(|_| current)
     }
 
+    /// Applies a prevalidated leaf mutation using the snapshot protected by
+    /// `guard`. The caller supplies only the changed fields, so this path does
+    /// not materialize or revalidate another 4 KiB extent-node image.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn persist_prevalidated_extent_leaf_update_with_guard(
+        self: &Arc<Self>,
+        guard: &MetadataMutationGuard,
+        current: PersistentObjectRef,
+        initial_entry_count: usize,
+        level_count_flags_word: u64,
+        appends: [Option<ExtentRecordEntry>; 2],
+        range_update: Option<(usize, u64)>,
+        target_update: Option<(usize, ExtentTarget)>,
+        fault: Option<FaultPoint>,
+    ) -> Result<PersistentObjectRef> {
+        let append_count = appends.iter().flatten().count();
+        if appends[0].is_none() && appends[1].is_some() {
+            return_errno_with_message!(Errno::EINVAL, "extent appends are not dense");
+        }
+        let final_entry_count = initial_entry_count
+            .checked_add(append_count)
+            .filter(|count| *count <= EXTENT_NODE_ENTRY_CAPACITY)
+            .ok_or_else(|| Error::new(Errno::ENOSPC))?;
+        let encoded_count = usize::try_from((level_count_flags_word >> 16) & u64::from(u16::MAX))
+            .map_err(|_| Error::new(Errno::EOVERFLOW))?;
+        if level_count_flags_word & u64::from(u16::MAX) != 0 || encoded_count != initial_entry_count
+        {
+            return_errno_with_message!(Errno::EINVAL, "extent leaf snapshot is inconsistent");
+        }
+        for entry in appends.iter().flatten() {
+            entry.validate_for_level(0)?;
+        }
+        if let Some((index, replacement)) = range_update {
+            if index >= initial_entry_count || replacement == 0 || replacement >> 32 != 0 {
+                return_errno_with_message!(Errno::EINVAL, "invalid extent range update");
+            }
+        }
+        if let Some((index, replacement)) = target_update {
+            if index >= final_entry_count || !replacement.is_published() {
+                return_errno_with_message!(Errno::EINVAL, "invalid extent target update");
+            }
+        }
+
+        let (_, key) = self.metadata_identity(current)?;
+        let frame = self.validate_metadata_mutation_guard(guard, current, key)?;
+        self.begin_exclusive_metadata_update(frame, current.allocation_seq())?;
+        #[cfg(ktest)]
+        self.note_extent_field_update_session();
+
+        let result = (|| {
+            let mut count = initial_entry_count;
+            for entry in appends.into_iter().flatten() {
+                let logical_offset = extent_entry_field_offset(count, EXTENT_ENTRY_LOGICAL_OFFSET)?;
+                let range_offset = extent_entry_field_offset(count, EXTENT_ENTRY_RANGE_OFFSET)?;
+                let target_offset = extent_entry_field_offset(count, EXTENT_ENTRY_TARGET_OFFSET)?;
+                self.persist_page_u64(frame, logical_offset, entry.logical_block())?;
+                inject(fault, FaultPoint::AfterExtentPreparedPersist)?;
+                self.persist_page_u64(frame, range_offset, entry.range_tail())?;
+                inject(fault, FaultPoint::AfterDependencyPersist)?;
+                self.persist_page_u64(frame, target_offset, entry.target().raw())?;
+                inject(fault, FaultPoint::AfterVisibilityPersist)?;
+                count += 1;
+                let count = u16::try_from(count).map_err(|_| Error::new(Errno::EOVERFLOW))?;
+                let count_word = (level_count_flags_word & !(u64::from(u16::MAX) << 16))
+                    | (u64::from(count) << 16);
+                self.persist_page_u64(frame, EXTENT_NODE_LEVEL_COUNT_FLAGS_OFFSET, count_word)?;
+                inject(fault, FaultPoint::AfterContentPersist)?;
+            }
+            if let Some((index, replacement)) = range_update {
+                let offset = extent_entry_field_offset(index, EXTENT_ENTRY_RANGE_OFFSET)?;
+                self.persist_page_u64(frame, offset, replacement)?;
+                inject(fault, FaultPoint::AfterExtentChildPersist)?;
+            }
+            if let Some((index, replacement)) = target_update {
+                let offset = extent_entry_field_offset(index, EXTENT_ENTRY_TARGET_OFFSET)?;
+                inject(fault, FaultPoint::BeforeContentPersist)?;
+                self.persist_page_u64(frame, offset, replacement.raw())?;
+                inject(fault, FaultPoint::AfterVisibilityPersist)?;
+            }
+            Ok(())
+        })();
+
+        let mut state = self.objects.lock(frame.index());
+        state.records[frame.index()].pins -= 1;
+        state.records[frame.index()].persisting = false;
+        self.account_unpin();
+        drop(state);
+        note_metadata_pin_change();
+        result.map(|_| current)
+    }
+
     /// Publishes a fully initialized FAIR sibling with one atomic slot word.
     pub(crate) fn persist_extent_sibling_with_guard(
         self: &Arc<Self>,
         guard: &MetadataMutationGuard,
         current: PersistentObjectRef,
-        expected_slot: Option<u64>,
+        expected_slot_plus_one: Option<u64>,
         sibling: PersistentObjectRef,
         fault: Option<FaultPoint>,
     ) -> Result<PersistentObjectRef> {
@@ -3501,8 +3694,11 @@ impl Rnvpc {
         let frame = self.validate_metadata_mutation_guard(guard, current, key)?;
         self.begin_exclusive_metadata_update(frame, current.allocation_seq())?;
         let result = (|| {
-            let node = self.read_metadata_page_unchecked::<ExtentNodeRecord>(frame)?;
-            if node.right_sibling_slot() != expected_slot {
+            let sibling_slot_plus_one =
+                self.read_metadata_page_value::<u64>(frame, EXTENT_NODE_RIGHT_SIBLING_OFFSET)?;
+            let current_slot_plus_one =
+                (sibling_slot_plus_one != 0).then_some(sibling_slot_plus_one);
+            if current_slot_plus_one != expected_slot_plus_one {
                 return_errno_with_message!(Errno::ESTALE, "extent sibling changed");
             }
             inject(fault, FaultPoint::BeforeContentPersist)?;
@@ -3534,15 +3730,19 @@ impl Rnvpc {
         let frame = self.validate_metadata_mutation_guard(guard, current, key)?;
         self.begin_exclusive_metadata_update(frame, current.allocation_seq())?;
         let result = (|| {
-            let node = self.read_metadata_page_unchecked::<ExtentNodeRecord>(frame)?;
-            if node.entry_count() != expected || node.right_sibling_slot().is_none() {
+            let level_count_flags =
+                self.read_metadata_page_value::<u64>(frame, EXTENT_NODE_LEVEL_COUNT_FLAGS_OFFSET)?;
+            let entry_count = usize::from((level_count_flags >> 16) as u16);
+            let sibling_slot_plus_one =
+                self.read_metadata_page_value::<u64>(frame, EXTENT_NODE_RIGHT_SIBLING_OFFSET)?;
+            if entry_count != expected || sibling_slot_plus_one == 0 {
                 return_errno_with_message!(Errno::ESTALE, "FAIR split state changed");
             }
             let count = u16::try_from(replacement).map_err(|_| Error::new(Errno::EOVERFLOW))?;
             self.persist_page_u64(
                 frame,
                 EXTENT_NODE_LEVEL_COUNT_FLAGS_OFFSET,
-                node.level_count_flags_word(count),
+                (level_count_flags & !(u64::from(u16::MAX) << 16)) | (u64::from(count) << 16),
             )?;
             inject(fault, FaultPoint::AfterContentPersist)
         })();

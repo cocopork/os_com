@@ -326,6 +326,8 @@ pub(crate) fn flush_candidates(
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct RnvpceFlushCandidate {
+    pub(crate) inode: u64,
+    pub(crate) page_index: u64,
     pub(crate) page: NvPageId,
     pub(crate) reference: metadata::PersistentObjectRef,
     pub(crate) reverse: index::ReverseExtentRef,
@@ -370,6 +372,8 @@ pub(crate) fn rnvpce_flush_candidates(fs_id: u64, budget: usize) -> Vec<RnvpceFl
             continue;
         }
         out.push(RnvpceFlushCandidate {
+            inode: key.inode,
+            page_index: key.page_index,
             page: candidate.page,
             reference,
             reverse,

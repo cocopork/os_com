@@ -89,6 +89,20 @@ pub(crate) static NV_COMPLETION_QUEUE_WAIT: Metric = Metric::new();
 pub(crate) static NV_COMPLETION_TOTAL: Metric = Metric::new();
 pub(crate) static NV_DEVICE_FLUSH: Metric = Metric::new();
 pub(crate) static NV_EXTENT_PUBLISH: Metric = Metric::new();
+pub(crate) static NV_EXTENT_GROUP: Metric = Metric::new();
+pub(crate) static NV_EXTENT_PREPARE: Metric = Metric::new();
+pub(crate) static NV_EXTENT_PUBLICATION_LOCK: Metric = Metric::new();
+pub(crate) static NV_EXTENT_MEMBER_VALIDATE: Metric = Metric::new();
+pub(crate) static NV_EXTENT_REVERSE_LOOKUP: Metric = Metric::new();
+pub(crate) static NV_EXTENT_LEAF_LOCK: Metric = Metric::new();
+pub(crate) static NV_EXTENT_LEAF_READ: Metric = Metric::new();
+pub(crate) static NV_EXTENT_LEAF_VALIDATE: Metric = Metric::new();
+pub(crate) static NV_EXTENT_TARGET_PERSIST: Metric = Metric::new();
+pub(crate) static NV_EXTENT_CREDIT_SCAN: Metric = Metric::new();
+pub(crate) static NV_EXTENT_CREDIT_PERSIST: Metric = Metric::new();
+pub(crate) static NV_EXTENT_OUTCOME_BUILD: Metric = Metric::new();
+pub(crate) static NV_EXTENT_LEDGER: Metric = Metric::new();
+pub(crate) static NV_EXTENT_RESULT: Metric = Metric::new();
 pub(crate) static NV_RECLAIM: Metric = Metric::new();
 
 pub(crate) fn dump_snapshot() {
@@ -121,6 +135,20 @@ pub(crate) fn dump_snapshot() {
         ("nv_completion_total", &NV_COMPLETION_TOTAL),
         ("nv_device_flush", &NV_DEVICE_FLUSH),
         ("nv_extent_publish", &NV_EXTENT_PUBLISH),
+        ("nv_extent_group", &NV_EXTENT_GROUP),
+        ("nv_extent_prepare", &NV_EXTENT_PREPARE),
+        ("nv_extent_publication_lock", &NV_EXTENT_PUBLICATION_LOCK),
+        ("nv_extent_member_validate", &NV_EXTENT_MEMBER_VALIDATE),
+        ("nv_extent_reverse_lookup", &NV_EXTENT_REVERSE_LOOKUP),
+        ("nv_extent_leaf_lock", &NV_EXTENT_LEAF_LOCK),
+        ("nv_extent_leaf_read", &NV_EXTENT_LEAF_READ),
+        ("nv_extent_leaf_validate", &NV_EXTENT_LEAF_VALIDATE),
+        ("nv_extent_target_persist", &NV_EXTENT_TARGET_PERSIST),
+        ("nv_extent_credit_scan", &NV_EXTENT_CREDIT_SCAN),
+        ("nv_extent_credit_persist", &NV_EXTENT_CREDIT_PERSIST),
+        ("nv_extent_outcome_build", &NV_EXTENT_OUTCOME_BUILD),
+        ("nv_extent_ledger", &NV_EXTENT_LEDGER),
+        ("nv_extent_result", &NV_EXTENT_RESULT),
         ("nv_reclaim", &NV_RECLAIM),
     ] {
         let mut histogram = String::new();

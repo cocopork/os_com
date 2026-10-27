@@ -511,7 +511,7 @@ fn rnvpce_optimistic_extent_claim_rolls_back_every_member_on_stale_identity() {
     const LOGICAL_START: u64 = 96;
     let pool = test_pool(48, 16, 32, None);
     let (references, locator) = install_claimable_nv_extent(&pool, FS_ID, INODE, LOGICAL_START, 4);
-    pool.install_reverse(
+    pool.replace_reverse(
         references[2],
         ReverseExtentRef::new(locator.leaf_slot(), 1).unwrap(),
     )

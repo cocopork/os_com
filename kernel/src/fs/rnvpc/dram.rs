@@ -23,6 +23,10 @@ const DEFAULT_CHUNK_PAGES: usize = 512;
 pub(crate) struct DramNvBackendStats {
     pub(crate) persist_calls: u64,
     pub(crate) fence_calls: u64,
+    #[cfg(ktest)]
+    pub(crate) full_page_reads: u64,
+    #[cfg(ktest)]
+    pub(crate) range_reads: u64,
 }
 
 struct ImageBytes {
@@ -161,6 +165,10 @@ struct DramNvImageInner {
     epoch: AtomicU64,
     persist_calls: AtomicU64,
     fence_calls: AtomicU64,
+    #[cfg(ktest)]
+    full_page_reads: AtomicU64,
+    #[cfg(ktest)]
+    range_reads: AtomicU64,
     // Only crash-model fixtures serialize snapshots; ordinary access uses caller leases.
     #[cfg(ktest)]
     io_lock: Mutex<()>,
@@ -205,6 +213,10 @@ impl DramNvImage {
                 epoch: AtomicU64::new(0),
                 persist_calls: AtomicU64::new(0),
                 fence_calls: AtomicU64::new(0),
+                #[cfg(ktest)]
+                full_page_reads: AtomicU64::new(0),
+                #[cfg(ktest)]
+                range_reads: AtomicU64::new(0),
                 #[cfg(ktest)]
                 io_lock: Mutex::new(()),
             }),
@@ -282,6 +294,10 @@ impl DramNvBackend {
         DramNvBackendStats {
             persist_calls: self.image.inner.persist_calls.load(Ordering::Relaxed),
             fence_calls: self.image.inner.fence_calls.load(Ordering::Relaxed),
+            #[cfg(ktest)]
+            full_page_reads: self.image.inner.full_page_reads.load(Ordering::Relaxed),
+            #[cfg(ktest)]
+            range_reads: self.image.inner.range_reads.load(Ordering::Relaxed),
         }
     }
 
@@ -368,6 +384,39 @@ impl NvMemoryBackend for DramNvBackend {
             .checked_mul(PAGE_SIZE)
             .ok_or_else(|| Error::new(Errno::EOVERFLOW))?;
         self.validate_data_range(offset, output.len())?;
+        #[cfg(ktest)]
+        self.image
+            .inner
+            .full_page_reads
+            .fetch_add(1, Ordering::Relaxed);
+        #[cfg(ktest)]
+        let _guard = self
+            .image
+            .inner
+            .durable
+            .as_ref()
+            .map(|_| self.image.inner.io_lock.lock());
+        self.image
+            .inner
+            .working
+            .read_data(self.image.inner.chunk_pages, offset, output)
+    }
+
+    fn read_page_range(&self, id: NvPageId, page_offset: usize, output: &mut [u8]) -> Result<()> {
+        let end = page_offset
+            .checked_add(output.len())
+            .ok_or_else(|| Error::new(Errno::EOVERFLOW))?;
+        if end > PAGE_SIZE {
+            return_errno_with_message!(Errno::EINVAL, "RNVPC page range is out of bounds");
+        }
+        let offset = id
+            .index()
+            .checked_mul(PAGE_SIZE)
+            .and_then(|base| base.checked_add(page_offset))
+            .ok_or_else(|| Error::new(Errno::EOVERFLOW))?;
+        self.validate_data_range(offset, output.len())?;
+        #[cfg(ktest)]
+        self.image.inner.range_reads.fetch_add(1, Ordering::Relaxed);
         #[cfg(ktest)]
         let _guard = self
             .image

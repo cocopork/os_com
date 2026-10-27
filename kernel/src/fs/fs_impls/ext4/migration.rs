@@ -172,45 +172,74 @@ impl Ext4 {
         let mut pages = Vec::new();
         if self.rnvpc_extend_enabled() {
             let candidates = rnvpc::rnvpce_flush_candidates(self.rnvpc_fs_id(), budget);
+            let mut candidate_groups = BTreeMap::new();
             for candidate in candidates {
-                let claimed =
-                    match pool.claim_migration_extent(candidate.reference, candidate.reverse) {
-                        Ok(claimed) => claimed,
-                        Err(_) => {
+                candidate_groups
+                    .entry((candidate.inode, candidate.reverse.leaf_slot()))
+                    .or_insert_with(Vec::new)
+                    .push(candidate);
+            }
+            for candidates in candidate_groups.into_values() {
+                let remaining = budget.saturating_sub(pages.len());
+                if remaining == 0 {
+                    for candidate in candidates {
+                        let _ = pool.enqueue_dirty_nvpage(
+                            candidate.page,
+                            candidate.reference.allocation_seq(),
+                        );
+                    }
+                    continue;
+                }
+                let seeds: Vec<_> = candidates
+                    .iter()
+                    .map(|candidate| (candidate.reference, candidate.reverse))
+                    .collect();
+                let claimed_extents = match pool.claim_migration_extents(&seeds, remaining) {
+                    Ok(claimed) => claimed,
+                    Err(_) => {
+                        for candidate in candidates {
                             let _ = pool.enqueue_dirty_nvpage(
                                 candidate.page,
                                 candidate.reference.allocation_seq(),
                             );
-                            continue;
                         }
-                    };
-                if pages.len().saturating_add(claimed.len()) > budget {
-                    drop(claimed);
-                    let _ = pool
-                        .enqueue_dirty_nvpage(candidate.page, candidate.reference.allocation_seq());
-                    continue;
+                        continue;
+                    }
+                };
+                for candidate in &candidates {
+                    let covered = claimed_extents
+                        .iter()
+                        .any(|extent| extent.logical_range().contains(&candidate.page_index));
+                    if !covered {
+                        let _ = pool.enqueue_dirty_nvpage(
+                            candidate.page,
+                            candidate.reference.allocation_seq(),
+                        );
+                    }
                 }
-                let (identity, claimed_pages) = claimed.into_parts();
-                for claimed in claimed_pages {
-                    let page = rnvpc::id::NvPageId::try_from(
-                        usize::try_from(
-                            claimed
-                                .reference
-                                .slot()
-                                .ok_or_else(|| Error::new(Errno::EUCLEAN))?,
-                        )
-                        .map_err(|_| Error::new(Errno::EOVERFLOW))?,
-                    )?;
-                    pages.push(PendingPage {
-                        inode: claimed.key.inode,
-                        index: claimed.key.page_index,
-                        page,
-                        generation: claimed.reference.allocation_seq(),
-                        target: claimed.ssd_block,
-                        reference: Some(claimed.reference),
-                        extent: Some(identity.clone()),
-                        lease: claimed.eviction,
-                    });
+                for claimed in claimed_extents {
+                    let (identity, claimed_pages) = claimed.into_parts();
+                    for claimed in claimed_pages {
+                        let page = rnvpc::id::NvPageId::try_from(
+                            usize::try_from(
+                                claimed
+                                    .reference
+                                    .slot()
+                                    .ok_or_else(|| Error::new(Errno::EUCLEAN))?,
+                            )
+                            .map_err(|_| Error::new(Errno::EOVERFLOW))?,
+                        )?;
+                        pages.push(PendingPage {
+                            inode: claimed.key.inode,
+                            index: claimed.key.page_index,
+                            page,
+                            generation: claimed.reference.allocation_seq(),
+                            target: claimed.ssd_block,
+                            reference: Some(claimed.reference),
+                            extent: Some(identity.clone()),
+                            lease: claimed.eviction,
+                        });
+                    }
                 }
             }
         } else {
@@ -487,6 +516,7 @@ impl Ext4 {
         for (inode_id, pages) in groups {
             if self.rnvpc_extend_enabled() {
                 let publish_started = pp::now();
+                let group_started = pp::now();
                 let mut extents: BTreeMap<u64, (Arc<MigrationExtentIdentity>, Vec<PendingPage>)> =
                     BTreeMap::new();
                 for page in pages {
@@ -512,7 +542,11 @@ impl Ext4 {
                     entry.1.push(page);
                 }
                 let published_pages = extents.values().map(|(_, pages)| pages.len()).sum();
+                pp::NV_EXTENT_GROUP.record_since(group_started, published_pages);
+                let mut published_references = Vec::new();
+                let mut published_extents = Vec::new();
                 for (identity, mut pages) in extents.into_values() {
+                    let prepare_started = pp::now();
                     pages.sort_by_key(|page| page.index);
                     let updates: Vec<_> = pages
                         .iter()
@@ -526,42 +560,75 @@ impl Ext4 {
                             })
                         })
                         .collect::<Result<_>>()?;
-                    let results = match rnvpc::write_transaction::migrate_claimed_nv_extent_to_ssd(
-                        pool, &identity, &updates, None,
-                    ) {
-                        Ok(results) => results,
-                        Err(error) if error.error() == Errno::ESTALE => {
-                            let still_authoritative = updates.iter().all(|update| {
-                                rnvpc::write_transaction::mapped_nv_page_ref(
-                                    pool,
-                                    self.rnvpc_fs_id(),
+                    pp::NV_EXTENT_PREPARE.record_since(prepare_started, pages.len());
+                    let references =
+                        match rnvpc::write_transaction::publish_claimed_nv_extent_to_ssd(
+                            pool, &identity, &updates, None,
+                        ) {
+                            Ok(references) => references,
+                            Err(error) if error.error() == Errno::ESTALE => {
+                                let still_authoritative = updates.iter().all(|update| {
+                                    rnvpc::write_transaction::mapped_nv_page_ref(
+                                        pool,
+                                        self.rnvpc_fs_id(),
+                                        inode_id,
+                                        update.logical_block,
+                                    )
+                                    .ok()
+                                    .flatten()
+                                        == Some(update.reference)
+                                });
+                                if !still_authoritative {
+                                    return_errno_with_message!(
+                                        Errno::EUCLEAN,
+                                        "stale migration extent is no longer authoritative"
+                                    );
+                                }
+                                let retry: Vec<_> = pages
+                                    .iter()
+                                    .map(|page| (page.page, page.generation))
+                                    .collect();
+                                drop(pages);
+                                for (page, generation) in retry {
+                                    pool.enqueue_dirty_nvpage(page, generation)?;
+                                }
+                                continue;
+                            }
+                            Err(error) => {
+                                error!(
+                                    "NV extent target publication failed: inode={} logical={} pages={} error={error:?}",
                                     inode_id,
-                                    update.logical_block,
-                                )
-                                .ok()
-                                .flatten()
-                                    == Some(update.reference)
-                            });
-                            if !still_authoritative {
-                                return_errno_with_message!(
-                                    Errno::EUCLEAN,
-                                    "stale migration extent is no longer authoritative"
+                                    identity.logical_start(),
+                                    pages.len()
                                 );
+                                return Err(error);
                             }
-                            let retry: Vec<_> = pages
-                                .iter()
-                                .map(|page| (page.page, page.generation))
-                                .collect();
-                            drop(pages);
-                            for (page, generation) in retry {
-                                pool.enqueue_dirty_nvpage(page, generation)?;
-                            }
-                            continue;
-                        }
-                        Err(error) => return Err(error),
-                    };
-                    let mut reclaim = Vec::with_capacity(pages.len());
-                    let mut released = 0;
+                        };
+                    published_references.push(references);
+                    published_extents.push(pages);
+                }
+
+                let results = match rnvpc::write_transaction::finish_claimed_nv_extents_to_ssd(
+                    pool,
+                    self.rnvpc_fs_id(),
+                    inode_id,
+                    &published_references,
+                ) {
+                    Ok(results) => results,
+                    Err(error) => {
+                        error!(
+                            "NV extent credit/ledger completion failed: inode={} extents={} error={error:?}",
+                            inode_id,
+                            published_references.len()
+                        );
+                        return Err(error);
+                    }
+                };
+                let result_started = pp::now();
+                let result_pages = published_extents.iter().map(Vec::len).sum();
+                let mut reclaim = Vec::with_capacity(result_pages);
+                let mut released = 0;
+                for (pages, results) in published_extents.into_iter().zip(results) {
                     for (page, result) in pages.into_iter().zip(results) {
                         match result {
                             Ok(consumed) => {
@@ -571,20 +638,39 @@ impl Ext4 {
                             Err(error) => failure = Some(error),
                         }
                     }
-                    if released != 0 {
-                        self.release_rnvpce_blocks(released as u64)?;
-                    }
-                    let started = batch_metrics::now();
-                    let reclaim_started = pp::now();
-                    let reclaimed = reclaim.len();
-                    if let Err(error) = pool.reclaim_migrated_pages(reclaim, None) {
-                        failure = Some(error);
-                    } else {
-                        batch_metrics::count(Event::ReclaimedPages, reclaimed);
-                    }
-                    pp::NV_RECLAIM.record_since(reclaim_started, reclaimed);
-                    batch_metrics::elapsed(Phase::Reclaim, started);
                 }
+                if released != 0 {
+                    if let Err(error) = self.release_rnvpce_blocks(released as u64) {
+                        error!(
+                            "NV runtime reservation release failed: inode={} pages={} error={error:?}",
+                            inode_id, released
+                        );
+                        return Err(error);
+                    }
+                }
+                pp::NV_EXTENT_RESULT.record_since(result_started, result_pages);
+                let started = batch_metrics::now();
+                let reclaim_started = pp::now();
+                let reclaimed = reclaim.len();
+                let mut reclaim = reclaim.into_iter();
+                loop {
+                    let batch: Vec<_> = reclaim.by_ref().take(128).collect();
+                    if batch.is_empty() {
+                        break;
+                    }
+                    let batch_len = batch.len();
+                    if let Err(error) = pool.reclaim_migrated_pages(batch, None) {
+                        error!(
+                            "NV descriptor reclaim failed: inode={} pages={} error={error:?}",
+                            inode_id, batch_len
+                        );
+                        failure = Some(error);
+                        break;
+                    }
+                    batch_metrics::count(Event::ReclaimedPages, batch_len);
+                }
+                pp::NV_RECLAIM.record_since(reclaim_started, reclaimed);
+                batch_metrics::elapsed(Phase::Reclaim, started);
                 pp::NV_EXTENT_PUBLISH.record_since(publish_started, published_pages);
             } else {
                 for page in pages {

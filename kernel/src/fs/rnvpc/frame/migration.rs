@@ -59,7 +59,13 @@ impl Rnvpc {
             descriptor.mark_migration_credit_released()?;
             updates.push((slot, descriptor));
         }
-        self.persist.update_descriptors(&updates, fault)
+        // Descriptor selector publication is intentionally bounded to 128
+        // slots. A larger completion round advances it in durable chunks;
+        // recovery can finish ledger accounting from any partial prefix.
+        for updates in updates.chunks(128) {
+            self.persist.update_descriptors(updates, fault)?;
+        }
+        Ok(())
     }
 
     fn migration_slot(&self, reference: PersistentObjectRef, require_lease: bool) -> Result<usize> {

@@ -22,7 +22,7 @@ use super::{
     },
 };
 use crate::{
-    fs::fs_impls::ext4::{LATENCY_STATS, read_ns},
+    fs::fs_impls::ext4::{LATENCY_STATS, pipeline_profile as pp, read_ns},
     prelude::*,
 };
 
@@ -1884,6 +1884,11 @@ pub(crate) struct SsdMigrationPage {
     pub(crate) ssd_block: u64,
 }
 
+pub(crate) struct ClaimedSsdMigrationExtent {
+    pub(crate) identity: Arc<MigrationExtentIdentity>,
+    pub(crate) updates: Vec<SsdMigrationPage>,
+}
+
 /// Completes one claimed contiguous NV extent as a single authority change.
 pub(crate) fn migrate_claimed_nv_extent_to_ssd(
     pool: &Arc<Rnvpc>,
@@ -1891,27 +1896,73 @@ pub(crate) fn migrate_claimed_nv_extent_to_ssd(
     pages: &[SsdMigrationPage],
     fault: Option<FaultPoint>,
 ) -> Result<Vec<Result<bool>>> {
+    let references = publish_claimed_nv_extent_to_ssd(pool, identity, pages, fault)?;
+    finish_claimed_nv_extents_to_ssd(pool, identity.fs_id(), identity.inode(), &[references])
+        .map(|mut outcomes| outcomes.pop().unwrap_or_default())
+}
+
+pub(crate) fn migrate_claimed_nv_extents_to_ssd(
+    pool: &Arc<Rnvpc>,
+    fs_id: u64,
+    inode: u64,
+    extents: &[ClaimedSsdMigrationExtent],
+    fault: Option<FaultPoint>,
+) -> Result<Vec<Vec<Result<bool>>>> {
+    if extents.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut references = Vec::with_capacity(extents.len());
+    for extent in extents {
+        if extent.identity.fs_id() != fs_id || extent.identity.inode() != inode {
+            return_errno_with_message!(Errno::EINVAL, "mixed-owner migration batch");
+        }
+        references.push(publish_claimed_nv_extent_to_ssd(
+            pool,
+            &extent.identity,
+            &extent.updates,
+            fault,
+        )?);
+    }
+    finish_claimed_nv_extents_to_ssd(pool, fs_id, inode, &references)
+}
+
+pub(crate) fn publish_claimed_nv_extent_to_ssd(
+    pool: &Arc<Rnvpc>,
+    identity: &MigrationExtentIdentity,
+    pages: &[SsdMigrationPage],
+    fault: Option<FaultPoint>,
+) -> Result<Vec<PersistentObjectRef>> {
     if pages.is_empty()
         || pages.len() > SSD_MIGRATION_BATCH_PAGES
         || pages.len() != identity.length() as usize
     {
         return_errno_with_message!(Errno::EINVAL, "invalid claimed extent completion size");
     }
-    let mutation =
-        ExtentMutation::new_completion(pool.clone(), identity.fs_id(), identity.inode())?;
-    let inode_ref = authoritative_inode_ref(pool, identity.fs_id(), identity.inode())?
-        .ok_or_else(|| Error::new(Errno::ESTALE))?;
-    let inode = pool.read_authoritative_metadata::<InodeRecord>(inode_ref)?;
-    let root = inode.extent_root();
-    if root.is_none() {
-        return_errno_with_message!(Errno::ESTALE, "claimed extent inode has no tree");
-    }
-
     let mut updates = Vec::with_capacity(pages.len());
     let mut identities = BTreeSet::new();
-    for page in pages {
+    let first_ssd = pages[0].ssd_block;
+    if first_ssd == 0 {
+        return_errno_with_message!(Errno::EAGAIN, "NV extent has no SSD target");
+    }
+    let reverse_started = pp::now();
+    let locator = pool
+        .reverse_lookup(pages[0].reference)?
+        .ok_or_else(|| Error::new(Errno::ESTALE))?;
+    pp::NV_EXTENT_REVERSE_LOOKUP.record_since(reverse_started, pages.len());
+    let validation_started = pp::now();
+    for (offset, page) in pages.iter().enumerate() {
+        let offset = u64::try_from(offset).map_err(|_| Error::new(Errno::EOVERFLOW))?;
+        let expected_ssd = first_ssd
+            .checked_add(offset)
+            .ok_or_else(|| Error::new(Errno::EOVERFLOW))?;
+        if page.ssd_block != expected_ssd {
+            return_errno_with_message!(Errno::EAGAIN, "fragmented extent migration targets");
+        }
         if page.reference.is_none()
             || !identities.insert((page.reference.slot(), page.reference.allocation_seq()))
+            || page.logical_block != identity.logical_start().saturating_add(offset)
+            || page.reference.slot_plus_one()
+                != identity.nv_base_slot_plus_one().saturating_add(offset)
             || pool.validate_persistent_data_ref(page.reference)?
                 != PageKey::new(identity.fs_id(), identity.inode(), page.logical_block)
             || pool.persistent_data_ssd_backing(page.reference)? != page.ssd_block
@@ -1919,25 +1970,34 @@ pub(crate) fn migrate_claimed_nv_extent_to_ssd(
             return_errno_with_message!(Errno::ESTALE, "claimed extent member changed");
         }
         updates.push(SsdExtentUpdate {
-            locator: identity.locator_hint(),
+            locator,
             expected: page.reference,
             logical_block: page.logical_block,
             ssd_block: page.ssd_block,
         });
     }
+    pp::NV_EXTENT_MEMBER_VALIDATE.record_since(validation_started, pages.len());
     let started = read_ns();
-    let published = mutation.publish_claimed_ssd_extent(
-        root,
-        identity.logical_start(),
-        identity.length(),
-        identity.nv_base_slot_plus_one(),
+    let _published = ExtentMutation::publish_ssd_extents_locked(
+        pool,
+        identity.fs_id(),
+        identity.inode(),
         &updates,
         fault,
     )?;
     LATENCY_STATS.migration_leaf.record_since(started);
 
-    let references: Vec<_> = pages.iter().map(|page| page.reference).collect();
-    let mut outcomes: Vec<Result<bool>> = references.iter().map(|_| Ok(false)).collect();
+    Ok(pages.iter().map(|page| page.reference).collect())
+}
+
+pub(crate) fn finish_claimed_nv_extents_to_ssd(
+    pool: &Arc<Rnvpc>,
+    fs_id: u64,
+    inode: u64,
+    extent_references: &[Vec<PersistentObjectRef>],
+) -> Result<Vec<Vec<Result<bool>>>> {
+    let credit_scan_started = pp::now();
+    let references: Vec<_> = extent_references.iter().flatten().copied().collect();
     let releasable: Result<Vec<_>> = references
         .iter()
         .copied()
@@ -1953,18 +2013,38 @@ pub(crate) fn migrate_claimed_nv_extent_to_ssd(
         })
         .collect();
     let releasable = releasable?;
+    pp::NV_EXTENT_CREDIT_SCAN.record_since(credit_scan_started, references.len());
+
+    let credit_persist_started = pp::now();
     pool.mark_migration_credits_released(&releasable, None)?;
-    for (index, reference) in references.iter().enumerate() {
-        outcomes[index] = Ok(releasable.contains(reference));
-    }
+    pp::NV_EXTENT_CREDIT_PERSIST.record_since(credit_persist_started, releasable.len());
+
     let consumed = releasable.len() as u64;
+    let ledger_started = pp::now();
     if consumed != 0
-        && let Err(error) =
-            consume_ssd_capacity_locked(pool, identity.fs_id(), identity.inode(), consumed)
+        && let Err(error) = consume_ssd_capacity_locked(pool, fs_id, inode, consumed)
     {
         warn!("rNVPCe batch reservation ledger update deferred to recovery: {error:?}");
     }
-    let _ = published;
+    pp::NV_EXTENT_LEDGER.record_since(ledger_started, consumed as usize);
+
+    let outcome_started = pp::now();
+    let releasable: BTreeSet<_> = releasable
+        .into_iter()
+        .map(|reference| (reference.slot(), reference.allocation_seq()))
+        .collect();
+    let outcomes = extent_references
+        .iter()
+        .map(|extent| {
+            extent
+                .iter()
+                .map(|reference| {
+                    Ok(releasable.contains(&(reference.slot(), reference.allocation_seq())))
+                })
+                .collect()
+        })
+        .collect();
+    pp::NV_EXTENT_OUTCOME_BUILD.record_since(outcome_started, references.len());
     Ok(outcomes)
 }
 
