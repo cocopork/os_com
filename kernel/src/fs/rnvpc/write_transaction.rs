@@ -1222,6 +1222,9 @@ where
         block_count,
         inode_fault,
     )?;
+    for page in request.pages.iter().take(committed_pages.len()) {
+        pool.advance_baseline_generation(fs_id, inode, page.logical_block, 1)?;
+    }
     LATENCY_STATS.fg_inode_publish.record_since(started);
     let started = read_ns();
     // Local extent mutation installs the reverse locators under the same
@@ -1350,7 +1353,6 @@ where
         request.old_block_count,
         inode_fault,
     )?;
-
     // A newly selected descriptor is already authoritative. Retire unpinned
     // predecessors opportunistically; in-flight generations remain for their
     // exact completion path.
@@ -1605,6 +1607,9 @@ pub(crate) fn commit_write_batch(
         request.block_count,
         inode_fault,
     )?;
+    for page in request.pages {
+        pool.advance_baseline_generation(fs_id, inode, page.logical_block, 1)?;
+    }
     Ok(CommittedUpdateWriteBatch {
         allocations: allocation_refs,
         data_pages: data_refs,
@@ -2117,6 +2122,12 @@ pub(crate) fn publish_claimed_nv_extent_to_ssd(
         identity.inode(),
         &updates,
         fault,
+    )?;
+    pool.advance_baseline_generation(
+        identity.fs_id(),
+        identity.inode(),
+        identity.logical_start(),
+        pages.len(),
     )?;
     LATENCY_STATS.migration_leaf.record_since(started);
 

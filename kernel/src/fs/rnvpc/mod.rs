@@ -10,6 +10,7 @@
 use spin::Once;
 
 pub(crate) mod backend;
+pub(crate) mod baseline_generation;
 pub(crate) mod batch_metrics;
 pub(crate) mod capacity;
 pub(crate) mod config;
@@ -334,11 +335,23 @@ pub(crate) struct RnvpceFlushCandidate {
     pub(crate) reverse: index::ReverseExtentRef,
 }
 
+pub(crate) fn rnvpce_redirect_ranges(
+    fs_id: u64,
+    budget: usize,
+) -> Vec<redirect_index::RedirectRange> {
+    pool()
+        .map(|pool| pool.dirty_redirect_ranges(fs_id, budget))
+        .unwrap_or_default()
+}
+
 /// rNVPCe candidates come from the duplicate-suppressed physical dirty queue.
 /// The reverse locator is validated again when migration is claimed and when
 /// completion publishes the SSD mapping; candidate discovery never walks an
 /// inode extent tree.
-pub(crate) fn rnvpce_flush_candidates(fs_id: u64, budget: usize) -> Vec<RnvpceFlushCandidate> {
+pub(crate) fn rnvpce_legacy_flush_candidates(
+    fs_id: u64,
+    budget: usize,
+) -> Vec<RnvpceFlushCandidate> {
     let Some(pool) = pool() else {
         return Vec::new();
     };

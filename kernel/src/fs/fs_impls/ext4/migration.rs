@@ -14,9 +14,11 @@ use super::{
 };
 use crate::fs::rnvpc::{
     self,
+    baseline_generation::BaselineRangeToken,
     batch_metrics::{self, Event, Phase},
-    frame::{EvictingDataPage, MigrationExtentIdentity},
+    frame::{EvictingDataPage, MigrationExtentIdentity, PinnedDataPage},
     metadata::PersistentObjectRef,
+    redirect_index::DescriptorHandle,
 };
 
 mod batch;
@@ -37,7 +39,22 @@ struct PendingPage {
     target: u64,
     reference: Option<PersistentObjectRef>,
     extent: Option<Arc<MigrationExtentIdentity>>,
-    lease: EvictingDataPage,
+    redirect: Option<(DescriptorHandle, Arc<BaselineRangeToken>)>,
+    lease: MigrationLease,
+}
+
+enum MigrationLease {
+    Legacy(EvictingDataPage),
+    Redirect(PinnedDataPage),
+}
+
+impl MigrationLease {
+    fn dma_segment(&self) -> Result<ostd::mm::USegment> {
+        match self {
+            Self::Legacy(lease) => lease.dma_segment(),
+            Self::Redirect(pin) => pin.dma_segment(),
+        }
+    }
 }
 
 impl Ext4 {
@@ -171,7 +188,32 @@ impl Ext4 {
         let candidate_started = pp::now();
         let mut pages = Vec::new();
         if self.rnvpc_extend_enabled() {
-            let candidates = rnvpc::rnvpce_flush_candidates(self.rnvpc_fs_id(), budget);
+            for snapshot in rnvpc::rnvpce_redirect_ranges(self.rnvpc_fs_id(), budget) {
+                let remaining = budget.saturating_sub(pages.len());
+                if remaining == 0 {
+                    break;
+                }
+                for claimed in pool.claim_redirect_range(&snapshot, remaining)? {
+                    let token = Arc::new(claimed.baseline_token);
+                    for claimed in claimed.pages {
+                        let page = claimed.pin.id();
+                        pages.push(PendingPage {
+                            inode: claimed.key.inode,
+                            index: claimed.key.page_index,
+                            page,
+                            generation: claimed.handle.reference.allocation_seq(),
+                            target: claimed.handle.ssd_target,
+                            reference: Some(claimed.handle.reference),
+                            extent: None,
+                            redirect: Some((claimed.handle, token.clone())),
+                            lease: MigrationLease::Redirect(claimed.pin),
+                        });
+                    }
+                }
+            }
+
+            let remaining = budget.saturating_sub(pages.len());
+            let candidates = rnvpc::rnvpce_legacy_flush_candidates(self.rnvpc_fs_id(), remaining);
             let mut candidate_groups = BTreeMap::new();
             for candidate in candidates {
                 candidate_groups
@@ -237,7 +279,8 @@ impl Ext4 {
                             target: claimed.ssd_block,
                             reference: Some(claimed.reference),
                             extent: Some(identity.clone()),
-                            lease: claimed.eviction,
+                            redirect: None,
+                            lease: MigrationLease::Legacy(claimed.eviction),
                         });
                     }
                 }
@@ -258,7 +301,8 @@ impl Ext4 {
                         target,
                         reference: None,
                         extent: None,
-                        lease,
+                        redirect: None,
+                        lease: MigrationLease::Legacy(lease),
                     });
                 }
             }
@@ -493,6 +537,27 @@ impl Ext4 {
         let pool = rnvpc::pool().ok_or_else(|| Error::new(Errno::EINVAL))?;
         let (jobs, metadata_failed) = batch.take_jobs();
         if metadata_failed || jobs.iter().any(|job| job.status != BioStatus::Complete) {
+            let mut redirects = Vec::new();
+            for job in jobs {
+                for page in job.pages {
+                    if let Some((handle, _)) = page.redirect {
+                        let key =
+                            rnvpc::index::PageKey::new(self.rnvpc_fs_id(), page.inode, page.index);
+                        redirects.push((key, handle));
+                    }
+                    drop(page.lease);
+                }
+            }
+            for chunk in redirects.chunks(128) {
+                let _ = pool.transition_redirects(
+                    chunk,
+                    rnvpc::descriptor::NvObjectState::NvDirty,
+                    None,
+                );
+                for (key, _) in chunk {
+                    pool.release_baseline_migration(*key);
+                }
+            }
             return_errno_with_message!(Errno::EIO, "orderless migration batch I/O failed");
         }
         let started = batch_metrics::now();
@@ -517,6 +582,14 @@ impl Ext4 {
             if self.rnvpc_extend_enabled() {
                 let publish_started = pp::now();
                 let group_started = pp::now();
+                let (redirect_pages, pages): (Vec<_>, Vec<_>) =
+                    pages.into_iter().partition(|page| page.redirect.is_some());
+                if !redirect_pages.is_empty() {
+                    self.finish_redirect_pages(pool, redirect_pages)?;
+                }
+                if pages.is_empty() {
+                    continue;
+                }
                 let mut extents: BTreeMap<u64, (Arc<MigrationExtentIdentity>, Vec<PendingPage>)> =
                     BTreeMap::new();
                 for page in pages {
@@ -633,7 +706,13 @@ impl Ext4 {
                         match result {
                             Ok(consumed) => {
                                 released += usize::from(consumed);
-                                reclaim.push((page.lease, page.reference.unwrap()));
+                                let MigrationLease::Legacy(lease) = page.lease else {
+                                    return_errno_with_message!(
+                                        Errno::EUCLEAN,
+                                        "redirect lease reached structural completion"
+                                    );
+                                };
+                                reclaim.push((lease, page.reference.unwrap()));
                             }
                             Err(error) => failure = Some(error),
                         }
@@ -689,7 +768,13 @@ impl Ext4 {
                             page.page,
                             page.generation,
                         )? {
-                            page.lease.finish(None)?;
+                            let MigrationLease::Legacy(lease) = page.lease else {
+                                return_errno_with_message!(
+                                    Errno::EUCLEAN,
+                                    "redirect lease reached rNVPC completion"
+                                );
+                            };
+                            lease.finish(None)?;
                             rnvpc::finalize_flush_completion(
                                 self.rnvpc_fs_id(),
                                 page.inode,
@@ -763,6 +848,51 @@ impl Ext4 {
         }
         self.persist_nv_allocations()?;
         batch_metrics::dump();
+        Ok(())
+    }
+
+    fn finish_redirect_pages(
+        &self,
+        pool: &Arc<rnvpc::frame::Rnvpc>,
+        pages: Vec<PendingPage>,
+    ) -> Result<()> {
+        let mut exact = Vec::with_capacity(pages.len());
+        let mut baseline_valid = true;
+        for page in pages {
+            let (handle, token) = page.redirect.ok_or_else(|| Error::new(Errno::EUCLEAN))?;
+            baseline_valid &= pool.validate_baseline_token(&token);
+            let key = rnvpc::index::PageKey::new(self.rnvpc_fs_id(), page.inode, page.index);
+            exact.push((key, handle));
+            drop(page.lease);
+        }
+        if !baseline_valid {
+            for (key, handle) in exact {
+                if pool.redirect_lookup(key) == Some(handle) {
+                    let _ = pool.transition_redirects(
+                        &[(key, handle)],
+                        rnvpc::descriptor::NvObjectState::NvDirty,
+                        None,
+                    );
+                } else if let Ok(reclaimed) = pool.clear_redirects_exact(&[(key, handle)], None) {
+                    for page in reclaimed {
+                        let _ = pool.free_data_page(page);
+                    }
+                }
+                pool.release_baseline_migration(key);
+            }
+            return Ok(());
+        }
+        for chunk in exact.chunks(128) {
+            let reclaimed = pool.clear_redirects_exact(chunk, None);
+            for (key, _) in chunk {
+                pool.release_baseline_migration(*key);
+            }
+            let reclaimed = reclaimed?;
+            for page in reclaimed {
+                pool.free_data_page(page)?;
+                batch_metrics::count(Event::ReclaimedPages, 1);
+            }
+        }
         Ok(())
     }
 }

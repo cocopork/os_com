@@ -25,11 +25,59 @@ fn ext4_research_routes() {
         nv_route_rnvpce_round_budget_is_independent_of_global_in_flight,
         nv_route_rnvpce_capacity_wait_releases_inode_lock,
         nv_route_rnvpce_direct_partial_write_and_deferred_export,
+        nv_route_rnvpce_redirect_completion_avoids_leaf,
         nv_route_rnvpc_wal_and_native_paths_remain_distinct,
         nv_route_busy_lease_read_and_partial_write_retry,
         nv_route_rnvpc_failed_allocation_flush_does_not_append_wal,
         nv_route_mount_rejects_switching_persistent_authority,
     );
+}
+
+fn nv_route_rnvpce_redirect_completion_avoids_leaf() {
+    crate::fs::rnvpc::init_for_ext4_tests();
+    crate::time::clocks::init_for_ktest();
+    let fixture = Ext4FixtureBuilder::new(2048, 256, 2048)
+        .with_block_bitmap_metadata_marked()
+        .with_free_blocks(128)
+        .with_uuid([0xb4; 16])
+        .with_mount_options("rnvpce=on,rtio=off")
+        .build()
+        .unwrap();
+    fixture.write_raw_inode(11, &make_empty_file_inode());
+    let inode = fixture.ext4.read_inode(11).unwrap();
+    let first = vec![0x41; 4 * PAGE_SIZE];
+    inode
+        .write_at(0, &mut VmReader::from(first.as_slice()).to_fallible())
+        .unwrap();
+    assert_eq!(fixture.ext4.migrate_nv_round(64).unwrap(), 4);
+    fixture.ext4.drain_nv_in_flight().unwrap();
+
+    let second = vec![0x82; 4 * PAGE_SIZE];
+    inode
+        .write_at(0, &mut VmReader::from(second.as_slice()).to_fallible())
+        .unwrap();
+    let pool = crate::fs::rnvpc::pool().unwrap();
+    let routes = pool.extent_tree_routes();
+    assert_eq!(fixture.ext4.migrate_nv_round(64).unwrap(), 4);
+    fixture.ext4.drain_nv_in_flight().unwrap();
+    assert_eq!(pool.extent_tree_routes(), routes);
+    for logical in 0..4 {
+        assert!(
+            crate::fs::rnvpc::write_transaction::mapped_nv_page_ref(
+                pool,
+                fixture.ext4.rnvpc_fs_id(),
+                11,
+                logical,
+            )
+            .unwrap()
+            .is_none()
+        );
+    }
+    let mut output = vec![0; second.len()];
+    inode
+        .read_at(0, &mut VmWriter::from(output.as_mut_slice()).to_fallible())
+        .unwrap();
+    assert_eq!(output, second);
 }
 
 fn nv_route_rnvpce_round_budget_is_independent_of_global_in_flight() {

@@ -1075,6 +1075,137 @@ fn rnvpce_redirect_io_128k_overwrite_publishes_one_redirect_range() {
     assert_eq!(ranges[0].pages.len(), 32);
 }
 
+fn publish_test_redirect_range(pool: &Arc<Rnvpc>, fs_id: u64, inode: u64, pages: usize) {
+    let staged = (0..pages)
+        .map(|page| {
+            (
+                staged_redirect_page(pool, page as u8),
+                PageKey::new(fs_id, inode, page as u64),
+                60_000 + page as u64,
+            )
+        })
+        .collect::<Vec<_>>();
+    pool.publish_redirect_batch(&staged, None).unwrap();
+}
+
+#[ktest]
+fn rnvpce_redirect_claim_claims_32_pages_with_one_range_snapshot() {
+    let pool = test_pool(48, 8, 40, None);
+    publish_test_redirect_range(&pool, 0xa205, 45, 32);
+    let snapshot = pool.dirty_redirect_ranges(0xa205, 32).remove(0);
+    let claimed = pool.claim_redirect_range(&snapshot, 32).unwrap();
+    assert_eq!(claimed.len(), 1);
+    assert_eq!(claimed[0].pages.len(), 32);
+    assert_eq!(claimed[0].baseline_token.logical_start, 0);
+    assert_eq!(claimed[0].baseline_token.generations, vec![0; 32]);
+}
+
+#[ktest]
+fn rnvpce_redirect_claim_splits_around_one_stale_page() {
+    const FS_ID: u64 = 0xa206;
+    const INODE: u64 = 46;
+    let pool = test_pool(16, 2, 14, None);
+    publish_test_redirect_range(&pool, FS_ID, INODE, 4);
+    let snapshot = pool.dirty_redirect_ranges(FS_ID, 4).remove(0);
+    let replacement = staged_redirect_page(&pool, 0xee);
+    pool.publish_redirect_batch(
+        &[(replacement, PageKey::new(FS_ID, INODE, 2), 60_002)],
+        None,
+    )
+    .unwrap();
+
+    let claimed = pool.claim_redirect_range(&snapshot, 4).unwrap();
+    assert_eq!(
+        claimed
+            .iter()
+            .map(|range| range.pages.len())
+            .collect::<Vec<_>>(),
+        vec![2, 1]
+    );
+    assert_eq!(
+        pool.redirect_lookup(PageKey::new(FS_ID, INODE, 2))
+            .unwrap()
+            .state,
+        NvObjectState::NvDirty
+    );
+}
+
+#[ktest]
+fn rnvpce_redirect_claim_obeys_budget_without_losing_tail() {
+    const FS_ID: u64 = 0xa207;
+    let pool = test_pool(12, 2, 10, None);
+    publish_test_redirect_range(&pool, FS_ID, 47, 4);
+    let snapshot = pool.dirty_redirect_ranges(FS_ID, 4).remove(0);
+    let claimed = pool.claim_redirect_range(&snapshot, 2).unwrap();
+    assert_eq!(
+        claimed.iter().map(|range| range.pages.len()).sum::<usize>(),
+        2
+    );
+    assert_eq!(
+        pool.dirty_redirect_ranges(FS_ID, 4)
+            .iter()
+            .map(|range| range.pages.len())
+            .sum::<usize>(),
+        2
+    );
+}
+
+#[ktest]
+fn rnvpce_redirect_claim_reads_no_extent_leaf() {
+    const FS_ID: u64 = 0xa208;
+    let pool = test_pool(12, 2, 10, None);
+    publish_test_redirect_range(&pool, FS_ID, 48, 4);
+    let routes = pool.extent_tree_routes();
+    let leaf_reads = pool.migration_claim_leaf_reads();
+    let snapshot = pool.dirty_redirect_ranges(FS_ID, 4).remove(0);
+    let claimed = pool.claim_redirect_range(&snapshot, 4).unwrap();
+    assert_eq!(claimed[0].pages.len(), 4);
+    assert_eq!(pool.extent_tree_routes(), routes);
+    assert_eq!(pool.migration_claim_leaf_reads(), leaf_reads);
+}
+
+#[ktest]
+fn rnvpce_redirect_completion_older_bio_owns_page_key_until_release() {
+    const KEY: PageKey = PageKey::new(0xa209, 49, 0);
+    let pool = test_pool(8, 1, 7, None);
+    publish_test_redirect_range(&pool, KEY.fs_id, KEY.inode, 1);
+    let old_snapshot = pool.dirty_redirect_ranges(KEY.fs_id, 1).remove(0);
+    let old_claim = pool.claim_redirect_range(&old_snapshot, 1).unwrap();
+    assert_eq!(old_claim[0].pages.len(), 1);
+
+    let replacement = staged_redirect_page(&pool, 0xf1);
+    pool.publish_redirect_batch(&[(replacement, KEY, 60_000)], None)
+        .unwrap();
+    let new_snapshot = pool.dirty_redirect_ranges(KEY.fs_id, 1).remove(0);
+    assert!(
+        pool.claim_redirect_range(&new_snapshot, 1)
+            .unwrap()
+            .is_empty(),
+        "new generation must not submit while the old SSD BIO owns PageKey"
+    );
+    pool.release_baseline_migration(KEY);
+    assert_eq!(
+        pool.claim_redirect_range(&new_snapshot, 1)
+            .unwrap()
+            .iter()
+            .map(|range| range.pages.len())
+            .sum::<usize>(),
+        1
+    );
+}
+
+#[ktest]
+fn rnvpce_redirect_completion_detects_baseline_generation_change() {
+    const FS_ID: u64 = 0xa20a;
+    let pool = test_pool(8, 1, 7, None);
+    publish_test_redirect_range(&pool, FS_ID, 50, 1);
+    let snapshot = pool.dirty_redirect_ranges(FS_ID, 1).remove(0);
+    let claimed = pool.claim_redirect_range(&snapshot, 1).unwrap();
+    assert!(pool.validate_baseline_token(&claimed[0].baseline_token));
+    pool.advance_baseline_generation(FS_ID, 50, 0, 1).unwrap();
+    assert!(!pool.validate_baseline_token(&claimed[0].baseline_token));
+}
+
 #[ktest]
 fn rnvpce_redirect_io_write_during_old_writeback_publishes_cow_generation() {
     const KEY: PageKey = PageKey::new(0xa204, 44, 5);

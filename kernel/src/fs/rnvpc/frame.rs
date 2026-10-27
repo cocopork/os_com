@@ -15,6 +15,7 @@ use ostd::{mm::USegment, sync::WaitQueue};
 
 use super::{
     backend::NvMemoryBackend,
+    baseline_generation::{BaselineGenerationMap, BaselineRangeToken},
     capacity::{CapacityState, PoolClass, RnvpcStats},
     config::RnvpcConfig,
     data_page::DataPageState,
@@ -38,7 +39,7 @@ use super::{
     },
     persist::PersistEngine,
     recover,
-    redirect_index::{DescriptorHandle, RedirectDirectory},
+    redirect_index::{DescriptorHandle, RedirectDirectory, RedirectRange},
 };
 use crate::{
     fs::fs_impls::ext4::{LATENCY_ENABLED, LATENCY_STATS, read_ns},
@@ -351,6 +352,7 @@ pub(crate) struct Rnvpc {
     // Completion checks this inode-sharded directory instead of `state`.
     pending_extent_index: PendingExtentIndex,
     redirects: RedirectDirectory,
+    baseline_generations: BaselineGenerationMap,
     recovered_pcache: Mutex<Option<recover::RecoveredPcacheCatalog>>,
     objects: ObjectTable,
     // Diagnostic total only. Admission/freeing uses the slot-protected pins.
@@ -391,6 +393,17 @@ pub(crate) struct ClaimedMigrationPage {
     pub(crate) reference: PersistentObjectRef,
     pub(crate) ssd_block: u64,
     pub(crate) eviction: EvictingDataPage,
+}
+
+pub(crate) struct ClaimedRedirectRange {
+    pub(crate) baseline_token: BaselineRangeToken,
+    pub(crate) pages: Vec<ClaimedRedirectPage>,
+}
+
+pub(crate) struct ClaimedRedirectPage {
+    pub(crate) key: PageKey,
+    pub(crate) handle: DescriptorHandle,
+    pub(crate) pin: PinnedDataPage,
 }
 
 impl MigrationExtentIdentity {
@@ -529,6 +542,7 @@ impl Rnvpc {
             repair_workspace: Mutex::new(RepairWorkspace::new(config.meta_reserve_pages())),
             pending_extent_index: PendingExtentIndex::new(),
             redirects: RedirectDirectory::new()?,
+            baseline_generations: BaselineGenerationMap::new()?,
             recovered_pcache: Mutex::new(None),
             allocation: SpinLock::new(AllocationState {
                 free_ids,
@@ -5194,6 +5208,10 @@ impl PinnedDataPage {
 
     pub(crate) fn read(&self, output: &mut [u8]) -> Result<()> {
         self.pool.backend.read_page(self.id, output)
+    }
+
+    pub(crate) fn dma_segment(&self) -> Result<USegment> {
+        self.pool.backend.data_page_segment(self.id)
     }
 
     pub(crate) fn copy_to_writer(

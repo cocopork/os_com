@@ -220,16 +220,18 @@ impl Rnvpc {
             objects.records[slot].pins = 1;
             objects.records[slot].persisting = true;
             drop(objects);
-            let descriptor = self.persist.read_entry(slot).and_then(|descriptor| {
-                let mut descriptor = descriptor
-                    .filter(|descriptor| {
-                        descriptor.allocation_seq() == handle.reference.allocation_seq()
-                            && descriptor.recovery_id == handle.logical_version
-                    })
-                    .ok_or_else(|| Error::new(Errno::ESTALE))?;
-                descriptor.transition_to(next)?;
-                Ok(descriptor)
-            });
+            let descriptor = self
+                .descriptor_for(
+                    PoolClass::Data,
+                    *key,
+                    handle.logical_version,
+                    slot,
+                    Some(handle.ssd_target),
+                )
+                .and_then(|mut descriptor| {
+                    descriptor.transition_to(next)?;
+                    Ok(descriptor)
+                });
             let descriptor = match descriptor {
                 Ok(descriptor) => descriptor,
                 Err(error) => {
@@ -270,6 +272,131 @@ impl Rnvpc {
             transitioned.push(new);
         }
         Ok(transitioned)
+    }
+
+    pub(crate) fn dirty_redirect_ranges(&self, fs_id: u64, budget: usize) -> Vec<RedirectRange> {
+        self.redirects
+            .dirty_ranges(budget)
+            .into_iter()
+            .filter(|range| range.fs_id == fs_id)
+            .collect()
+    }
+
+    pub(crate) fn claim_redirect_range(
+        self: &Arc<Self>,
+        snapshot: &RedirectRange,
+        budget: usize,
+    ) -> Result<Vec<ClaimedRedirectRange>> {
+        let limit = snapshot.pages.len().min(budget).min(128);
+        let mut candidates = Vec::new();
+        for (offset, handle) in snapshot.pages.iter().copied().take(limit).enumerate() {
+            let page_index = snapshot
+                .logical_start
+                .checked_add(offset as u64)
+                .ok_or_else(|| Error::new(Errno::EOVERFLOW))?;
+            let key = PageKey::new(snapshot.fs_id, snapshot.inode, page_index);
+            if self.redirects.lookup(key) == Some(handle)
+                && self.reverse_lookup(handle.reference)?.is_none()
+                && self.baseline_generations.try_claim_migration(key)
+            {
+                candidates.push((key, handle));
+            }
+        }
+
+        let mut claimed = Vec::new();
+        let mut cursor = 0;
+        while cursor < candidates.len() {
+            let start = cursor;
+            cursor += 1;
+            while cursor < candidates.len()
+                && candidates[cursor].0.page_index == candidates[cursor - 1].0.page_index + 1
+            {
+                cursor += 1;
+            }
+            let group = &candidates[start..cursor];
+            let transitioned =
+                match self.transition_redirects(group, NvObjectState::NvWriteback, None) {
+                    Ok(handles) => group
+                        .iter()
+                        .zip(handles)
+                        .map(|((key, _), handle)| (*key, handle))
+                        .collect(),
+                    Err(error)
+                        if error.error() == Errno::ESTALE || error.error() == Errno::EBUSY =>
+                    {
+                        let mut pages = Vec::new();
+                        for item in group {
+                            if let Ok(mut handles) = self.transition_redirects(
+                                core::slice::from_ref(item),
+                                NvObjectState::NvWriteback,
+                                None,
+                            ) {
+                                pages.push((item.0, handles.remove(0)));
+                            } else {
+                                self.baseline_generations.release_migration(item.0);
+                            }
+                        }
+                        pages
+                    }
+                    Err(error) => {
+                        for (key, _) in group {
+                            self.baseline_generations.release_migration(*key);
+                        }
+                        return Err(error);
+                    }
+                };
+            if transitioned.is_empty() {
+                continue;
+            }
+
+            let mut pages = Vec::new();
+            for (key, handle) in transitioned {
+                match self.pin_redirect(key, handle) {
+                    Ok(pin) => pages.push(ClaimedRedirectPage { key, handle, pin }),
+                    Err(_) => {
+                        self.baseline_generations.release_migration(key);
+                        if let Ok(reclaimed) = self.clear_redirects_exact(&[(key, handle)], None) {
+                            for page in reclaimed {
+                                let _ = self.free_data_page(page);
+                            }
+                        }
+                    }
+                }
+            }
+            if pages.is_empty() {
+                continue;
+            }
+            let baseline_token = self.baseline_generations.snapshot(
+                snapshot.fs_id,
+                snapshot.inode,
+                pages[0].key.page_index,
+                pages.len(),
+            )?;
+            claimed.push(ClaimedRedirectRange {
+                baseline_token,
+                pages,
+            });
+        }
+        Ok(claimed)
+    }
+
+    pub(crate) fn validate_baseline_token(&self, token: &BaselineRangeToken) -> bool {
+        self.baseline_generations.validate(token)
+    }
+
+    pub(crate) fn release_baseline_migration(&self, key: PageKey) {
+        self.baseline_generations.release_migration(key);
+    }
+
+    pub(crate) fn advance_baseline_generation(
+        &self,
+        fs_id: u64,
+        inode: u64,
+        logical_start: u64,
+        pages: usize,
+    ) -> Result<()> {
+        self.baseline_generations
+            .advance(fs_id, inode, logical_start, pages)
     }
 
     fn release_transition_pins(
