@@ -77,6 +77,7 @@ impl Ext4 {
                     observed = fs.nv_migration_epoch.load(Ordering::Acquire);
                     if rnvpc::needs_flush_watermark()
                         || fs.nv_capacity_waiters.load(Ordering::Acquire) != 0
+                        || fs.nv_migration_progress_waiters.load(Ordering::Acquire) != 0
                     {
                         match fs.migrate_nv_round(MIGRATION_BATCH_PAGES) {
                             // Keep the pipeline full while work and credits exist.
@@ -168,6 +169,31 @@ impl Ext4 {
         self.nv_capacity_waiters.fetch_sub(1, Ordering::AcqRel);
         if self.is_shutdown() || self.nv_migration_failed.load(Ordering::Acquire) {
             return_errno_with_message!(Errno::EIO, "NV migration cannot reclaim capacity");
+        }
+        Ok(())
+    }
+
+    /// Forces progress for a page whose redirect is already owned by migration.
+    /// This is distinct from capacity pressure: below the high watermark, only
+    /// an explicit waiter makes the worker drain such a page.
+    pub(super) fn wait_for_nv_migration_progress(
+        &self,
+        pool: &rnvpc::frame::Rnvpc,
+        lease_epoch: u64,
+    ) -> Result<()> {
+        if !self.nv_migration_enabled() {
+            return_errno_with_message!(Errno::EAGAIN, "NV migration is disabled");
+        }
+        self.nv_migration_progress_waiters
+            .fetch_add(1, Ordering::AcqRel);
+        self.request_nv_migration();
+        pool.wait_for_data_page_lease_change_until(lease_epoch, || {
+            self.is_shutdown() || self.nv_migration_failed.load(Ordering::Acquire)
+        });
+        self.nv_migration_progress_waiters
+            .fetch_sub(1, Ordering::AcqRel);
+        if self.is_shutdown() || self.nv_migration_failed.load(Ordering::Acquire) {
+            return_errno_with_message!(Errno::EIO, "NV migration cannot make progress");
         }
         Ok(())
     }
@@ -439,16 +465,8 @@ impl Ext4 {
         for (index, target) in allocated {
             pages[index].target = target;
             if let Some((handle, _)) = pages[index].redirect.as_mut() {
-                let key = rnvpc::index::PageKey::new(
-                    self.rnvpc_fs_id(),
-                    pages[index].inode,
-                    pages[index].index,
-                );
-                let current = pool
-                    .redirect_lookup(key)
-                    .filter(|current| current.reference == handle.reference)
-                    .ok_or_else(|| Error::new(Errno::ESTALE))?;
-                *handle = current;
+                handle.ssd_target = target;
+                handle.migration_target = true;
             }
         }
         Ok(groups)
@@ -521,14 +539,24 @@ impl Ext4 {
         for (_inode_id, pages) in groups {
             if self.rnvpc_extend_enabled() {
                 let publish_started = pp::now();
-                if pages.iter().any(|page| page.redirect.is_none()) {
-                    return_errno_with_message!(
-                        Errno::EUCLEAN,
-                        "rNVPCe migration reached a legacy extent candidate"
-                    );
-                }
                 let published_pages = pages.len();
-                self.finish_redirect_pages(pool, pages)?;
+                let result = (|| {
+                    if pages.iter().any(|page| page.redirect.is_none()) {
+                        return_errno_with_message!(
+                            Errno::EUCLEAN,
+                            "rNVPCe migration reached a legacy extent candidate"
+                        );
+                    }
+                    self.finish_redirect_pages(pool, pages)
+                })();
+                if let Err(error) = result {
+                    // SSD durability already completed. A failure from this
+                    // point can leave publication or credit phases partially
+                    // durable, so both async completion and synchronous drain
+                    // must force mount-time recovery rather than retry blindly.
+                    self.fail_nv_migration();
+                    return Err(error);
+                }
                 pp::NV_EXTENT_PUBLISH.record_since(publish_started, published_pages);
             } else {
                 for page in pages {
@@ -664,14 +692,35 @@ impl Ext4 {
         let mut new_baselines = Vec::new();
         let mut new_target_refs = Vec::new();
         let mut baseline_valid = true;
+        let compare_started = batch_metrics::now();
         for page in &pages {
             let (handle, token) = page
                 .redirect
                 .as_ref()
                 .ok_or_else(|| Error::new(Errno::EUCLEAN))?;
-            baseline_valid &= pool.validate_baseline_token(token);
             let handle = *handle;
             let key = rnvpc::index::PageKey::new(self.rnvpc_fs_id(), page.inode, page.index);
+            let token_matches = token.target(page.index).is_some_and(|target| {
+                target
+                    == if handle.migration_target {
+                        0
+                    } else {
+                        handle.ssd_target
+                    }
+            });
+            let generation_matches = pool.validate_baseline_token(token);
+            if !generation_matches || !token_matches {
+                let resolved = rnvpc::write_transaction::current_page_mapping(
+                    pool,
+                    self.rnvpc_fs_id(),
+                    page.inode,
+                    page.index,
+                )?;
+                baseline_valid &= !page.needs_baseline
+                    && resolved.is_some_and(|mapping| {
+                        mapping.is_written() && mapping.ssd_block() == page.target
+                    });
+            }
             exact.push((key, handle));
             if page.needs_baseline {
                 if page.target == 0 {
@@ -681,6 +730,8 @@ impl Ext4 {
                 new_target_refs.push(handle.reference);
             }
         }
+        batch_metrics::elapsed(Phase::CompletionCompare, compare_started);
+        batch_metrics::count(Event::CompletionComparisons, exact.len());
         if !baseline_valid {
             drop(pages);
             for (key, handle) in exact {
@@ -702,7 +753,7 @@ impl Ext4 {
         if !new_baselines.is_empty() {
             new_baselines.sort_unstable_by_key(|(logical, _)| *logical);
             let inode = pages[0].inode;
-            rnvpc::write_transaction::publish_ssd_baseline_batch(
+            rnvpc::write_transaction::publish_claimed_ssd_baseline_batch(
                 pool,
                 self.rnvpc_fs_id(),
                 inode,
@@ -723,21 +774,42 @@ impl Ext4 {
             for references in releasable.chunks(128) {
                 pool.mark_migration_credits_released(references, None)?;
             }
-            rnvpc::write_transaction::consume_ssd_capacity_locked(
-                pool,
-                self.rnvpc_fs_id(),
-                inode,
-                new_baselines.len() as u64,
-            )?;
-            self.release_rnvpce_blocks(new_baselines.len() as u64)?;
+            if !releasable.is_empty() {
+                rnvpc::write_transaction::consume_ssd_capacity_locked(
+                    pool,
+                    self.rnvpc_fs_id(),
+                    inode,
+                    releasable.len() as u64,
+                )?;
+                self.release_rnvpce_blocks(releasable.len() as u64)?;
+            }
         }
         drop(pages);
         for chunk in exact.chunks(128) {
-            let reclaimed = pool.clear_redirects_exact(chunk, None);
+            let reclaimed = loop {
+                let lease_epoch = pool.data_page_lease_epoch();
+                match pool.clear_redirects_exact(chunk, None) {
+                    Ok(reclaimed) => break reclaimed,
+                    Err(error) if error.error() == Errno::EBUSY => {
+                        pool.wait_for_data_page_lease_change(lease_epoch);
+                    }
+                    Err(error) => return Err(error),
+                }
+            };
             for (key, _) in chunk {
                 pool.release_baseline_migration(*key);
             }
-            let reclaimed = reclaimed?;
+            let mut slots = reclaimed
+                .iter()
+                .map(|page| page.index())
+                .collect::<Vec<_>>();
+            slots.sort_unstable();
+            let ranges = slots
+                .iter()
+                .enumerate()
+                .filter(|(index, slot)| *index == 0 || **slot != slots[*index - 1] + 1)
+                .count();
+            batch_metrics::count(Event::ReclaimedSlotRanges, ranges);
             for page in reclaimed {
                 pool.free_data_page(page)?;
                 batch_metrics::count(Event::ReclaimedPages, 1);

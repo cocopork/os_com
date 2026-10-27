@@ -3,6 +3,7 @@
 //! Exact descriptor publication and retirement for rNVPCe redirects.
 
 use super::*;
+use crate::fs::rnvpc::batch_metrics;
 
 impl Rnvpc {
     pub(crate) fn publish_redirect_batch(
@@ -16,12 +17,19 @@ impl Rnvpc {
         if pages.len() > 128 {
             return_errno_with_message!(Errno::EINVAL, "redirect publication exceeds 128 pages");
         }
+        let metrics_started = batch_metrics::now();
         let keys: Vec<_> = pages.iter().map(|(_, key, _)| *key).collect();
-        let reservation = self.redirects.reserve_versions(&keys)?;
         let mut prepared = Vec::new();
         prepared
             .try_reserve_exact(pages.len())
             .map_err(|_| Error::new(Errno::ENOMEM))?;
+        let reservation = loop {
+            match self.redirects.reserve_versions(&keys) {
+                Ok(reservation) => break reservation,
+                Err(error) if error.error() == Errno::EBUSY => crate::thread::Thread::yield_now(),
+                Err(error) => return Err(error),
+            }
+        };
         let mut slots = BTreeSet::new();
         let preparation = (|| -> Result<()> {
             for (page, key, ssd_target) in pages {
@@ -93,6 +101,8 @@ impl Rnvpc {
             }
             return Err(error);
         }
+        batch_metrics::count(batch_metrics::Event::RedirectPublishBatches, 1);
+        batch_metrics::count(batch_metrics::Event::RedirectPublishedPages, updates.len());
 
         let redirect_updates: Vec<_> = prepared
             .iter()
@@ -127,10 +137,12 @@ impl Rnvpc {
                 );
             }
         }
-        Ok(prepared
+        let handles = prepared
             .into_iter()
             .map(|(_, _, _, handle)| handle)
-            .collect())
+            .collect();
+        batch_metrics::elapsed(batch_metrics::Phase::RedirectPublish, metrics_started);
+        Ok(handles)
     }
 
     fn release_redirect_publication_pins(
@@ -143,6 +155,9 @@ impl Rnvpc {
             record.pins -= 1;
             record.persisting = false;
             self.account_unpin();
+        }
+        if !prepared.is_empty() {
+            note_data_page_lease_change();
         }
     }
 
@@ -287,6 +302,9 @@ impl Rnvpc {
             }
             transitioned.push(new);
         }
+        if !transitioned.is_empty() {
+            note_data_page_lease_change();
+        }
         Ok(transitioned)
     }
 
@@ -303,8 +321,10 @@ impl Rnvpc {
         snapshot: &RedirectRange,
         budget: usize,
     ) -> Result<Vec<ClaimedRedirectRange>> {
+        let metrics_started = batch_metrics::now();
         let limit = snapshot.pages.len().min(budget).min(128);
         let mut candidates = Vec::new();
+        let mut claimed_generations = BTreeMap::new();
         for (offset, handle) in snapshot.pages.iter().copied().take(limit).enumerate() {
             let page_index = snapshot
                 .logical_start
@@ -312,9 +332,10 @@ impl Rnvpc {
                 .ok_or_else(|| Error::new(Errno::EOVERFLOW))?;
             let key = PageKey::new(snapshot.fs_id, snapshot.inode, page_index);
             if self.redirects.lookup(key) == Some(handle)
-                && self.baseline_generations.try_claim_migration(key)
+                && let Some(generation) = self.baseline_generations.try_claim_migration(key)
             {
                 candidates.push((key, handle));
+                claimed_generations.insert(key, generation);
             }
         }
 
@@ -367,7 +388,12 @@ impl Rnvpc {
             let mut pages = Vec::new();
             for (key, handle) in transitioned {
                 match self.pin_redirect(key, handle) {
-                    Ok(pin) => pages.push(ClaimedRedirectPage { key, handle, pin }),
+                    Ok(pin) => pages.push(ClaimedRedirectPage {
+                        key,
+                        handle,
+                        pin,
+                        baseline_generation: claimed_generations[&key],
+                    }),
                     Err(_) => {
                         self.baseline_generations.release_migration(key);
                         if let Ok(reclaimed) = self.clear_redirects_exact(&[(key, handle)], None) {
@@ -390,18 +416,33 @@ impl Rnvpc {
                 }
                 let contiguous = pages.drain(page_start..page_cursor).collect::<Vec<_>>();
                 page_cursor = page_start;
-                let baseline_token = self.baseline_generations.snapshot(
-                    snapshot.fs_id,
-                    snapshot.inode,
-                    contiguous[0].key.page_index,
-                    contiguous.len(),
-                )?;
+                let token_pages = contiguous
+                    .iter()
+                    .map(|page| {
+                        (
+                            page.key,
+                            page.baseline_generation,
+                            if page.handle.migration_target {
+                                0
+                            } else {
+                                page.handle.ssd_target
+                            },
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                let baseline_token = self.baseline_generations.claimed_token(&token_pages)?;
                 claimed.push(ClaimedRedirectRange {
                     baseline_token,
                     pages: contiguous,
                 });
             }
         }
+        batch_metrics::count(batch_metrics::Event::CandidateRanges, claimed.len());
+        batch_metrics::count(
+            batch_metrics::Event::CandidatePages,
+            claimed.iter().map(|range| range.pages.len()).sum(),
+        );
+        batch_metrics::elapsed(batch_metrics::Phase::RangeClaim, metrics_started);
         Ok(claimed)
     }
 
@@ -413,6 +454,18 @@ impl Rnvpc {
         self.baseline_generations.release_migration(key);
     }
 
+    pub(crate) fn begin_baseline_mutation(
+        &self,
+        keys: &[PageKey],
+    ) -> Result<BaselineMutationGuard<'_>> {
+        self.baseline_generations.begin_mutation(keys)
+    }
+
+    pub(crate) fn advance_claimed_baseline(&self, keys: &[PageKey]) -> Result<()> {
+        self.baseline_generations.advance_claimed(keys)
+    }
+
+    #[cfg(ktest)]
     pub(crate) fn advance_baseline_generation(
         &self,
         fs_id: u64,
@@ -434,6 +487,9 @@ impl Rnvpc {
             objects.records[*slot].persisting = false;
             self.account_unpin();
         }
+        if !updates.is_empty() {
+            note_data_page_lease_change();
+        }
     }
 
     fn release_one_redirect_pin(&self, slot: usize) {
@@ -441,6 +497,8 @@ impl Rnvpc {
         objects.records[slot].pins = 0;
         objects.records[slot].persisting = false;
         self.account_unpin();
+        drop(objects);
+        note_data_page_lease_change();
     }
 
     pub(crate) fn clear_redirects_exact(
@@ -448,6 +506,7 @@ impl Rnvpc {
         redirects: &[(PageKey, DescriptorHandle)],
         fault: Option<FaultPoint>,
     ) -> Result<Vec<NvPageId>> {
+        let metrics_started = batch_metrics::now();
         let mut prepared = Vec::new();
         let mut slots = BTreeSet::new();
         for (key, handle) in redirects {
@@ -467,12 +526,15 @@ impl Rnvpc {
                 || record.alloc_seq != handle.reference.allocation_seq()
                 || record.key != Some(*key)
                 || record.version != handle.logical_version
-                || record.persisting
-                || record.pins != 0
             {
                 drop(objects);
                 self.release_clear_pins(&prepared);
                 return_errno!(Errno::ESTALE);
+            }
+            if record.persisting || record.pins != 0 {
+                drop(objects);
+                self.release_clear_pins(&prepared);
+                return_errno_with_message!(Errno::EBUSY, "redirect still has an active pin");
             }
             if let Err(error) = self.account_pin() {
                 drop(objects);
@@ -489,6 +551,7 @@ impl Rnvpc {
                 self.release_clear_pins(&prepared);
                 return Err(error);
             }
+            batch_metrics::count(batch_metrics::Event::DescriptorClearBatches, 1);
         }
         let mut reclaimed = Vec::with_capacity(prepared.len());
         for (slot, key, handle) in prepared {
@@ -516,6 +579,7 @@ impl Rnvpc {
         if !reclaimed.is_empty() {
             note_data_page_lease_change();
         }
+        batch_metrics::elapsed(batch_metrics::Phase::DescriptorClear, metrics_started);
         Ok(reclaimed)
     }
 
@@ -525,6 +589,9 @@ impl Rnvpc {
             objects.records[*slot].pins = 0;
             objects.records[*slot].persisting = false;
             self.account_unpin();
+        }
+        if !prepared.is_empty() {
+            note_data_page_lease_change();
         }
     }
 

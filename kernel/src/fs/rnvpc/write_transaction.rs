@@ -846,6 +846,7 @@ impl<'a> RangeWriteBatch<'a> {
             || generation > UPDATE_ALLOCATION_MAX_GENERATION
             || write_len == 0
             || pages.is_empty()
+            || pages.len() > SSD_MIGRATION_BATCH_PAGES
             || sectors_per_block == 0
         {
             return_errno_with_message!(Errno::EINVAL, "invalid range write batch");
@@ -1005,6 +1006,22 @@ where
         return Ok(committed);
     }
 
+    let baseline_keys = request
+        .pages
+        .iter()
+        .map(|page| PageKey::new(fs_id, inode, page.logical_block))
+        .collect::<Vec<_>>();
+    let _baseline_guard = match pool.begin_baseline_mutation(&baseline_keys) {
+        Ok(guard) => guard,
+        Err(error) if error.error() == Errno::EBUSY => {
+            return_errno_with_message!(
+                Errno::EAGAIN,
+                "SSD baseline migration won the foreground publication race"
+            )
+        }
+        Err(error) => return Err(error),
+    };
+
     let started = read_ns();
     let mut existing_refs = Vec::new();
     existing_refs
@@ -1090,7 +1107,6 @@ where
     LATENCY_STATS.fg_allocate.record_since(started);
     let started = read_ns();
     let mut copied = 0usize;
-    let mut committed_page_count = 0usize;
     let mut newly_mapped = 0u64;
     let mut pending_new_pages = Vec::new();
     pending_new_pages
@@ -1158,7 +1174,6 @@ where
         copied = copied
             .checked_add(page_copied)
             .ok_or_else(|| Error::new(Errno::EOVERFLOW))?;
-        committed_page_count += 1;
         if page_copied != page.len {
             break;
         }
@@ -1226,9 +1241,6 @@ where
         block_count,
         inode_fault,
     )?;
-    for page in request.pages.iter().take(committed_page_count) {
-        pool.advance_baseline_generation(fs_id, inode, page.logical_block, 1)?;
-    }
     LATENCY_STATS.fg_inode_publish.record_since(started);
     LATENCY_STATS.fg_enqueue.record_events(0);
     LATENCY_STATS.fg_body.record_since(body_started);
@@ -1428,6 +1440,7 @@ impl<'a> WriteBatch<'a> {
             || generation > UPDATE_ALLOCATION_MAX_GENERATION
             || write_len == 0
             || pages.is_empty()
+            || pages.len() > SSD_MIGRATION_BATCH_PAGES
         {
             return_errno_with_message!(Errno::EINVAL, "invalid write batch");
         }
@@ -1505,6 +1518,12 @@ pub(crate) fn commit_write_batch(
     }
     let current_root = current_inode.extent_root();
     validate_ssd_targets(&pool, fs_id, inode, current_root, request)?;
+    let baseline_keys = request
+        .pages
+        .iter()
+        .map(|page| PageKey::new(fs_id, inode, page.logical_block))
+        .collect::<Vec<_>>();
+    let _baseline_guard = pool.begin_baseline_mutation(&baseline_keys)?;
 
     let mut allocation_refs = Vec::new();
     let mut data_refs = Vec::new();
@@ -1578,9 +1597,6 @@ pub(crate) fn commit_write_batch(
         request.block_count,
         inode_fault,
     )?;
-    for page in request.pages {
-        pool.advance_baseline_generation(fs_id, inode, page.logical_block, 1)?;
-    }
     for old in old_redirects {
         if let Ok(pages) = pool.clear_redirects_exact(&[old], None) {
             for page in pages {
@@ -1612,6 +1628,10 @@ fn coalesce_ssd_extent_entries(mappings: &[(u64, u64)]) -> Result<Vec<ExtentReco
     let mut start = 0;
     while start < mappings.len() {
         let (logical_start, physical_start) = mappings[start];
+        if physical_start == 0 {
+            start += 1;
+            continue;
+        }
         let mut end = start + 1;
         while end < mappings.len() {
             let offset = u64::try_from(end - start).map_err(|_| Error::new(Errno::EOVERFLOW))?;
@@ -1641,10 +1661,43 @@ pub(crate) fn publish_ssd_baseline_batch(
     inode: u64,
     mappings: &[(u64, u64)],
 ) -> Result<()> {
+    publish_ssd_baseline_batch_inner(pool, fs_id, inode, mappings, false)
+}
+
+pub(crate) fn publish_claimed_ssd_baseline_batch(
+    pool: &Arc<Rnvpc>,
+    fs_id: u64,
+    inode: u64,
+    mappings: &[(u64, u64)],
+) -> Result<()> {
+    publish_ssd_baseline_batch_inner(pool, fs_id, inode, mappings, true)
+}
+
+fn publish_ssd_baseline_batch_inner(
+    pool: &Arc<Rnvpc>,
+    fs_id: u64,
+    inode: u64,
+    mappings: &[(u64, u64)],
+    claimed: bool,
+) -> Result<()> {
     if mappings.is_empty() {
         return Ok(());
     }
+    if mappings.iter().any(|(_, block)| *block == 0) {
+        return_errno_with_message!(Errno::EINVAL, "SSD baseline target is block zero");
+    }
+    let metrics_started = super::batch_metrics::now();
     let mutation = ExtentMutation::new(pool.clone(), fs_id, inode)?;
+    let keys = mappings
+        .iter()
+        .map(|(logical, _)| PageKey::new(fs_id, inode, *logical))
+        .collect::<Vec<_>>();
+    let _baseline_guard = if claimed {
+        pool.advance_claimed_baseline(&keys)?;
+        None
+    } else {
+        Some(pool.begin_baseline_mutation(&keys)?)
+    };
     let inode_ref =
         authoritative_inode_ref(pool, fs_id, inode)?.ok_or_else(|| Error::new(Errno::ESTALE))?;
     let inode_record = pool.read_authoritative_metadata::<InodeRecord>(inode_ref)?;
@@ -1664,9 +1717,11 @@ pub(crate) fn publish_ssd_baseline_batch(
         inode_record.block_count(),
         None,
     )?;
-    for (logical_block, _) in mappings {
-        pool.advance_baseline_generation(fs_id, inode, *logical_block, 1)?;
-    }
+    super::batch_metrics::count(super::batch_metrics::Event::StructuralBaselineMutations, 1);
+    super::batch_metrics::elapsed(
+        super::batch_metrics::Phase::StructuralBaseline,
+        metrics_started,
+    );
     Ok(())
 }
 
@@ -1871,7 +1926,9 @@ where
         }
         for entry in node.entries()?.iter().rev() {
             if node.level() == 0 {
-                if matches!(entry.data_ref()?, ExtentDataRef::Ssd(_)) && !entry.is_unwritten() {
+                if matches!(entry.data_ref()?, ExtentDataRef::Ssd(block) if block != 0)
+                    && !entry.is_unwritten()
+                {
                     visit(*entry)?;
                 }
             } else {
@@ -1912,6 +1969,7 @@ pub(crate) fn current_page_mapping(
         return Ok(None);
     };
     let (ssd_block, in_flight) = match entry.data_ref()? {
+        ExtentDataRef::Ssd(0) => return Ok(None),
         ExtentDataRef::Ssd(first) => (
             first
                 .checked_add(logical_block - entry.logical_block())

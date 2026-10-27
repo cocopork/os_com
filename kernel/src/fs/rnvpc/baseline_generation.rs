@@ -1,11 +1,9 @@
 // SPDX-License-Identifier: MPL-2.0
 
-//! Volatile generations for confirmed SSD baseline mappings.
+//! Volatile generations and ownership for confirmed SSD baseline mappings.
 
 use super::index::PageKey;
 use crate::prelude::*;
-
-const BASELINE_SHARDS: usize = 64;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct BaselineRangeToken {
@@ -13,35 +11,49 @@ pub(crate) struct BaselineRangeToken {
     pub(crate) inode: u64,
     pub(crate) logical_start: u64,
     pub(crate) generations: Vec<u64>,
+    pub(crate) targets: Vec<u64>,
+}
+
+impl BaselineRangeToken {
+    pub(crate) fn target(&self, page_index: u64) -> Option<u64> {
+        let offset = page_index.checked_sub(self.logical_start)?;
+        self.targets.get(usize::try_from(offset).ok()?).copied()
+    }
+}
+
+#[derive(Default)]
+struct BaselineState {
+    generations: BTreeMap<PageKey, u64>,
+    migrations: BTreeSet<PageKey>,
+    mutations: BTreeSet<PageKey>,
 }
 
 pub(crate) struct BaselineGenerationMap {
-    shards: Box<[SpinLock<BTreeMap<PageKey, u64>>]>,
-    owners: Box<[SpinLock<BTreeSet<PageKey>>]>,
+    state: SpinLock<BaselineState>,
+}
+
+pub(crate) struct BaselineMutationGuard<'a> {
+    map: &'a BaselineGenerationMap,
+    keys: Vec<PageKey>,
+}
+
+impl Drop for BaselineMutationGuard<'_> {
+    fn drop(&mut self) {
+        let mut state = self.map.state.lock();
+        for key in &self.keys {
+            state.mutations.remove(key);
+        }
+    }
 }
 
 impl BaselineGenerationMap {
     pub(crate) fn new() -> Result<Self> {
-        let mut shards = Vec::new();
-        shards
-            .try_reserve_exact(BASELINE_SHARDS)
-            .map_err(|_| Error::new(Errno::ENOMEM))?;
-        for _ in 0..BASELINE_SHARDS {
-            shards.push(SpinLock::new(BTreeMap::new()));
-        }
-        let mut owners = Vec::new();
-        owners
-            .try_reserve_exact(BASELINE_SHARDS)
-            .map_err(|_| Error::new(Errno::ENOMEM))?;
-        for _ in 0..BASELINE_SHARDS {
-            owners.push(SpinLock::new(BTreeSet::new()));
-        }
         Ok(Self {
-            shards: shards.into_boxed_slice(),
-            owners: owners.into_boxed_slice(),
+            state: SpinLock::new(BaselineState::default()),
         })
     }
 
+    #[cfg(ktest)]
     pub(crate) fn snapshot(
         &self,
         fs_id: u64,
@@ -49,6 +61,7 @@ impl BaselineGenerationMap {
         logical_start: u64,
         pages: usize,
     ) -> Result<BaselineRangeToken> {
+        let state = self.state.lock();
         let mut generations = Vec::new();
         generations
             .try_reserve_exact(pages)
@@ -57,11 +70,10 @@ impl BaselineGenerationMap {
             let page_index = logical_start
                 .checked_add(offset as u64)
                 .ok_or_else(|| Error::new(Errno::EOVERFLOW))?;
-            let key = PageKey::new(fs_id, inode, page_index);
             generations.push(
-                self.shards[self.shard(key)]
-                    .lock()
-                    .get(&key)
+                state
+                    .generations
+                    .get(&PageKey::new(fs_id, inode, page_index))
                     .copied()
                     .unwrap_or(0),
             );
@@ -71,10 +83,37 @@ impl BaselineGenerationMap {
             inode,
             logical_start,
             generations,
+            targets: vec![0; pages],
+        })
+    }
+
+    pub(crate) fn claimed_token(
+        &self,
+        pages: &[(PageKey, u64, u64)],
+    ) -> Result<BaselineRangeToken> {
+        let Some((first, _, _)) = pages.first() else {
+            return_errno!(Errno::EINVAL);
+        };
+        if pages.iter().enumerate().any(|(offset, (key, _, _))| {
+            (key.fs_id, key.inode) != (first.fs_id, first.inode)
+                || key.page_index != first.page_index + offset as u64
+        }) {
+            return_errno_with_message!(Errno::EINVAL, "baseline token pages are not contiguous");
+        }
+        Ok(BaselineRangeToken {
+            fs_id: first.fs_id,
+            inode: first.inode,
+            logical_start: first.page_index,
+            generations: pages.iter().map(|(_, generation, _)| *generation).collect(),
+            targets: pages.iter().map(|(_, _, target)| *target).collect(),
         })
     }
 
     pub(crate) fn validate(&self, token: &BaselineRangeToken) -> bool {
+        if token.generations.len() != token.targets.len() {
+            return false;
+        }
+        let state = self.state.lock();
         token
             .generations
             .iter()
@@ -83,16 +122,69 @@ impl BaselineGenerationMap {
                 let Some(page_index) = token.logical_start.checked_add(offset as u64) else {
                     return false;
                 };
-                let key = PageKey::new(token.fs_id, token.inode, page_index);
-                self.shards[self.shard(key)]
-                    .lock()
-                    .get(&key)
+                state
+                    .generations
+                    .get(&PageKey::new(token.fs_id, token.inode, page_index))
                     .copied()
                     .unwrap_or(0)
                     == *expected
             })
     }
 
+    pub(crate) fn try_claim_migration(&self, key: PageKey) -> Option<u64> {
+        let mut state = self.state.lock();
+        if state.mutations.contains(&key) || !state.migrations.insert(key) {
+            return None;
+        }
+        Some(state.generations.get(&key).copied().unwrap_or(0))
+    }
+
+    pub(crate) fn begin_mutation(&self, keys: &[PageKey]) -> Result<BaselineMutationGuard<'_>> {
+        let unique = keys.iter().copied().collect::<BTreeSet<_>>();
+        let mut state = self.state.lock();
+        if unique
+            .iter()
+            .any(|key| state.migrations.contains(key) || state.mutations.contains(key))
+        {
+            return_errno_with_message!(Errno::EBUSY, "SSD baseline range is owned by migration");
+        }
+        if unique
+            .iter()
+            .any(|key| state.generations.get(key).copied().unwrap_or(0) == u64::MAX)
+        {
+            return_errno!(Errno::EOVERFLOW);
+        }
+        for key in &unique {
+            state.mutations.insert(*key);
+            let generation = state.generations.entry(*key).or_insert(0);
+            *generation += 1;
+        }
+        drop(state);
+        Ok(BaselineMutationGuard {
+            map: self,
+            keys: unique.into_iter().collect(),
+        })
+    }
+
+    pub(crate) fn advance_claimed(&self, keys: &[PageKey]) -> Result<()> {
+        let mut state = self.state.lock();
+        if keys.iter().any(|key| !state.migrations.contains(key)) {
+            return_errno_with_message!(Errno::ESTALE, "SSD baseline migration owner was lost");
+        }
+        if keys
+            .iter()
+            .any(|key| state.generations.get(key).copied().unwrap_or(0) == u64::MAX)
+        {
+            return_errno!(Errno::EOVERFLOW);
+        }
+        for key in keys {
+            let generation = state.generations.entry(*key).or_insert(0);
+            *generation += 1;
+        }
+        Ok(())
+    }
+
+    #[cfg(ktest)]
     pub(crate) fn advance(
         &self,
         fs_id: u64,
@@ -100,31 +192,15 @@ impl BaselineGenerationMap {
         logical_start: u64,
         pages: usize,
     ) -> Result<()> {
-        for offset in 0..pages {
-            let page_index = logical_start
-                .checked_add(offset as u64)
-                .ok_or_else(|| Error::new(Errno::EOVERFLOW))?;
-            let key = PageKey::new(fs_id, inode, page_index);
-            let mut shard = self.shards[self.shard(key)].lock();
-            let generation = shard.entry(key).or_insert(0);
-            *generation = generation
-                .checked_add(1)
-                .ok_or_else(|| Error::new(Errno::EOVERFLOW))?;
-        }
+        let keys = (0..pages)
+            .map(|offset| PageKey::new(fs_id, inode, logical_start + offset as u64))
+            .collect::<Vec<_>>();
+        drop(self.begin_mutation(&keys)?);
         Ok(())
     }
 
-    pub(crate) fn try_claim_migration(&self, key: PageKey) -> bool {
-        self.owners[self.shard(key)].lock().insert(key)
-    }
-
     pub(crate) fn release_migration(&self, key: PageKey) {
-        self.owners[self.shard(key)].lock().remove(&key);
-    }
-
-    fn shard(&self, key: PageKey) -> usize {
-        let owner = key.fs_id.rotate_left(13) ^ key.inode.rotate_left(31) ^ key.page_index;
-        owner as usize % self.shards.len()
+        self.state.lock().migrations.remove(&key);
     }
 }
 
@@ -142,5 +218,43 @@ mod tests {
         assert!(!generations.validate(&token));
         assert!(generations.validate(&generations.snapshot(1, 2, 10, 2).unwrap()));
         assert!(generations.validate(&generations.snapshot(1, 2, 13, 1).unwrap()));
+    }
+
+    #[ktest]
+    fn baseline_mutation_and_migration_claim_exclude_each_other() {
+        let generations = BaselineGenerationMap::new().unwrap();
+        let key = PageKey::new(1, 2, 10);
+        let generation = generations.try_claim_migration(key).unwrap();
+        assert_eq!(generation, 0);
+        assert!(generations.begin_mutation(&[key]).is_err());
+        generations.release_migration(key);
+        let guard = generations.begin_mutation(&[key]).unwrap();
+        assert!(generations.try_claim_migration(key).is_none());
+        drop(guard);
+        assert_eq!(generations.try_claim_migration(key), Some(1));
+    }
+
+    #[ktest]
+    fn claimed_generation_overflow_does_not_partially_advance_batch() {
+        let generations = BaselineGenerationMap::new().unwrap();
+        let first = PageKey::new(1, 2, 10);
+        let overflow = PageKey::new(1, 2, 11);
+        {
+            let mut state = generations.state.lock();
+            state.generations.insert(first, 7);
+            state.generations.insert(overflow, u64::MAX);
+            state.migrations.insert(first);
+            state.migrations.insert(overflow);
+        }
+        assert_eq!(
+            generations
+                .advance_claimed(&[first, overflow])
+                .unwrap_err()
+                .error(),
+            Errno::EOVERFLOW
+        );
+        let state = generations.state.lock();
+        assert_eq!(state.generations.get(&first), Some(&7));
+        assert_eq!(state.generations.get(&overflow), Some(&u64::MAX));
     }
 }

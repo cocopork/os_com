@@ -1482,6 +1482,7 @@ impl Inode {
                         inner = Some(self.inner.read());
                         continue;
                     }
+                    Err(error) if error.error() == Errno::ESTALE => continue,
                     Err(error) => return Err(error),
                 };
                 let copied = match page.copy_to_writer(page_offset, writer, amount) {
@@ -1738,7 +1739,12 @@ impl Inode {
         if fs.is_rdonly() {
             return_errno_with_message!(Errno::EROFS, "read-only filesystem");
         }
-        let write_len = reader.remain();
+        let max_write_len = 128usize
+            .checked_mul(PAGE_SIZE)
+            .and_then(|bytes| bytes.checked_sub(offset % PAGE_SIZE))
+            .ok_or_else(|| Error::new(Errno::EOVERFLOW))?;
+        let write_len = reader.remain().min(max_write_len);
+        reader.limit(write_len);
         let end = offset
             .checked_add(write_len)
             .ok_or_else(|| Error::with_message(Errno::EINVAL, "write range overflow"))?;
@@ -1803,6 +1809,13 @@ impl Inode {
                 .map_err(|_| Error::new(Errno::ENOMEM))?;
             for page_index in first_page..last_page {
                 let logical_block = page_index as u64;
+                let redirect_key =
+                    crate::fs::rnvpc::index::PageKey::new(fs_id, inode_id, logical_block);
+                let redirect = pool.redirect_lookup(redirect_key);
+                has_in_flight |= redirect.is_some_and(|handle| {
+                    handle.state == crate::fs::rnvpc::descriptor::NvObjectState::NvWriteback
+                        || handle.migration_target
+                });
                 let page_start = page_index * PAGE_SIZE;
                 let copy_start = offset.max(page_start);
                 let copy_end = end.min(page_start + PAGE_SIZE);
@@ -1819,10 +1832,12 @@ impl Inode {
                     has_in_flight |= mapping.is_in_flight();
                 } else {
                     targets.push(0);
-                    newly_reserved = newly_reserved
-                        .checked_add(1)
-                        .ok_or_else(|| Error::new(Errno::EOVERFLOW))?;
-                    newly_allocated = true;
+                    if redirect.is_none() {
+                        newly_reserved = newly_reserved
+                            .checked_add(1)
+                            .ok_or_else(|| Error::new(Errno::EOVERFLOW))?;
+                        newly_allocated = true;
+                    }
                 }
                 spans.push(crate::fs::rnvpc::write_transaction::RangeWritePage::new(
                     logical_block,
@@ -1851,7 +1866,7 @@ impl Inode {
                 // metadata coordination layers.
                 drop(mutation);
                 drop(inner);
-                pool.wait_for_data_page_lease_change(lease_epoch);
+                fs.wait_for_nv_migration_progress(&pool, lease_epoch)?;
                 continue;
             }
             let needed = crate::fs::rnvpc::write_transaction::range_write_new_pages(
@@ -1911,6 +1926,12 @@ impl Inode {
                         fs.request_nv_migration();
                     }
                     Ok(committed.copied())
+                }
+                Err(error) if error.error() == Errno::EAGAIN => {
+                    fs.release_rnvpce_blocks(newly_reserved)?;
+                    drop(inner);
+                    fs.wait_for_nv_migration_progress(&pool, lease_epoch)?;
+                    continue;
                 }
                 Err(error) => {
                     // Publication can fail after durable capacity reservation. Rebuild the

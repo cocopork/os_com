@@ -99,6 +99,12 @@ impl RedirectDirectory {
                 .find(|(index, _)| *index == shard)
                 .map(|(_, state)| state)
                 .expect("requested redirect shard is locked");
+            if state.pending.contains_key(key) {
+                return_errno_with_message!(
+                    Errno::EBUSY,
+                    "redirect key already has a pending publication"
+                );
+            }
             let committed = state
                 .committed
                 .get(key)
@@ -420,21 +426,24 @@ mod tests {
     }
 
     #[ktest]
-    fn redirect_reservations_are_monotonic_while_persist_is_unlocked() {
+    fn redirect_reservations_serialize_the_same_page() {
         let directory = RedirectDirectory::new().unwrap();
         let key = PageKey::new(1, 2, 3);
         let first = directory.reserve_versions(&[key]).unwrap();
-        let second = directory.reserve_versions(&[key]).unwrap();
         assert_eq!(first.logical_version(key), Some(1));
-        assert_eq!(second.logical_version(key), Some(2));
+        assert_eq!(
+            directory.reserve_versions(&[key]).unwrap_err().error(),
+            Errno::EBUSY
+        );
 
         directory.abort_reserved(&first).unwrap();
+        let second = directory.reserve_versions(&[key]).unwrap();
         directory
-            .commit_reserved(&second, &[(key, handle(11, 101, 2, 1003))])
+            .commit_reserved(&second, &[(key, handle(11, 101, 1, 1003))])
             .unwrap();
-        assert_eq!(directory.lookup(key), Some(handle(11, 101, 2, 1003)));
+        assert_eq!(directory.lookup(key), Some(handle(11, 101, 1, 1003)));
         let third = directory.reserve_versions(&[key]).unwrap();
-        assert_eq!(third.logical_version(key), Some(3));
+        assert_eq!(third.logical_version(key), Some(2));
     }
 
     #[ktest]

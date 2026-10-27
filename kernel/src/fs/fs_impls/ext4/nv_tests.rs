@@ -52,6 +52,7 @@ fn nv_route_rnvpce_redirect_completion_avoids_leaf() {
     assert_eq!(fixture.ext4.migrate_nv_round(64).unwrap(), 4);
     fixture.ext4.drain_nv_in_flight().unwrap();
 
+    crate::fs::rnvpc::batch_metrics::reset_for_test();
     let second = vec![0x82; 4 * PAGE_SIZE];
     inode
         .write_at(0, &mut VmReader::from(second.as_slice()).to_fallible())
@@ -61,6 +62,16 @@ fn nv_route_rnvpce_redirect_completion_avoids_leaf() {
     assert_eq!(fixture.ext4.migrate_nv_round(64).unwrap(), 4);
     fixture.ext4.drain_nv_in_flight().unwrap();
     assert_eq!(pool.extent_tree_routes(), routes);
+    use crate::fs::rnvpc::batch_metrics::{Event, event_count};
+    assert_eq!(event_count(Event::RedirectPublishBatches), 1);
+    assert_eq!(event_count(Event::RedirectPublishedPages), 4);
+    assert_eq!(event_count(Event::CandidateRanges), 1);
+    assert_eq!(event_count(Event::CandidatePages), 4);
+    assert_eq!(event_count(Event::CompletionComparisons), 4);
+    assert_eq!(event_count(Event::DescriptorClearBatches), 1);
+    assert_eq!(event_count(Event::ReclaimedPages), 4);
+    assert_eq!(event_count(Event::ReclaimedSlotRanges), 1);
+    assert_eq!(event_count(Event::StructuralBaselineMutations), 0);
     for logical in 0..4 {
         assert!(
             crate::fs::rnvpc::write_transaction::mapped_nv_page_ref(
@@ -793,18 +804,16 @@ fn nv_route_rnvpce_batch_allocation_durability() {
             Some(reference),
             "failed completion flush must retain NV authority"
         );
-        let mapping = crate::fs::rnvpc::write_transaction::current_page_mapping(
-            pool,
-            failed.ext4.rnvpc_fs_id(),
-            11,
-            index,
-        )
-        .unwrap()
-        .unwrap();
-        assert_eq!(
-            mapping.ssd_block(),
-            0,
-            "failed device flush must not publish an unconfirmed SSD baseline"
+        assert!(
+            crate::fs::rnvpc::write_transaction::current_page_mapping(
+                pool,
+                failed.ext4.rnvpc_fs_id(),
+                11,
+                index,
+            )
+            .unwrap()
+            .is_none(),
+            "failed device flush must leave the SSD baseline absent"
         );
     }
     assert_eq!(failed.ext4.migrate_nv_round(64).unwrap(), 32);

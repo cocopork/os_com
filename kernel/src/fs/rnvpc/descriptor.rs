@@ -249,6 +249,14 @@ impl NvDescriptor {
         Ok(())
     }
 
+    pub(crate) fn recover_as_dirty(&mut self) -> Result<()> {
+        if self.kind()? != NvObjectKind::NvPage || !self.state()?.is_persistable() {
+            return_errno_with_message!(Errno::EINVAL, "invalid recovered NVPage state");
+        }
+        self.state = NvObjectState::NvDirty as u8;
+        Ok(())
+    }
+
     pub(crate) fn is_valid(&self) -> bool {
         if self.magic != NV_DESCRIPTOR_MAGIC || self.version != NV_DESCRIPTOR_VERSION {
             return false;

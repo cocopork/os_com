@@ -17,7 +17,7 @@ use ostd::{mm::USegment, sync::WaitQueue};
 use super::index::ReverseExtentRef;
 use super::{
     backend::NvMemoryBackend,
-    baseline_generation::{BaselineGenerationMap, BaselineRangeToken},
+    baseline_generation::{BaselineGenerationMap, BaselineMutationGuard, BaselineRangeToken},
     capacity::{CapacityState, PoolClass, RnvpcStats},
     config::RnvpcConfig,
     data_page::DataPageState,
@@ -406,6 +406,7 @@ pub(crate) struct ClaimedRedirectPage {
     pub(crate) key: PageKey,
     pub(crate) handle: DescriptorHandle,
     pub(crate) pin: PinnedDataPage,
+    pub(crate) baseline_generation: u64,
 }
 
 #[cfg(ktest)]
@@ -500,6 +501,16 @@ impl Rnvpc {
         });
     }
 
+    pub(crate) fn wait_for_data_page_lease_change_until(
+        &self,
+        observed: u64,
+        cancelled: impl Fn() -> bool,
+    ) {
+        let _ = DATA_PAGE_LEASE_WAITERS.wait_until(|| {
+            (cancelled() || DATA_PAGE_LEASE_EPOCH.load(Ordering::Acquire) != observed).then_some(())
+        });
+    }
+
     /// Waits on actual data-page releases, including aborted reservations.
     /// The cancellation predicate must not acquire an inode/publication lock.
     pub(crate) fn wait_for_data_capacity(&self, pages: usize, cancelled: impl Fn() -> bool) {
@@ -509,6 +520,7 @@ impl Rnvpc {
 
     pub(crate) fn wake_data_capacity_waiters(&self) {
         DATA_CAPACITY_WAITERS.wake_all();
+        DATA_PAGE_LEASE_WAITERS.wake_all();
     }
 
     pub(crate) fn foreground_write_must_throttle(&self) -> bool {
@@ -643,10 +655,27 @@ impl Rnvpc {
         let recover::RecoveredScan {
             mut metadata,
             wal_data,
-            data,
+            mut data,
             max_allocation_seq,
         } = recovered;
         let obsolete_data = data.obsolete;
+        let mut normalized = Vec::new();
+        for entry in data.selected.values_mut() {
+            if entry.state == NvObjectState::NvDirty {
+                continue;
+            }
+            let mut descriptor = pool
+                .persist
+                .read_entry(entry.index)?
+                .filter(|descriptor| descriptor.allocation_seq() == entry.allocation_seq)
+                .ok_or_else(|| Error::new(Errno::EUCLEAN))?;
+            descriptor.recover_as_dirty()?;
+            normalized.push((entry.index, descriptor));
+            entry.state = NvObjectState::NvDirty;
+        }
+        for chunk in normalized.chunks(128) {
+            pool.persist.update_descriptors(chunk, None)?;
+        }
         pool.redirects.rebuild(
             data.selected
                 .iter()
@@ -659,7 +688,7 @@ impl Rnvpc {
                                 entry.allocation_seq,
                             )?,
                             logical_version: entry.version,
-                            state: entry.state,
+                            state: NvObjectState::NvDirty,
                             ssd_target: entry.ssd_backing_block,
                             migration_target: entry.migration_target,
                         },
@@ -709,7 +738,7 @@ impl Rnvpc {
                             )?,
                             logical_version: entry.version,
                             ssd_backing_block: entry.ssd_backing_block,
-                            state: entry.state,
+                            state: NvObjectState::NvDirty,
                         },
                     );
                 } else {
@@ -5111,7 +5140,12 @@ impl Rnvpc {
         debug_assert!(matches!(record.kind, ObjectKind::Data(_)));
         debug_assert!(record.pins > 0);
         record.pins -= 1;
+        let became_unpinned = record.pins == 0;
         self.account_unpin();
+        drop(state);
+        if became_unpinned {
+            note_data_page_lease_change();
+        }
     }
 
     fn abort_frame_eviction(&self, id: NvFrameId) {

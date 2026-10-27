@@ -14,6 +14,7 @@ impl Rnvpc {
     ) -> Result<()> {
         let mut updates = Vec::with_capacity(targets.len());
         let mut keys = Vec::with_capacity(targets.len());
+        let mut expected = Vec::with_capacity(targets.len());
         for (reference, target) in targets {
             let slot = self.migration_slot(*reference, true)?;
             let mut descriptor = self
@@ -21,35 +22,55 @@ impl Rnvpc {
                 .read_entry(slot)?
                 .filter(|d| d.allocation_seq() == reference.allocation_seq())
                 .ok_or_else(|| Error::new(Errno::ESTALE))?;
-            descriptor.assign_migration_target(*target)?;
             keys.push(PageKey::new(
                 descriptor.fs_id,
                 descriptor.inode,
                 descriptor.logical_index,
             ));
+            expected.push(DescriptorHandle {
+                reference: *reference,
+                logical_version: descriptor.recovery_id,
+                state: descriptor.state()?,
+                ssd_target: descriptor.ssd_backing_block,
+                migration_target: descriptor.has_migration_target(),
+            });
+            descriptor.assign_migration_target(*target)?;
             updates.push((slot, descriptor));
         }
         self.persist.update_descriptors(&updates, fault)?;
         // One short control-index critical section per batch, never across persist.
         {
             let mut state = self.state.lock();
-            for (key, (_, target)) in keys.iter().zip(targets) {
+            for ((key, expected), (_, target)) in keys.iter().zip(&expected).zip(targets) {
                 if let Some(entry) = state.index.lookup_mut(*key) {
-                    entry.ssd_backing_block = *target;
-                    entry.state = NvObjectState::NvWriteback;
+                    if entry.reference == expected.reference
+                        && entry.logical_version == expected.logical_version
+                    {
+                        entry.ssd_backing_block = *target;
+                        entry.state = NvObjectState::NvWriteback;
+                    }
                 }
             }
         }
-        for (key, (_, target)) in keys.iter().zip(targets) {
-            if let Some(old) = self.redirects.lookup(*key) {
-                let replacement = DescriptorHandle {
-                    ssd_target: *target,
-                    migration_target: true,
-                    ..old
-                };
-                if !self.redirects.compare_update(*key, old, replacement) {
-                    return_errno_with_message!(Errno::ESTALE, "migration redirect target changed");
+        for ((key, expected), (_, target)) in keys.iter().zip(expected).zip(targets) {
+            let replacement = DescriptorHandle {
+                ssd_target: *target,
+                migration_target: true,
+                ..expected
+            };
+            match self.redirects.lookup(*key) {
+                Some(current) if current == expected => {
+                    if !self.redirects.compare_update(*key, expected, replacement) {
+                        return_errno_with_message!(
+                            Errno::ESTALE,
+                            "migration redirect generation changed"
+                        );
+                    }
                 }
+                // A newer foreground CoW owns the PageKey. The old descriptor
+                // still carries this BIO target and is retired by old completion.
+                Some(_) => {}
+                None => {}
             }
         }
         Ok(())
@@ -91,9 +112,7 @@ impl Rnvpc {
             || !record.committed
             || record.alloc_seq != reference.allocation_seq()
             || (require_lease
-                && (record.kind != ObjectKind::Data(DataPageState::InFlight)
-                    || record.persisting
-                    || record.pins != 1))
+                && (record.kind != ObjectKind::Data(DataPageState::InFlight) || record.pins != 1))
         {
             return_errno!(Errno::ESTALE);
         }
@@ -111,7 +130,6 @@ impl Rnvpc {
             return_errno!(Errno::EINVAL);
         }
         let mut slots = Vec::with_capacity(pages.len());
-        let mut redirects = Vec::with_capacity(pages.len());
         let mut seen = BTreeSet::new();
         let started = read_ns();
         for (lease, reference) in &pages {
@@ -123,15 +141,6 @@ impl Rnvpc {
                 return_errno!(Errno::ESTALE);
             }
             let slot = self.migration_slot(*reference, true)?;
-            let objects = self.objects.lock(slot);
-            let record = &objects.records[slot];
-            let key = record.key.ok_or_else(|| Error::new(Errno::ESTALE))?;
-            if let Some(handle) = self.redirects.lookup(key)
-                && handle.reference == *reference
-                && handle.logical_version == record.version
-            {
-                redirects.push((key, handle));
-            }
             slots.push(slot);
         }
         LATENCY_STATS
@@ -156,16 +165,6 @@ impl Rnvpc {
                 allocation.capacity.account_free(PoolClass::Data);
                 self.account_unpin();
                 lease.active = false;
-            }
-        }
-        for (key, handle) in redirects {
-            self.redirects.compare_remove(key, handle);
-            let mut legacy = self.state.lock();
-            if legacy.index.lookup(key).is_some_and(|entry| {
-                entry.reference == handle.reference
-                    && entry.logical_version == handle.logical_version
-            }) {
-                legacy.index.remove(key);
             }
         }
         // Notify once after the complete successful batch is reusable.

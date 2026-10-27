@@ -31,7 +31,7 @@ impl ExtentTarget {
                 ExtentTargetKind::SsdWritten
             },
             block,
-            true,
+            false,
         )
     }
 
@@ -70,13 +70,8 @@ impl ExtentTarget {
 
     pub(crate) fn payload(self) -> Result<u64> {
         let payload = self.0 & TARGET_PAYLOAD_MASK;
-        if payload == 0
-            && matches!(
-                self.kind()?,
-                ExtentTargetKind::NvPage | ExtentTargetKind::Child
-            )
-        {
-            return_errno_with_message!(Errno::EINVAL, "null NVM extent target");
+        if payload == 0 {
+            return_errno_with_message!(Errno::EINVAL, "null persistent extent target");
         }
         Ok(payload)
     }
@@ -90,3 +85,28 @@ impl ExtentTarget {
 }
 
 const _: () = assert!(size_of::<ExtentTarget>() == size_of::<u64>());
+
+#[cfg(ktest)]
+mod tests {
+    use ostd::prelude::ktest;
+
+    use super::*;
+
+    #[ktest]
+    fn ssd_block_zero_is_not_a_persistent_extent_target() {
+        assert_eq!(
+            ExtentTarget::ssd(0, false).unwrap_err().error(),
+            Errno::EINVAL
+        );
+        assert_eq!(
+            ExtentTarget::ssd(0, true).unwrap_err().error(),
+            Errno::EINVAL
+        );
+        assert_eq!(
+            ExtentTarget::from_raw((ExtentTargetKind::SsdWritten as u64) << TARGET_KIND_SHIFT)
+                .unwrap_err()
+                .error(),
+            Errno::EINVAL
+        );
+    }
+}

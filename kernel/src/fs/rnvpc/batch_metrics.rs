@@ -16,6 +16,11 @@ pub(crate) enum Phase {
     LeafPublish,
     CreditPublish,
     Reclaim,
+    RedirectPublish,
+    RangeClaim,
+    CompletionCompare,
+    DescriptorClear,
+    StructuralBaseline,
 }
 
 #[derive(Clone, Copy)]
@@ -28,6 +33,14 @@ pub(crate) enum Event {
     DataPersist,
     ControlPersist,
     Fence,
+    RedirectPublishedPages,
+    RedirectPublishBatches,
+    CandidateRanges,
+    CandidatePages,
+    CompletionComparisons,
+    DescriptorClearBatches,
+    ReclaimedSlotRanges,
+    StructuralBaselineMutations,
 }
 
 struct Timing {
@@ -36,14 +49,14 @@ struct Timing {
     max_ns: AtomicU64,
 }
 
-static TIMINGS: [Timing; 7] = [const {
+static TIMINGS: [Timing; 12] = [const {
     Timing {
         calls: AtomicU64::new(0),
         ns: AtomicU64::new(0),
         max_ns: AtomicU64::new(0),
     }
-}; 7];
-static EVENTS: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
+}; 12];
+static EVENTS: [AtomicU64; 15] = [const { AtomicU64::new(0) }; 15];
 
 pub(crate) fn now() -> u64 {
     if ENABLED {
@@ -65,9 +78,21 @@ pub(crate) fn elapsed(phase: Phase, started: u64) {
 }
 
 pub(crate) fn count(event: Event, n: usize) {
-    if ENABLED {
+    if ENABLED || cfg!(ktest) {
         EVENTS[event as usize].fetch_add(n as u64, Ordering::Relaxed);
     }
+}
+
+#[cfg(ktest)]
+pub(crate) fn reset_for_test() {
+    for event in &EVENTS {
+        event.store(0, Ordering::Relaxed);
+    }
+}
+
+#[cfg(ktest)]
+pub(crate) fn event_count(event: Event) -> u64 {
+    EVENTS[event as usize].load(Ordering::Relaxed)
 }
 
 /// Emits cumulative snapshots; the final sync snapshot includes all migrations.
@@ -84,6 +109,11 @@ pub(crate) fn dump() {
         "leaf_publish",
         "credit_publish",
         "reclaim",
+        "redirect_publish",
+        "range_claim",
+        "completion_compare",
+        "descriptor_clear",
+        "structural_baseline",
     ]
     .iter()
     .zip(&TIMINGS)
@@ -104,6 +134,14 @@ pub(crate) fn dump() {
         "data_persist",
         "control_persist",
         "fence",
+        "redirect_published_pages",
+        "redirect_publish_batches",
+        "candidate_ranges",
+        "candidate_pages",
+        "completion_comparisons",
+        "descriptor_clear_batches",
+        "reclaimed_slot_ranges",
+        "structural_baseline_mutations",
     ]
     .iter()
     .zip(&EVENTS)
