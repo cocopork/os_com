@@ -582,7 +582,7 @@ fn fair_sibling_relink_accepts_existing_slot_plus_one() {
 }
 
 #[ktest]
-fn rnvpce_random_overwrites_split_an_inplace_leaf() {
+fn rnvpce_random_overwrites_leave_baseline_leaf_unchanged() {
     const FS_ID: u64 = 0xf404;
     const INODE: u64 = 20;
     const FILE_PAGES: u64 = 512;
@@ -599,6 +599,13 @@ fn rnvpce_random_overwrites_split_an_inplace_leaf() {
     )
     .unwrap();
     bootstrap_inode_authority(pool.clone(), FS_ID, INODE, &snapshot, None).unwrap();
+    let inode_before = pool.fixed_inode_ref(FS_ID, INODE).unwrap().unwrap();
+    let record_before = pool
+        .read_authoritative_metadata::<InodeRecord>(inode_before)
+        .unwrap();
+    let root_before = pool
+        .read_authoritative_metadata_boxed::<ExtentNodeRecord>(record_before.extent_root())
+        .unwrap();
 
     for iteration in 0..300u64 {
         let logical = iteration * 197 % FILE_PAGES;
@@ -643,42 +650,15 @@ fn rnvpce_random_overwrites_split_an_inplace_leaf() {
                 "random overwrite {iteration} misrouted logical page {page}",
             );
         }
-
-        let reference = mapped_nv_page_ref(&pool, FS_ID, INODE, logical)
-            .unwrap()
-            .unwrap();
-        let reverse = pool.reverse_lookup(reference).unwrap().unwrap();
-        let (identity, claimed_pages) = pool
-            .claim_migration_extent(reference, reverse)
-            .unwrap()
-            .into_parts();
-        let mut updates = Vec::new();
-        let mut evictions = Vec::new();
-        for claimed in claimed_pages {
-            let target = SSD_START + claimed.key.page_index;
-            claimed
-                .eviction
-                .assign_migration_target(claimed.reference, target)
-                .unwrap();
-            updates.push(SsdMigrationPage {
-                logical_block: claimed.key.page_index,
-                reference: claimed.reference,
-                ssd_block: target,
-            });
-            evictions.push(claimed.eviction);
-        }
-        assert!(
-            migrate_claimed_nv_extent_to_ssd(&pool, &identity, &updates, None)
-                .unwrap()
-                .into_iter()
-                .all(|result| result.unwrap())
-        );
-        for (update, eviction) in updates.iter().zip(evictions) {
-            eviction
-                .reclaim_after_ssd_publish(update.reference, None)
-                .unwrap();
-        }
     }
+    let inode_after = pool.fixed_inode_ref(FS_ID, INODE).unwrap().unwrap();
+    let record_after = pool
+        .read_authoritative_metadata::<InodeRecord>(inode_after)
+        .unwrap();
+    let root_after = pool
+        .read_authoritative_metadata_boxed::<ExtentNodeRecord>(record_after.extent_root())
+        .unwrap();
+    assert_eq!(root_before.as_bytes(), root_after.as_bytes());
 }
 
 #[ktest]
@@ -965,6 +945,157 @@ fn rnvpce_clearing_old_descriptor_keeps_new_redirect() {
     let mut bytes = [0; PAGE_SIZE];
     pin.read(&mut bytes).unwrap();
     assert_eq!(bytes, [0xb2; PAGE_SIZE]);
+}
+
+#[ktest]
+fn rnvpce_redirect_io_middle_page_overwrite_keeps_extent_tree_bytes_unchanged() {
+    const FS_ID: u64 = 0xa201;
+    const INODE: u64 = 41;
+    let pool = test_pool(32, 8, 24, None);
+    let baseline = ExtentRecordEntry::leaf(0, 8, 20_000, false).unwrap();
+    let baselines = [baseline];
+    let snapshot = AuthoritySnapshot::new(
+        1,
+        &baselines,
+        8 * PAGE_SIZE as u64,
+        (8 * PAGE_SIZE / 512) as u64,
+        0o100644,
+        0,
+    )
+    .unwrap();
+    let authority = bootstrap_inode_authority(pool.clone(), FS_ID, INODE, &snapshot, None).unwrap();
+    let before = pool
+        .read_metadata_record::<ExtentNodeRecord>(
+            NvFrameId::try_from(authority.extent_root().slot().unwrap() as usize).unwrap(),
+        )
+        .unwrap();
+    let spans = [RangeWritePage::new(4, 20_004, 0, PAGE_SIZE, false).unwrap()];
+    let request = RangeWriteBatch::new(
+        2,
+        4 * PAGE_SIZE as u64,
+        PAGE_SIZE,
+        &[],
+        &spans,
+        8 * PAGE_SIZE as u64,
+        (8 * PAGE_SIZE / 512) as u64,
+        (PAGE_SIZE / 512) as u64,
+    )
+    .unwrap();
+    let input = [0xc1; PAGE_SIZE];
+    commit_range_write(
+        pool.clone(),
+        FS_ID,
+        INODE,
+        &request,
+        &mut VmReader::from(input.as_slice()).to_fallible(),
+        |_, _| panic!("full overwrite must not load SSD"),
+        None,
+    )
+    .unwrap();
+    let after = pool
+        .read_metadata_record::<ExtentNodeRecord>(
+            NvFrameId::try_from(authority.extent_root().slot().unwrap() as usize).unwrap(),
+        )
+        .unwrap();
+    assert_eq!(before, after);
+    assert_eq!(
+        pool.redirect_lookup(PageKey::new(FS_ID, INODE, 4))
+            .unwrap()
+            .ssd_target,
+        20_004
+    );
+}
+
+#[ktest]
+fn rnvpce_redirect_io_reads_mixed_ssd_and_redirect_pages() {
+    const KEY: PageKey = PageKey::new(0xa202, 42, 3);
+    let pool = test_pool(8, 1, 7, None);
+    let page = staged_redirect_page(&pool, 0xd1);
+    let handle = pool
+        .publish_redirect_batch(&[(page, KEY, 30_003)], None)
+        .unwrap()[0];
+    assert_eq!(
+        mapped_nv_page_ref(&pool, KEY.fs_id, KEY.inode, 2).unwrap(),
+        None
+    );
+    assert_eq!(
+        mapped_nv_page_ref(&pool, KEY.fs_id, KEY.inode, 3).unwrap(),
+        Some(handle.reference)
+    );
+    let pin = pool.pin_redirect(KEY, handle).unwrap();
+    let mut bytes = [0; PAGE_SIZE];
+    pin.read(&mut bytes).unwrap();
+    assert_eq!(bytes, [0xd1; PAGE_SIZE]);
+}
+
+#[ktest]
+fn rnvpce_redirect_io_128k_overwrite_publishes_one_redirect_range() {
+    const FS_ID: u64 = 0xa203;
+    const INODE: u64 = 43;
+    let pool = test_pool(64, 8, 56, None);
+    let baseline = ExtentRecordEntry::leaf(0, 32, 40_000, false).unwrap();
+    let baselines = [baseline];
+    let snapshot = AuthoritySnapshot::new(
+        1,
+        &baselines,
+        32 * PAGE_SIZE as u64,
+        (32 * PAGE_SIZE / 512) as u64,
+        0o100644,
+        0,
+    )
+    .unwrap();
+    bootstrap_inode_authority(pool.clone(), FS_ID, INODE, &snapshot, None).unwrap();
+    let spans = (0..32)
+        .map(|page| RangeWritePage::new(page, 40_000 + page, 0, PAGE_SIZE, false).unwrap())
+        .collect::<Vec<_>>();
+    let request = RangeWriteBatch::new(
+        2,
+        0,
+        32 * PAGE_SIZE,
+        &[],
+        &spans,
+        32 * PAGE_SIZE as u64,
+        (32 * PAGE_SIZE / 512) as u64,
+        (PAGE_SIZE / 512) as u64,
+    )
+    .unwrap();
+    let input = [0xe1; 32 * PAGE_SIZE];
+    commit_range_write(
+        pool.clone(),
+        FS_ID,
+        INODE,
+        &request,
+        &mut VmReader::from(input.as_slice()).to_fallible(),
+        |_, _| panic!("full overwrite must not load SSD"),
+        None,
+    )
+    .unwrap();
+    let ranges = pool.redirect_dirty_ranges_for_test(64);
+    assert_eq!(ranges.len(), 1);
+    assert_eq!(ranges[0].pages.len(), 32);
+}
+
+#[ktest]
+fn rnvpce_redirect_io_write_during_old_writeback_publishes_cow_generation() {
+    const KEY: PageKey = PageKey::new(0xa204, 44, 5);
+    let pool = test_pool(12, 1, 11, None);
+    let old_page = staged_redirect_page(&pool, 0xf1);
+    let old = pool
+        .publish_redirect_batch(&[(old_page, KEY, 50_005)], None)
+        .unwrap()[0];
+    let writeback = pool
+        .transition_redirects(&[(KEY, old)], NvObjectState::NvWriteback, None)
+        .unwrap()[0];
+    let new_page = staged_redirect_page(&pool, 0xf2);
+    let new = pool
+        .publish_redirect_batch(&[(new_page, KEY, 50_005)], None)
+        .unwrap()[0];
+    assert!(new.logical_version > writeback.logical_version);
+    assert_eq!(pool.redirect_lookup(KEY), Some(new));
+    let old_pin = pool.pin_persistent_data_page(writeback.reference).unwrap();
+    let mut old_bytes = [0; PAGE_SIZE];
+    old_pin.read(&mut old_bytes).unwrap();
+    assert_eq!(old_bytes, [0xf1; PAGE_SIZE]);
 }
 
 fn recovery_descriptor(
@@ -1523,7 +1654,7 @@ fn rnvpce_foreground_batch_updates_each_leaf_once() {
 }
 
 #[ktest]
-fn rnvpce_inplace_extent_split_uses_one_field_update_session() {
+fn rnvpce_existing_baseline_overwrite_uses_no_extent_update_session() {
     const FS_ID: u64 = 0x9925;
     const INODE: u64 = 35;
     const FILE_PAGES: u64 = 8;
@@ -1569,7 +1700,7 @@ fn rnvpce_inplace_extent_split_uses_one_field_update_session() {
     )
     .unwrap();
 
-    assert_eq!(pool.extent_field_update_sessions() - before, 1);
+    assert_eq!(pool.extent_field_update_sessions() - before, 0);
     assert!(
         mapped_nv_page_ref(&pool, FS_ID, INODE, 2)
             .unwrap()

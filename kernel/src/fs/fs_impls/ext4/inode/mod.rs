@@ -1470,14 +1470,11 @@ impl Inode {
             let logical_block = (position / PAGE_SIZE) as u64;
             let page_offset = position % PAGE_SIZE;
             let amount = (end - position).min(PAGE_SIZE - page_offset);
-            if let Some(reference) = crate::fs::rnvpc::write_transaction::mapped_nv_page_ref(
-                &pool,
-                fs_id,
-                inode_id,
-                logical_block,
-            )? {
+            let redirect_key =
+                crate::fs::rnvpc::index::PageKey::new(fs_id, inode_id, logical_block);
+            if let Some(handle) = pool.redirect_lookup(redirect_key) {
                 let lease_epoch = pool.data_page_lease_epoch();
-                let page = match pool.pin_persistent_data_page(reference) {
+                let page = match pool.pin_redirect(redirect_key, handle) {
                     Ok(page) => page,
                     Err(error) if error.error() == Errno::EBUSY => {
                         drop(inner.take());

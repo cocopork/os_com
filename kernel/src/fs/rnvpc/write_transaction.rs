@@ -929,6 +929,17 @@ pub(crate) fn range_write_new_pages(
     inode: u64,
     request: &RangeWriteBatch<'_>,
 ) -> Result<usize> {
+    let mut existing_baseline = true;
+    for page in request.pages {
+        let mapping = current_page_mapping(pool, fs_id, inode, page.logical_block)?;
+        existing_baseline &= !page.newly_allocated
+            && mapping.is_some_and(|mapping| {
+                mapping.is_written() && mapping.ssd_block() == page.ssd_block
+            });
+    }
+    if existing_baseline {
+        return Ok(request.pages.len());
+    }
     let mut pages = 0;
     for page in request.pages {
         if mapped_nv_page_ref(pool, fs_id, inode, page.logical_block)?.is_none() {
@@ -962,6 +973,23 @@ where
     }
     let current_root = current_inode.extent_root();
     LATENCY_STATS.fg_inode_read.record_since(started);
+
+    if let Some(committed) = try_commit_existing_baseline_redirect_write(
+        &pool,
+        fs_id,
+        inode,
+        request,
+        reader,
+        &mut load_ssd_page,
+        inode_fault,
+        &mutation,
+        &mut reservation,
+        current_inode_ref,
+        &current_inode,
+    )? {
+        LATENCY_STATS.fg_body.record_since(body_started);
+        return Ok(committed);
+    }
 
     let started = read_ns();
     let mut existing_refs = Vec::new();
@@ -1207,6 +1235,137 @@ where
         inode: inode_ref,
         reserved_blocks: newly_mapped,
     })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn try_commit_existing_baseline_redirect_write<F>(
+    pool: &Arc<Rnvpc>,
+    fs_id: u64,
+    inode: u64,
+    request: &RangeWriteBatch<'_>,
+    reader: &mut VmReader,
+    load_ssd_page: &mut F,
+    inode_fault: Option<FaultPoint>,
+    mutation: &ExtentMutation,
+    reservation: &mut super::frame::CapacityReservation,
+    current_inode_ref: PersistentObjectRef,
+    current_inode: &InodeRecord,
+) -> Result<Option<CommittedRangeWrite>>
+where
+    F: FnMut(u64, &mut super::frame::StagingDataPage) -> Result<()>,
+{
+    if request.pages.iter().any(|page| page.newly_allocated) {
+        return Ok(None);
+    }
+    for page in request.pages {
+        let Some(entry) = lookup_tree_extent(
+            pool,
+            fs_id,
+            inode,
+            current_inode.extent_root(),
+            page.logical_block,
+        )?
+        else {
+            return Ok(None);
+        };
+        let ExtentDataRef::Ssd(first) = entry.data_ref()? else {
+            return Ok(None);
+        };
+        let target = first
+            .checked_add(page.logical_block - entry.logical_block())
+            .ok_or_else(|| Error::new(Errno::EOVERFLOW))?;
+        if entry.is_unwritten() || target != page.ssd_block {
+            return Ok(None);
+        }
+    }
+
+    let mut pending = Vec::new();
+    pending
+        .try_reserve_exact(request.pages.len())
+        .map_err(|_| Error::new(Errno::ENOMEM))?;
+    let mut old_redirects = Vec::new();
+    let mut copied = 0usize;
+    let staging_result = (|| -> Result<()> {
+        for page in request.pages {
+            let key = PageKey::new(fs_id, inode, page.logical_block);
+            let previous = pool.redirect_lookup(key);
+            let mut staging = pool.begin_reserved_data_page(reservation)?;
+            let full_overwrite = page.page_offset == 0 && page.len == PAGE_SIZE;
+            if full_overwrite {
+                staging.zero_all()?;
+            } else if let Some(handle) = previous {
+                let pin = pool.pin_redirect(key, handle)?;
+                let mut bytes = [0; PAGE_SIZE];
+                pin.read(&mut bytes)?;
+                staging.write_all(&bytes)?;
+            } else {
+                staging.zero_all()?;
+                load_ssd_page(page.ssd_block, &mut staging)?;
+            }
+            let amount = staging.copy_from_reader(page.page_offset, reader, page.len)?;
+            if amount == 0 {
+                return_errno_with_message!(Errno::EFAULT, "write copied no user bytes");
+            }
+            let id = staging.finish()?;
+            pool.transition_data_page(id, DataPageState::Staged, DataPageState::NvDirty)?;
+            pending.push((id, key, page.ssd_block));
+            if let Some(handle) = previous {
+                old_redirects.push((key, handle));
+            }
+            copied = copied
+                .checked_add(amount)
+                .ok_or_else(|| Error::new(Errno::EOVERFLOW))?;
+            if amount != page.len {
+                break;
+            }
+        }
+        Ok(())
+    })();
+    if let Err(error) = staging_result {
+        for (page, _, _) in pending {
+            let _ = pool.abort_data_page(page);
+        }
+        return Err(error);
+    }
+    for batch in pending.chunks(128) {
+        if let Err(error) = pool.publish_redirect_batch(batch, None) {
+            for (page, _, _) in &pending {
+                let _ = pool.abort_data_page(*page);
+            }
+            return Err(error);
+        }
+    }
+
+    let root = mutation.committed_node(current_inode.extent_root())?;
+    let visible_end = request
+        .file_offset
+        .checked_add(copied as u64)
+        .ok_or_else(|| Error::new(Errno::EOVERFLOW))?;
+    let inode_ref = mutation.publish_inode_state_with_generation(
+        current_inode_ref,
+        current_inode.extent_root(),
+        &root,
+        request.generation,
+        request.old_file_size.max(visible_end),
+        request.old_block_count,
+        inode_fault,
+    )?;
+
+    // A newly selected descriptor is already authoritative. Retire unpinned
+    // predecessors opportunistically; in-flight generations remain for their
+    // exact completion path.
+    for old in old_redirects {
+        if let Ok(pages) = pool.clear_redirects_exact(&[old], None) {
+            for page in pages {
+                let _ = pool.free_data_page(page);
+            }
+        }
+    }
+    Ok(Some(CommittedRangeWrite {
+        copied,
+        inode: inode_ref,
+        reserved_blocks: 0,
+    }))
 }
 
 impl WriteAllocation {
@@ -1646,35 +1805,9 @@ pub(crate) fn mapped_nv_page_ref(
     inode: u64,
     logical_block: u64,
 ) -> Result<Option<PersistentObjectRef>> {
-    let Some(inode_ref) = authoritative_inode_ref(pool, fs_id, inode)? else {
-        return Ok(None);
-    };
-    let inode_record = pool.read_authoritative_metadata::<InodeRecord>(inode_ref)?;
-    if inode_record.extent_root().is_none() {
-        return Ok(None);
-    }
-    let Some(entry) = lookup_tree_extent(
-        pool,
-        fs_id,
-        inode,
-        inode_record.extent_root(),
-        logical_block,
-    )?
-    else {
-        return Ok(None);
-    };
-    match entry.data_ref()? {
-        ExtentDataRef::Nv(_) => {
-            let reference = pool.persistent_data_ref_from_slot(entry.nv_slot_at(logical_block)?)?;
-            if pool.validate_persistent_data_ref(reference)?
-                != PageKey::new(fs_id, inode, logical_block)
-            {
-                return_errno_with_message!(Errno::EUCLEAN, "extent data object identity mismatch");
-            }
-            Ok(Some(reference))
-        }
-        ExtentDataRef::Ssd(_) => Ok(None),
-    }
+    Ok(pool
+        .redirect_lookup(PageKey::new(fs_id, inode, logical_block))
+        .map(|handle| handle.reference))
 }
 
 /// Returns true only while the inode's extent tree has no recoverable local

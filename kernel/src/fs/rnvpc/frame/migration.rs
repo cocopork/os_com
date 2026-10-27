@@ -97,6 +97,7 @@ impl Rnvpc {
             return_errno!(Errno::EINVAL);
         }
         let mut slots = Vec::with_capacity(pages.len());
+        let mut redirects = Vec::with_capacity(pages.len());
         let mut seen = BTreeSet::new();
         let started = read_ns();
         for (lease, reference) in &pages {
@@ -108,8 +109,17 @@ impl Rnvpc {
                 return_errno!(Errno::ESTALE);
             }
             let slot = self.migration_slot(*reference, true)?;
-            if self.objects.lock(slot).reverse.is_none() {
+            let objects = self.objects.lock(slot);
+            if objects.reverse.is_none() {
                 return_errno!(Errno::ESTALE);
+            }
+            let record = &objects.records[slot];
+            let key = record.key.ok_or_else(|| Error::new(Errno::ESTALE))?;
+            if let Some(handle) = self.redirects.lookup(key)
+                && handle.reference == *reference
+                && handle.logical_version == record.version
+            {
+                redirects.push((key, handle));
             }
             slots.push(slot);
         }
@@ -136,6 +146,16 @@ impl Rnvpc {
                 allocation.capacity.account_free(PoolClass::Data);
                 self.account_unpin();
                 lease.active = false;
+            }
+        }
+        for (key, handle) in redirects {
+            self.redirects.compare_remove(key, handle);
+            let mut legacy = self.state.lock();
+            if legacy.index.lookup(key).is_some_and(|entry| {
+                entry.reference == handle.reference
+                    && entry.logical_version == handle.logical_version
+            }) {
+                legacy.index.remove(key);
             }
         }
         // Notify once after the complete successful batch is reusable.

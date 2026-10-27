@@ -1499,6 +1499,14 @@ impl Rnvpc {
     }
 
     #[cfg(ktest)]
+    pub(crate) fn redirect_dirty_ranges_for_test(
+        &self,
+        budget: usize,
+    ) -> Vec<super::redirect_index::RedirectRange> {
+        self.redirects.dirty_ranges(budget)
+    }
+
+    #[cfg(ktest)]
     pub(crate) fn install_redirect_for_test(
         &self,
         key: PageKey,
@@ -4352,6 +4360,7 @@ impl Rnvpc {
         }
         let result = self.persist.commit_frames(&updates, fault);
         let mut state = self.state.lock();
+        let mut redirects = Vec::new();
         for (id, key, ssd_backing_block, version, _) in &prepared {
             let mut objects = self.objects.lock(id.index());
             objects.records[id.index()].pins -= 1;
@@ -4361,21 +4370,37 @@ impl Rnvpc {
                 objects.records[id.index()].committed = true;
                 objects.records[id.index()].key = Some(*key);
                 objects.records[id.index()].version = *version;
+                let reference = PersistentObjectRef::new(
+                    id.index() as u64,
+                    objects.records[id.index()].alloc_seq,
+                )
+                .expect("committed data page has a nonzero allocation sequence");
                 state.index.insert(
                     *key,
                     PageEntry {
                         residency: Residency::Nv,
                         handle: Some(RuntimeHandle::Nv(*id)),
-                        reference: PersistentObjectRef::new(
-                            id.index() as u64,
-                            objects.records[id.index()].alloc_seq,
-                        )
-                        .expect("committed data page has a nonzero allocation sequence"),
+                        reference,
                         logical_version: *version,
                         ssd_backing_block: *ssd_backing_block,
                         state: NvObjectState::NvDirty,
                     },
                 );
+                redirects.push((
+                    *key,
+                    DescriptorHandle {
+                        reference,
+                        logical_version: *version,
+                        state: NvObjectState::NvDirty,
+                        ssd_target: *ssd_backing_block,
+                    },
+                ));
+            }
+        }
+        drop(state);
+        if result.is_ok() {
+            for (key, handle) in redirects {
+                self.redirects.install_committed(key, handle)?;
             }
         }
         result.map(|_| {
@@ -4425,6 +4450,7 @@ impl Rnvpc {
         let result = self.persist.commit_frame(id.index(), &descriptor, fault);
         let mut state = self.state.lock();
         let mut objects = self.objects.lock(id.index());
+        let mut redirect = None;
         objects.records[id.index()].pins -= 1;
         objects.records[id.index()].persisting = false;
         self.account_unpin();
@@ -4433,20 +4459,31 @@ impl Rnvpc {
             objects.records[id.index()].key = Some(key);
             objects.records[id.index()].version = version;
             // 同一 key 的新版本直接覆盖索引条目：索引永远指向当前版本。
+            let reference =
+                PersistentObjectRef::new(id.index() as u64, descriptor.allocation_seq())?;
+            let target = ssd_backing_block.unwrap_or(id.index() as u64);
             state.index.insert(
                 key,
                 PageEntry {
                     residency: Residency::Nv,
                     handle: Some(RuntimeHandle::Nv(id)),
-                    reference: PersistentObjectRef::new(
-                        id.index() as u64,
-                        descriptor.allocation_seq(),
-                    )?,
+                    reference,
                     logical_version: version,
-                    ssd_backing_block: ssd_backing_block.unwrap_or(id.index() as u64),
+                    ssd_backing_block: target,
                     state: NvObjectState::NvDirty,
                 },
             );
+            redirect = Some(DescriptorHandle {
+                reference,
+                logical_version: version,
+                state: NvObjectState::NvDirty,
+                ssd_target: target,
+            });
+        }
+        drop(objects);
+        drop(state);
+        if let Some(handle) = redirect {
+            self.redirects.install_committed(key, handle)?;
         }
         result.map(|_| old.and_then(|index| NvPageId::try_from(index).ok()))
     }
@@ -5195,6 +5232,18 @@ impl StagingDataPage {
     pub(crate) fn zero_all(&mut self) -> Result<()> {
         let pin = self.pin.as_ref().expect("staging page is active");
         pin.pool.backend.zero_page_range(pin.id, 0, PAGE_SIZE)?;
+        self.initialized = true;
+        Ok(())
+    }
+
+    pub(crate) fn write_all(&mut self, input: &[u8]) -> Result<()> {
+        if input.len() != PAGE_SIZE {
+            return_errno!(Errno::EINVAL);
+        }
+        self.pin
+            .as_ref()
+            .expect("staging page is active")
+            .write(input)?;
         self.initialized = true;
         Ok(())
     }
