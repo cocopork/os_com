@@ -35,6 +35,7 @@ pub(crate) mod persist;
 pub(crate) mod persistent_btree;
 pub(crate) mod reclaim;
 pub(crate) mod recover;
+pub(crate) mod redirect_index;
 pub(crate) mod wal;
 pub(crate) mod write_transaction;
 

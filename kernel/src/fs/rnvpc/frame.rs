@@ -38,6 +38,7 @@ use super::{
     },
     persist::PersistEngine,
     recover,
+    redirect_index::{DescriptorHandle, RedirectDirectory},
 };
 use crate::{
     fs::fs_impls::ext4::{LATENCY_ENABLED, LATENCY_STATS, read_ns},
@@ -348,6 +349,7 @@ pub(crate) struct Rnvpc {
     repair_workspace: Mutex<RepairWorkspace>,
     // Completion checks this inode-sharded directory instead of `state`.
     pending_extent_index: PendingExtentIndex,
+    redirects: RedirectDirectory,
     recovered_pcache: Mutex<Option<recover::RecoveredPcacheCatalog>>,
     objects: ObjectTable,
     // Diagnostic total only. Admission/freeing uses the slot-protected pins.
@@ -525,6 +527,7 @@ impl Rnvpc {
             publication_contexts: Mutex::new(BTreeMap::new()),
             repair_workspace: Mutex::new(RepairWorkspace::new(config.meta_reserve_pages())),
             pending_extent_index: PendingExtentIndex::new(),
+            redirects: RedirectDirectory::new()?,
             recovered_pcache: Mutex::new(None),
             allocation: SpinLock::new(AllocationState {
                 free_ids,
@@ -625,6 +628,25 @@ impl Rnvpc {
             max_allocation_seq,
         } = recovered;
         let obsolete_data = data.obsolete;
+        pool.redirects.rebuild(
+            data.selected
+                .iter()
+                .map(|(key, entry)| {
+                    Ok((
+                        *key,
+                        DescriptorHandle {
+                            reference: PersistentObjectRef::new(
+                                entry.index as u64,
+                                entry.allocation_seq,
+                            )?,
+                            logical_version: entry.version,
+                            state: entry.state,
+                            ssd_target: entry.ssd_backing_block,
+                        },
+                    ))
+                })
+                .collect::<Result<Vec<_>>>()?,
+        )?;
         metadata.extend(wal_data);
         metadata.extend(data.selected.into_values());
         {
@@ -1469,6 +1491,10 @@ impl Rnvpc {
     pub(crate) fn indexed_data_entry(&self, key: PageKey) -> Option<PageEntry> {
         self.index_lookup(key)
             .filter(|entry| entry.residency == Residency::Nv && !entry.reference.is_none())
+    }
+
+    pub(crate) fn redirect_lookup(&self, key: PageKey) -> Option<DescriptorHandle> {
+        self.redirects.lookup(key)
     }
 
     /// Resolves and pins the current committed NV version of `key` atomically.

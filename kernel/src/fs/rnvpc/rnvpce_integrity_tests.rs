@@ -23,6 +23,7 @@ use super::{
         ExtentDataRef, ExtentMutationPhase, ExtentNodeRecord, ExtentRecordEntry, InodeRecord,
         PENDING_EXTENT_MUTATION_LOGICAL_INDEX, PendingExtentMutationRecord, PersistentObjectRef,
     },
+    redirect_index::DescriptorHandle,
     write_transaction::{
         AuthoritySnapshot, ClaimedSsdMigrationExtent, RangeWriteBatch, RangeWritePage,
         SsdMigrationPage, authoritative_inode_state, bootstrap_inode_authority, commit_range_write,
@@ -831,6 +832,15 @@ fn rnvpce_recovery_selects_highest_data_version_independent_of_slot_order() {
     assert_eq!(entry.reference.allocation_seq(), 19);
     assert_eq!(entry.logical_version, 9);
     assert_eq!(entry.ssd_backing_block, 900);
+    assert_eq!(
+        recovered.redirect_lookup(key),
+        Some(DescriptorHandle {
+            reference: entry.reference,
+            logical_version: 9,
+            state: NvObjectState::NvDirty,
+            ssd_target: 900,
+        })
+    );
 }
 
 #[ktest]
