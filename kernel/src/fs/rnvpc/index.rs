@@ -3,6 +3,7 @@
 use super::{
     descriptor::{NvDescriptor, NvObjectKind},
     id::NvPageId,
+    metadata::PersistentObjectRef,
 };
 use crate::prelude::*;
 
@@ -90,6 +91,10 @@ pub(crate) enum RuntimeHandle {
 pub(crate) struct PageEntry {
     pub(crate) residency: Residency,
     pub(crate) handle: Option<RuntimeHandle>,
+    /// Exact persistent generation selected for this logical page.
+    pub(crate) reference: PersistentObjectRef,
+    /// Monotonic version within one [`PageKey`].
+    pub(crate) logical_version: u64,
     /// 该页在 SSD 上的物理位置（NV 侧自带；Dram-only 页为 0）。
     pub(crate) ssd_backing_block: u64,
     /// 生命周期状态（`descriptor::NvObjectState`，与 `design.md §4.4` 同一套）。
@@ -185,6 +190,8 @@ impl PageIndex {
                 PageEntry {
                     residency: Residency::Nv,
                     handle: Some(RuntimeHandle::Nv(handle)),
+                    reference: PersistentObjectRef::NONE,
+                    logical_version: descriptor.recovery_id,
                     ssd_backing_block: descriptor.ssd_backing_block,
                     state: descriptor.state()?,
                 },

@@ -11,12 +11,14 @@ use super::{
     backend::NvMemoryBackend,
     config::{NvSimMode, RnvpcConfig},
     data_page::DataPageState,
+    descriptor::{NvDescriptor, NvObjectState},
     dram::{DramNvBackend, DramNvImage},
     extent_mutation::ExtentMutation,
     fault::FaultPoint,
     frame::{EvictingDataPage, MigrationExtentIdentity, Rnvpc},
     id::{NvFrameId, NvPageId},
     index::PageKey,
+    layout::{commit_offset, descriptor_offset},
     metadata::{
         ExtentDataRef, ExtentMutationPhase, ExtentNodeRecord, ExtentRecordEntry, InodeRecord,
         PENDING_EXTENT_MUTATION_LOGICAL_INDEX, PendingExtentMutationRecord, PersistentObjectRef,
@@ -756,6 +758,187 @@ fn restartable_pool(total: usize) -> (DramNvImage, RnvpcConfig, Arc<Rnvpc>) {
         Rnvpc::format(Arc::new(image.attach()), config, None).expect("fresh image should format"),
     );
     (image, config, pool)
+}
+
+fn persist_recovery_descriptor(image: &DramNvImage, slot: usize, descriptor: NvDescriptor) {
+    let backend = image.attach();
+    let selector = 1;
+    let descriptor_offset = descriptor_offset(slot, selector).unwrap();
+    backend
+        .write_control(descriptor_offset, descriptor.encode())
+        .unwrap();
+    backend
+        .persist_control(descriptor_offset, size_of::<NvDescriptor>())
+        .unwrap();
+    backend.fence().unwrap();
+    let commit_offset = commit_offset(slot).unwrap();
+    backend.store_control_u64(commit_offset, selector).unwrap();
+    backend
+        .persist_control(commit_offset, size_of::<u64>())
+        .unwrap();
+    backend.fence().unwrap();
+}
+
+fn recovery_descriptor(
+    key: PageKey,
+    ssd_block: u64,
+    logical_version: u64,
+    allocation_seq: u64,
+    state: NvObjectState,
+) -> NvDescriptor {
+    let mut descriptor = NvDescriptor::for_nv_page(
+        key.fs_id,
+        key.inode,
+        key.page_index,
+        ssd_block,
+        logical_version,
+    )
+    .with_allocation_seq(allocation_seq)
+    .unwrap();
+    if state != NvObjectState::NvDirty {
+        descriptor
+            .transition_to(NvObjectState::NvWriteback)
+            .unwrap();
+    }
+    if state == NvObjectState::NvReclaimable {
+        descriptor
+            .transition_to(NvObjectState::NvReclaimable)
+            .unwrap();
+    }
+    descriptor
+}
+
+#[ktest]
+fn rnvpce_recovery_selects_highest_data_version_independent_of_slot_order() {
+    let (image, config, pool) = restartable_pool(8);
+    drop(pool);
+    let key = PageKey::new(0xa701, 41, 7);
+    persist_recovery_descriptor(
+        &image,
+        0,
+        recovery_descriptor(key, 900, 9, 19, NvObjectState::NvDirty),
+    );
+    persist_recovery_descriptor(
+        &image,
+        1,
+        recovery_descriptor(key, 800, 8, 18, NvObjectState::NvDirty),
+    );
+    image.simulate_crash();
+
+    let recovered = Rnvpc::recover(Arc::new(image.attach()), config, None).unwrap();
+    let entry = recovered.indexed_data_entry(key).unwrap();
+    assert_eq!(entry.reference.slot(), Some(0));
+    assert_eq!(entry.reference.allocation_seq(), 19);
+    assert_eq!(entry.logical_version, 9);
+    assert_eq!(entry.ssd_backing_block, 900);
+}
+
+#[ktest]
+fn rnvpce_recovery_rejects_equal_data_versions() {
+    let (image, config, pool) = restartable_pool(8);
+    drop(pool);
+    let key = PageKey::new(0xa702, 42, 8);
+    persist_recovery_descriptor(
+        &image,
+        0,
+        recovery_descriptor(key, 800, 11, 21, NvObjectState::NvDirty),
+    );
+    persist_recovery_descriptor(
+        &image,
+        1,
+        recovery_descriptor(key, 801, 11, 22, NvObjectState::NvDirty),
+    );
+    image.simulate_crash();
+
+    let error = match Rnvpc::recover(Arc::new(image.attach()), config, None) {
+        Ok(_) => panic!("equal logical versions must be rejected"),
+        Err(error) => error,
+    };
+    assert_eq!(error.error(), Errno::EUCLEAN);
+}
+
+#[ktest]
+fn rnvpce_recovery_keeps_all_redirect_states_authoritative() {
+    let (image, config, pool) = restartable_pool(8);
+    drop(pool);
+    for (slot, state) in [
+        NvObjectState::NvDirty,
+        NvObjectState::NvWriteback,
+        NvObjectState::NvReclaimable,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        persist_recovery_descriptor(
+            &image,
+            slot,
+            recovery_descriptor(
+                PageKey::new(0xa703, 43, slot as u64),
+                900 + slot as u64,
+                1,
+                30 + slot as u64,
+                state,
+            ),
+        );
+    }
+    image.simulate_crash();
+
+    let recovered = Rnvpc::recover(Arc::new(image.attach()), config, None).unwrap();
+    for (slot, expected) in [
+        NvObjectState::NvDirty,
+        NvObjectState::NvWriteback,
+        NvObjectState::NvReclaimable,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let entry = recovered
+            .indexed_data_entry(PageKey::new(0xa703, 43, slot as u64))
+            .unwrap();
+        assert_eq!(entry.state, expected);
+        assert_eq!(
+            recovered
+                .data_page_nv_state(NvPageId::try_from(slot).unwrap())
+                .unwrap(),
+            Some(NvObjectState::NvDirty)
+        );
+    }
+}
+
+#[ktest]
+fn rnvpce_recovery_cleanup_is_idempotent() {
+    let (image, config, pool) = restartable_pool(8);
+    drop(pool);
+    let key = PageKey::new(0xa704, 44, 9);
+    persist_recovery_descriptor(
+        &image,
+        0,
+        recovery_descriptor(key, 800, 1, 40, NvObjectState::NvDirty),
+    );
+    persist_recovery_descriptor(
+        &image,
+        1,
+        recovery_descriptor(key, 801, 2, 41, NvObjectState::NvDirty),
+    );
+    image.simulate_crash();
+
+    let recovered = Rnvpc::recover(Arc::new(image.attach()), config, None).unwrap();
+    assert_eq!(recovered.stats().data_pages, 1);
+    assert_eq!(recovered.stats().free_pages, 7);
+    assert_eq!(
+        recovered.indexed_data_entry(key).unwrap().reference.slot(),
+        Some(1)
+    );
+    drop(recovered);
+    image.simulate_crash();
+
+    let recovered = Rnvpc::recover(Arc::new(image.attach()), config, None).unwrap();
+    assert_eq!(recovered.stats().data_pages, 1);
+    assert_eq!(recovered.stats().free_pages, 7);
+    assert_eq!(
+        recovered.indexed_data_entry(key).unwrap().reference.slot(),
+        Some(1)
+    );
 }
 
 struct ClaimedExtentFixture {

@@ -4,7 +4,7 @@
 
 use super::{
     capacity::PoolClass,
-    descriptor::NvObjectKind,
+    descriptor::{NvObjectKind, NvObjectState},
     extent_mutation::ExtentMutation,
     frame::{FIXED_INODE_LOGICAL_INDEX, Rnvpc},
     id::{NvFrameId, NvPageId},
@@ -84,14 +84,54 @@ pub(super) struct RecoveredEntry {
     pub(super) version: u64,
     pub(super) allocation_seq: u64,
     pub(super) ssd_backing_block: u64,
+    pub(super) state: NvObjectState,
 }
 
-pub(super) fn scan(engine: &PersistEngine, capacity_pages: usize) -> Result<Vec<RecoveredEntry>> {
+pub(super) struct RecoveredDataSet {
+    pub(super) selected: BTreeMap<PageKey, RecoveredEntry>,
+    pub(super) obsolete: Vec<RecoveredEntry>,
+}
+
+pub(super) struct RecoveredScan {
+    pub(super) metadata: Vec<RecoveredEntry>,
+    pub(super) wal_data: Vec<RecoveredEntry>,
+    pub(super) data: RecoveredDataSet,
+    pub(super) max_allocation_seq: u64,
+}
+
+pub(super) fn select_data_versions(entries: Vec<RecoveredEntry>) -> Result<RecoveredDataSet> {
+    let mut selected = BTreeMap::<PageKey, RecoveredEntry>::new();
+    let mut obsolete = Vec::new();
+    for entry in entries {
+        match selected.entry(entry.key) {
+            alloc::collections::btree_map::Entry::Vacant(slot) => {
+                slot.insert(entry);
+            }
+            alloc::collections::btree_map::Entry::Occupied(mut slot) => {
+                if entry.version == slot.get().version {
+                    return_errno_with_message!(
+                        Errno::EUCLEAN,
+                        "duplicate RNVPC data logical version"
+                    );
+                }
+                if entry.version > slot.get().version {
+                    obsolete.push(slot.insert(entry));
+                } else {
+                    obsolete.push(entry);
+                }
+            }
+        }
+    }
+    Ok(RecoveredDataSet { selected, obsolete })
+}
+
+pub(super) fn scan(engine: &PersistEngine, capacity_pages: usize) -> Result<RecoveredScan> {
     engine.read_header()?;
     let mut metadata_identities = BTreeSet::new();
     let mut fixed_roots = BTreeSet::new();
     let mut metadata_entries = Vec::new();
     let mut data_entries = Vec::new();
+    let mut max_allocation_seq = 0;
     for index in 0..capacity_pages {
         // 自描述：只靠条目自己的描述符就能知道“这页是谁、数据在哪”，
         // 不需要预建“SSD block → NV object”的全局映射。
@@ -104,6 +144,8 @@ pub(super) fn scan(engine: &PersistEngine, capacity_pages: usize) -> Result<Vec<
         };
         let key = PageKey::new(descriptor.fs_id, descriptor.inode, descriptor.logical_index);
         let version = descriptor.recovery_id;
+        let state = descriptor.state()?;
+        max_allocation_seq = max_allocation_seq.max(descriptor.allocation_seq());
         let candidate = RecoveredEntry {
             index,
             class,
@@ -111,6 +153,7 @@ pub(super) fn scan(engine: &PersistEngine, capacity_pages: usize) -> Result<Vec<
             version,
             allocation_seq: descriptor.allocation_seq(),
             ssd_backing_block: descriptor.ssd_backing_block,
+            state,
         };
         if class == PoolClass::Data {
             data_entries.push(candidate);
@@ -126,9 +169,26 @@ pub(super) fn scan(engine: &PersistEngine, capacity_pages: usize) -> Result<Vec<
         }
         metadata_entries.push(candidate);
     }
-    let mut entries = metadata_entries;
-    entries.extend(data_entries);
-    Ok(entries)
+    let wal_owners: BTreeSet<_> = metadata_entries
+        .iter()
+        .filter(|entry| typed_object_type(entry.key.page_index).is_some())
+        .map(|entry| (entry.key.fs_id, entry.key.inode))
+        .collect();
+    let mut wal_data = Vec::new();
+    let mut rnvpce_data = Vec::new();
+    for entry in data_entries {
+        if wal_owners.contains(&(entry.key.fs_id, entry.key.inode)) {
+            wal_data.push(entry);
+        } else {
+            rnvpce_data.push(entry);
+        }
+    }
+    Ok(RecoveredScan {
+        metadata: metadata_entries,
+        wal_data,
+        data: select_data_versions(rnvpce_data)?,
+        max_allocation_seq,
+    })
 }
 
 /// Completes persistent local mutations and removes objects that are not

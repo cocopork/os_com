@@ -611,20 +611,32 @@ impl Rnvpc {
         let total_start = recovery_now_ns(profile);
         let persist = PersistEngine::new(backend.clone(), config.total_pages())?;
         let scan_start = recovery_now_ns(profile);
-        let entries = recover::scan(&persist, config.total_pages())?;
+        let recovered = recover::scan(&persist, config.total_pages())?;
         let mut recovery_profile = recover::RecoveryProfile {
             descriptor_scan_ns: recovery_elapsed_ns(profile, scan_start),
             ..Default::default()
         };
         let rebuild_start = recovery_now_ns(profile);
         let mut pool = Self::new(backend, config, high_water_wake)?;
+        let recover::RecoveredScan {
+            mut metadata,
+            wal_data,
+            data,
+            max_allocation_seq,
+        } = recovered;
+        let obsolete_data = data.obsolete;
+        metadata.extend(wal_data);
+        metadata.extend(data.selected.into_values());
         {
             let state = pool.state.get_mut();
             let allocation = pool.allocation.get_mut();
-            let mut max_alloc_seq = 0;
-            for entry in entries {
+            for entry in metadata {
                 pool.objects.get_mut(entry.index).kind = match entry.class {
                     PoolClass::Metadata => ObjectKind::Metadata,
+                    // Persistent writeback/reclaimable phases remain visible in
+                    // PageEntry, while volatile leases are lost at a crash. The
+                    // recovered page must therefore re-enter the retryable dirty
+                    // runtime state until recovery resumes or completes migration.
                     PoolClass::Data => ObjectKind::Data(DataPageState::NvDirty),
                     // WAL 是 DRAM-only（`porting.md §3.1`），扫描不应当产出它。
                     PoolClass::Wal => {
@@ -638,7 +650,6 @@ impl Rnvpc {
                 pool.objects.get_mut(entry.index).key = Some(entry.key);
                 pool.objects.get_mut(entry.index).version = entry.version;
                 pool.objects.get_mut(entry.index).alloc_seq = entry.allocation_seq;
-                max_alloc_seq = max_alloc_seq.max(entry.allocation_seq);
                 allocation.capacity.account_recovered(entry.class)?;
                 // T3.3：只从自描述描述符重建 `Nv` 条目；`Dram` 条目掉电即失效，
                 // 没有任何东西可以让它们复活（也不该复活）。
@@ -650,8 +661,13 @@ impl Rnvpc {
                         PageEntry {
                             residency: Residency::Nv,
                             handle: Some(RuntimeHandle::Nv(id)),
+                            reference: PersistentObjectRef::new(
+                                entry.index as u64,
+                                entry.allocation_seq,
+                            )?,
+                            logical_version: entry.version,
                             ssd_backing_block: entry.ssd_backing_block,
-                            state: NvObjectState::NvDirty,
+                            state: entry.state,
                         },
                     );
                 } else {
@@ -668,14 +684,18 @@ impl Rnvpc {
             allocation
                 .free_ids
                 .retain(|index| pool.objects.get_mut(*index).kind == ObjectKind::Free);
-            if max_alloc_seq != 0 {
-                allocation.next_alloc_seq = max_alloc_seq
+            if max_allocation_seq != 0 {
+                allocation.next_alloc_seq = max_allocation_seq
                     .checked_add(1)
                     .ok_or_else(|| Error::new(Errno::EOVERFLOW))?;
             }
         }
         pool.rebuild_pending_extent_index();
         recovery_profile.runtime_rebuild_ns = recovery_elapsed_ns(profile, rebuild_start);
+        for obsolete in obsolete_data.chunks(128) {
+            let slots: Vec<_> = obsolete.iter().map(|entry| entry.index).collect();
+            persist.clear_frames(&slots, None)?;
+        }
         pool.persist = persist;
         let pool = Arc::new(pool);
         recover::reconcile_profiled(&pool, profile.then_some(&mut recovery_profile))?;
@@ -1444,6 +1464,11 @@ impl Rnvpc {
     /// 按逻辑身份查 DRAM 页索引。
     pub(crate) fn index_lookup(&self, key: PageKey) -> Option<PageEntry> {
         self.state.lock().index.lookup(key).copied()
+    }
+
+    pub(crate) fn indexed_data_entry(&self, key: PageKey) -> Option<PageEntry> {
+        self.index_lookup(key)
+            .filter(|entry| entry.residency == Residency::Nv && !entry.reference.is_none())
     }
 
     /// Resolves and pins the current committed NV version of `key` atomically.
@@ -2565,8 +2590,10 @@ impl Rnvpc {
             PageEntry {
                 residency: Residency::Nv,
                 handle: Some(RuntimeHandle::Nv(page)),
+                reference,
+                logical_version: descriptor.recovery_id,
                 ssd_backing_block: descriptor.ssd_backing_block,
-                state: NvObjectState::NvDirty,
+                state: descriptor.state()?,
             },
         );
         Ok(())
@@ -4167,6 +4194,11 @@ impl Rnvpc {
                 PageEntry {
                     residency: Residency::Nv,
                     handle: Some(RuntimeHandle::Nv(id)),
+                    reference: PersistentObjectRef::new(
+                        id.index() as u64,
+                        descriptor.allocation_seq(),
+                    )?,
+                    logical_version: 1,
                     ssd_backing_block: id.index() as u64,
                     state: NvObjectState::NvDirty,
                 },
@@ -4298,6 +4330,12 @@ impl Rnvpc {
                     PageEntry {
                         residency: Residency::Nv,
                         handle: Some(RuntimeHandle::Nv(*id)),
+                        reference: PersistentObjectRef::new(
+                            id.index() as u64,
+                            objects.records[id.index()].alloc_seq,
+                        )
+                        .expect("committed data page has a nonzero allocation sequence"),
+                        logical_version: *version,
                         ssd_backing_block: *ssd_backing_block,
                         state: NvObjectState::NvDirty,
                     },
@@ -4364,6 +4402,11 @@ impl Rnvpc {
                 PageEntry {
                     residency: Residency::Nv,
                     handle: Some(RuntimeHandle::Nv(id)),
+                    reference: PersistentObjectRef::new(
+                        id.index() as u64,
+                        descriptor.allocation_seq(),
+                    )?,
+                    logical_version: version,
                     ssd_backing_block: ssd_backing_block.unwrap_or(id.index() as u64),
                     state: NvObjectState::NvDirty,
                 },
