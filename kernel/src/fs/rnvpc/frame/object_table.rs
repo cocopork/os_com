@@ -1,12 +1,14 @@
 // SPDX-License-Identifier: MPL-2.0
 
-//! Each slot owns one lock protecting its record and reverse locator.
+//! Each slot owns one lock protecting its runtime record.
 
 use core::ops::{Index, IndexMut};
 
 use ostd::sync::{PreemptDisabled, WaitQueue};
 
-use super::{ObjectRecord, ReverseExtentRef};
+use super::ObjectRecord;
+#[cfg(ktest)]
+use super::ReverseExtentRef;
 use crate::prelude::*;
 
 pub(super) struct ObjectTable {
@@ -20,6 +22,7 @@ struct SlotEntry {
 
 pub(super) struct ObjectSlot {
     pub(super) records: SlotRecords,
+    #[cfg(ktest)]
     pub(super) reverse: Option<ReverseExtentRef>,
     pub(super) metadata_mutation: Option<u64>,
 }
@@ -42,6 +45,7 @@ impl ObjectTable {
                         slot,
                         record: ObjectRecord::free(),
                     },
+                    #[cfg(ktest)]
                     reverse: None,
                     metadata_mutation: None,
                 }),

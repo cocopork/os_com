@@ -31,11 +31,25 @@ impl Rnvpc {
         }
         self.persist.update_descriptors(&updates, fault)?;
         // One short control-index critical section per batch, never across persist.
-        let mut state = self.state.lock();
+        {
+            let mut state = self.state.lock();
+            for (key, (_, target)) in keys.iter().zip(targets) {
+                if let Some(entry) = state.index.lookup_mut(*key) {
+                    entry.ssd_backing_block = *target;
+                    entry.state = NvObjectState::NvWriteback;
+                }
+            }
+        }
         for (key, (_, target)) in keys.iter().zip(targets) {
-            if let Some(entry) = state.index.lookup_mut(*key) {
-                entry.ssd_backing_block = *target;
-                entry.state = NvObjectState::NvWriteback;
+            if let Some(old) = self.redirects.lookup(*key) {
+                let replacement = DescriptorHandle {
+                    ssd_target: *target,
+                    migration_target: true,
+                    ..old
+                };
+                if !self.redirects.compare_update(*key, old, replacement) {
+                    return_errno_with_message!(Errno::ESTALE, "migration redirect target changed");
+                }
             }
         }
         Ok(())
@@ -78,7 +92,7 @@ impl Rnvpc {
             || record.alloc_seq != reference.allocation_seq()
             || (require_lease
                 && (record.kind != ObjectKind::Data(DataPageState::InFlight)
-                    || !record.persisting
+                    || record.persisting
                     || record.pins != 1))
         {
             return_errno!(Errno::ESTALE);
@@ -110,9 +124,6 @@ impl Rnvpc {
             }
             let slot = self.migration_slot(*reference, true)?;
             let objects = self.objects.lock(slot);
-            if objects.reverse.is_none() {
-                return_errno!(Errno::ESTALE);
-            }
             let record = &objects.records[slot];
             let key = record.key.ok_or_else(|| Error::new(Errno::ESTALE))?;
             if let Some(handle) = self.redirects.lookup(key)
@@ -140,7 +151,6 @@ impl Rnvpc {
                 let slot = lease.id.index();
                 let mut state = self.objects.lock(slot);
                 debug_assert_eq!(state.records[slot].alloc_seq, reference.allocation_seq());
-                state.reverse = None;
                 state.records[slot] = ObjectRecord::free();
                 allocation.free_ids.push(slot);
                 allocation.capacity.account_free(PoolClass::Data);

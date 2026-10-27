@@ -9,6 +9,8 @@
 
 use core::cell::RefCell;
 
+#[cfg(ktest)]
+use super::index::ReverseExtentRef;
 use super::{
     fault::{FaultPoint, inject},
     frame::{
@@ -16,7 +18,7 @@ use super::{
         Rnvpc,
     },
     id::NvFrameId,
-    index::{PageKey, ReverseExtentRef},
+    index::PageKey,
     metadata::{
         AuthoritativeMetadataRecord, EXTENT_NODE_ENTRY_CAPACITY, ExtentDataRef,
         ExtentMutationOperation, ExtentMutationPhase, ExtentNodeRecord, ExtentRecordEntry,
@@ -24,14 +26,17 @@ use super::{
         PersistentObjectRef,
     },
 };
+#[cfg(ktest)]
+use crate::fs::fs_impls::ext4::pipeline_profile as pp;
 use crate::{
-    fs::fs_impls::ext4::{LATENCY_STATS, pipeline_profile as pp, read_ns},
+    fs::fs_impls::ext4::{LATENCY_STATS, read_ns},
     prelude::*,
 };
 
 const EXTENT_TRANSIENT_LOGICAL_INDEX_TAG: u64 = 1 << 62;
 
 #[derive(Clone, Copy)]
+#[cfg(ktest)]
 pub(crate) struct SsdExtentUpdate {
     pub(crate) locator: ReverseExtentRef,
     pub(crate) expected: PersistentObjectRef,
@@ -120,6 +125,7 @@ impl ExtentMutation {
 
     /// Validates a leaf's completed pages before persisting one combined image.
     /// A failure preserves every NV reference in this leaf for retry.
+    #[cfg(ktest)]
     pub(crate) fn publish_ssd_extents_by_reverse(
         &self,
         updates: &[SsdExtentUpdate],
@@ -128,6 +134,7 @@ impl ExtentMutation {
         Self::publish_ssd_extents_locked(&self.pool, self.fs_id, self.inode, updates, fault)
     }
 
+    #[cfg(ktest)]
     pub(crate) fn publish_ssd_extents_locked(
         pool: &Arc<Rnvpc>,
         fs_id: u64,
@@ -141,6 +148,7 @@ impl ExtentMutation {
         result
     }
 
+    #[cfg(ktest)]
     fn publish_ssd_extents_profiled(
         pool: &Arc<Rnvpc>,
         fs_id: u64,
@@ -2879,6 +2887,7 @@ impl ExtentMutation {
         self.committed_node(current)
     }
 
+    #[cfg(ktest)]
     fn refresh_leaf_reverse(&self, leaf_ref: PersistentObjectRef) -> Result<()> {
         let leaf = self.read_locked_node(leaf_ref)?;
         if leaf.level() != 0 {
@@ -2903,6 +2912,7 @@ impl ExtentMutation {
         Ok(())
     }
 
+    #[cfg(ktest)]
     fn install_extent_reverse(
         &self,
         leaf_ref: PersistentObjectRef,
@@ -2924,6 +2934,21 @@ impl ExtentMutation {
                 .persistent_data_ref_from_slot(entry.nv_slot_at(logical_block)?)?;
             self.pool.replace_reverse(reference, locator)?;
         }
+        Ok(())
+    }
+
+    #[cfg(not(ktest))]
+    fn refresh_leaf_reverse(&self, _leaf_ref: PersistentObjectRef) -> Result<()> {
+        Ok(())
+    }
+
+    #[cfg(not(ktest))]
+    fn install_extent_reverse(
+        &self,
+        _leaf_ref: PersistentObjectRef,
+        _entry_index: usize,
+        _entry: ExtentRecordEntry,
+    ) -> Result<()> {
         Ok(())
     }
 }

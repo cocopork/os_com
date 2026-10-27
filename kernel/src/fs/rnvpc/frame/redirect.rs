@@ -48,6 +48,7 @@ impl Rnvpc {
                         logical_version,
                         state: NvObjectState::NvDirty,
                         ssd_target: *ssd_target,
+                        migration_target: false,
                     },
                 ));
             }
@@ -220,8 +221,22 @@ impl Rnvpc {
             objects.records[slot].pins = 1;
             objects.records[slot].persisting = true;
             drop(objects);
-            let descriptor = self
-                .descriptor_for(
+            let descriptor = if handle.migration_target
+                || (handle.state == NvObjectState::NvWriteback && next == NvObjectState::NvDirty)
+            {
+                self.persist
+                    .read_entry(slot)?
+                    .filter(|descriptor| {
+                        descriptor.allocation_seq() == handle.reference.allocation_seq()
+                            && descriptor.recovery_id == handle.logical_version
+                    })
+                    .ok_or_else(|| Error::new(Errno::ESTALE))
+                    .and_then(|mut descriptor| {
+                        descriptor.transition_to(next)?;
+                        Ok(descriptor)
+                    })
+            } else {
+                self.descriptor_for(
                     PoolClass::Data,
                     *key,
                     handle.logical_version,
@@ -231,7 +246,8 @@ impl Rnvpc {
                 .and_then(|mut descriptor| {
                     descriptor.transition_to(next)?;
                     Ok(descriptor)
-                });
+                })
+            };
             let descriptor = match descriptor {
                 Ok(descriptor) => descriptor,
                 Err(error) => {
@@ -296,7 +312,6 @@ impl Rnvpc {
                 .ok_or_else(|| Error::new(Errno::EOVERFLOW))?;
             let key = PageKey::new(snapshot.fs_id, snapshot.inode, page_index);
             if self.redirects.lookup(key) == Some(handle)
-                && self.reverse_lookup(handle.reference)?.is_none()
                 && self.baseline_generations.try_claim_migration(key)
             {
                 candidates.push((key, handle));
@@ -363,19 +378,29 @@ impl Rnvpc {
                     }
                 }
             }
-            if pages.is_empty() {
-                continue;
+            let mut page_cursor = 0;
+            while page_cursor < pages.len() {
+                let page_start = page_cursor;
+                page_cursor += 1;
+                while page_cursor < pages.len()
+                    && pages[page_cursor].key.page_index
+                        == pages[page_cursor - 1].key.page_index + 1
+                {
+                    page_cursor += 1;
+                }
+                let contiguous = pages.drain(page_start..page_cursor).collect::<Vec<_>>();
+                page_cursor = page_start;
+                let baseline_token = self.baseline_generations.snapshot(
+                    snapshot.fs_id,
+                    snapshot.inode,
+                    contiguous[0].key.page_index,
+                    contiguous.len(),
+                )?;
+                claimed.push(ClaimedRedirectRange {
+                    baseline_token,
+                    pages: contiguous,
+                });
             }
-            let baseline_token = self.baseline_generations.snapshot(
-                snapshot.fs_id,
-                snapshot.inode,
-                pages[0].key.page_index,
-                pages.len(),
-            )?;
-            claimed.push(ClaimedRedirectRange {
-                baseline_token,
-                pages,
-            });
         }
         Ok(claimed)
     }

@@ -188,7 +188,6 @@ impl Rnvpc {
                 record.key = None;
                 record.version = 0;
                 record.kind = ObjectKind::Free;
-                objects.reverse = None;
                 allocation.free_ids.push(id.index());
                 allocation.capacity.account_free(PoolClass::Metadata);
             }
@@ -271,7 +270,6 @@ impl Rnvpc {
                 || record.alloc_seq != generation
                 || record.pins != 0
                 || record.persisting
-                || objects.reverse.is_some()
                 || state.references.values().any(|entry| entry.page == id)
             {
                 return Ok(false);
@@ -304,7 +302,6 @@ impl Rnvpc {
                 record.key = None;
                 record.version = 0;
                 record.kind = ObjectKind::Free;
-                objects.reverse = None;
                 allocation.free_ids.push(id.index());
                 allocation.capacity.account_free(PoolClass::Data);
             }

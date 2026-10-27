@@ -853,6 +853,7 @@ fn rnvpce_logical_version_overflow_rejects_publication() {
             logical_version: u64::MAX,
             state: NvObjectState::NvDirty,
             ssd_target: 9009,
+            migration_target: false,
         },
     )
     .unwrap();
@@ -1288,6 +1289,7 @@ fn rnvpce_recovery_selects_highest_data_version_independent_of_slot_order() {
             logical_version: 9,
             state: NvObjectState::NvDirty,
             ssd_target: 900,
+            migration_target: false,
         })
     );
 }
@@ -2243,7 +2245,7 @@ fn rnvpce_candidate_claim_reads_shared_leaf_once() {
 }
 
 #[ktest]
-fn rnvpce_short_reader_publishes_only_durable_prefix_and_credit() {
+fn rnvpce_recovery_rebuilds_redirects_without_reverse_edges() {
     const FS_ID: u64 = 0x9925;
     const INODE: u64 = 35;
     let (image, config, pool) = restartable_pool(32);
@@ -2310,7 +2312,7 @@ fn rnvpce_short_reader_publishes_only_durable_prefix_and_credit() {
         let reference = mapped_nv_page_ref(&recovered, FS_ID, INODE, logical)
             .unwrap()
             .unwrap();
-        assert!(recovered.reverse_lookup(reference).unwrap().is_some());
+        assert!(recovered.reverse_lookup(reference).unwrap().is_none());
         let page = NvPageId::try_from(reference.slot().unwrap() as usize).unwrap();
         let pin = recovered.pin_data_page(page).unwrap();
         let mut contents = vec![0; PAGE_SIZE];

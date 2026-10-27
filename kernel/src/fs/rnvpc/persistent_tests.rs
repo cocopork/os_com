@@ -5,10 +5,12 @@
 use ostd::prelude::ktest;
 
 use super::{
+    backend::NvMemoryBackend,
     config::{NvSimMode, RnvpcConfig},
     cow::InodeCowContext,
     dram::DramNvBackend,
     frame::Rnvpc,
+    layout::NvImageHeader,
     pcache_store::PcFaultPoint,
 };
 use crate::prelude::*;
@@ -106,6 +108,18 @@ fn restartable_pool() -> (super::dram::DramNvImage, RnvpcConfig, Arc<Rnvpc>) {
     let image = super::dram::DramNvImage::allocate_model(config).unwrap();
     let pool = Arc::new(Rnvpc::format(Arc::new(image.attach()), config, None).unwrap());
     (image, config, pool)
+}
+
+#[ktest]
+fn rnvpce_old_image_version_is_rejected() {
+    let (image, config, pool) = restartable_pool();
+    drop(pool);
+    let backend = Arc::new(image.attach());
+    let mut header = NvImageHeader::default();
+    backend.read_control(0, header.as_mut_bytes()).unwrap();
+    header.version = 4;
+    backend.write_control(0, header.as_bytes()).unwrap();
+    assert!(Rnvpc::recover(backend, config, None).is_err());
 }
 
 #[ktest]

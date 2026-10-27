@@ -2,12 +2,14 @@
 
 //! Reconstruction of volatile RNVPC indexes from committed control-image entries.
 
+#[cfg(ktest)]
+use super::id::NvPageId;
 use super::{
     capacity::PoolClass,
     descriptor::{NvObjectKind, NvObjectState},
     extent_mutation::ExtentMutation,
     frame::{FIXED_INODE_LOGICAL_INDEX, Rnvpc},
-    id::{NvFrameId, NvPageId},
+    id::NvFrameId,
     index::{PageKey, ReverseExtentRef},
     metadata::{
         AllocationRecord, ExtentDataRef, ExtentNodeRecord, ExtentRecordEntry, InodeRecord,
@@ -16,7 +18,9 @@ use super::{
     pcache_layout::{InodePcAnchor, PcObjectType, PersistentPageRef, WAL_FRAME_COUNT},
     pcache_store::{PersistentMetadataStore, typed_object_index, typed_object_type},
     persist::PersistEngine,
-    write_transaction::{INITIAL_ALLOCATION_LOGICAL_INDEX, reconcile_ssd_capacity},
+    write_transaction::{
+        INITIAL_ALLOCATION_LOGICAL_INDEX, SPACE_RESERVATION_LOGICAL_INDEX, reconcile_ssd_capacity,
+    },
 };
 use crate::prelude::*;
 
@@ -85,6 +89,7 @@ pub(super) struct RecoveredEntry {
     pub(super) allocation_seq: u64,
     pub(super) ssd_backing_block: u64,
     pub(super) state: NvObjectState,
+    pub(super) migration_target: bool,
 }
 
 pub(super) struct RecoveredDataSet {
@@ -154,6 +159,7 @@ pub(super) fn scan(engine: &PersistEngine, capacity_pages: usize) -> Result<Reco
             allocation_seq: descriptor.allocation_seq(),
             ssd_backing_block: descriptor.ssd_backing_block,
             state,
+            migration_target: descriptor.has_migration_target(),
         };
         if class == PoolClass::Data {
             data_entries.push(candidate);
@@ -233,7 +239,7 @@ pub(super) fn reconcile_profiled(
                 managed.insert(owner);
             }
             PersistentMetadataKind::SpaceReservation
-                if key.page_index == INITIAL_ALLOCATION_LOGICAL_INDEX =>
+                if key.page_index == SPACE_RESERVATION_LOGICAL_INDEX =>
             {
                 managed.insert(owner);
             }
@@ -301,12 +307,46 @@ pub(super) fn reconcile_profiled(
             &mut traversal_stats,
         )?;
     }
+
+    // In image v5, selected data descriptors are the persistent redirect
+    // authority and intentionally do not appear in SSD-only extent leaves.
+    // Keep descriptors only for owners with a durable inode root; orphaned
+    // publications from an interrupted first write remain reclaimable.
+    for (key, page) in pool.committed_data_pages() {
+        let owner = InodeIdentity {
+            fs_id: key.fs_id,
+            inode: key.inode,
+        };
+        if !rooted.contains(&owner) {
+            continue;
+        }
+        let reference = pool.persistent_data_ref(page)?;
+        let identity = ObjectIdentity::from_ref(reference)?;
+        if reachable_data_keys
+            .get(&key)
+            .is_some_and(|existing| *existing != identity)
+        {
+            return_errno_with_message!(
+                Errno::EUCLEAN,
+                "extent and redirect select different NV generations"
+            );
+        }
+        reachable_data_keys.insert(key, identity);
+        if live.insert(identity) {
+            reachable_data.push(reference);
+        }
+        let ssd_target = pool.persistent_data_ssd_backing(reference)?;
+        if ssd_target != 0 {
+            reachable_ssd_blocks.insert((owner, ssd_target));
+        }
+    }
     if let Some(profile) = profile.as_deref_mut() {
         profile.extent_scan_ns = elapsed_ns(true, extent_start);
         profile.extent_nodes = traversal_stats.extent_nodes;
         profile.extent_entries = traversal_stats.extent_entries;
     }
 
+    #[cfg(ktest)]
     {
         let reverse_start = now_ns(profiling);
         let mut installed = BTreeSet::new();
@@ -337,7 +377,8 @@ pub(super) fn reconcile_profiled(
     for reference in &reachable_data {
         let key = pool.validate_persistent_data_ref(*reference)?;
         if pool.persistent_data_ssd_backing(*reference)? == 0
-            || pool.persistent_data_has_migration_target(*reference)?
+            || (pool.persistent_data_has_migration_target(*reference)?
+                && !pool.persistent_data_migration_credit_released(*reference)?)
         {
             let owner = InodeIdentity {
                 fs_id: key.fs_id,

@@ -202,7 +202,13 @@ impl NvDescriptor {
         }
         self.ssd_backing_block = target;
         self.flags |= NV_DESCRIPTOR_MIGRATION_TARGET;
-        self.transition_to(NvObjectState::NvWriteback)
+        match self.state()? {
+            NvObjectState::NvDirty => self.transition_to(NvObjectState::NvWriteback),
+            // Redirect-range claim persists NvWriteback before SSD allocation
+            // so no allocated target is needed while candidate locks are held.
+            NvObjectState::NvWriteback => Ok(()),
+            _ => return_errno_with_message!(Errno::EINVAL, "invalid migration target state"),
+        }
     }
 
     pub(crate) fn clear_migration_target(&mut self) -> Result<()> {

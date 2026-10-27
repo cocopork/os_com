@@ -13,6 +13,8 @@ use core::{
 use aster_block::BLOCK_SIZE;
 use ostd::{mm::USegment, sync::WaitQueue};
 
+#[cfg(ktest)]
+use super::index::ReverseExtentRef;
 use super::{
     backend::NvMemoryBackend,
     baseline_generation::{BaselineGenerationMap, BaselineRangeToken},
@@ -23,10 +25,7 @@ use super::{
     extent_target::ExtentTarget,
     fault::{FaultPoint, inject},
     id::{NvFrameId, NvPageId},
-    index::{
-        DirtyNvPage, IndexCounters, PageEntry, PageIndex, PageKey, Residency, ReverseExtentRef,
-        RuntimeHandle,
-    },
+    index::{DirtyNvPage, IndexCounters, PageEntry, PageIndex, PageKey, Residency, RuntimeHandle},
     metadata::{
         AuthoritativeMetadataRecord, EXTENT_ENTRY_LOGICAL_OFFSET, EXTENT_ENTRY_RANGE_OFFSET,
         EXTENT_ENTRY_TARGET_OFFSET, EXTENT_NODE_ENTRY_CAPACITY,
@@ -375,6 +374,7 @@ pub(crate) struct ExtentRangeFreeze {
 }
 
 #[derive(Debug)]
+#[cfg(ktest)]
 pub(crate) struct MigrationExtentIdentity {
     fs_id: u64,
     inode: u64,
@@ -383,11 +383,13 @@ pub(crate) struct MigrationExtentIdentity {
     nv_base_slot_plus_one: u64,
 }
 
+#[cfg(ktest)]
 pub(crate) struct ClaimedMigrationExtent {
     identity: Arc<MigrationExtentIdentity>,
     pages: Vec<ClaimedMigrationPage>,
 }
 
+#[cfg(ktest)]
 pub(crate) struct ClaimedMigrationPage {
     pub(crate) key: PageKey,
     pub(crate) reference: PersistentObjectRef,
@@ -406,6 +408,7 @@ pub(crate) struct ClaimedRedirectPage {
     pub(crate) pin: PinnedDataPage,
 }
 
+#[cfg(ktest)]
 impl MigrationExtentIdentity {
     pub(crate) fn fs_id(&self) -> u64 {
         self.fs_id
@@ -432,6 +435,7 @@ impl MigrationExtentIdentity {
     }
 }
 
+#[cfg(ktest)]
 impl ClaimedMigrationExtent {
     pub(crate) fn logical_range(&self) -> Range<u64> {
         self.identity.logical_range()
@@ -657,6 +661,7 @@ impl Rnvpc {
                             logical_version: entry.version,
                             state: entry.state,
                             ssd_target: entry.ssd_backing_block,
+                            migration_target: entry.migration_target,
                         },
                     ))
                 })
@@ -1250,7 +1255,10 @@ impl Rnvpc {
                 record.version = 0;
                 record.alloc_seq = allocation.next_alloc_seq;
                 allocation.next_alloc_seq += 1;
-                objects.reverse = None;
+                #[cfg(ktest)]
+                {
+                    objects.reverse = None;
+                }
                 wake |= allocation.capacity.account_allocate(PoolClass::Data);
                 reservation.pages.push(NvPageId::try_from(index).unwrap());
             }
@@ -1725,6 +1733,7 @@ impl Rnvpc {
         Ok(true)
     }
 
+    #[cfg(ktest)]
     pub(crate) fn enqueue_dirty_nvrefs(&self, references: &[PersistentObjectRef]) -> Result<usize> {
         let mut state = self.state.lock();
         let mut inserted = 0usize;
@@ -1764,6 +1773,7 @@ impl Rnvpc {
         Ok(inserted)
     }
 
+    #[cfg(ktest)]
     pub(crate) fn collect_dirty_nvpages(&self, budget: usize) -> Vec<DirtyNvPage> {
         let mut state = self.state.lock();
         let mut out = Vec::new();
@@ -1789,6 +1799,7 @@ impl Rnvpc {
         out
     }
 
+    #[cfg(ktest)]
     pub(crate) fn install_reverse(
         &self,
         data: PersistentObjectRef,
@@ -1814,6 +1825,7 @@ impl Rnvpc {
         Ok(())
     }
 
+    #[cfg(ktest)]
     pub(crate) fn replace_reverse(
         &self,
         data: PersistentObjectRef,
@@ -1833,6 +1845,7 @@ impl Rnvpc {
         Ok(())
     }
 
+    #[cfg(ktest)]
     pub(crate) fn reverse_lookup(
         &self,
         data: PersistentObjectRef,
@@ -1847,6 +1860,7 @@ impl Rnvpc {
         })
     }
 
+    #[cfg(ktest)]
     pub(crate) fn clear_reverse(&self, data: PersistentObjectRef) -> Result<bool> {
         let slot = usize::try_from(data.slot().ok_or_else(|| Error::new(Errno::EINVAL))?)
             .map_err(|_| Error::new(Errno::EOVERFLOW))?;
@@ -2378,6 +2392,7 @@ impl Rnvpc {
 
     /// The caller holds inode publication and the page's migration lease.
     /// Snapshot identity and reverse together; read descriptor bytes outside the spinlock.
+    #[cfg(ktest)]
     pub(crate) fn validate_migration_and_reverse(
         self: &Arc<Self>,
         reference: PersistentObjectRef,
@@ -2436,6 +2451,7 @@ impl Rnvpc {
         Ok(locator)
     }
 
+    #[cfg(ktest)]
     pub(crate) fn migration_extent_length(
         self: &Arc<Self>,
         reference: PersistentObjectRef,
@@ -2462,6 +2478,7 @@ impl Rnvpc {
     /// Claims one complete NV extent while retaining no metadata coordination
     /// after this function returns. Exact page generations remain pinned until
     /// completion publishes the SSD target or the claim is dropped.
+    #[cfg(ktest)]
     pub(crate) fn claim_migration_extent(
         self: &Arc<Self>,
         seed: PersistentObjectRef,
@@ -2474,6 +2491,7 @@ impl Rnvpc {
 
     /// Claims complete NV extents from one leaf under one short publication
     /// section. No metadata coordination is retained after this function.
+    #[cfg(ktest)]
     pub(crate) fn claim_migration_extents(
         self: &Arc<Self>,
         seeds: &[(PersistentObjectRef, ReverseExtentRef)],
@@ -4407,6 +4425,7 @@ impl Rnvpc {
                         logical_version: *version,
                         state: NvObjectState::NvDirty,
                         ssd_target: *ssd_backing_block,
+                        migration_target: false,
                     },
                 ));
             }
@@ -4492,6 +4511,7 @@ impl Rnvpc {
                 logical_version: version,
                 state: NvObjectState::NvDirty,
                 ssd_target: target,
+                migration_target: false,
             });
         }
         drop(objects);
@@ -4712,7 +4732,10 @@ impl Rnvpc {
         let seq = state.next_alloc_seq;
         state.next_alloc_seq = next_seq;
         objects.records[index].alloc_seq = seq;
-        objects.reverse = None;
+        #[cfg(ktest)]
+        {
+            objects.reverse = None;
+        }
         Ok((index, seq, state.capacity.account_allocate(class)))
     }
 
@@ -4764,7 +4787,10 @@ impl Rnvpc {
         record.version = 0;
         record.alloc_seq = allocation.next_alloc_seq;
         allocation.next_alloc_seq = next_seq;
-        objects.reverse = None;
+        #[cfg(ktest)]
+        {
+            objects.reverse = None;
+        }
         Ok(())
     }
 

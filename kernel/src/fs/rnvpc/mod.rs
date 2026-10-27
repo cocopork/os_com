@@ -326,15 +326,6 @@ pub(crate) fn flush_candidates(
     out
 }
 
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct RnvpceFlushCandidate {
-    pub(crate) inode: u64,
-    pub(crate) page_index: u64,
-    pub(crate) page: NvPageId,
-    pub(crate) reference: metadata::PersistentObjectRef,
-    pub(crate) reverse: index::ReverseExtentRef,
-}
-
 pub(crate) fn rnvpce_redirect_ranges(
     fs_id: u64,
     budget: usize,
@@ -342,58 +333,6 @@ pub(crate) fn rnvpce_redirect_ranges(
     pool()
         .map(|pool| pool.dirty_redirect_ranges(fs_id, budget))
         .unwrap_or_default()
-}
-
-/// rNVPCe candidates come from the duplicate-suppressed physical dirty queue.
-/// The reverse locator is validated again when migration is claimed and when
-/// completion publishes the SSD mapping; candidate discovery never walks an
-/// inode extent tree.
-pub(crate) fn rnvpce_legacy_flush_candidates(
-    fs_id: u64,
-    budget: usize,
-) -> Vec<RnvpceFlushCandidate> {
-    let Some(pool) = pool() else {
-        return Vec::new();
-    };
-    let mut out = Vec::new();
-    let mut seen = BTreeSet::new();
-    for candidate in pool.collect_dirty_nvpages(budget) {
-        let Ok(reference) = pool.persistent_data_ref(candidate.page) else {
-            continue;
-        };
-        if reference.allocation_seq() != candidate.allocation_seq {
-            continue;
-        }
-        let Ok(key) = pool.validate_persistent_data_ref(reference) else {
-            continue;
-        };
-        if key.fs_id != fs_id {
-            let _ = pool.enqueue_dirty_nvpage(candidate.page, candidate.allocation_seq);
-            continue;
-        }
-        if pool.migration_is_frozen(key) {
-            let _ = pool.enqueue_dirty_nvpage(candidate.page, candidate.allocation_seq);
-            continue;
-        }
-        let Ok(Some(reverse)) = pool.reverse_lookup(reference) else {
-            // A local extent mutation may be retargeting this locator. Keep
-            // the exact generation discoverable and let the next pass retry
-            // after the per-inode publication gate is released.
-            let _ = pool.enqueue_dirty_nvpage(candidate.page, candidate.allocation_seq);
-            continue;
-        };
-        if !seen.insert((key.inode, reverse.leaf_slot(), reverse.entry_index())) {
-            continue;
-        }
-        out.push(RnvpceFlushCandidate {
-            inode: key.inode,
-            page_index: key.page_index,
-            page: candidate.page,
-            reference,
-            reverse,
-        });
-    }
-    out
 }
 
 /// rTIO v0：一页的 SSD 写已完成，推进 completion（两条路线各自退休/回收）。

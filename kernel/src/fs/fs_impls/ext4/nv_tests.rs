@@ -801,7 +801,11 @@ fn nv_route_rnvpce_batch_allocation_durability() {
         )
         .unwrap()
         .unwrap();
-        assert_eq!(mapping.ssd_block(), target);
+        assert_eq!(
+            mapping.ssd_block(),
+            0,
+            "failed device flush must not publish an unconfirmed SSD baseline"
+        );
     }
     assert_eq!(failed.ext4.migrate_nv_round(64).unwrap(), 32);
     failed.ext4.drain_nv_in_flight().unwrap();
@@ -1032,11 +1036,7 @@ fn nv_route_rnvpce_fragmented_batch_and_partial_rollback() {
         assert_eq!(pool.persistent_data_ssd_backing(reference).unwrap(), 0);
     }
     assert_eq!(fixture.ext4.migrate_nv_round(64).unwrap(), 8);
-    assert_eq!(
-        fixture.ext4.drain_nv_in_flight().unwrap_err().error(),
-        Errno::EAGAIN,
-        "a complete NV extent cannot publish a fragmented SSD target run"
-    );
+    fixture.ext4.drain_nv_in_flight().unwrap();
     for logical in 0..8 {
         assert!(
             crate::fs::rnvpc::write_transaction::mapped_nv_page_ref(
@@ -1046,8 +1046,17 @@ fn nv_route_rnvpce_fragmented_batch_and_partial_rollback() {
                 logical as u64,
             )
             .unwrap()
-            .is_some(),
-            "fragmented completion must retain the complete NV authority"
+            .is_none(),
+            "fragmented per-page completion must reclaim NV authority"
         );
+        let mapping = crate::fs::rnvpc::write_transaction::current_page_mapping(
+            pool,
+            fixture.ext4.rnvpc_fs_id(),
+            11,
+            logical as u64,
+        )
+        .unwrap()
+        .unwrap();
+        assert_ne!(mapping.ssd_block(), 0);
     }
 }

@@ -14,6 +14,7 @@ pub(crate) struct DescriptorHandle {
     pub(crate) logical_version: u64,
     pub(crate) state: NvObjectState,
     pub(crate) ssd_target: u64,
+    pub(crate) migration_target: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -414,6 +415,7 @@ mod tests {
             logical_version,
             state: NvObjectState::NvDirty,
             ssd_target: target,
+            migration_target: false,
         }
     }
 

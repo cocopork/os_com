@@ -16,7 +16,7 @@ use crate::fs::rnvpc::{
     self,
     baseline_generation::BaselineRangeToken,
     batch_metrics::{self, Event, Phase},
-    frame::{EvictingDataPage, MigrationExtentIdentity, PinnedDataPage},
+    frame::{EvictingDataPage, PinnedDataPage},
     metadata::PersistentObjectRef,
     redirect_index::DescriptorHandle,
 };
@@ -38,7 +38,7 @@ struct PendingPage {
     generation: u64,
     target: u64,
     reference: Option<PersistentObjectRef>,
-    extent: Option<Arc<MigrationExtentIdentity>>,
+    needs_baseline: bool,
     redirect: Option<(DescriptorHandle, Arc<BaselineRangeToken>)>,
     lease: MigrationLease,
 }
@@ -204,83 +204,10 @@ impl Ext4 {
                             generation: claimed.handle.reference.allocation_seq(),
                             target: claimed.handle.ssd_target,
                             reference: Some(claimed.handle.reference),
-                            extent: None,
+                            needs_baseline: claimed.handle.ssd_target == 0
+                                || claimed.handle.migration_target,
                             redirect: Some((claimed.handle, token.clone())),
                             lease: MigrationLease::Redirect(claimed.pin),
-                        });
-                    }
-                }
-            }
-
-            let remaining = budget.saturating_sub(pages.len());
-            let candidates = rnvpc::rnvpce_legacy_flush_candidates(self.rnvpc_fs_id(), remaining);
-            let mut candidate_groups = BTreeMap::new();
-            for candidate in candidates {
-                candidate_groups
-                    .entry((candidate.inode, candidate.reverse.leaf_slot()))
-                    .or_insert_with(Vec::new)
-                    .push(candidate);
-            }
-            for candidates in candidate_groups.into_values() {
-                let remaining = budget.saturating_sub(pages.len());
-                if remaining == 0 {
-                    for candidate in candidates {
-                        let _ = pool.enqueue_dirty_nvpage(
-                            candidate.page,
-                            candidate.reference.allocation_seq(),
-                        );
-                    }
-                    continue;
-                }
-                let seeds: Vec<_> = candidates
-                    .iter()
-                    .map(|candidate| (candidate.reference, candidate.reverse))
-                    .collect();
-                let claimed_extents = match pool.claim_migration_extents(&seeds, remaining) {
-                    Ok(claimed) => claimed,
-                    Err(_) => {
-                        for candidate in candidates {
-                            let _ = pool.enqueue_dirty_nvpage(
-                                candidate.page,
-                                candidate.reference.allocation_seq(),
-                            );
-                        }
-                        continue;
-                    }
-                };
-                for candidate in &candidates {
-                    let covered = claimed_extents
-                        .iter()
-                        .any(|extent| extent.logical_range().contains(&candidate.page_index));
-                    if !covered {
-                        let _ = pool.enqueue_dirty_nvpage(
-                            candidate.page,
-                            candidate.reference.allocation_seq(),
-                        );
-                    }
-                }
-                for claimed in claimed_extents {
-                    let (identity, claimed_pages) = claimed.into_parts();
-                    for claimed in claimed_pages {
-                        let page = rnvpc::id::NvPageId::try_from(
-                            usize::try_from(
-                                claimed
-                                    .reference
-                                    .slot()
-                                    .ok_or_else(|| Error::new(Errno::EUCLEAN))?,
-                            )
-                            .map_err(|_| Error::new(Errno::EOVERFLOW))?,
-                        )?;
-                        pages.push(PendingPage {
-                            inode: claimed.key.inode,
-                            index: claimed.key.page_index,
-                            page,
-                            generation: claimed.reference.allocation_seq(),
-                            target: claimed.ssd_block,
-                            reference: Some(claimed.reference),
-                            extent: Some(identity.clone()),
-                            redirect: None,
-                            lease: MigrationLease::Legacy(claimed.eviction),
                         });
                     }
                 }
@@ -300,7 +227,7 @@ impl Ext4 {
                         generation,
                         target,
                         reference: None,
-                        extent: None,
+                        needs_baseline: false,
                         redirect: None,
                         lease: MigrationLease::Legacy(lease),
                     });
@@ -310,7 +237,20 @@ impl Ext4 {
         pp::NV_CANDIDATE_SELECT.record_since(candidate_started, pages.len());
         let target_started = pp::now();
         let metadata_groups = if self.rnvpc_extend_enabled() {
-            self.prepare_nv_targets(&mut pages)?
+            match self.prepare_nv_targets(&mut pages) {
+                Ok(groups) => groups,
+                Err(error) => {
+                    let pool = rnvpc::pool().ok_or_else(|| Error::new(Errno::EINVAL))?;
+                    self.restore_failed_migration_jobs(
+                        pool,
+                        vec![CompletionJob {
+                            status: BioStatus::IoError,
+                            pages,
+                        }],
+                    );
+                    return Err(error);
+                }
+            }
         } else {
             BTreeSet::new()
         };
@@ -498,6 +438,18 @@ impl Ext4 {
             .collect::<Result<BTreeSet<_>>>()?;
         for (index, target) in allocated {
             pages[index].target = target;
+            if let Some((handle, _)) = pages[index].redirect.as_mut() {
+                let key = rnvpc::index::PageKey::new(
+                    self.rnvpc_fs_id(),
+                    pages[index].inode,
+                    pages[index].index,
+                );
+                let current = pool
+                    .redirect_lookup(key)
+                    .filter(|current| current.reference == handle.reference)
+                    .ok_or_else(|| Error::new(Errno::ESTALE))?;
+                *handle = current;
+            }
         }
         Ok(groups)
     }
@@ -537,34 +489,22 @@ impl Ext4 {
         let pool = rnvpc::pool().ok_or_else(|| Error::new(Errno::EINVAL))?;
         let (jobs, metadata_failed) = batch.take_jobs();
         if metadata_failed || jobs.iter().any(|job| job.status != BioStatus::Complete) {
-            let mut redirects = Vec::new();
-            for job in jobs {
-                for page in job.pages {
-                    if let Some((handle, _)) = page.redirect {
-                        let key =
-                            rnvpc::index::PageKey::new(self.rnvpc_fs_id(), page.inode, page.index);
-                        redirects.push((key, handle));
-                    }
-                    drop(page.lease);
-                }
-            }
-            for chunk in redirects.chunks(128) {
-                let _ = pool.transition_redirects(
-                    chunk,
-                    rnvpc::descriptor::NvObjectState::NvDirty,
-                    None,
-                );
-                for (key, _) in chunk {
-                    pool.release_baseline_migration(*key);
-                }
-            }
+            self.restore_failed_migration_jobs(pool, jobs);
             return_errno_with_message!(Errno::EIO, "orderless migration batch I/O failed");
         }
         let started = batch_metrics::now();
         let device_flush_started = pp::now();
         if self.rnvpc_extend_enabled() {
-            if self.block_device().sync()? != BioStatus::Complete {
-                return_errno!(Errno::EIO);
+            match self.block_device().sync() {
+                Ok(BioStatus::Complete) => {}
+                Ok(_) => {
+                    self.restore_failed_migration_jobs(pool, jobs);
+                    return_errno!(Errno::EIO);
+                }
+                Err(error) => {
+                    self.restore_failed_migration_jobs(pool, jobs);
+                    return Err(error.into());
+                }
             }
         } else {
             self.persist_nv_allocations()?;
@@ -578,178 +518,17 @@ impl Ext4 {
                 groups.entry(page.inode).or_default().push(page);
             }
         }
-        for (inode_id, pages) in groups {
+        for (_inode_id, pages) in groups {
             if self.rnvpc_extend_enabled() {
                 let publish_started = pp::now();
-                let group_started = pp::now();
-                let (redirect_pages, pages): (Vec<_>, Vec<_>) =
-                    pages.into_iter().partition(|page| page.redirect.is_some());
-                if !redirect_pages.is_empty() {
-                    self.finish_redirect_pages(pool, redirect_pages)?;
+                if pages.iter().any(|page| page.redirect.is_none()) {
+                    return_errno_with_message!(
+                        Errno::EUCLEAN,
+                        "rNVPCe migration reached a legacy extent candidate"
+                    );
                 }
-                if pages.is_empty() {
-                    continue;
-                }
-                let mut extents: BTreeMap<u64, (Arc<MigrationExtentIdentity>, Vec<PendingPage>)> =
-                    BTreeMap::new();
-                for page in pages {
-                    let identity = page
-                        .extent
-                        .clone()
-                        .ok_or_else(|| Error::new(Errno::EUCLEAN))?;
-                    if identity.inode() != inode_id || identity.fs_id() != self.rnvpc_fs_id() {
-                        return_errno_with_message!(
-                            Errno::EUCLEAN,
-                            "migration extent owner changed"
-                        );
-                    }
-                    let entry = extents
-                        .entry(identity.logical_start())
-                        .or_insert_with(|| (identity.clone(), Vec::new()));
-                    if !Arc::ptr_eq(&entry.0, &identity) {
-                        return_errno_with_message!(
-                            Errno::EUCLEAN,
-                            "duplicate migration extent identity"
-                        );
-                    }
-                    entry.1.push(page);
-                }
-                let published_pages = extents.values().map(|(_, pages)| pages.len()).sum();
-                pp::NV_EXTENT_GROUP.record_since(group_started, published_pages);
-                let mut published_references = Vec::new();
-                let mut published_extents = Vec::new();
-                for (identity, mut pages) in extents.into_values() {
-                    let prepare_started = pp::now();
-                    pages.sort_by_key(|page| page.index);
-                    let updates: Vec<_> = pages
-                        .iter()
-                        .map(|page| {
-                            Ok(rnvpc::write_transaction::SsdMigrationPage {
-                                logical_block: page.index,
-                                reference: page
-                                    .reference
-                                    .ok_or_else(|| Error::new(Errno::EUCLEAN))?,
-                                ssd_block: page.target,
-                            })
-                        })
-                        .collect::<Result<_>>()?;
-                    pp::NV_EXTENT_PREPARE.record_since(prepare_started, pages.len());
-                    let references =
-                        match rnvpc::write_transaction::publish_claimed_nv_extent_to_ssd(
-                            pool, &identity, &updates, None,
-                        ) {
-                            Ok(references) => references,
-                            Err(error) if error.error() == Errno::ESTALE => {
-                                let still_authoritative = updates.iter().all(|update| {
-                                    rnvpc::write_transaction::mapped_nv_page_ref(
-                                        pool,
-                                        self.rnvpc_fs_id(),
-                                        inode_id,
-                                        update.logical_block,
-                                    )
-                                    .ok()
-                                    .flatten()
-                                        == Some(update.reference)
-                                });
-                                if !still_authoritative {
-                                    return_errno_with_message!(
-                                        Errno::EUCLEAN,
-                                        "stale migration extent is no longer authoritative"
-                                    );
-                                }
-                                let retry: Vec<_> = pages
-                                    .iter()
-                                    .map(|page| (page.page, page.generation))
-                                    .collect();
-                                drop(pages);
-                                for (page, generation) in retry {
-                                    pool.enqueue_dirty_nvpage(page, generation)?;
-                                }
-                                continue;
-                            }
-                            Err(error) => {
-                                error!(
-                                    "NV extent target publication failed: inode={} logical={} pages={} error={error:?}",
-                                    inode_id,
-                                    identity.logical_start(),
-                                    pages.len()
-                                );
-                                return Err(error);
-                            }
-                        };
-                    published_references.push(references);
-                    published_extents.push(pages);
-                }
-
-                let results = match rnvpc::write_transaction::finish_claimed_nv_extents_to_ssd(
-                    pool,
-                    self.rnvpc_fs_id(),
-                    inode_id,
-                    &published_references,
-                ) {
-                    Ok(results) => results,
-                    Err(error) => {
-                        error!(
-                            "NV extent credit/ledger completion failed: inode={} extents={} error={error:?}",
-                            inode_id,
-                            published_references.len()
-                        );
-                        return Err(error);
-                    }
-                };
-                let result_started = pp::now();
-                let result_pages = published_extents.iter().map(Vec::len).sum();
-                let mut reclaim = Vec::with_capacity(result_pages);
-                let mut released = 0;
-                for (pages, results) in published_extents.into_iter().zip(results) {
-                    for (page, result) in pages.into_iter().zip(results) {
-                        match result {
-                            Ok(consumed) => {
-                                released += usize::from(consumed);
-                                let MigrationLease::Legacy(lease) = page.lease else {
-                                    return_errno_with_message!(
-                                        Errno::EUCLEAN,
-                                        "redirect lease reached structural completion"
-                                    );
-                                };
-                                reclaim.push((lease, page.reference.unwrap()));
-                            }
-                            Err(error) => failure = Some(error),
-                        }
-                    }
-                }
-                if released != 0 {
-                    if let Err(error) = self.release_rnvpce_blocks(released as u64) {
-                        error!(
-                            "NV runtime reservation release failed: inode={} pages={} error={error:?}",
-                            inode_id, released
-                        );
-                        return Err(error);
-                    }
-                }
-                pp::NV_EXTENT_RESULT.record_since(result_started, result_pages);
-                let started = batch_metrics::now();
-                let reclaim_started = pp::now();
-                let reclaimed = reclaim.len();
-                let mut reclaim = reclaim.into_iter();
-                loop {
-                    let batch: Vec<_> = reclaim.by_ref().take(128).collect();
-                    if batch.is_empty() {
-                        break;
-                    }
-                    let batch_len = batch.len();
-                    if let Err(error) = pool.reclaim_migrated_pages(batch, None) {
-                        error!(
-                            "NV descriptor reclaim failed: inode={} pages={} error={error:?}",
-                            inode_id, batch_len
-                        );
-                        failure = Some(error);
-                        break;
-                    }
-                    batch_metrics::count(Event::ReclaimedPages, batch_len);
-                }
-                pp::NV_RECLAIM.record_since(reclaim_started, reclaimed);
-                batch_metrics::elapsed(Phase::Reclaim, started);
+                let published_pages = pages.len();
+                self.finish_redirect_pages(pool, pages)?;
                 pp::NV_EXTENT_PUBLISH.record_since(publish_started, published_pages);
             } else {
                 for page in pages {
@@ -795,6 +574,31 @@ impl Ext4 {
         }
         pp::NV_COMPLETION_TOTAL.record_since(completion_started, page_count);
         Ok(())
+    }
+
+    fn restore_failed_migration_jobs(
+        &self,
+        pool: &Arc<rnvpc::frame::Rnvpc>,
+        jobs: Vec<CompletionJob>,
+    ) {
+        let mut redirects = Vec::new();
+        for job in jobs {
+            for page in job.pages {
+                if let Some((handle, _)) = page.redirect {
+                    let key =
+                        rnvpc::index::PageKey::new(self.rnvpc_fs_id(), page.inode, page.index);
+                    redirects.push((key, handle));
+                }
+                drop(page.lease);
+            }
+        }
+        for chunk in redirects.chunks(128) {
+            let _ =
+                pool.transition_redirects(chunk, rnvpc::descriptor::NvObjectState::NvDirty, None);
+            for (key, _) in chunk {
+                pool.release_baseline_migration(*key);
+            }
+        }
     }
 
     fn persist_nv_allocations(&self) -> Result<()> {
@@ -857,15 +661,28 @@ impl Ext4 {
         pages: Vec<PendingPage>,
     ) -> Result<()> {
         let mut exact = Vec::with_capacity(pages.len());
+        let mut new_baselines = Vec::new();
+        let mut new_target_refs = Vec::new();
         let mut baseline_valid = true;
-        for page in pages {
-            let (handle, token) = page.redirect.ok_or_else(|| Error::new(Errno::EUCLEAN))?;
-            baseline_valid &= pool.validate_baseline_token(&token);
+        for page in &pages {
+            let (handle, token) = page
+                .redirect
+                .as_ref()
+                .ok_or_else(|| Error::new(Errno::EUCLEAN))?;
+            baseline_valid &= pool.validate_baseline_token(token);
+            let handle = *handle;
             let key = rnvpc::index::PageKey::new(self.rnvpc_fs_id(), page.inode, page.index);
             exact.push((key, handle));
-            drop(page.lease);
+            if page.needs_baseline {
+                if page.target == 0 {
+                    return_errno_with_message!(Errno::EUCLEAN, "migration has no SSD target");
+                }
+                new_baselines.push((page.index, page.target));
+                new_target_refs.push(handle.reference);
+            }
         }
         if !baseline_valid {
+            drop(pages);
             for (key, handle) in exact {
                 if pool.redirect_lookup(key) == Some(handle) {
                     let _ = pool.transition_redirects(
@@ -882,6 +699,39 @@ impl Ext4 {
             }
             return Ok(());
         }
+        if !new_baselines.is_empty() {
+            new_baselines.sort_unstable_by_key(|(logical, _)| *logical);
+            let inode = pages[0].inode;
+            rnvpc::write_transaction::publish_ssd_baseline_batch(
+                pool,
+                self.rnvpc_fs_id(),
+                inode,
+                &new_baselines,
+            )?;
+            let mut releasable = Vec::with_capacity(new_target_refs.len());
+            for reference in new_target_refs {
+                if !pool.persistent_data_has_migration_target(reference)? {
+                    return_errno_with_message!(
+                        Errno::EUCLEAN,
+                        "published SSD baseline has no migration target"
+                    );
+                }
+                if !pool.persistent_data_migration_credit_released(reference)? {
+                    releasable.push(reference);
+                }
+            }
+            for references in releasable.chunks(128) {
+                pool.mark_migration_credits_released(references, None)?;
+            }
+            rnvpc::write_transaction::consume_ssd_capacity_locked(
+                pool,
+                self.rnvpc_fs_id(),
+                inode,
+                new_baselines.len() as u64,
+            )?;
+            self.release_rnvpce_blocks(new_baselines.len() as u64)?;
+        }
+        drop(pages);
         for chunk in exact.chunks(128) {
             let reclaimed = pool.clear_redirects_exact(chunk, None);
             for (key, _) in chunk {

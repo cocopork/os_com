@@ -512,6 +512,23 @@ impl ExtentRecordEntry {
     }
 
     pub(crate) fn validate_for_level(&self, level: u16) -> Result<()> {
+        self.validate_level_shape(level)?;
+        #[cfg(not(ktest))]
+        if level == 0 && self.is_nv_data() {
+            return_errno_with_message!(Errno::EINVAL, "v5 extent leaf cannot reference NV data");
+        }
+        Ok(())
+    }
+
+    pub(crate) fn validate_v5_for_level(&self, level: u16) -> Result<()> {
+        self.validate_level_shape(level)?;
+        if level == 0 && self.is_nv_data() {
+            return_errno_with_message!(Errno::EINVAL, "v5 extent leaf cannot reference NV data");
+        }
+        Ok(())
+    }
+
+    fn validate_level_shape(&self, level: u16) -> Result<()> {
         if self.range_tail >> 32 != 0 || !self.target.is_published() {
             return_errno_with_message!(Errno::EINVAL, "invalid persistent extent entry");
         }
@@ -1506,5 +1523,20 @@ mod recovery_tests {
         assert!(entry.nv_slot_at(99).is_err());
         assert!(entry.nv_slot_at(132).is_err());
         entry.validate_for_level(0).unwrap();
+    }
+
+    #[cfg_attr(ktest, ostd::prelude::ktest)]
+    #[cfg_attr(not(ktest), test)]
+    fn rnvpce_new_image_rejects_nv_extent_data_target() {
+        let entry = ExtentRecordEntry::nv_leaf_range(100, 32, 401).unwrap();
+        assert!(entry.validate_v5_for_level(0).is_err());
+        ExtentRecordEntry::leaf(100, 32, 900, false)
+            .unwrap()
+            .validate_v5_for_level(0)
+            .unwrap();
+        ExtentRecordEntry::child(100, PersistentObjectRef::new(7, 1).unwrap())
+            .unwrap()
+            .validate_v5_for_level(1)
+            .unwrap();
     }
 }
