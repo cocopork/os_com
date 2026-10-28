@@ -10,7 +10,7 @@ use ostd::prelude::ktest;
 use super::{
     allocation_metadata::{
         ALLOCATION_BITMAP_CHUNK_BYTES, AllocationBitmapChunkRecord, AllocationGroupDirectoryRecord,
-        AllocationGroupImage, select_allocation_group_image,
+        AllocationGroupImage, AllocationMetadataCache, select_allocation_group_image,
     },
     backend::NvMemoryBackend,
     config::{NvSimMode, RnvpcConfig},
@@ -156,6 +156,97 @@ fn rnvpce_allocation_directory_rejects_corrupt_selected_chunk() {
             .error(),
         Errno::EUCLEAN
     );
+}
+
+#[ktest]
+fn rnvpce_allocation_cache_recovers_selected_image() {
+    let config = RnvpcConfig::from_bytes(
+        Some(32 * PAGE_SIZE),
+        Some(16 * PAGE_SIZE),
+        Some(16 * PAGE_SIZE),
+        Some(NvSimMode::Model),
+    )
+    .unwrap()
+    .unwrap();
+    let persistent_image = DramNvImage::allocate_model(config).unwrap();
+    let pool = Arc::new(Rnvpc::format(Arc::new(persistent_image.attach()), config, None).unwrap());
+    let expected = allocation_test_image(1, 0xa5, 47);
+    AllocationMetadataCache::new(pool)
+        .publish_initial(
+            ALLOCATION_TEST_FS_ID,
+            ALLOCATION_TEST_GROUP,
+            &expected,
+            None,
+        )
+        .unwrap();
+
+    let recovered =
+        Arc::new(Rnvpc::recover(Arc::new(persistent_image.attach()), config, None).unwrap());
+    let actual = AllocationMetadataCache::new(recovered)
+        .selected_image(ALLOCATION_TEST_FS_ID, ALLOCATION_TEST_GROUP)
+        .unwrap()
+        .unwrap();
+    assert_eq!(actual, expected);
+}
+
+#[ktest]
+fn rnvpce_allocation_checkpoint_releases_resident_image_by_generation() {
+    let config = RnvpcConfig::from_bytes(
+        Some(32 * PAGE_SIZE),
+        Some(16 * PAGE_SIZE),
+        Some(16 * PAGE_SIZE),
+        Some(NvSimMode::Model),
+    )
+    .unwrap()
+    .unwrap();
+    let backend: Arc<dyn NvMemoryBackend> =
+        Arc::new(DramNvBackend::allocate_with_chunk_pages(config, 2).unwrap());
+    let pool = Arc::new(Rnvpc::new(backend, config, None).unwrap());
+    let cache = AllocationMetadataCache::new(pool);
+    let first = allocation_test_image(1, 0x35, 71);
+    cache
+        .publish_initial(
+            ALLOCATION_TEST_FS_ID + 1,
+            ALLOCATION_TEST_GROUP,
+            &first,
+            None,
+        )
+        .unwrap();
+
+    assert_eq!(
+        cache
+            .mark_checkpointed(
+                ALLOCATION_TEST_FS_ID + 1,
+                ALLOCATION_TEST_GROUP,
+                first.generation() + 1,
+            )
+            .unwrap_err()
+            .error(),
+        Errno::ESTALE
+    );
+    cache
+        .mark_checkpointed(
+            ALLOCATION_TEST_FS_ID + 1,
+            ALLOCATION_TEST_GROUP,
+            first.generation(),
+        )
+        .unwrap();
+    assert!(
+        cache
+            .selected_image(ALLOCATION_TEST_FS_ID + 1, ALLOCATION_TEST_GROUP)
+            .unwrap()
+            .is_none()
+    );
+
+    let second_generation = cache
+        .publish_dirty_bitmap(
+            ALLOCATION_TEST_FS_ID + 1,
+            ALLOCATION_TEST_GROUP,
+            *first.bitmap(),
+            first.free_blocks(),
+        )
+        .unwrap();
+    assert_eq!(second_generation, 2);
 }
 
 fn test_pool(

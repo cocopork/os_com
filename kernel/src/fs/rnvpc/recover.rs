@@ -5,6 +5,7 @@
 #[cfg(ktest)]
 use super::id::NvPageId;
 use super::{
+    allocation_metadata::{AllocationGroupDirectoryRecord, AllocationMetadataCache},
     capacity::PoolClass,
     descriptor::{NvObjectKind, NvObjectState},
     extent_mutation::ExtentMutation,
@@ -213,6 +214,7 @@ pub(super) fn reconcile_profiled(
     let mut managed = BTreeSet::new();
     let mut rooted = BTreeSet::new();
     let mut pcache_owners = BTreeSet::new();
+    let mut allocation_directories = Vec::new();
 
     for reference in metadata {
         let key = pool.persistent_metadata_key(reference)?;
@@ -227,6 +229,12 @@ pub(super) fn reconcile_profiled(
             continue;
         }
         match pool.persistent_metadata_kind(reference)? {
+            PersistentMetadataKind::AllocationGroupDirectory => {
+                managed.insert(owner);
+                if pool.current_metadata_ref(key) == Some(reference) {
+                    allocation_directories.push(reference);
+                }
+            }
             PersistentMetadataKind::Inode if key.page_index == FIXED_INODE_LOGICAL_INDEX => {
                 managed.insert(owner);
                 rooted.insert(owner);
@@ -285,6 +293,26 @@ pub(super) fn reconcile_profiled(
     let mut reverse_candidates = Vec::new();
     let mut traversal_stats = TraversalStats::default();
     let extent_start = now_ns(profiling);
+
+    // The selected allocation directory is the persistent root for one block
+    // group's authoritative NVM bitmap. Its chunks are reached through stored
+    // object references rather than the ordinary PageIndex, so recovery must
+    // mark this graph explicitly before sweeping obsolete metadata versions.
+    let allocation_cache = AllocationMetadataCache::new(pool.clone());
+    for directory_ref in allocation_directories {
+        let directory =
+            pool.read_authoritative_metadata::<AllocationGroupDirectoryRecord>(directory_ref)?;
+        live.insert(ObjectIdentity::from_ref(directory_ref)?);
+        if directory.state()?.is_resident() {
+            allocation_cache
+                .selected_image(directory.header().fs_id(), directory.group())?
+                .ok_or_else(|| Error::new(Errno::EUCLEAN))?;
+            for chunk_ref in directory.chunks() {
+                live.insert(ObjectIdentity::from_ref(chunk_ref)?);
+            }
+        }
+    }
+
     for owner in rooted.iter().copied() {
         let inode_ref = pool
             .fixed_inode_ref(owner.fs_id, owner.inode)?
@@ -308,7 +336,7 @@ pub(super) fn reconcile_profiled(
         )?;
     }
 
-    // In image v5, selected data descriptors are the persistent redirect
+    // In image v6, selected data descriptors are the persistent redirect
     // authority and intentionally do not appear in SSD-only extent leaves.
     // Keep descriptors only for owners with a durable inode root; orphaned
     // publications from an interrupted first write remain reclaimable.

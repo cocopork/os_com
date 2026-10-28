@@ -50,6 +50,7 @@ use super::{
     prelude::*,
     super_block::SuperBlock,
 };
+use crate::fs::rnvpc::allocation_metadata::AllocationGroupImage;
 
 /// `bg_flags` bit: the group's inode bitmap and inode table are uninitialized
 /// (`EXT4_BG_INODE_UNINIT`). No inode has ever been allocated here; the on-disk
@@ -448,6 +449,62 @@ impl Debug for BlockGroup {
 impl BlockGroup {
     pub(super) fn lock_allocation(&self) -> ostd::sync::MutexGuard<'_, ()> {
         self.allocation_gate.lock()
+    }
+
+    /// Returns a complete NVM-checkpointable block-allocation image without I/O.
+    pub(super) fn allocation_image(&self, generation: u64) -> Result<AllocationGroupImage> {
+        let _allocation = self.allocation_gate.lock();
+        let metadata = self.metadata.read();
+        let mut bitmap = [0u8; BLOCK_SIZE];
+        bitmap.copy_from_slice(metadata.block_bitmap.as_bytes());
+        AllocationGroupImage::new(generation, bitmap, metadata.desc.free_blocks_count())
+    }
+
+    /// Snapshots the allocation fields for one NVM-authority publication.
+    pub(super) fn allocation_bitmap_snapshot(&self) -> ([u8; BLOCK_SIZE], u32) {
+        let _allocation = self.allocation_gate.lock();
+        let metadata = self.metadata.read();
+        let mut bitmap = [0u8; BLOCK_SIZE];
+        bitmap.copy_from_slice(metadata.block_bitmap.as_bytes());
+        (bitmap, metadata.desc.free_blocks_count())
+    }
+
+    /// Installs an NVM-authoritative block bitmap without accessing the device.
+    pub(super) fn install_authoritative_allocation_image(
+        &self,
+        image: &AllocationGroupImage,
+    ) -> Result<()> {
+        let group_size = self
+            .last_block
+            .checked_sub(self.first_block)
+            .and_then(|blocks| blocks.checked_add(1))
+            .ok_or_else(|| Error::new(Errno::EOVERFLOW))?;
+        let capacity = u16::try_from(group_size).map_err(|_| Error::new(Errno::EOVERFLOW))?;
+        let bitmap = IdBitmap::from_buf(image.bitmap().to_vec().into_boxed_slice(), capacity);
+        if u32::from(bitmap.free_count()) != image.free_blocks() {
+            return_errno_with_message!(Errno::EUCLEAN, "NVM allocation count mismatches bitmap");
+        }
+
+        let _allocation = self.allocation_gate.lock();
+        let mut metadata = self.metadata.write();
+        for bit in 0..capacity {
+            if !bitmap.is_allocated(bit) {
+                let block = self.first_block + Ext4Bid::from(bit);
+                if self.overlaps_system_zone_with(&metadata.desc, block..block + 1) {
+                    return_errno_with_message!(
+                        Errno::EUCLEAN,
+                        "NVM allocation bitmap frees EXT4 system metadata"
+                    );
+                }
+            }
+        }
+        let mut bitmap = Dirty::new(bitmap);
+        bitmap.mark_dirty();
+        metadata.block_bitmap = bitmap;
+        metadata.desc.free_blocks_count = image.free_blocks();
+        metadata.desc.flags &= !BG_BLOCK_UNINIT;
+        metadata.free_index = None;
+        Ok(())
     }
 
     /// Protects one NVM-owned migration target while mounting rNVPCe.

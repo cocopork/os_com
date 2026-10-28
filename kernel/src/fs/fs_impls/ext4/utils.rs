@@ -33,6 +33,11 @@ impl<T: Debug> Dirty<T> {
     pub(super) fn clear_dirty(&mut self) {
         self.dirty = false;
     }
+
+    /// Marks the wrapped value dirty after a validated whole-object replacement.
+    pub(super) fn mark_dirty(&mut self) {
+        self.dirty = true;
+    }
 }
 
 impl<T: Debug> Deref for Dirty<T> {

@@ -491,6 +491,13 @@ impl<T: PersistentMetadataRecord> Deref for BoxedMetadataRecord<T> {
 }
 
 impl Rnvpc {
+    /// Three persistent pages represent one resident group. Reserving sixteen
+    /// metadata pages per cache entry leaves replacement headroom and most of
+    /// the metadata reserve for inode and extent authority.
+    pub(crate) fn allocation_group_cache_limit(&self) -> usize {
+        (self.config.meta_reserve_pages() / 16).max(1)
+    }
+
     pub(crate) fn data_page_lease_epoch(&self) -> u64 {
         DATA_PAGE_LEASE_EPOCH.load(Ordering::Acquire)
     }

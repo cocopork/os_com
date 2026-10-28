@@ -2,14 +2,20 @@
 
 //! NVM-authoritative EXT4 block-allocation metadata.
 
-use super::metadata::{
-    AuthoritativeMetadataRecord, PersistentMetadataHeader, PersistentMetadataKind,
-    PersistentMetadataRecord, PersistentObjectRef,
+use super::{
+    fault::FaultPoint,
+    frame::Rnvpc,
+    index::PageKey,
+    metadata::{
+        AuthoritativeMetadataRecord, PersistentMetadataHeader, PersistentMetadataKind,
+        PersistentMetadataRecord, PersistentObjectRef,
+    },
 };
 use crate::prelude::*;
 
 pub(crate) const ALLOCATION_BITMAP_CHUNK_BYTES: usize = PAGE_SIZE / 2;
 const ALLOCATION_BITMAP_CHUNKS: u16 = 2;
+const ALLOCATION_METADATA_LOGICAL_INDEX_TAG: u64 = 1 << 59;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u32)]
@@ -31,7 +37,7 @@ impl AllocationGroupState {
         }
     }
 
-    const fn is_resident(self) -> bool {
+    pub(crate) const fn is_resident(self) -> bool {
         !matches!(self, Self::CleanOnSsd)
     }
 }
@@ -50,6 +56,26 @@ pub(crate) struct AllocationGroupDirectoryRecord {
 }
 
 impl AllocationGroupDirectoryRecord {
+    pub(crate) fn clean_on_ssd(
+        fs_id: u64,
+        group: u32,
+        generation: u64,
+        free_blocks: u32,
+        bitmap_checksum: u32,
+    ) -> Result<Self> {
+        Self::new(
+            fs_id,
+            group,
+            generation,
+            AllocationGroupState::CleanOnSsd,
+            free_blocks,
+            bitmap_checksum,
+            generation,
+            [PersistentObjectRef::NONE; 2],
+        )
+    }
+
+    #[cfg(ktest)]
     pub(crate) fn resident_dirty(
         fs_id: u64,
         group: u32,
@@ -65,7 +91,33 @@ impl AllocationGroupDirectoryRecord {
             free_blocks,
             bitmap_checksum,
             0,
-            [PersistentObjectRef::NONE; 2],
+            [
+                PersistentObjectRef::new(1, 1)?,
+                PersistentObjectRef::new(2, 1)?,
+            ],
+        )
+    }
+
+    pub(crate) fn resident_dirty_with_chunks(
+        fs_id: u64,
+        group: u32,
+        generation: u64,
+        free_blocks: u32,
+        bitmap_checksum: u32,
+        chunks: [PersistentObjectRef; 2],
+    ) -> Result<Self> {
+        if chunks.iter().any(PersistentObjectRef::is_none) {
+            return_errno_with_message!(Errno::EINVAL, "resident allocation image has no chunks");
+        }
+        Self::new(
+            fs_id,
+            group,
+            generation,
+            AllocationGroupState::ResidentDirty,
+            free_blocks,
+            bitmap_checksum,
+            0,
+            chunks,
         )
     }
 
@@ -88,7 +140,7 @@ impl AllocationGroupDirectoryRecord {
                 PersistentMetadataKind::AllocationGroupDirectory,
                 size_of::<Self>() - size_of::<PersistentMetadataHeader>(),
                 fs_id,
-                u64::from(group),
+                0,
                 generation,
             )?,
             group,
@@ -108,13 +160,19 @@ impl AllocationGroupDirectoryRecord {
             PersistentMetadataKind::AllocationGroupDirectory,
             size_of::<Self>() - size_of::<PersistentMetadataHeader>(),
         )?;
-        if self.header.inode() != u64::from(self.group)
+        if self.header.inode() != 0
             || self.header.generation() == 0
             || self.checkpoint_generation > self.header.generation()
         {
             return_errno_with_message!(Errno::EINVAL, "invalid allocation group directory");
         }
-        self.state()?;
+        let state = self.state()?;
+        if state.is_resident() && self.chunks.iter().any(PersistentObjectRef::is_none) {
+            return_errno_with_message!(Errno::EUCLEAN, "resident allocation image has no chunks");
+        }
+        if !state.is_resident() && self.chunks.iter().any(|reference| !reference.is_none()) {
+            return_errno_with_message!(Errno::EUCLEAN, "evicted allocation image retains chunks");
+        }
         Ok(())
     }
 
@@ -206,7 +264,7 @@ impl AllocationBitmapChunkRecord {
                 PersistentMetadataKind::AllocationBitmapChunk,
                 size_of::<Self>() - size_of::<PersistentMetadataHeader>(),
                 fs_id,
-                u64::from(group),
+                0,
                 generation,
             )?,
             group,
@@ -226,7 +284,7 @@ impl AllocationBitmapChunkRecord {
             PersistentMetadataKind::AllocationBitmapChunk,
             size_of::<Self>() - size_of::<PersistentMetadataHeader>(),
         )?;
-        if self.header.inode() != u64::from(self.group)
+        if self.header.inode() != 0
             || self.header.generation() == 0
             || self.chunk_index >= ALLOCATION_BITMAP_CHUNKS
             || self.chunk_count != ALLOCATION_BITMAP_CHUNKS
@@ -291,6 +349,245 @@ pub(crate) struct AllocationGroupImage {
     bitmap: [u8; PAGE_SIZE],
     free_blocks: u32,
     checksum: u32,
+}
+
+pub(crate) struct AllocationMetadataCache {
+    pool: Arc<Rnvpc>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ResidentAllocationGroup {
+    pub(crate) group: u32,
+    pub(crate) generation: u64,
+    pub(crate) free_blocks: u32,
+}
+
+impl AllocationMetadataCache {
+    pub(crate) fn new(pool: Arc<Rnvpc>) -> Self {
+        Self { pool }
+    }
+
+    pub(crate) fn publish_initial(
+        &self,
+        fs_id: u64,
+        group: u32,
+        image: &AllocationGroupImage,
+        fault: Option<FaultPoint>,
+    ) -> Result<PersistentObjectRef> {
+        let directory_key = allocation_metadata_key(fs_id, group, 0)?;
+        if self.pool.current_metadata_ref(directory_key).is_some() {
+            return_errno_with_message!(Errno::EEXIST, "allocation group is already admitted");
+        }
+        let chunks = allocation_chunk_records(fs_id, group, image)?;
+        let chunk_refs = [
+            self.pool.persist_authoritative_metadata(
+                allocation_metadata_key(fs_id, group, 1)?,
+                &chunks[0],
+                None,
+            )?,
+            self.pool.persist_authoritative_metadata(
+                allocation_metadata_key(fs_id, group, 2)?,
+                &chunks[1],
+                None,
+            )?,
+        ];
+        let directory = AllocationGroupDirectoryRecord::resident_dirty_with_chunks(
+            fs_id,
+            group,
+            image.generation(),
+            image.free_blocks(),
+            image.checksum(),
+            chunk_refs,
+        )?;
+        self.pool
+            .persist_authoritative_metadata(directory_key, &directory, fault)
+    }
+
+    pub(crate) fn publish_update(
+        &self,
+        fs_id: u64,
+        group: u32,
+        image: &AllocationGroupImage,
+        fault: Option<FaultPoint>,
+    ) -> Result<PersistentObjectRef> {
+        let directory_key = allocation_metadata_key(fs_id, group, 0)?;
+        let current_directory_ref = self
+            .pool
+            .current_metadata_ref(directory_key)
+            .ok_or_else(|| Error::new(Errno::ENOENT))?;
+        let current_directory = self
+            .pool
+            .read_authoritative_metadata::<AllocationGroupDirectoryRecord>(current_directory_ref)?;
+        if image.generation() <= current_directory.header().generation() {
+            return_errno_with_message!(Errno::ESTALE, "allocation generation did not advance");
+        }
+        let current_chunks = current_directory.chunks();
+        let chunks = allocation_chunk_records(fs_id, group, image)?;
+        let chunk_refs = if current_directory.state()?.is_resident() {
+            if current_chunks.iter().any(PersistentObjectRef::is_none) {
+                return_errno_with_message!(
+                    Errno::EUCLEAN,
+                    "resident allocation directory lost chunks"
+                );
+            }
+            [
+                self.pool
+                    .replace_authoritative_metadata(current_chunks[0], &chunks[0], None)?,
+                self.pool
+                    .replace_authoritative_metadata(current_chunks[1], &chunks[1], None)?,
+            ]
+        } else {
+            [
+                self.pool.persist_authoritative_metadata(
+                    allocation_metadata_key(fs_id, group, 1)?,
+                    &chunks[0],
+                    None,
+                )?,
+                self.pool.persist_authoritative_metadata(
+                    allocation_metadata_key(fs_id, group, 2)?,
+                    &chunks[1],
+                    None,
+                )?,
+            ]
+        };
+        let directory = AllocationGroupDirectoryRecord::resident_dirty_with_chunks(
+            fs_id,
+            group,
+            image.generation(),
+            image.free_blocks(),
+            image.checksum(),
+            chunk_refs,
+        )?;
+        let new_directory_ref =
+            self.pool
+                .replace_authoritative_metadata(current_directory_ref, &directory, fault)?;
+        // Once the directory commit point selects the new chunks, the former
+        // graph is no longer a recovery candidate. Reclaim it so repeated rTIO
+        // batches consume a fixed three-frame working set per resident group.
+        self.pool
+            .reclaim_committed_metadata(current_directory_ref)?;
+        for reference in current_chunks {
+            if !reference.is_none() {
+                self.pool.reclaim_committed_metadata(reference)?;
+            }
+        }
+        Ok(new_directory_ref)
+    }
+
+    pub(crate) fn selected_image(
+        &self,
+        fs_id: u64,
+        group: u32,
+    ) -> Result<Option<AllocationGroupImage>> {
+        let Some(directory_ref) = self
+            .pool
+            .current_metadata_ref(allocation_metadata_key(fs_id, group, 0)?)
+        else {
+            return Ok(None);
+        };
+        let directory = self
+            .pool
+            .read_authoritative_metadata::<AllocationGroupDirectoryRecord>(directory_ref)?;
+        if !directory.state()?.is_resident() {
+            return Ok(None);
+        }
+        let chunk_refs = directory.chunks();
+        if chunk_refs.iter().any(PersistentObjectRef::is_none) {
+            return_errno_with_message!(Errno::EUCLEAN, "resident allocation directory lost chunks");
+        }
+        let first = self
+            .pool
+            .read_authoritative_metadata::<AllocationBitmapChunkRecord>(chunk_refs[0])?;
+        let second = self
+            .pool
+            .read_authoritative_metadata::<AllocationBitmapChunkRecord>(chunk_refs[1])?;
+        select_allocation_group_image(&directory, [&first, &second]).map(Some)
+    }
+
+    /// Publishes one complete dirty group image. The directory replacement is
+    /// the commit point and must precede persistent migration-target pointers.
+    pub(crate) fn publish_dirty_bitmap(
+        &self,
+        fs_id: u64,
+        group: u32,
+        bitmap: [u8; PAGE_SIZE],
+        free_blocks: u32,
+    ) -> Result<u64> {
+        let directory_key = allocation_metadata_key(fs_id, group, 0)?;
+        let current = self.pool.current_metadata_ref(directory_key);
+        let generation = current.map_or(Ok(1), |reference| {
+            self.pool
+                .read_authoritative_metadata::<AllocationGroupDirectoryRecord>(reference)?
+                .header()
+                .generation()
+                .checked_add(1)
+                .ok_or_else(|| Error::new(Errno::EOVERFLOW))
+        })?;
+        let image = AllocationGroupImage::new(generation, bitmap, free_blocks)?;
+        if current.is_some() {
+            self.publish_update(fs_id, group, &image, None)?;
+        } else {
+            self.publish_initial(fs_id, group, &image, None)?;
+        }
+        Ok(generation)
+    }
+
+    /// Transfers authority to an SSD checkpoint of exactly `generation` and
+    /// then releases the no-longer-needed resident bitmap chunks.
+    pub(crate) fn mark_checkpointed(&self, fs_id: u64, group: u32, generation: u64) -> Result<()> {
+        let key = allocation_metadata_key(fs_id, group, 0)?;
+        let current_ref = self
+            .pool
+            .current_metadata_ref(key)
+            .ok_or_else(|| Error::new(Errno::ENOENT))?;
+        let current = self
+            .pool
+            .read_authoritative_metadata::<AllocationGroupDirectoryRecord>(current_ref)?;
+        if current.header().generation() != generation || !current.state()?.is_resident() {
+            return_errno_with_message!(Errno::ESTALE, "allocation checkpoint generation changed");
+        }
+        let chunks = current.chunks();
+        let clean = AllocationGroupDirectoryRecord::clean_on_ssd(
+            fs_id,
+            group,
+            generation,
+            current.free_blocks(),
+            current.bitmap_checksum(),
+        )?;
+        self.pool
+            .replace_authoritative_metadata(current_ref, &clean, None)?;
+        self.pool.reclaim_committed_metadata(current_ref)?;
+        for reference in chunks {
+            self.pool.reclaim_committed_metadata(reference)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn resident_groups(&self, fs_id: u64) -> Result<Vec<ResidentAllocationGroup>> {
+        let mut groups = Vec::new();
+        for reference in self.pool.committed_metadata_refs() {
+            if self.pool.persistent_metadata_kind(reference)?
+                != PersistentMetadataKind::AllocationGroupDirectory
+            {
+                continue;
+            }
+            let key = self.pool.persistent_metadata_key(reference)?;
+            if key.fs_id != fs_id || self.pool.current_metadata_ref(key) != Some(reference) {
+                continue;
+            }
+            let directory = self
+                .pool
+                .read_authoritative_metadata::<AllocationGroupDirectoryRecord>(reference)?;
+            if directory.state()?.is_resident() {
+                groups.push(ResidentAllocationGroup {
+                    group: directory.group(),
+                    generation: directory.header().generation(),
+                    free_blocks: directory.free_blocks(),
+                });
+            }
+        }
+        Ok(groups)
+    }
 }
 
 impl AllocationGroupImage {
@@ -371,6 +668,41 @@ fn allocation_bitmap_checksum(bytes: &[u8]) -> u32 {
         hash = hash.wrapping_mul(0x0100_0193);
     }
     hash
+}
+
+fn allocation_chunk_records(
+    fs_id: u64,
+    group: u32,
+    image: &AllocationGroupImage,
+) -> Result<[AllocationBitmapChunkRecord; 2]> {
+    Ok([
+        AllocationBitmapChunkRecord::new(
+            fs_id,
+            group,
+            image.generation(),
+            0,
+            &image.bitmap()[..ALLOCATION_BITMAP_CHUNK_BYTES],
+        )?,
+        AllocationBitmapChunkRecord::new(
+            fs_id,
+            group,
+            image.generation(),
+            1,
+            &image.bitmap()[ALLOCATION_BITMAP_CHUNK_BYTES..],
+        )?,
+    ])
+}
+
+fn allocation_metadata_key(fs_id: u64, group: u32, component: u64) -> Result<PageKey> {
+    let group_index = u64::from(group)
+        .checked_mul(4)
+        .and_then(|value| value.checked_add(component))
+        .ok_or_else(|| Error::new(Errno::EOVERFLOW))?;
+    Ok(PageKey::new(
+        fs_id,
+        0,
+        ALLOCATION_METADATA_LOGICAL_INDEX_TAG | group_index,
+    ))
 }
 
 const _: () = {

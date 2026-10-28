@@ -131,6 +131,67 @@ impl Ext4 {
             }
         })
         .spawn();
+        let weak = Arc::downgrade(self);
+        let trigger = self.nv_allocation_pager_trigger.clone();
+        crate::thread::kernel_thread::ThreadOptions::new(move || {
+            loop {
+                let Some(fs) = weak.upgrade() else {
+                    break;
+                };
+                if fs.is_shutdown() || fs.nv_migration_failed.load(Ordering::Acquire) {
+                    break;
+                }
+                let observed = fs.nv_allocation_pager_epoch.load(Ordering::Acquire);
+                match fs.checkpoint_one_allocation_group() {
+                    Ok(true) => continue,
+                    Ok(false) => {}
+                    Err(error) => {
+                        error!("allocation metadata pager failed: {error:?}");
+                        fs.fail_nv_migration();
+                        break;
+                    }
+                }
+                drop(fs);
+                let _ = trigger.wait_until_or_timeout(
+                    || {
+                        weak.upgrade()
+                            .is_none_or(|fs| {
+                                fs.is_shutdown()
+                                    || fs.nv_allocation_pager_epoch.load(Ordering::Acquire)
+                                        != observed
+                            })
+                            .then_some(())
+                    },
+                    &Duration::from_millis(100),
+                );
+            }
+        })
+        .spawn();
+    }
+
+    pub(super) fn request_allocation_checkpoint(&self) {
+        self.nv_allocation_pager_epoch
+            .fetch_add(1, Ordering::Release);
+        self.nv_allocation_pager_trigger.wake_one();
+    }
+
+    fn checkpoint_one_allocation_group(&self) -> Result<bool> {
+        let pool = rnvpc::pool().ok_or_else(|| Error::new(Errno::EINVAL))?;
+        let cache = rnvpc::allocation_metadata::AllocationMetadataCache::new(pool.clone());
+        let mut resident = cache.resident_groups(self.rnvpc_fs_id())?;
+        if resident.len() < pool.allocation_group_cache_limit() {
+            return Ok(false);
+        }
+        // Full groups cannot satisfy a future allocation. Otherwise evict the
+        // group with the least remaining space before broad free groups.
+        resident.sort_by_key(|group| (group.free_blocks != 0, group.free_blocks, group.group));
+        let victim = resident[0];
+        let _migration = self.nv_migration_lock.lock();
+        let Some(current) = cache.selected_image(self.rnvpc_fs_id(), victim.group)? else {
+            return Ok(true);
+        };
+        self.checkpoint_rnvpce_allocation_group(victim.group, current.generation())?;
+        Ok(true)
     }
 
     pub(super) fn wake_nv_capacity_waiters(&self) {
@@ -262,9 +323,9 @@ impl Ext4 {
         }
         pp::NV_CANDIDATE_SELECT.record_since(candidate_started, pages.len());
         let target_started = pp::now();
-        let metadata_groups = if self.rnvpc_extend_enabled() {
+        if self.rnvpc_extend_enabled() {
             match self.prepare_nv_targets(&mut pages) {
-                Ok(groups) => groups,
+                Ok(()) => {}
                 Err(error) => {
                     let pool = rnvpc::pool().ok_or_else(|| Error::new(Errno::EINVAL))?;
                     self.restore_failed_migration_jobs(
@@ -277,9 +338,7 @@ impl Ext4 {
                     return Err(error);
                 }
             }
-        } else {
-            BTreeSet::new()
-        };
+        }
         pp::NV_TARGET_PREPARE.record_since(target_started, pages.len());
         let submitted = pages.len();
         if submitted == 0 {
@@ -353,32 +412,16 @@ impl Ext4 {
             }
         }
         pp::NV_DATA_SUBMIT.record_since(data_submit_started, submitted);
-        let metadata_started = pp::now();
-        let metadata_result = if self.rnvpc_extend_enabled() {
-            // Data BIOs are already in flight. These nojournal metadata writes
-            // may complete in either order and become durable together at the
-            // completion worker's single device flush.
-            self.sync_rnvpce_allocation_metadata(&metadata_groups)
-        } else {
-            Ok(())
-        };
-        pp::NV_METADATA_SUBMIT.record_since(metadata_started, submitted);
-        batch.complete_metadata(
-            metadata_result.is_ok() && submit_error.is_none(),
-            &self.nv_completion_queue,
-            &self.nv_completion_trigger,
-        );
         if let Some(error) = submit_error {
             return Err(error.into());
         }
-        metadata_result?;
         pp::NV_FLUSH_TOTAL.record_since(profile_started, submitted);
         Ok(submitted)
     }
 
     /// Allocates SSD targets and publishes their identities in NVM.
     /// EXT4 allocation metadata joins the later orderless batch barrier.
-    fn prepare_nv_targets(&self, pages: &mut [PendingPage]) -> Result<BTreeSet<usize>> {
+    fn prepare_nv_targets(&self, pages: &mut [PendingPage]) -> Result<()> {
         let mut allocated = Vec::with_capacity(pages.len());
         let result = (|| {
             // Adjacent logical pages share a range allocation; preserve existing
@@ -435,6 +478,28 @@ impl Ext4 {
             }
             return Err(error);
         }
+        let groups = allocated
+            .iter()
+            .map(|(_, target)| self.block_group_index_for_block(*target))
+            .collect::<Result<BTreeSet<_>>>()?;
+        // NVM allocation authority is durable before any descriptor can name
+        // a newly allocated SSD target. No bitmap/GDT/superblock SSD I/O occurs.
+        if let Err(error) = self.persist_rnvpce_allocation_metadata(&groups) {
+            for (_, target) in &allocated {
+                let op = self.begin_op(self.single_block_map_credits(0))?;
+                self.free_blocks(
+                    super::journal::BlockFreeAuth::without_revoke_duty(*target, 1),
+                    op.get(),
+                )?;
+            }
+            // A partially published generation may have committed before the
+            // error. Publish the rolled-back bitmap as the next authority.
+            if let Err(rollback_error) = self.persist_rnvpce_allocation_metadata(&groups) {
+                self.fail_nv_migration();
+                error!("NV allocation rollback publication failed: {rollback_error:?}");
+            }
+            return Err(error);
+        }
         let targets: Result<Vec<_>> = allocated
             .iter()
             .map(|(index, target)| {
@@ -458,10 +523,6 @@ impl Ext4 {
         }
         batch_metrics::elapsed(Phase::TargetPublish, started);
         batch_metrics::count(Event::TargetPages, allocated.len());
-        let groups = allocated
-            .iter()
-            .map(|(_, target)| self.block_group_index_for_block(*target))
-            .collect::<Result<BTreeSet<_>>>()?;
         for (index, target) in allocated {
             pages[index].target = target;
             if let Some((handle, _)) = pages[index].redirect.as_mut() {
@@ -469,7 +530,7 @@ impl Ext4 {
                 handle.migration_target = true;
             }
         }
-        Ok(groups)
+        Ok(())
     }
 
     pub(super) fn process_nv_completions(&self) -> Result<usize> {
@@ -505,8 +566,8 @@ impl Ext4 {
         let completion_started = batch.completion_started();
         let page_count = batch.page_count();
         let pool = rnvpc::pool().ok_or_else(|| Error::new(Errno::EINVAL))?;
-        let (jobs, metadata_failed) = batch.take_jobs();
-        if metadata_failed || jobs.iter().any(|job| job.status != BioStatus::Complete) {
+        let jobs = batch.take_jobs();
+        if jobs.iter().any(|job| job.status != BioStatus::Complete) {
             self.restore_failed_migration_jobs(pool, jobs);
             return_errno_with_message!(Errno::EIO, "orderless migration batch I/O failed");
         }
@@ -678,7 +739,22 @@ impl Ext4 {
             self.read_inode(ino.try_into().map_err(|_| Error::new(Errno::EOVERFLOW))?)?
                 .export_rnvpce_extents(self)?;
         }
+        // Serialize the final allocation checkpoint against target assignment.
+        // After the device flush, exact-generation transitions transfer
+        // authority back to SSD and release the resident bitmap chunks.
+        let _migration = self.nv_migration_lock.lock();
+        let cache = rnvpc::allocation_metadata::AllocationMetadataCache::new(pool.clone());
+        let mut checkpointed = Vec::new();
+        let nr_groups = self.super_block().nr_block_groups();
+        for group_id in 0..nr_groups {
+            if let Some(image) = cache.selected_image(self.rnvpc_fs_id(), group_id)? {
+                checkpointed.push((group_id, image.generation()));
+            }
+        }
         self.persist_nv_allocations()?;
+        for (group, generation) in checkpointed {
+            cache.mark_checkpointed(self.rnvpc_fs_id(), group, generation)?;
+        }
         batch_metrics::dump();
         Ok(())
     }

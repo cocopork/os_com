@@ -10,7 +10,7 @@ use crate::prelude::*;
 pub(super) const NV_IMAGE_MAGIC: u64 = 0x4e56_504f_4f4c_3031;
 /// Version 5 makes extent leaves SSD-only; selected data descriptors carry all
 /// temporary NV residency. Older mixed-residency images require conversion.
-pub(super) const NV_IMAGE_VERSION: u32 = 5;
+pub(super) const NV_IMAGE_VERSION: u32 = 6;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Pod)]

@@ -4,6 +4,7 @@
 use ostd::prelude::*;
 
 use super::{
+    Ext4,
     prelude::*,
     test_utils::{Ext4FixtureBuilder, make_empty_file_inode},
 };
@@ -21,6 +22,7 @@ fn ext4_research_routes() {
         nv_route_rnvpce_reservation_abort_wakes_writer,
         nv_route_rnvpce_batch_allocation_durability,
         nv_route_rnvpce_recovers_unflushed_target_bitmap,
+        nv_route_rnvpce_recovery_prefers_nv_allocation_bitmap,
         nv_route_rnvpce_fragmented_batch_and_partial_rollback,
         nv_route_rnvpce_round_budget_is_independent_of_global_in_flight,
         nv_route_rnvpce_capacity_wait_releases_inode_lock,
@@ -30,6 +32,49 @@ fn ext4_research_routes() {
         nv_route_busy_lease_read_and_partial_write_retry,
         nv_route_rnvpc_failed_allocation_flush_does_not_append_wal,
         nv_route_mount_rejects_switching_persistent_authority,
+    );
+}
+
+fn nv_route_rnvpce_recovery_prefers_nv_allocation_bitmap() {
+    use crate::fs::rnvpc::allocation_metadata::AllocationMetadataCache;
+
+    crate::fs::rnvpc::init_for_ext4_tests();
+    let fixture = Ext4FixtureBuilder::new(2048, 256, 2048)
+        .with_block_bitmap_metadata_marked()
+        .with_free_blocks(256)
+        .with_uuid([0xc7; 16])
+        .with_mount_options("rnvpce=on,rtio=off")
+        .build()
+        .unwrap();
+    let group = fixture.ext4.block_group(0);
+    let target = (group.first_block()..=group.last_block())
+        .find(|block| {
+            let bit = u16::try_from(*block - group.first_block()).unwrap();
+            !group.metadata().block_bitmap.is_allocated(bit)
+        })
+        .expect("fixture must contain a free data block");
+    assert!(group.protect_recovered_block(target).unwrap());
+    let image = group.allocation_image(1).unwrap();
+    AllocationMetadataCache::new(crate::fs::rnvpc::pool().unwrap().clone())
+        .publish_initial(fixture.ext4.rnvpc_fs_id(), 0, &image, None)
+        .unwrap();
+
+    let disk = fixture.disk.clone();
+    core::mem::forget(fixture);
+    let options = CString::new("rnvpce=on,rtio=off").unwrap();
+    let recovered = Ext4::open(disk, Some(options.as_c_str())).unwrap();
+    let bit = u16::try_from(target - recovered.block_group(0).first_block()).unwrap();
+    assert!(
+        recovered
+            .block_group(0)
+            .metadata()
+            .block_bitmap
+            .is_allocated(bit)
+    );
+    let group_free = recovered.block_group(0).free_blocks_count();
+    assert_eq!(
+        recovered.super_block().free_blocks_count(),
+        u64::from(group_free)
     );
 }
 
@@ -232,7 +277,6 @@ fn nv_route_rnvpce_clean_journal_is_unused() {
 fn nv_route_rnvpce_rejects_unrecovered_journal() {
     use super::{
         feature::FeatureIncompatSet,
-        fs::Ext4,
         super_block::{RawSuperBlock, SUPER_BLOCK_OFFSET},
         test_utils::JOURNAL_START_BLOCK,
     };
@@ -843,8 +887,6 @@ fn nv_route_rnvpce_batch_allocation_durability() {
 }
 
 fn nv_route_rnvpce_recovers_unflushed_target_bitmap() {
-    use super::fs::Ext4;
-
     crate::fs::rnvpc::init_for_ext4_tests();
     crate::time::clocks::init_for_ktest();
     let fixture = Ext4FixtureBuilder::new(2048, 256, 2048)
@@ -875,25 +917,19 @@ fn nv_route_rnvpce_recovers_unflushed_target_bitmap() {
     fixture
         .disk
         .set_fail_write_block(Some(bitmap_block as usize));
-    assert_eq!(
-        fixture.ext4.migrate_nv_round(1).unwrap_err().error(),
-        Errno::EIO
-    );
-    assert_eq!(
-        fixture.ext4.drain_nv_in_flight().unwrap_err().error(),
-        Errno::EIO
-    );
+    assert_eq!(fixture.ext4.migrate_nv_round(1).unwrap(), 1);
+    fixture.ext4.drain_nv_in_flight().unwrap();
     fixture.disk.set_fail_write_block(None);
     let pool = crate::fs::rnvpc::pool().unwrap();
-    let reference = crate::fs::rnvpc::write_transaction::mapped_nv_page_ref(
+    let target = crate::fs::rnvpc::write_transaction::current_page_mapping(
         pool,
         fixture.ext4.rnvpc_fs_id(),
         11,
         0,
     )
     .unwrap()
-    .unwrap();
-    let target = pool.persistent_data_ssd_backing(reference).unwrap();
+    .unwrap()
+    .ssd_block();
     assert_ne!(target, 0);
     let bit = (target - fixture.ext4.block_group(0).first_block()) as u16;
     let mut raw_bitmap = [0u8; BLOCK_SIZE];
@@ -910,7 +946,7 @@ fn nv_route_rnvpce_recovers_unflushed_target_bitmap() {
     let before = disk.flush_count();
     let options = CString::new("rnvpce=on,rtio=off").unwrap();
     let recovered = Ext4::open(disk.clone(), Some(options.as_c_str())).unwrap();
-    assert_eq!(disk.flush_count() - before, 1);
+    assert_eq!(disk.flush_count() - before, 0);
     assert!(
         recovered
             .block_group(0)
@@ -933,7 +969,7 @@ fn nv_route_rnvpce_recovers_unflushed_target_bitmap() {
     disk.segment()
         .read_bytes(bitmap_block as usize * BLOCK_SIZE, &mut raw_bitmap)
         .unwrap();
-    assert_ne!(raw_bitmap[bit as usize / 8] & (1 << (bit % 8)), 0);
+    assert_eq!(raw_bitmap[bit as usize / 8] & (1 << (bit % 8)), 0);
 }
 
 fn nv_route_rnvpce_reservation_abort_wakes_writer() {

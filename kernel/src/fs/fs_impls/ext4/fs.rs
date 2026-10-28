@@ -245,6 +245,8 @@ pub struct Ext4 {
     pub(super) nv_completion_lock: Mutex<()>,
     pub(super) nv_completion_queue: super::migration::CompletionQueue,
     pub(super) nv_completion_trigger: Arc<ostd::sync::WaitQueue>,
+    pub(super) nv_allocation_pager_trigger: Arc<ostd::sync::WaitQueue>,
+    pub(super) nv_allocation_pager_epoch: AtomicUsize,
     pub(super) nv_in_flight: AtomicUsize,
     pub(super) nv_migration_failed: AtomicBool,
     pub(super) nv_inodes: Mutex<BTreeSet<Ext4Ino>>,
@@ -347,10 +349,30 @@ impl Ext4 {
             return Ok(());
         }
         self.block_capacity.reset(free_blocks);
-        self.sync_rnvpce_allocation_metadata(&groups)?;
-        if self.block_device.sync()? != BioStatus::Complete {
-            return_errno_with_message!(Errno::EIO, "failed to persist recovered migration targets");
+        self.persist_rnvpce_allocation_metadata(&groups)?;
+        Ok(())
+    }
+
+    /// Overlays SSD checkpoint bitmaps with NVM-authoritative allocation images.
+    fn restore_rnvpce_allocation_metadata(&self) -> Result<()> {
+        let pool = crate::fs::rnvpc::pool().ok_or_else(|| Error::new(Errno::EINVAL))?;
+        let cache =
+            crate::fs::rnvpc::allocation_metadata::AllocationMetadataCache::new(pool.clone());
+        for (group, block_group) in self.block_groups.iter().enumerate() {
+            let group = u32::try_from(group).map_err(|_| Error::new(Errno::EOVERFLOW))?;
+            if let Some(image) = cache.selected_image(self.rnvpc_fs_id, group)? {
+                block_group.install_authoritative_allocation_image(&image)?;
+            }
         }
+        let free_blocks = self.block_groups.iter().try_fold(0u64, |total, group| {
+            total
+                .checked_add(u64::from(group.free_blocks_count()))
+                .ok_or_else(|| Error::new(Errno::EOVERFLOW))
+        })?;
+        self.super_block
+            .write()
+            .reconcile_free_blocks(free_blocks)?;
+        self.block_capacity.reset(free_blocks);
         Ok(())
     }
     /// Mounts an ext4 volume from a block device.
@@ -414,6 +436,8 @@ impl Ext4 {
             nv_completion_lock: Mutex::new(()),
             nv_completion_queue: Arc::new(SpinLock::new(VecDeque::new())),
             nv_completion_trigger: Arc::new(ostd::sync::WaitQueue::new()),
+            nv_allocation_pager_trigger: Arc::new(ostd::sync::WaitQueue::new()),
+            nv_allocation_pager_epoch: AtomicUsize::new(0),
             nv_in_flight: AtomicUsize::new(0),
             nv_migration_failed: AtomicBool::new(false),
             nv_inodes: Mutex::new(BTreeSet::new()),
@@ -544,6 +568,7 @@ impl Ext4 {
         }
 
         if ext4.rnvpc_extend_enabled() {
+            ext4.restore_rnvpce_allocation_metadata()?;
             ext4.reconcile_rnvpce_migration_targets()?;
             ext4.reconcile_rnvpce_reservations()?;
         }
@@ -2308,21 +2333,62 @@ impl Ext4 {
         self.sync_superblock_metadata()
     }
 
-    /// Writes only allocation groups touched by one rNVPCe migration round.
-    /// Data BIOs are already submitted; the completion worker supplies the
-    /// single device flush after both classes of writes complete.
-    pub(super) fn sync_rnvpce_allocation_metadata(&self, groups: &BTreeSet<usize>) -> Result<()> {
+    /// Publishes touched allocation groups to NVM without issuing SSD I/O.
+    pub(super) fn persist_rnvpce_allocation_metadata(
+        &self,
+        groups: &BTreeSet<usize>,
+    ) -> Result<()> {
         self.ensure_not_shutdown()?;
         if self.journal().is_some() {
             return_errno_with_message!(Errno::EUCLEAN, "rNVPCe allocation metadata has a journal");
         }
+        let pool = crate::fs::rnvpc::pool().ok_or_else(|| Error::new(Errno::EINVAL))?;
+        let cache =
+            crate::fs::rnvpc::allocation_metadata::AllocationMetadataCache::new(pool.clone());
         for &group in groups {
-            self.block_groups
+            let block_group = self
+                .block_groups
                 .get(group)
-                .ok_or_else(|| Error::new(Errno::EINVAL))?
-                .sync_metadata()?;
+                .ok_or_else(|| Error::new(Errno::EINVAL))?;
+            let (bitmap, free_blocks) = block_group.allocation_bitmap_snapshot();
+            cache.publish_dirty_bitmap(
+                self.rnvpc_fs_id,
+                u32::try_from(group).map_err(|_| Error::new(Errno::EOVERFLOW))?,
+                bitmap,
+                free_blocks,
+            )?;
         }
-        self.sync_superblock_metadata()
+        self.request_allocation_checkpoint();
+        Ok(())
+    }
+
+    /// Checkpoints one exact allocation generation from the pager context.
+    /// NVM remains authoritative until all SSD writes and the device flush
+    /// complete; only then are its bitmap chunks released.
+    pub(super) fn checkpoint_rnvpce_allocation_group(
+        &self,
+        group: u32,
+        generation: u64,
+    ) -> Result<()> {
+        self.ensure_not_shutdown()?;
+        let pool = crate::fs::rnvpc::pool().ok_or_else(|| Error::new(Errno::EINVAL))?;
+        let cache =
+            crate::fs::rnvpc::allocation_metadata::AllocationMetadataCache::new(pool.clone());
+        let selected = cache
+            .selected_image(self.rnvpc_fs_id, group)?
+            .ok_or_else(|| Error::new(Errno::ESTALE))?;
+        if selected.generation() != generation {
+            return_errno_with_message!(Errno::ESTALE, "allocation checkpoint generation changed");
+        }
+        self.block_groups
+            .get(usize::try_from(group).map_err(|_| Error::new(Errno::EOVERFLOW))?)
+            .ok_or_else(|| Error::new(Errno::EINVAL))?
+            .sync_metadata()?;
+        self.sync_superblock_metadata()?;
+        if self.block_device.sync()? != BioStatus::Complete {
+            return_errno_with_message!(Errno::EIO, "allocation checkpoint flush failed");
+        }
+        cache.mark_checkpointed(self.rnvpc_fs_id, group, generation)
     }
 
     fn sync_superblock_metadata(&self) -> Result<()> {

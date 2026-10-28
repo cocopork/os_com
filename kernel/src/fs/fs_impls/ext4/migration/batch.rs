@@ -11,8 +11,6 @@ use crate::{fs::fs_impls::ext4::pipeline_profile as pp, prelude::*};
 
 pub(crate) struct MigrationBatch {
     remaining_data: AtomicUsize,
-    metadata_ready: AtomicBool,
-    metadata_failed: AtomicBool,
     queued: AtomicBool,
     page_count: usize,
     created_at_ns: u64,
@@ -25,8 +23,6 @@ impl MigrationBatch {
         debug_assert!(data_requests != 0);
         Arc::new(Self {
             remaining_data: AtomicUsize::new(data_requests),
-            metadata_ready: AtomicBool::new(false),
-            metadata_failed: AtomicBool::new(false),
             queued: AtomicBool::new(false),
             page_count,
             created_at_ns: pp::now(),
@@ -62,24 +58,8 @@ impl MigrationBatch {
         }
     }
 
-    pub(super) fn complete_metadata(
-        self: &Arc<Self>,
-        success: bool,
-        queue: &CompletionQueue,
-        trigger: &ostd::sync::WaitQueue,
-    ) {
-        if self.metadata_ready.swap(true, Ordering::AcqRel) {
-            return;
-        }
-        if !success {
-            self.metadata_failed.store(true, Ordering::Release);
-        }
-        self.try_queue(queue, trigger);
-    }
-
     fn try_queue(self: &Arc<Self>, queue: &CompletionQueue, trigger: &ostd::sync::WaitQueue) {
-        if !self.metadata_ready.load(Ordering::Acquire)
-            || self.remaining_data.load(Ordering::Acquire) != 0
+        if self.remaining_data.load(Ordering::Acquire) != 0
             || self.queued.swap(true, Ordering::AcqRel)
         {
             return;
@@ -91,10 +71,9 @@ impl MigrationBatch {
         trigger.wake_one();
     }
 
-    pub(super) fn take_jobs(&self) -> (Vec<CompletionJob>, bool) {
+    pub(super) fn take_jobs(&self) -> Vec<CompletionJob> {
         let mut jobs = self.jobs.lock();
-        let completed = core::mem::take(&mut *jobs);
-        (completed, self.metadata_failed.load(Ordering::Acquire))
+        core::mem::take(&mut *jobs)
     }
 }
 
@@ -110,7 +89,7 @@ mod tests {
     }
 
     #[ktest]
-    fn orderless_batch_waits_for_data_and_metadata_once() {
+    fn orderless_batch_waits_for_all_data_once() {
         let trigger = ostd::sync::WaitQueue::new();
         let completed = queue();
         let batch = MigrationBatch::new(1, 7);
@@ -122,29 +101,10 @@ mod tests {
             &completed,
             &trigger,
         );
-        assert!(completed.lock().is_empty());
-        batch.complete_metadata(true, &completed, &trigger);
-        batch.complete_metadata(true, &completed, &trigger);
         assert_eq!(completed.lock().len(), 1);
         let ready = completed.lock().pop_front().unwrap();
         assert_eq!(ready.page_count(), 7);
-        let (jobs, failed) = ready.take_jobs();
+        let jobs = ready.take_jobs();
         assert_eq!(jobs.len(), 1);
-        assert!(!failed);
-
-        let completed = queue();
-        let failed = MigrationBatch::new(1, 1);
-        failed.complete_metadata(false, &completed, &trigger);
-        assert!(completed.lock().is_empty());
-        failed.complete_data(
-            CompletionJob {
-                status: BioStatus::Complete,
-                pages: Vec::new(),
-            },
-            &completed,
-            &trigger,
-        );
-        let failed = completed.lock().pop_front().unwrap();
-        assert!(failed.take_jobs().1);
     }
 }
