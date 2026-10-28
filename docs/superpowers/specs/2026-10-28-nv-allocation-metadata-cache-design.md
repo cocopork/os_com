@@ -13,9 +13,12 @@ counter are asynchronous writeback images, not migration dependencies.
 
 This design removes `sync_rnvpce_allocation_metadata()` from the migration hot
 path. A bounded NVM allocation-metadata cache stores the authoritative state of
-active block groups. A separate metadata pager writes immutable snapshots to
-SSD and changes a group's persistent directory state only after asynchronous
-I/O completion and a device flush.
+active block groups. A separate allocation-metadata writeback worker writes a
+stable group image to SSD and changes the persistent authority state only after
+I/O completion and a device flush. The first implementation reuses the existing
+blocking EXT4 metadata-write primitive in that worker; asynchronous immutable
+after-image submission is a later optimization and is not part of rTIO's data
+migration path.
 
 ## 2. Scope
 
@@ -69,14 +72,17 @@ object graph. There is no persistent or incrementing `mutation_epoch`.
 Each block group also has at most one data-migration owner. A second data batch
 or allocation-metadata writeback for the same group is deferred. Disjoint groups
 may proceed independently. Foreground allocation remains allowed during
-metadata writeback and only sets `DIRTY`; no group lock spans SSD I/O.
+metadata writeback and only sets `DIRTY`. The allocation-state gate is released
+before SSD I/O. The first implementation still holds the block group's existing
+metadata write guard while its worker performs blocking I/O; removing that
+broader guard requires immutable after-images and asynchronous submission.
 
 An eviction is valid only in this order:
 
 ```text
 publish snapshot generation G in NVM and set WRITEBACK
-  -> asynchronously submit bitmap and GDT after-images
-  -> wait for both completions outside allocation locks
+  -> write bitmap and GDT after-images from the metadata worker
+  -> wait for both completions outside the allocation-state gate
   -> issue and complete one device flush
   -> persist directory CleanOnSsd(G)
   -> release the NVM bitmap slots
@@ -171,11 +177,13 @@ is no per-migration SSD bitmap/GDT BIO because allocation durability is already
 provided by NVM. The completion worker issues one device flush for the data
 batch, publishes the SSD baseline in NVM, and reclaims NVPages.
 
-Metadata pager BIOs are also asynchronous. Data and metadata I/O may proceed
-concurrently for different block groups, but one group has only one migration
-or allocation-metadata writeback owner. Writeback state advances only after its
-registered requests and a device flush complete. Sharing one physical flush is
-an optional optimization; correctness does not depend on it.
+Allocation-metadata writeback is separate from rTIO and may proceed concurrently
+with data migration for different block groups, but one group has only one data
+migration or allocation-metadata writeback owner. The current worker uses the
+existing blocking EXT4 metadata-write primitive; a later implementation may
+submit immutable after-images asynchronously. In either form, writeback state
+advances only after all writes and a device flush complete. Sharing one physical
+flush is an optional optimization; correctness does not depend on it.
 
 The following APIs are forbidden from the rTIO flush call graph:
 

@@ -134,6 +134,7 @@ impl Ext4 {
                             // Keep the pipeline full while work and credits exist.
                             Ok(submitted) if submitted != 0 => continue,
                             Ok(_) => {}
+                            Err(error) if error.error() == Errno::EAGAIN => {}
                             Err(error) => {
                                 error!("NV migration failed: {error:?}");
                                 fs.fail_nv_migration();
@@ -378,10 +379,13 @@ impl Ext4 {
         }
         pp::NV_CANDIDATE_SELECT.record_since(candidate_started, pages.len());
         let target_started = pp::now();
-        let mut migration_groups = BTreeSet::new();
-        if self.rnvpc_extend_enabled() {
+        let group_reservation = if self.rnvpc_extend_enabled() {
             match self.prepare_nv_targets(&mut pages) {
-                Ok(groups) => migration_groups = groups,
+                Ok(groups) if groups.is_empty() => None,
+                Ok(groups) => Some(MigrationGroupReservation::new(
+                    &self.nv_migration_groups,
+                    groups,
+                )),
                 Err(error) if error.error() == Errno::EBUSY => {
                     let pool = rnvpc::pool().ok_or_else(|| Error::new(Errno::EINVAL))?;
                     self.restore_failed_migration_jobs(
@@ -391,7 +395,10 @@ impl Ext4 {
                             pages,
                         }],
                     );
-                    return Ok(0);
+                    return_errno_with_message!(
+                        Errno::EAGAIN,
+                        "allocation group migration is deferred"
+                    );
                 }
                 Err(error) => {
                     let pool = rnvpc::pool().ok_or_else(|| Error::new(Errno::EINVAL))?;
@@ -405,14 +412,15 @@ impl Ext4 {
                     return Err(error);
                 }
             }
-        }
+        } else {
+            None
+        };
         pp::NV_TARGET_PREPARE.record_since(target_started, pages.len());
         let submitted = pages.len();
         if submitted == 0 {
+            debug_assert!(group_reservation.is_none());
             return Ok(0);
         }
-        let group_reservation =
-            MigrationGroupReservation::new(&self.nv_migration_groups, migration_groups);
         let data_submit_started = pp::now();
         pages.sort_by_key(|page| page.target);
         let max_segments = self
@@ -444,7 +452,8 @@ impl Ext4 {
         let batch = MigrationBatch::new(
             submissions.len(),
             submitted,
-            group_reservation.transfer_to_batch(),
+            group_reservation
+                .map_or_else(BTreeSet::new, |reservation| reservation.transfer_to_batch()),
         );
         self.nv_in_flight.fetch_add(submitted, Ordering::AcqRel);
         let mut submit_error = None;
@@ -567,6 +576,8 @@ impl Ext4 {
             }
             return_errno_with_message!(Errno::EBUSY, "allocation group is already migrating");
         }
+        let group_reservation =
+            MigrationGroupReservation::new(&self.nv_migration_groups, groups.clone());
         // NVM allocation authority is durable before any descriptor can name
         // a newly allocated SSD target. No bitmap/GDT/superblock SSD I/O occurs.
         if let Err(error) = self.persist_rnvpce_allocation_metadata(&groups) {
@@ -583,7 +594,6 @@ impl Ext4 {
                 self.fail_nv_migration();
                 error!("NV allocation rollback publication failed: {rollback_error:?}");
             }
-            self.nv_migration_groups.lock().release(&groups);
             return Err(error);
         }
         let targets: Result<Vec<_>> = allocated
@@ -598,22 +608,17 @@ impl Ext4 {
             })
             .collect();
         let Some(pool) = rnvpc::pool() else {
-            self.nv_migration_groups.lock().release(&groups);
             return_errno!(Errno::EINVAL);
         };
         let started = batch_metrics::now();
         let targets = match targets {
             Ok(targets) => targets,
-            Err(error) => {
-                self.nv_migration_groups.lock().release(&groups);
-                return Err(error);
-            }
+            Err(error) => return Err(error),
         };
         for targets in targets.chunks(rnvpc::write_transaction::SSD_MIGRATION_BATCH_PAGES) {
             if let Err(error) = pool.assign_migration_targets(targets, None) {
                 // Some selectors may already be durable: never free possibly named blocks.
                 self.fail_nv_migration();
-                self.nv_migration_groups.lock().release(&groups);
                 return Err(error);
             }
         }
@@ -626,7 +631,7 @@ impl Ext4 {
                 handle.migration_target = true;
             }
         }
-        Ok(groups)
+        Ok(group_reservation.transfer_to_batch())
     }
 
     pub(super) fn process_nv_completions(&self) -> Result<usize> {
@@ -826,8 +831,15 @@ impl Ext4 {
             return Ok(());
         }
         loop {
-            let submitted = self.migrate_nv_round(MIGRATION_BATCH_PAGES)?;
+            let (submitted, deferred) = match self.migrate_nv_round(MIGRATION_BATCH_PAGES) {
+                Ok(submitted) => (submitted, false),
+                Err(error) if error.error() == Errno::EAGAIN => (0, true),
+                Err(error) => return Err(error),
+            };
             self.drain_nv_in_flight()?;
+            if deferred {
+                continue;
+            }
             if submitted == 0 {
                 break;
             }

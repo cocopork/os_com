@@ -2437,7 +2437,8 @@ impl Ext4 {
 
         let mut state = block_group.lock_allocation();
         if state.is_dirty() {
-            debug_assert!(!state.finish());
+            let handed_off = state.finish();
+            debug_assert!(!handed_off);
             drop(state);
             self.request_allocation_writeback();
             return_errno_with_message!(Errno::ESTALE, "allocation changed during writeback");
@@ -2448,7 +2449,8 @@ impl Ext4 {
             state.abort();
             return Err(error);
         }
-        debug_assert!(state.finish());
+        let handed_off = state.finish();
+        debug_assert!(handed_off);
         Ok(())
     }
 

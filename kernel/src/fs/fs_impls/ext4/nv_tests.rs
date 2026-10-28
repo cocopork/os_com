@@ -25,6 +25,7 @@ fn ext4_research_routes() {
         nv_route_rnvpce_recovery_prefers_nv_allocation_bitmap,
         nv_route_rnvpce_sync_transfers_allocation_authority_to_ssd,
         nv_route_rnvpce_fragmented_batch_and_partial_rollback,
+        nv_route_rnvpce_same_group_migration_defers_until_completion,
         nv_route_rnvpce_round_budget_is_independent_of_global_in_flight,
         nv_route_rnvpce_capacity_wait_releases_inode_lock,
         nv_route_rnvpce_direct_partial_write_and_deferred_export,
@@ -34,6 +35,34 @@ fn ext4_research_routes() {
         nv_route_rnvpc_failed_allocation_flush_does_not_append_wal,
         nv_route_mount_rejects_switching_persistent_authority,
     );
+}
+
+fn nv_route_rnvpce_same_group_migration_defers_until_completion() {
+    crate::fs::rnvpc::init_for_ext4_tests();
+    crate::time::clocks::init_for_ktest();
+    let fixture = Ext4FixtureBuilder::new(2048, 256, 2048)
+        .with_block_bitmap_metadata_marked()
+        .with_uuid([0xc9; 16])
+        .with_mount_options("rnvpce=on,rtio=off")
+        .build()
+        .unwrap();
+    fixture.write_raw_inode(11, &make_empty_file_inode());
+    let inode = fixture.ext4.read_inode(11).unwrap();
+    inode
+        .write_at(
+            0,
+            &mut VmReader::from([0x4a; 2 * PAGE_SIZE].as_slice()).to_fallible(),
+        )
+        .unwrap();
+
+    assert_eq!(fixture.ext4.migrate_nv_round(1).unwrap(), 1);
+    assert_eq!(
+        fixture.ext4.migrate_nv_round(1).unwrap_err().error(),
+        Errno::EAGAIN
+    );
+    fixture.ext4.drain_nv_in_flight().unwrap();
+    assert_eq!(fixture.ext4.migrate_nv_round(1).unwrap(), 1);
+    fixture.ext4.drain_nv_in_flight().unwrap();
 }
 
 fn nv_route_rnvpce_sync_transfers_allocation_authority_to_ssd() {
