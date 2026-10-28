@@ -748,6 +748,17 @@ impl Ext4 {
         // authority back to SSD and release the resident bitmap chunks.
         let _migration = self.nv_migration_lock.lock();
         let cache = rnvpc::allocation_metadata::AllocationMetadataCache::new(pool.clone());
+        // Export may allocate native extent metadata after the last rTIO
+        // target publication. Refresh every resident group so the generation
+        // checkpointed below names the exact post-export allocation epoch.
+        let resident = cache.resident_groups(self.rnvpc_fs_id())?;
+        let resident_groups = resident
+            .iter()
+            .map(|group| usize::try_from(group.group).map_err(|_| Error::new(Errno::EOVERFLOW)))
+            .collect::<Result<BTreeSet<_>>>()?;
+        if !resident_groups.is_empty() {
+            self.persist_rnvpce_allocation_metadata(&resident_groups)?;
+        }
         let mut checkpointed = Vec::new();
         let nr_groups = self.super_block().nr_block_groups();
         for group_id in 0..nr_groups {
@@ -760,7 +771,6 @@ impl Ext4 {
             match self.mark_rnvpce_allocation_checkpoint_if_epoch(group, generation, mutation_epoch)
             {
                 Ok(()) => {}
-                Err(error) if error.error() == Errno::ESTALE => {}
                 Err(error) => return Err(error),
             }
         }

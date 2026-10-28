@@ -68,8 +68,14 @@ fn nv_route_rnvpce_sync_transfers_allocation_authority_to_ssd() {
     .unwrap()
     .unwrap()
     .ssd_block();
+    // Model an extent-export metadata allocation after rTIO published its
+    // target bitmap. sync must refresh the resident NVM generation instead of
+    // silently accepting the older mutation epoch.
+    let late_allocation = fixture.ext4.alloc_blocks(1, target + 1, None).unwrap();
+    let late_target = late_allocation.start;
     let bitmap_block = fixture.ext4.block_group(0).block_bitmap_bid_for_test();
     let bit = u16::try_from(target - fixture.ext4.block_group(0).first_block()).unwrap();
+    let late_bit = u16::try_from(late_target - fixture.ext4.block_group(0).first_block()).unwrap();
     let mut raw_bitmap = [0u8; BLOCK_SIZE];
     fixture
         .disk
@@ -77,6 +83,7 @@ fn nv_route_rnvpce_sync_transfers_allocation_authority_to_ssd() {
         .read_bytes(bitmap_block as usize * BLOCK_SIZE, &mut raw_bitmap)
         .unwrap();
     assert_eq!(raw_bitmap[bit as usize / 8] & (1 << (bit % 8)), 0);
+    assert_eq!(raw_bitmap[late_bit as usize / 8] & (1 << (late_bit % 8)), 0);
 
     fixture.ext4.sync_all().unwrap();
     assert!(
@@ -91,6 +98,7 @@ fn nv_route_rnvpce_sync_transfers_allocation_authority_to_ssd() {
         .read_bytes(bitmap_block as usize * BLOCK_SIZE, &mut raw_bitmap)
         .unwrap();
     assert_ne!(raw_bitmap[bit as usize / 8] & (1 << (bit % 8)), 0);
+    assert_ne!(raw_bitmap[late_bit as usize / 8] & (1 << (late_bit % 8)), 0);
 
     assert_eq!(
         fixture.ext4.super_block().free_blocks_count(),
