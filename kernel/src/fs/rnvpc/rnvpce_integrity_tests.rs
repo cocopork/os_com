@@ -97,30 +97,6 @@ fn rnvpce_allocation_bitmap_requires_two_matching_chunks() {
 }
 
 #[ktest]
-fn rnvpce_allocation_image_preserves_mutation_epoch() {
-    let bitmap = [0x3c; PAGE_SIZE];
-    let image = AllocationGroupImage::new_with_epoch(4, 37, bitmap, 73).unwrap();
-    let chunks = allocation_test_chunks(4, &image);
-    let directory = AllocationGroupDirectoryRecord::resident_dirty_with_chunks(
-        ALLOCATION_TEST_FS_ID,
-        ALLOCATION_TEST_GROUP,
-        4,
-        image.free_blocks(),
-        image.checksum(),
-        image.mutation_epoch(),
-        [
-            PersistentObjectRef::new(1, 1).unwrap(),
-            PersistentObjectRef::new(2, 1).unwrap(),
-        ],
-    )
-    .unwrap();
-
-    let selected = select_allocation_group_image(&directory, [&chunks[0], &chunks[1]]).unwrap();
-    assert_eq!(selected.mutation_epoch(), 37);
-    assert_eq!(selected, image);
-}
-
-#[ktest]
 fn rnvpce_allocation_directory_selects_only_complete_generation() {
     let old_image = allocation_test_image(8, 0x11, 113);
     let new_image = allocation_test_image(9, 0x22, 57);
@@ -214,7 +190,7 @@ fn rnvpce_allocation_cache_recovers_selected_image() {
 }
 
 #[ktest]
-fn rnvpce_allocation_checkpoint_releases_resident_image_by_generation() {
+fn rnvpce_allocation_authority_handoff_requires_exact_generation() {
     let config = RnvpcConfig::from_bytes(
         Some(32 * PAGE_SIZE),
         Some(16 * PAGE_SIZE),
@@ -239,7 +215,7 @@ fn rnvpce_allocation_checkpoint_releases_resident_image_by_generation() {
 
     assert_eq!(
         cache
-            .mark_checkpointed(
+            .finish_authority_handoff(
                 ALLOCATION_TEST_FS_ID + 1,
                 ALLOCATION_TEST_GROUP,
                 first.generation() + 1,
@@ -249,7 +225,7 @@ fn rnvpce_allocation_checkpoint_releases_resident_image_by_generation() {
         Errno::ESTALE
     );
     cache
-        .mark_checkpointed(
+        .finish_authority_handoff(
             ALLOCATION_TEST_FS_ID + 1,
             ALLOCATION_TEST_GROUP,
             first.generation(),
@@ -266,7 +242,6 @@ fn rnvpce_allocation_checkpoint_releases_resident_image_by_generation() {
         .publish_dirty_bitmap(
             ALLOCATION_TEST_FS_ID + 1,
             ALLOCATION_TEST_GROUP,
-            2,
             *first.bitmap(),
             first.free_blocks(),
         )

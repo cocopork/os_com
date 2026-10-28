@@ -23,7 +23,6 @@ pub(crate) enum AllocationGroupState {
     CleanOnSsd = 1,
     ResidentClean = 2,
     ResidentDirty = 3,
-    Checkpointing = 4,
 }
 
 impl AllocationGroupState {
@@ -32,7 +31,6 @@ impl AllocationGroupState {
             1 => Ok(Self::CleanOnSsd),
             2 => Ok(Self::ResidentClean),
             3 => Ok(Self::ResidentDirty),
-            4 => Ok(Self::Checkpointing),
             _ => return_errno_with_message!(Errno::EINVAL, "invalid allocation group state"),
         }
     }
@@ -50,10 +48,9 @@ pub(crate) struct AllocationGroupDirectoryRecord {
     state: u32,
     free_blocks: u32,
     bitmap_checksum: u32,
-    checkpoint_generation: u64,
-    mutation_epoch: u64,
+    ssd_durable_generation: u64,
     chunks: [PersistentObjectRef; 2],
-    reserved: [u8; 56],
+    reserved: [u8; 64],
 }
 
 impl AllocationGroupDirectoryRecord {
@@ -63,7 +60,6 @@ impl AllocationGroupDirectoryRecord {
         generation: u64,
         free_blocks: u32,
         bitmap_checksum: u32,
-        mutation_epoch: u64,
     ) -> Result<Self> {
         Self::new(
             fs_id,
@@ -73,7 +69,6 @@ impl AllocationGroupDirectoryRecord {
             free_blocks,
             bitmap_checksum,
             generation,
-            mutation_epoch,
             [PersistentObjectRef::NONE; 2],
         )
     }
@@ -94,7 +89,6 @@ impl AllocationGroupDirectoryRecord {
             free_blocks,
             bitmap_checksum,
             0,
-            0,
             [
                 PersistentObjectRef::new(1, 1)?,
                 PersistentObjectRef::new(2, 1)?,
@@ -108,7 +102,6 @@ impl AllocationGroupDirectoryRecord {
         generation: u64,
         free_blocks: u32,
         bitmap_checksum: u32,
-        mutation_epoch: u64,
         chunks: [PersistentObjectRef; 2],
     ) -> Result<Self> {
         if chunks.iter().any(PersistentObjectRef::is_none) {
@@ -122,7 +115,6 @@ impl AllocationGroupDirectoryRecord {
             free_blocks,
             bitmap_checksum,
             0,
-            mutation_epoch,
             chunks,
         )
     }
@@ -135,11 +127,10 @@ impl AllocationGroupDirectoryRecord {
         state: AllocationGroupState,
         free_blocks: u32,
         bitmap_checksum: u32,
-        checkpoint_generation: u64,
-        mutation_epoch: u64,
+        ssd_durable_generation: u64,
         chunks: [PersistentObjectRef; 2],
     ) -> Result<Self> {
-        if generation == 0 || checkpoint_generation > generation {
+        if generation == 0 || ssd_durable_generation > generation {
             return_errno_with_message!(Errno::EINVAL, "invalid allocation group generation");
         }
         let record = Self {
@@ -154,10 +145,9 @@ impl AllocationGroupDirectoryRecord {
             state: state as u32,
             free_blocks,
             bitmap_checksum,
-            checkpoint_generation,
-            mutation_epoch,
+            ssd_durable_generation,
             chunks,
-            reserved: [0; 56],
+            reserved: [0; 64],
         };
         record.validate()?;
         Ok(record)
@@ -170,7 +160,7 @@ impl AllocationGroupDirectoryRecord {
         )?;
         if self.header.inode() != 0
             || self.header.generation() == 0
-            || self.checkpoint_generation > self.header.generation()
+            || self.ssd_durable_generation > self.header.generation()
         {
             return_errno_with_message!(Errno::EINVAL, "invalid allocation group directory");
         }
@@ -213,12 +203,8 @@ impl AllocationGroupDirectoryRecord {
         self.bitmap_checksum
     }
 
-    pub(crate) const fn checkpoint_generation(&self) -> u64 {
-        self.checkpoint_generation
-    }
-
-    pub(crate) const fn mutation_epoch(&self) -> u64 {
-        self.mutation_epoch
+    pub(crate) const fn ssd_durable_generation(&self) -> u64 {
+        self.ssd_durable_generation
     }
 
     pub(crate) const fn chunks(&self) -> [PersistentObjectRef; 2] {
@@ -358,7 +344,6 @@ impl AuthoritativeMetadataRecord for AllocationBitmapChunkRecord {}
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct AllocationGroupImage {
     generation: u64,
-    mutation_epoch: u64,
     bitmap: [u8; PAGE_SIZE],
     free_blocks: u32,
     checksum: u32,
@@ -410,7 +395,6 @@ impl AllocationMetadataCache {
             image.generation(),
             image.free_blocks(),
             image.checksum(),
-            image.mutation_epoch(),
             chunk_refs,
         )?;
         self.pool
@@ -470,7 +454,6 @@ impl AllocationMetadataCache {
             image.generation(),
             image.free_blocks(),
             image.checksum(),
-            image.mutation_epoch(),
             chunk_refs,
         )?;
         let new_directory_ref =
@@ -537,7 +520,6 @@ impl AllocationMetadataCache {
         &self,
         fs_id: u64,
         group: u32,
-        mutation_epoch: u64,
         bitmap: [u8; PAGE_SIZE],
         free_blocks: u32,
     ) -> Result<u64> {
@@ -551,8 +533,7 @@ impl AllocationMetadataCache {
                 .checked_add(1)
                 .ok_or_else(|| Error::new(Errno::EOVERFLOW))
         })?;
-        let image =
-            AllocationGroupImage::new_with_epoch(generation, mutation_epoch, bitmap, free_blocks)?;
+        let image = AllocationGroupImage::new(generation, bitmap, free_blocks)?;
         if current.is_some() {
             self.publish_update(fs_id, group, &image, None)?;
         } else {
@@ -561,9 +542,14 @@ impl AllocationMetadataCache {
         Ok(generation)
     }
 
-    /// Transfers authority to an SSD checkpoint of exactly `generation` and
+    /// Transfers authority to an SSD writeback of exactly `generation` and
     /// then releases the no-longer-needed resident bitmap chunks.
-    pub(crate) fn mark_checkpointed(&self, fs_id: u64, group: u32, generation: u64) -> Result<()> {
+    pub(crate) fn finish_authority_handoff(
+        &self,
+        fs_id: u64,
+        group: u32,
+        generation: u64,
+    ) -> Result<()> {
         let key = allocation_metadata_key(fs_id, group, 0)?;
         let current_ref = self
             .pool
@@ -573,7 +559,7 @@ impl AllocationMetadataCache {
             .pool
             .read_authoritative_metadata::<AllocationGroupDirectoryRecord>(current_ref)?;
         if current.header().generation() != generation || !current.state()?.is_resident() {
-            return_errno_with_message!(Errno::ESTALE, "allocation checkpoint generation changed");
+            return_errno_with_message!(Errno::ESTALE, "allocation writeback generation changed");
         }
         let chunks = current.chunks();
         let clean = AllocationGroupDirectoryRecord::clean_on_ssd(
@@ -582,7 +568,6 @@ impl AllocationMetadataCache {
             generation,
             current.free_blocks(),
             current.bitmap_checksum(),
-            current.mutation_epoch(),
         )?;
         self.pool
             .replace_authoritative_metadata(current_ref, &clean, None)?;
@@ -622,22 +607,12 @@ impl AllocationMetadataCache {
 
 impl AllocationGroupImage {
     pub(crate) fn new(generation: u64, bitmap: [u8; PAGE_SIZE], free_blocks: u32) -> Result<Self> {
-        Self::new_with_epoch(generation, 0, bitmap, free_blocks)
-    }
-
-    pub(crate) fn new_with_epoch(
-        generation: u64,
-        mutation_epoch: u64,
-        bitmap: [u8; PAGE_SIZE],
-        free_blocks: u32,
-    ) -> Result<Self> {
         if generation == 0 {
             return_errno_with_message!(Errno::EINVAL, "allocation image generation is zero");
         }
         let checksum = allocation_bitmap_checksum(&bitmap);
         Ok(Self {
             generation,
-            mutation_epoch,
             bitmap,
             free_blocks,
             checksum,
@@ -650,10 +625,6 @@ impl AllocationGroupImage {
 
     pub(crate) const fn bitmap(&self) -> &[u8; PAGE_SIZE] {
         &self.bitmap
-    }
-
-    pub(crate) const fn mutation_epoch(&self) -> u64 {
-        self.mutation_epoch
     }
 
     pub(crate) const fn free_blocks(&self) -> u32 {
@@ -698,12 +669,7 @@ pub(crate) fn select_allocation_group_image(
         let start = chunk_index * ALLOCATION_BITMAP_CHUNK_BYTES;
         bitmap[start..start + ALLOCATION_BITMAP_CHUNK_BYTES].copy_from_slice(chunk.data());
     }
-    let image = AllocationGroupImage::new_with_epoch(
-        generation,
-        directory.mutation_epoch(),
-        bitmap,
-        directory.free_blocks(),
-    )?;
+    let image = AllocationGroupImage::new(generation, bitmap, directory.free_blocks())?;
     if image.checksum() != directory.bitmap_checksum() {
         return_errno_with_message!(Errno::EUCLEAN, "allocation bitmap checksum mismatch");
     }

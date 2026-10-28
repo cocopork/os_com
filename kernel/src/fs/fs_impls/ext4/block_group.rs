@@ -39,10 +39,7 @@
 //!   locking (read then promote to write on miss). Never held while syncing an
 //!   inode (see [`BlockGroup::sync_inodes`]).
 
-use core::{
-    fmt,
-    sync::atomic::{AtomicU64, Ordering},
-};
+use core::fmt;
 
 use super::{
     allocator::free_space::FreeSpaceIndex,
@@ -403,8 +400,7 @@ pub(super) struct BlockGroup {
     /// lock.
     metadata: RwMutex<BlockGroupMetadata>,
     /// Serializes pin snapshots against free bitmap-clear + pin publication.
-    allocation_gate: Mutex<()>,
-    allocation_epoch: AtomicU64,
+    allocation_gate: Mutex<AllocationWritebackState>,
     /// Backing block device (shared with `Ext4` and other groups).
     block_device: Arc<dyn BlockDevice>,
     /// Cached geometry: first filesystem-wide block number of this group.
@@ -442,6 +438,66 @@ pub(super) struct BlockGroup {
     inode_cache: RwMutex<BTreeMap<u16, Arc<Inode>>>,
 }
 
+/// DRAM-only serialization for one block group's allocation-metadata writeback.
+/// Persistent generation numbers continue to identify NVM directory versions.
+#[derive(Debug)]
+pub(super) struct AllocationWritebackState {
+    dirty: bool,
+    writeback: bool,
+}
+
+impl AllocationWritebackState {
+    const fn new_clean() -> Self {
+        Self {
+            dirty: false,
+            writeback: false,
+        }
+    }
+
+    #[cfg(ktest)]
+    const fn new_dirty() -> Self {
+        Self {
+            dirty: true,
+            writeback: false,
+        }
+    }
+
+    pub(super) const fn is_dirty(&self) -> bool {
+        self.dirty
+    }
+
+    pub(super) const fn is_writeback(&self) -> bool {
+        self.writeback
+    }
+
+    pub(super) fn mark_dirty(&mut self) {
+        self.dirty = true;
+    }
+
+    /// Arms one writeback and clears DIRTY so later mutations redirty it.
+    pub(super) fn begin(&mut self) -> bool {
+        if self.writeback {
+            return false;
+        }
+        self.dirty = false;
+        self.writeback = true;
+        true
+    }
+
+    /// Ends one writeback. True permits the NVM-to-SSD authority handoff.
+    pub(super) fn finish(&mut self) -> bool {
+        debug_assert!(self.writeback);
+        self.writeback = false;
+        !self.dirty
+    }
+
+    /// Preserves NVM authority when submission, I/O, or handoff fails.
+    pub(super) fn abort(&mut self) {
+        self.dirty = true;
+        self.writeback = false;
+    }
+}
+
 impl Debug for BlockGroup {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("BlockGroup")
@@ -451,46 +507,35 @@ impl Debug for BlockGroup {
 }
 
 impl BlockGroup {
-    pub(super) fn lock_allocation(&self) -> MutexGuard<'_, ()> {
+    pub(super) fn lock_allocation(&self) -> MutexGuard<'_, AllocationWritebackState> {
         self.allocation_gate.lock()
     }
 
-    /// Returns a complete NVM-checkpointable block-allocation image without I/O.
+    /// Returns a complete NVM-authoritative block-allocation image without I/O.
     pub(super) fn allocation_image(&self, generation: u64) -> Result<AllocationGroupImage> {
         let _allocation = self.allocation_gate.lock();
         let metadata = self.metadata.read();
         let mut bitmap = [0u8; BLOCK_SIZE];
         bitmap.copy_from_slice(metadata.block_bitmap.as_bytes());
-        AllocationGroupImage::new_with_epoch(
-            generation,
-            self.allocation_epoch.load(Ordering::Acquire),
-            bitmap,
-            metadata.desc.free_blocks_count(),
-        )
+        AllocationGroupImage::new(generation, bitmap, metadata.desc.free_blocks_count())
     }
 
     /// Snapshots the allocation fields and keeps allocation mutations excluded
     /// until the caller commits this exact image to NVM.
     pub(super) fn lock_allocation_bitmap_snapshot(
         &self,
-    ) -> (MutexGuard<'_, ()>, [u8; BLOCK_SIZE], u32, u64) {
+    ) -> (
+        MutexGuard<'_, AllocationWritebackState>,
+        [u8; BLOCK_SIZE],
+        u32,
+    ) {
         let allocation = self.allocation_gate.lock();
         let metadata = self.metadata.read();
         let mut bitmap = [0u8; BLOCK_SIZE];
         bitmap.copy_from_slice(metadata.block_bitmap.as_bytes());
-        let snapshot = (
-            bitmap,
-            metadata.desc.free_blocks_count(),
-            self.allocation_epoch.load(Ordering::Acquire),
-        );
+        let free_blocks = metadata.desc.free_blocks_count();
         drop(metadata);
-        (allocation, snapshot.0, snapshot.1, snapshot.2)
-    }
-
-    pub(super) fn lock_allocation_epoch(&self) -> (MutexGuard<'_, ()>, u64) {
-        let guard = self.allocation_gate.lock();
-        let epoch = self.allocation_epoch.load(Ordering::Acquire);
-        (guard, epoch)
+        (allocation, bitmap, free_blocks)
     }
 
     /// Installs an NVM-authoritative block bitmap without accessing the device.
@@ -509,7 +554,7 @@ impl BlockGroup {
             return_errno_with_message!(Errno::EUCLEAN, "NVM allocation count mismatches bitmap");
         }
 
-        let _allocation = self.allocation_gate.lock();
+        let mut allocation = self.allocation_gate.lock();
         let mut metadata = self.metadata.write();
         for bit in 0..capacity {
             if !bitmap.is_allocated(bit) {
@@ -528,8 +573,7 @@ impl BlockGroup {
         metadata.desc.free_blocks_count = image.free_blocks();
         metadata.desc.flags &= !BG_BLOCK_UNINIT;
         metadata.free_index = None;
-        self.allocation_epoch
-            .store(image.mutation_epoch(), Ordering::Release);
+        allocation.mark_dirty();
         Ok(())
     }
 
@@ -539,7 +583,7 @@ impl BlockGroup {
         if block < self.first_block || block > self.last_block {
             return_errno_with_message!(Errno::EINVAL, "recovered block belongs to another group");
         }
-        let _allocation = self.allocation_gate.lock();
+        let mut allocation = self.allocation_gate.lock();
         let mut metadata = self.metadata.write();
         let bit =
             u16::try_from(block - self.first_block).map_err(|_| Error::new(Errno::EOVERFLOW))?;
@@ -571,7 +615,7 @@ impl BlockGroup {
             changed = true;
         }
         if changed {
-            self.allocation_epoch.fetch_add(1, Ordering::AcqRel);
+            allocation.mark_dirty();
         }
         Ok(changed)
     }
@@ -624,8 +668,7 @@ impl BlockGroup {
 
         Ok(Self {
             group_idx,
-            allocation_gate: Mutex::new(()),
-            allocation_epoch: AtomicU64::new(0),
+            allocation_gate: Mutex::new(AllocationWritebackState::new_clean()),
             metadata: RwMutex::new(BlockGroupMetadata {
                 desc: Dirty::new(desc),
                 block_bitmap: Dirty::new(block_bitmap),
@@ -1137,7 +1180,6 @@ impl BlockGroup {
 
         let range_start_block = self.first_block + range.start as Ext4Bid;
         let range_end_block = self.first_block + range.end as Ext4Bid;
-        self.allocation_epoch.fetch_add(1, Ordering::AcqRel);
         Ok(GroupBlockAlloc::Allocated(
             range_start_block..range_end_block,
         ))
@@ -1232,9 +1274,6 @@ impl BlockGroup {
             self.stamp_desc_csum_in_block(buf, &metadata);
         })?;
 
-        if actually_freed != 0 {
-            self.allocation_epoch.fetch_add(1, Ordering::AcqRel);
-        }
         Ok(actually_freed)
     }
 
@@ -1620,6 +1659,32 @@ mod tests {
     use super::{super::test_utils::Ext4MemoryDisk, *};
 
     #[ktest]
+    fn ext4_allocation_writeback_state() {
+        let mut state = AllocationWritebackState::new_dirty();
+        assert!(state.is_dirty());
+        assert!(state.begin());
+        assert!(!state.is_dirty());
+        assert!(state.is_writeback());
+        assert!(!state.begin(), "one group permits only one writeback");
+
+        state.mark_dirty();
+        assert!(
+            !state.finish(),
+            "redirtied metadata remains NVM-authoritative"
+        );
+        assert!(state.is_dirty());
+        assert!(!state.is_writeback());
+
+        assert!(state.begin());
+        assert!(
+            state.finish(),
+            "an unmodified writeback may hand authority to SSD"
+        );
+        assert!(!state.is_dirty());
+        assert!(!state.is_writeback());
+    }
+
+    #[ktest]
     fn ext4_block_group_uninitialized_bitmap() {
         crate::fs::fs_impls::ext4::test_utils::scenarios!(
             block_uninit_reconstructs_prefix_bitmap,
@@ -1909,8 +1974,7 @@ mod tests {
         let bg = BlockGroup {
             group_idx,
             metadata: RwMutex::new(metadata),
-            allocation_gate: Mutex::new(()),
-            allocation_epoch: AtomicU64::new(0),
+            allocation_gate: Mutex::new(AllocationWritebackState::new_clean()),
             block_device,
             first_block: 0,
             last_block: 32767,

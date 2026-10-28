@@ -9,7 +9,7 @@ Status: Approved for Native implementation.
 rNVPCe migration must not synchronously read or write SSD allocation metadata.
 The NVDIMM pool is authoritative for block allocation state while rNVPCe is
 active. SSD block bitmaps, group descriptors, and the superblock free-block
-counter are asynchronous checkpoint images, not migration dependencies.
+counter are asynchronous writeback images, not migration dependencies.
 
 This design removes `sync_rnvpce_allocation_metadata()` from the migration hot
 path. A bounded NVM allocation-metadata cache stores the authoritative state of
@@ -46,21 +46,35 @@ has admitted. The entry has one of these states:
   ready for allocation.
 - `ResidentDirty(generation, slots)`: the NVM image is newer and is the only
   authoritative allocation state.
-- `Checkpointing(generation, slots)`: an immutable SSD after-image is in flight;
-  the NVM image remains authoritative and may receive a newer generation.
 - `Loading(generation)`: an SSD image is being copied into NVM; it cannot serve
   allocation until NVM publication completes.
 
 Only the persistent transitions `CleanOnSsd -> ResidentClean`,
-`ResidentClean -> ResidentDirty`, and `ResidentDirty/Checkpointing ->
-CleanOnSsd` affect recovery authority. `Loading` and the I/O request state are
-DRAM-only. After a crash, an incomplete load remains `CleanOnSsd`; an incomplete
-checkpoint remains resident and authoritative.
+`ResidentClean -> ResidentDirty`, and `ResidentDirty -> CleanOnSsd` affect
+recovery authority. `Loading` and allocation-metadata I/O state are DRAM-only.
+After a crash, an incomplete load remains `CleanOnSsd`; an incomplete writeback
+remains resident and authoritative.
+
+Each block group has two DRAM state bits. `DIRTY` means its allocation metadata
+is newer than the SSD image. `WRITEBACK` means one allocation-metadata writeback
+is in flight. Starting writeback atomically clears `DIRTY` and sets `WRITEBACK`
+under the group allocation lock. Any allocation or free during I/O sets `DIRTY`
+again. Completion may transfer authority only when `DIRTY=0`; otherwise it
+clears `WRITEBACK`, keeps NVM authoritative, and queues another writeback.
+
+Persistent `generation` is not a mutation counter. It selects a complete NVM
+directory/chunk version and prevents an old completion from releasing a newer
+object graph. There is no persistent or incrementing `mutation_epoch`.
+
+Each block group also has at most one data-migration owner. A second data batch
+or allocation-metadata writeback for the same group is deferred. Disjoint groups
+may proceed independently. Foreground allocation remains allowed during
+metadata writeback and only sets `DIRTY`; no group lock spans SSD I/O.
 
 An eviction is valid only in this order:
 
 ```text
-freeze snapshot generation G in NVM
+publish snapshot generation G in NVM and set WRITEBACK
   -> asynchronously submit bitmap and GDT after-images
   -> wait for both completions outside allocation locks
   -> issue and complete one device flush
@@ -68,15 +82,16 @@ freeze snapshot generation G in NVM
   -> release the NVM bitmap slots
 ```
 
-If the resident image changes to generation `G+1` while `G` is in flight, the
-completion cannot evict it. The completed checkpoint remains useful, but the
-directory stays `ResidentDirty(G+1)`.
+If an allocation or free sets `DIRTY` while generation `G` is in flight, the
+completion cannot evict it. The completed SSD write remains useful, but the NVM
+directory stays resident and authoritative. A later writeback publishes the
+current bitmap as a newer generation.
 
 ## 4. Persistent Representation
 
 Each admitted group has a small `AllocationGroupDirectoryRecord`. It identifies
 the filesystem, group number, generation, authority state, bitmap chunk
-references, bitmap checksum, free-block count, and SSD checkpoint generation.
+references, bitmap checksum, free-block count, and SSD-durable generation.
 The directory record remains in NVM even when the bitmap is evicted.
 
 A 4 KiB EXT4 bitmap cannot share one page with the persistent metadata header.
@@ -128,14 +143,14 @@ pages.
 Allocation prefers resident groups with sufficient free space. The pager
 selects full groups first for eviction because rTIO cannot allocate from them.
 It then considers clean least-recently-used groups. A dirty group requires the
-checkpoint protocol before its chunks can be released.
+writeback protocol before its chunks can be released.
 
 When no suitable group is resident, `prepare_nv_targets` does not synchronously
 read SSD metadata. It queues a load request, releases migration/allocation
 locks, and ends the current migration round without assigning those targets.
 The pager constructs the resident image from the current DRAM group image in a
 normal boot; after recovery, the DRAM image is first loaded from the SSD
-checkpoint and then overlaid by every NVM-authoritative resident group.
+writeback and then overlaid by every NVM-authoritative resident group.
 
 The pager maintains a low watermark of free metadata slots so ordinary
 migration normally finds capacity without waiting. Permanent pager or device
@@ -156,8 +171,9 @@ is no per-migration SSD bitmap/GDT BIO because allocation durability is already
 provided by NVM. The completion worker issues one device flush for the data
 batch, publishes the SSD baseline in NVM, and reclaims NVPages.
 
-Metadata pager BIOs are also asynchronous. They may be submitted concurrently
-with data BIOs, but their own checkpoint state advances only after their
+Metadata pager BIOs are also asynchronous. Data and metadata I/O may proceed
+concurrently for different block groups, but one group has only one migration
+or allocation-metadata writeback owner. Writeback state advances only after its
 registered requests and a device flush complete. Sharing one physical flush is
 an optional optimization; correctness does not depend on it.
 
@@ -176,7 +192,7 @@ remains in completion, not in flush/target preparation.
 Mount recovery first reconstructs the rNVPC pool and validates its filesystem
 binding. Before enabling allocation or migration it then:
 
-1. loads the SSD superblock, GDT, and block bitmaps as checkpoint images;
+1. loads the SSD superblock, GDT, and block bitmaps as writeback images;
 2. scans allocation-group directory records;
 3. for every resident authoritative group, validates both selected bitmap
    chunks and overlays the SSD-derived DRAM bitmap;
@@ -192,9 +208,9 @@ silently accept the older SSD bitmap. Repeating recovery is idempotent.
 
 ## 9. Explicit Sync and Native Mountability
 
-An explicit sync or clean unmount drains data migration, checkpoints every
-dirty allocation group, exports native extents/inodes, and performs the final
-device flush. Only then can the SSD EXT4 image be mounted without NVM.
+An explicit sync or clean unmount drains data migration, exports native
+extents/inodes, writes back every dirty allocation group, and performs the
+final device flush. Only then can the SSD EXT4 image be mounted without NVM.
 
 After an unclean shutdown, native EXT4 and ordinary e2fsck do not understand the
 NVM authority directory and must not mount or repair the device before rNVPCe
@@ -203,7 +219,7 @@ recovery. The existing research-mode binding/check remains mandatory.
 ## 10. Verification
 
 Correctness tests cover crashes after every persistent transition, bitmap chunk
-selector failure, stale checkpoint completion, cache-full eviction, repeated
+selector failure, stale writeback completion, cache-full eviction, repeated
 recovery, pending-target protection, and I/O failure. A call-graph regression
 test asserts that target preparation and flush contain zero synchronous block
 I/O operations.

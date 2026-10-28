@@ -238,6 +238,7 @@ pub struct Ext4 {
     rnvpc_mode: RnvpcModeConfig,
     pub(super) cache_pressure: Arc<super::writeback::CachePressure>,
     pub(super) nv_migration_lock: Mutex<()>,
+    pub(super) nv_migration_groups: Mutex<super::migration::MigrationGroupOwners>,
     pub(super) nv_migration_trigger: Arc<ostd::sync::WaitQueue>,
     pub(super) nv_migration_epoch: AtomicUsize,
     pub(super) nv_capacity_waiters: AtomicUsize,
@@ -353,7 +354,7 @@ impl Ext4 {
         Ok(())
     }
 
-    /// Overlays SSD checkpoint bitmaps with NVM-authoritative allocation images.
+    /// Overlays SSD writeback images with NVM-authoritative allocation images.
     fn restore_rnvpce_allocation_metadata(&self) -> Result<()> {
         let pool = crate::fs::rnvpc::pool().ok_or_else(|| Error::new(Errno::EINVAL))?;
         let cache =
@@ -429,6 +430,7 @@ impl Ext4 {
             rnvpc_mode,
             cache_pressure: super::writeback::CachePressure::new(),
             nv_migration_lock: Mutex::new(()),
+            nv_migration_groups: Mutex::new(Default::default()),
             nv_migration_trigger: Arc::new(ostd::sync::WaitQueue::new()),
             nv_migration_epoch: AtomicUsize::new(0),
             nv_capacity_waiters: AtomicUsize::new(0),
@@ -1494,7 +1496,7 @@ impl Ext4 {
 
                 allocation_metrics::GROUP_VISITS.record(1);
                 let waiting = allocation_metrics::Span::new(&allocation_metrics::GROUP_WAIT);
-                let gate = group.lock_allocation();
+                let mut gate = group.lock_allocation();
                 drop(waiting);
                 let holding = allocation_metrics::Span::new(&allocation_metrics::GROUP_HOLD);
                 let pinned_frees = journal
@@ -1502,6 +1504,9 @@ impl Ext4 {
                     .map_or_else(Vec::new, |journal| journal.pinned_frees_snapshot());
                 let allocated =
                     group.alloc_blocks(count, count as u64, &pinned_frees, policy, handle);
+                if matches!(allocated, Ok(GroupBlockAlloc::Allocated(_))) {
+                    gate.mark_dirty();
+                }
                 drop(gate);
                 drop(holding);
                 let allocated = match allocated {
@@ -1683,7 +1688,7 @@ impl Ext4 {
             // non-journaled volume. A discharge `Err` still propagates
             // plainly: `discharge` can only fail before any of its effects
             // run, so nothing needs unwinding.
-            let gate = group.lock_allocation();
+            let mut gate = group.lock_allocation();
             if let (Some(handle), Some(duty)) = (handle, duty.as_ref()) {
                 duty.discharge(handle, current_block, blocks_in_group)?;
             }
@@ -1705,6 +1710,9 @@ impl Ext4 {
             let run_result = (|| -> Result<u32> {
                 let freed_count = group
                     .free_blocks(group_start_bit..(group_start_bit + blocks_in_group), handle)?;
+                if freed_count != 0 {
+                    gate.mark_dirty();
+                }
                 // Pin the freed run until this transaction commits (released
                 // at commit step 6). The bits are already clear, but no
                 // allocator can observe the gap: it needs the same group's
@@ -2350,24 +2358,22 @@ impl Ext4 {
                 .block_groups
                 .get(group)
                 .ok_or_else(|| Error::new(Errno::EINVAL))?;
-            let (_allocation, bitmap, free_blocks, mutation_epoch) =
-                block_group.lock_allocation_bitmap_snapshot();
+            let (_allocation, bitmap, free_blocks) = block_group.lock_allocation_bitmap_snapshot();
             cache.publish_dirty_bitmap(
                 self.rnvpc_fs_id,
                 u32::try_from(group).map_err(|_| Error::new(Errno::EOVERFLOW))?,
-                mutation_epoch,
                 bitmap,
                 free_blocks,
             )?;
         }
-        self.request_allocation_checkpoint();
+        self.request_allocation_writeback();
         Ok(())
     }
 
-    /// Checkpoints one exact allocation generation from the pager context.
+    /// Writes one exact allocation generation back from the pager context.
     /// NVM remains authoritative until all SSD writes and the device flush
     /// complete; only then are its bitmap chunks released.
-    pub(super) fn checkpoint_rnvpce_allocation_group(
+    pub(super) fn writeback_rnvpce_allocation_group(
         &self,
         group: u32,
         generation: u64,
@@ -2376,57 +2382,74 @@ impl Ext4 {
         let pool = crate::fs::rnvpc::pool().ok_or_else(|| Error::new(Errno::EINVAL))?;
         let cache =
             crate::fs::rnvpc::allocation_metadata::AllocationMetadataCache::new(pool.clone());
-        let mut selected = cache
+        let selected = cache
             .selected_image(self.rnvpc_fs_id, group)?
             .ok_or_else(|| Error::new(Errno::ESTALE))?;
         if selected.generation() != generation {
-            return_errno_with_message!(Errno::ESTALE, "allocation checkpoint generation changed");
+            return_errno_with_message!(Errno::ESTALE, "allocation writeback generation changed");
         }
         let block_group = self
             .block_groups
             .get(usize::try_from(group).map_err(|_| Error::new(Errno::EOVERFLOW))?)
             .ok_or_else(|| Error::new(Errno::EINVAL))?;
-        let (guard, epoch) = block_group.lock_allocation_epoch();
-        drop(guard);
-        if epoch != selected.mutation_epoch() {
-            let mut groups = BTreeSet::new();
-            groups.insert(usize::try_from(group).map_err(|_| Error::new(Errno::EOVERFLOW))?);
-            self.persist_rnvpce_allocation_metadata(&groups)?;
-            selected = cache
-                .selected_image(self.rnvpc_fs_id, group)?
-                .ok_or_else(|| Error::new(Errno::ESTALE))?;
+        if self
+            .nv_migration_groups
+            .lock()
+            .contains(usize::try_from(group).map_err(|_| Error::new(Errno::EOVERFLOW))?)
+        {
+            return_errno_with_message!(
+                Errno::EBUSY,
+                "allocation group has an active data migration"
+            );
         }
-        block_group.sync_metadata()?;
-        self.sync_superblock_metadata()?;
-        if self.block_device.sync()? != BioStatus::Complete {
-            return_errno_with_message!(Errno::EIO, "allocation checkpoint flush failed");
+        let (mut state, bitmap, free_blocks) = block_group.lock_allocation_bitmap_snapshot();
+        if !state.begin() {
+            return_errno_with_message!(
+                Errno::EBUSY,
+                "allocation group writeback is already active"
+            );
         }
-        let (_guard, current_epoch) = block_group.lock_allocation_epoch();
-        if current_epoch != selected.mutation_epoch() {
-            return_errno_with_message!(Errno::ESTALE, "allocation changed during checkpoint");
-        }
-        cache.mark_checkpointed(self.rnvpc_fs_id, group, selected.generation())
-    }
+        let writeback_generation =
+            match cache.publish_dirty_bitmap(self.rnvpc_fs_id, group, bitmap, free_blocks) {
+                Ok(generation) => generation,
+                Err(error) => {
+                    state.abort();
+                    return Err(error);
+                }
+            };
+        drop(state);
 
-    /// Transfers allocation authority only if the SSD checkpoint still
-    /// represents the exact in-memory allocation epoch that was submitted.
-    pub(super) fn mark_rnvpce_allocation_checkpoint_if_epoch(
-        &self,
-        group: u32,
-        generation: u64,
-        mutation_epoch: u64,
-    ) -> Result<()> {
-        let block_group = self
-            .block_groups
-            .get(usize::try_from(group).map_err(|_| Error::new(Errno::EOVERFLOW))?)
-            .ok_or_else(|| Error::new(Errno::EINVAL))?;
-        let (_guard, current_epoch) = block_group.lock_allocation_epoch();
-        if current_epoch != mutation_epoch {
-            return_errno_with_message!(Errno::ESTALE, "allocation changed during checkpoint");
+        let write_result = (|| {
+            block_group.sync_metadata()?;
+            self.sync_superblock_metadata()?;
+            if self.block_device.sync()? != BioStatus::Complete {
+                return_errno_with_message!(
+                    Errno::EIO,
+                    "allocation metadata writeback flush failed"
+                );
+            }
+            Ok(())
+        })();
+        if let Err(error) = write_result {
+            block_group.lock_allocation().abort();
+            return Err(error);
         }
-        let pool = crate::fs::rnvpc::pool().ok_or_else(|| Error::new(Errno::EINVAL))?;
-        crate::fs::rnvpc::allocation_metadata::AllocationMetadataCache::new(pool.clone())
-            .mark_checkpointed(self.rnvpc_fs_id, group, generation)
+
+        let mut state = block_group.lock_allocation();
+        if state.is_dirty() {
+            debug_assert!(!state.finish());
+            drop(state);
+            self.request_allocation_writeback();
+            return_errno_with_message!(Errno::ESTALE, "allocation changed during writeback");
+        }
+        if let Err(error) =
+            cache.finish_authority_handoff(self.rnvpc_fs_id, group, writeback_generation)
+        {
+            state.abort();
+            return Err(error);
+        }
+        debug_assert!(state.finish());
+        Ok(())
     }
 
     fn sync_superblock_metadata(&self) -> Result<()> {

@@ -15,11 +15,16 @@ pub(crate) struct MigrationBatch {
     page_count: usize,
     created_at_ns: u64,
     ready_at_ns: AtomicU64,
+    migration_groups: BTreeSet<usize>,
     jobs: SpinLock<Vec<CompletionJob>, LocalIrqDisabled>,
 }
 
 impl MigrationBatch {
-    pub(super) fn new(data_requests: usize, page_count: usize) -> Arc<Self> {
+    pub(super) fn new(
+        data_requests: usize,
+        page_count: usize,
+        migration_groups: BTreeSet<usize>,
+    ) -> Arc<Self> {
         debug_assert!(data_requests != 0);
         Arc::new(Self {
             remaining_data: AtomicUsize::new(data_requests),
@@ -27,12 +32,17 @@ impl MigrationBatch {
             page_count,
             created_at_ns: pp::now(),
             ready_at_ns: AtomicU64::new(0),
+            migration_groups,
             jobs: SpinLock::new(Vec::with_capacity(data_requests)),
         })
     }
 
     pub(super) const fn page_count(&self) -> usize {
         self.page_count
+    }
+
+    pub(super) const fn migration_groups(&self) -> &BTreeSet<usize> {
+        &self.migration_groups
     }
 
     pub(super) fn completion_started(&self) -> u64 {
@@ -92,7 +102,7 @@ mod tests {
     fn orderless_batch_waits_for_all_data_once() {
         let trigger = ostd::sync::WaitQueue::new();
         let completed = queue();
-        let batch = MigrationBatch::new(1, 7);
+        let batch = MigrationBatch::new(1, 7, BTreeSet::new());
         batch.complete_data(
             CompletionJob {
                 status: BioStatus::Complete,
