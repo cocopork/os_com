@@ -8,6 +8,10 @@ use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use ostd::prelude::ktest;
 
 use super::{
+    allocation_metadata::{
+        ALLOCATION_BITMAP_CHUNK_BYTES, AllocationBitmapChunkRecord, AllocationGroupDirectoryRecord,
+        AllocationGroupImage, select_allocation_group_image,
+    },
     backend::NvMemoryBackend,
     config::{NvSimMode, RnvpcConfig},
     data_page::DataPageState,
@@ -33,6 +37,126 @@ use super::{
     },
 };
 use crate::prelude::*;
+
+const ALLOCATION_TEST_FS_ID: u64 = 0xa110_ca7e;
+const ALLOCATION_TEST_GROUP: u32 = 7;
+
+fn allocation_test_image(generation: u64, fill: u8, free_blocks: u32) -> AllocationGroupImage {
+    let mut bitmap = [0u8; PAGE_SIZE];
+    bitmap.fill(fill);
+    AllocationGroupImage::new(generation, bitmap, free_blocks).unwrap()
+}
+
+fn allocation_test_chunks(
+    generation: u64,
+    image: &AllocationGroupImage,
+) -> [AllocationBitmapChunkRecord; 2] {
+    [
+        AllocationBitmapChunkRecord::new(
+            ALLOCATION_TEST_FS_ID,
+            ALLOCATION_TEST_GROUP,
+            generation,
+            0,
+            &image.bitmap()[..ALLOCATION_BITMAP_CHUNK_BYTES],
+        )
+        .unwrap(),
+        AllocationBitmapChunkRecord::new(
+            ALLOCATION_TEST_FS_ID,
+            ALLOCATION_TEST_GROUP,
+            generation,
+            1,
+            &image.bitmap()[ALLOCATION_BITMAP_CHUNK_BYTES..],
+        )
+        .unwrap(),
+    ]
+}
+
+#[ktest]
+fn rnvpce_allocation_bitmap_requires_two_matching_chunks() {
+    let image = allocation_test_image(3, 0x5a, 91);
+    let chunks = allocation_test_chunks(3, &image);
+    let directory = AllocationGroupDirectoryRecord::resident_dirty(
+        ALLOCATION_TEST_FS_ID,
+        ALLOCATION_TEST_GROUP,
+        3,
+        image.free_blocks(),
+        image.checksum(),
+    )
+    .unwrap();
+
+    let selected = select_allocation_group_image(&directory, [&chunks[0], &chunks[1]]).unwrap();
+    assert_eq!(selected, image);
+
+    let mismatched = allocation_test_chunks(4, &image);
+    assert_eq!(
+        select_allocation_group_image(&directory, [&chunks[0], &mismatched[1]])
+            .unwrap_err()
+            .error(),
+        Errno::EUCLEAN
+    );
+}
+
+#[ktest]
+fn rnvpce_allocation_directory_selects_only_complete_generation() {
+    let old_image = allocation_test_image(8, 0x11, 113);
+    let new_image = allocation_test_image(9, 0x22, 57);
+    let old_chunks = allocation_test_chunks(8, &old_image);
+    let _unreachable_new_chunks = allocation_test_chunks(9, &new_image);
+    let old_directory = AllocationGroupDirectoryRecord::resident_dirty(
+        ALLOCATION_TEST_FS_ID,
+        ALLOCATION_TEST_GROUP,
+        8,
+        old_image.free_blocks(),
+        old_image.checksum(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        select_allocation_group_image(&old_directory, [&old_chunks[0], &old_chunks[1]]).unwrap(),
+        old_image
+    );
+}
+
+#[ktest]
+fn rnvpce_allocation_update_crash_keeps_old_generation() {
+    let old_image = allocation_test_image(12, 0x33, 100);
+    let old_chunks = allocation_test_chunks(12, &old_image);
+    let directory = AllocationGroupDirectoryRecord::resident_dirty(
+        ALLOCATION_TEST_FS_ID,
+        ALLOCATION_TEST_GROUP,
+        12,
+        old_image.free_blocks(),
+        old_image.checksum(),
+    )
+    .unwrap();
+
+    let recovered =
+        select_allocation_group_image(&directory, [&old_chunks[0], &old_chunks[1]]).unwrap();
+    assert_eq!(recovered.generation(), 12);
+    assert_eq!(recovered, old_image);
+}
+
+#[ktest]
+fn rnvpce_allocation_directory_rejects_corrupt_selected_chunk() {
+    let image = allocation_test_image(21, 0x7e, 31);
+    let mut chunks = allocation_test_chunks(21, &image);
+    chunks[1].corrupt_payload_for_test(0);
+    let directory = AllocationGroupDirectoryRecord::resident_dirty(
+        ALLOCATION_TEST_FS_ID,
+        ALLOCATION_TEST_GROUP,
+        21,
+        image.free_blocks(),
+        image.checksum(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        select_allocation_group_image(&directory, [&chunks[0], &chunks[1]])
+            .unwrap_err()
+            .error(),
+        Errno::EUCLEAN
+    );
+}
 
 fn test_pool(
     total_pages: usize,

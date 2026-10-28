@@ -20,6 +20,8 @@ pub(crate) enum PersistentMetadataKind {
     /// Transitional kind used only by pre-rNVPCe batch helpers. New writes
     /// must use `SpaceReservation` and choose SSD blocks during migration.
     Allocation = 7,
+    AllocationGroupDirectory = 8,
+    AllocationBitmapChunk = 9,
 }
 
 impl PersistentMetadataKind {
@@ -30,6 +32,8 @@ impl PersistentMetadataKind {
             5 => Ok(Self::Inode),
             6 => Ok(Self::PendingExtentMutation),
             7 => Ok(Self::Allocation),
+            8 => Ok(Self::AllocationGroupDirectory),
+            9 => Ok(Self::AllocationBitmapChunk),
             _ => return_errno_with_message!(Errno::EINVAL, "unknown persistent metadata kind"),
         }
     }
@@ -57,7 +61,7 @@ const _: () = {
 };
 
 impl PersistentMetadataHeader {
-    fn new(
+    pub(super) fn new(
         kind: PersistentMetadataKind,
         payload_len: usize,
         fs_id: u64,
@@ -110,7 +114,7 @@ impl PersistentMetadataHeader {
         self.generation
     }
 
-    fn validate(
+    pub(super) fn validate(
         &self,
         expected_kind: PersistentMetadataKind,
         expected_payload_len: usize,

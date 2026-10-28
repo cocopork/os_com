@@ -9,6 +9,7 @@
 
 use spin::Once;
 
+pub(crate) mod allocation_metadata;
 pub(crate) mod backend;
 pub(crate) mod baseline_generation;
 pub(crate) mod batch_metrics;
