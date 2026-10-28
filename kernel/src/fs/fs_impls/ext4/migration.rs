@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: MPL-2.0
 
 //! Two-worker, bounded asynchronous NV migration. BIO callbacks enqueue only;
-//! process-context completion owns durability, publication and reclamation.
-use core::sync::atomic::Ordering;
+//! process-context completion owns durability and publishes reclaim tickets;
+//! foreground or background helpers own SSD publication and NVPage reclamation.
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 use aster_block::bio::BioDirection;
 use ostd::sync::LocalIrqDisabled;
@@ -22,8 +23,10 @@ use crate::fs::rnvpc::{
 };
 
 mod batch;
+mod reclaim;
 
 use batch::MigrationBatch;
+use reclaim::ReclaimReadyQueue;
 
 const MIGRATION_BATCH_PAGES: usize = super::writeback::WRITEBACK_BATCH;
 pub(super) type CompletionQueue = Arc<SpinLock<VecDeque<Arc<MigrationBatch>>, LocalIrqDisabled>>;
@@ -82,6 +85,47 @@ pub(super) struct CompletionJob {
     status: BioStatus,
     pages: Vec<PendingPage>,
 }
+pub(super) type ReclaimQueue = Arc<ReclaimReadyQueue<ReclaimTicket>>;
+
+pub(super) fn reclaim_queue() -> ReclaimQueue {
+    Arc::new(ReclaimReadyQueue::new())
+}
+
+#[cfg(ktest)]
+pub(super) fn assert_reclaim_queue_contract() {
+    reclaim::assert_queue_contract();
+}
+
+pub(super) struct ReclaimTicket {
+    pages: Vec<PendingPage>,
+    batch: Arc<ReclaimBatch>,
+    ready_at_ns: u64,
+}
+
+struct ReclaimBatch {
+    remaining_tickets: AtomicUsize,
+    migration_groups: BTreeSet<usize>,
+}
+
+impl ReclaimBatch {
+    fn new(tickets: usize, migration_groups: BTreeSet<usize>) -> Arc<Self> {
+        debug_assert!(tickets != 0);
+        Arc::new(Self {
+            remaining_tickets: AtomicUsize::new(tickets),
+            migration_groups,
+        })
+    }
+
+    fn complete_ticket(&self, fs: &Ext4) {
+        if self.remaining_tickets.fetch_sub(1, Ordering::AcqRel) == 1 {
+            fs.nv_migration_groups
+                .lock()
+                .release(&self.migration_groups);
+            fs.request_nv_migration();
+        }
+    }
+}
+
 struct PendingPage {
     inode: u64,
     index: u64,
@@ -156,6 +200,41 @@ impl Ext4 {
                     },
                     &Duration::from_millis(10),
                 );
+            }
+        })
+        .spawn();
+        let weak = Arc::downgrade(self);
+        let trigger = self.nv_reclaim_trigger.clone();
+        crate::thread::kernel_thread::ThreadOptions::new(move || {
+            loop {
+                let Some(fs) = weak.upgrade() else {
+                    break;
+                };
+                if fs.nv_reclaim_queue.ready_units() != 0
+                    && fs.nv_capacity_waiters.load(Ordering::Acquire) <= 1
+                {
+                    if let Err(error) = fs.help_nv_reclaim(MIGRATION_BATCH_PAGES) {
+                        error!("NV parallel reclaim failed: {error:?}");
+                    }
+                    continue;
+                }
+                if (fs.is_shutdown() || fs.nv_migration_failed.load(Ordering::Acquire))
+                    && fs.nv_reclaim_pending.load(Ordering::Acquire) == 0
+                {
+                    break;
+                }
+                drop(fs);
+                let _ = trigger.wait_until(|| {
+                    weak.upgrade()
+                        .is_none_or(|fs| {
+                            (fs.nv_reclaim_queue.ready_units() != 0
+                                && fs.nv_capacity_waiters.load(Ordering::Acquire) <= 1)
+                                || ((fs.is_shutdown()
+                                    || fs.nv_migration_failed.load(Ordering::Acquire))
+                                    && fs.nv_reclaim_pending.load(Ordering::Acquire) == 0)
+                        })
+                        .then_some(())
+                });
             }
         })
         .spawn();
@@ -255,6 +334,7 @@ impl Ext4 {
             pool.wake_data_capacity_waiters();
         }
         self.nv_completion_trigger.wake_all();
+        self.nv_reclaim_trigger.wake_all();
     }
 
     fn fail_nv_migration(&self) {
@@ -275,15 +355,36 @@ impl Ext4 {
             return_errno_with_message!(Errno::EAGAIN, "NV migration is disabled");
         }
         self.nv_capacity_waiters.fetch_add(1, Ordering::AcqRel);
-        self.request_nv_migration();
         let wait_started = pp::now();
-        if let Some(pool) = rnvpc::pool() {
-            pool.wait_for_data_capacity(pages, || {
-                self.is_shutdown() || self.nv_migration_failed.load(Ordering::Acquire)
-            });
-        }
+        let result: Result<()> = (|| {
+            let pool = rnvpc::pool().ok_or_else(|| Error::new(Errno::EINVAL))?;
+            loop {
+                if pool.can_reserve_data_pages(pages) {
+                    break;
+                }
+                if self.nv_capacity_waiters.load(Ordering::Acquire) > 1
+                    && self.help_nv_reclaim(pages.max(1))? != 0
+                {
+                    continue;
+                }
+                self.request_nv_migration();
+                pool.wait_for_data_capacity_or(
+                    pages,
+                    || self.is_shutdown() || self.nv_migration_failed.load(Ordering::Acquire),
+                    || self.nv_reclaim_queue.ready_units() != 0,
+                );
+                if self.is_shutdown() || self.nv_migration_failed.load(Ordering::Acquire) {
+                    break;
+                }
+            }
+            Ok(())
+        })();
         pp::NV_CAPACITY_WAIT.record_since(wait_started, pages);
         self.nv_capacity_waiters.fetch_sub(1, Ordering::AcqRel);
+        if self.nv_reclaim_queue.ready_units() != 0 {
+            self.nv_reclaim_trigger.wake_one();
+        }
+        result?;
         if self.is_shutdown() || self.nv_migration_failed.load(Ordering::Acquire) {
             return_errno_with_message!(Errno::EIO, "NV migration cannot reclaim capacity");
         }
@@ -650,22 +751,25 @@ impl Ext4 {
         let mut failure = None;
         while let Some(batch) = drained.pop_front() {
             let groups = batch.migration_groups().clone();
-            if let Err(error) = self.finish_nv_completion_batch(batch) {
-                failure = Some(error);
+            match self.finish_nv_completion_batch(batch) {
+                Ok(true) => {}
+                Ok(false) => self.nv_migration_groups.lock().release(&groups),
+                Err(error) => {
+                    self.nv_migration_groups.lock().release(&groups);
+                    failure = Some(error);
+                }
             }
-            self.nv_migration_groups.lock().release(&groups);
         }
         drop(drained);
         self.nv_in_flight.fetch_sub(count, Ordering::AcqRel);
         self.request_nv_migration();
-        self.wake_nv_capacity_waiters();
         match failure {
             Some(error) => Err(error),
             None => Ok(count),
         }
     }
 
-    fn finish_nv_completion_batch(&self, batch: Arc<MigrationBatch>) -> Result<()> {
+    fn finish_nv_completion_batch(&self, batch: Arc<MigrationBatch>) -> Result<bool> {
         let completion_started = batch.completion_started();
         let page_count = batch.page_count();
         let pool = rnvpc::pool().ok_or_else(|| Error::new(Errno::EINVAL))?;
@@ -700,64 +804,76 @@ impl Ext4 {
                 groups.entry(page.inode).or_default().push(page);
             }
         }
-        for (_inode_id, pages) in groups {
-            if self.rnvpc_extend_enabled() {
-                let publish_started = pp::now();
-                let published_pages = pages.len();
-                let result = (|| {
-                    if pages.iter().any(|page| page.redirect.is_none()) {
-                        return_errno_with_message!(
-                            Errno::EUCLEAN,
-                            "rNVPCe migration reached a legacy extent candidate"
-                        );
-                    }
-                    self.finish_redirect_pages(pool, pages)
-                })();
-                if let Err(error) = result {
-                    // SSD durability already completed. A failure from this
-                    // point can leave publication or credit phases partially
-                    // durable, so both async completion and synchronous drain
-                    // must force mount-time recovery rather than retry blindly.
-                    self.fail_nv_migration();
-                    return Err(error);
+        if self.rnvpc_extend_enabled() {
+            if groups.is_empty() {
+                pp::NV_COMPLETION_TOTAL.record_since(completion_started, page_count);
+                return Ok(false);
+            }
+            if groups
+                .values()
+                .any(|pages| pages.iter().any(|page| page.redirect.is_none()))
+            {
+                return_errno_with_message!(
+                    Errno::EUCLEAN,
+                    "rNVPCe migration reached a legacy extent candidate"
+                );
+            }
+            let reclaim_batch = ReclaimBatch::new(groups.len(), batch.migration_groups().clone());
+            for (_inode_id, pages) in groups {
+                let pages_count = pages.len();
+                self.nv_reclaim_pending
+                    .fetch_add(pages_count, Ordering::AcqRel);
+                self.nv_reclaim_queue.publish(
+                    ReclaimTicket {
+                        pages,
+                        batch: reclaim_batch.clone(),
+                        ready_at_ns: pp::now(),
+                    },
+                    pages_count,
+                );
+                if self.nv_capacity_waiters.load(Ordering::Acquire) <= 1 {
+                    self.nv_reclaim_trigger.wake_one();
                 }
-                pp::NV_EXTENT_PUBLISH.record_since(publish_started, published_pages);
-            } else {
-                for page in pages {
-                    let result = (|| {
-                        let inode = self.read_inode(
-                            page.inode
-                                .try_into()
-                                .map_err(|_| Error::new(Errno::EOVERFLOW))?,
-                        )?;
-                        inode.materialize_rnvpce_ssd_page(self, page.index, page.target)?;
-                        self.persist_nv_allocations()?;
-                        if rnvpc::prepare_flush_completion(
+                pool.wake_one_data_capacity_waiter();
+            }
+            pp::NV_COMPLETION_TOTAL.record_since(completion_started, page_count);
+            return Ok(true);
+        }
+        for (_inode_id, pages) in groups {
+            for page in pages {
+                let result = (|| {
+                    let inode = self.read_inode(
+                        page.inode
+                            .try_into()
+                            .map_err(|_| Error::new(Errno::EOVERFLOW))?,
+                    )?;
+                    inode.materialize_rnvpce_ssd_page(self, page.index, page.target)?;
+                    self.persist_nv_allocations()?;
+                    if rnvpc::prepare_flush_completion(
+                        self.rnvpc_fs_id(),
+                        page.inode,
+                        page.index,
+                        page.page,
+                        page.generation,
+                    )? {
+                        let MigrationLease::Legacy(lease) = page.lease else {
+                            return_errno_with_message!(
+                                Errno::EUCLEAN,
+                                "redirect lease reached rNVPC completion"
+                            );
+                        };
+                        lease.finish(None)?;
+                        rnvpc::finalize_flush_completion(
                             self.rnvpc_fs_id(),
                             page.inode,
-                            page.index,
                             page.page,
                             page.generation,
-                        )? {
-                            let MigrationLease::Legacy(lease) = page.lease else {
-                                return_errno_with_message!(
-                                    Errno::EUCLEAN,
-                                    "redirect lease reached rNVPC completion"
-                                );
-                            };
-                            lease.finish(None)?;
-                            rnvpc::finalize_flush_completion(
-                                self.rnvpc_fs_id(),
-                                page.inode,
-                                page.page,
-                                page.generation,
-                            )?;
-                        }
-                        Ok(())
-                    })();
-                    if let Err(error) = result {
-                        failure = Some(error);
+                        )?;
                     }
+                    Ok(())
+                })();
+                if let Err(error) = result {
+                    failure = Some(error);
                 }
             }
         }
@@ -765,7 +881,42 @@ impl Ext4 {
             return Err(error);
         }
         pp::NV_COMPLETION_TOTAL.record_since(completion_started, page_count);
-        Ok(())
+        Ok(false)
+    }
+
+    pub(super) fn help_nv_reclaim(&self, budget: usize) -> Result<usize> {
+        let mut reclaimed = 0usize;
+        while reclaimed < budget {
+            let Some((ticket, pages_count)) = self.nv_reclaim_queue.claim() else {
+                break;
+            };
+            let ReclaimTicket {
+                pages,
+                batch,
+                ready_at_ns,
+            } = ticket;
+            pp::NV_RECLAIM_READY_WAIT.record_since(ready_at_ns, pages_count);
+            let publish_started = pp::now();
+            let result = self.finish_redirect_pages(
+                rnvpc::pool().ok_or_else(|| Error::new(Errno::EINVAL))?,
+                pages,
+            );
+            if let Err(error) = result {
+                self.nv_reclaim_pending
+                    .fetch_sub(pages_count, Ordering::AcqRel);
+                batch.complete_ticket(self);
+                self.fail_nv_migration();
+                return Err(error);
+            }
+            pp::NV_EXTENT_PUBLISH.record_since(publish_started, pages_count);
+            pp::NV_RECLAIM_HELP.record_since(publish_started, pages_count);
+            self.nv_reclaim_pending
+                .fetch_sub(pages_count, Ordering::AcqRel);
+            batch.complete_ticket(self);
+            reclaimed = reclaimed.saturating_add(pages_count);
+            self.nv_reclaim_trigger.wake_all();
+        }
+        Ok(reclaimed)
     }
 
     fn restore_failed_migration_jobs(
@@ -807,15 +958,22 @@ impl Ext4 {
 
     pub(super) fn drain_nv_in_flight(&self) -> Result<()> {
         let mut failure = None;
-        while self.nv_in_flight.load(Ordering::Acquire) != 0 {
+        while self.nv_in_flight.load(Ordering::Acquire) != 0
+            || self.nv_reclaim_pending.load(Ordering::Acquire) != 0
+        {
             if let Err(error) = self.process_nv_completions() {
+                failure = Some(error);
+            }
+            if let Err(error) = self.help_nv_reclaim(MIGRATION_BATCH_PAGES) {
                 failure = Some(error);
             }
             let _ = self.nv_completion_trigger.wait_until_or_timeout(
                 || {
-                    (self.nv_in_flight.load(Ordering::Acquire) == 0
-                        || !self.nv_completion_queue.lock().is_empty())
-                    .then_some(())
+                    ((self.nv_in_flight.load(Ordering::Acquire) == 0
+                        && self.nv_reclaim_pending.load(Ordering::Acquire) == 0)
+                        || !self.nv_completion_queue.lock().is_empty()
+                        || self.nv_reclaim_queue.ready_units() != 0)
+                        .then_some(())
                 },
                 &Duration::from_millis(10),
             );
@@ -992,10 +1150,8 @@ impl Ext4 {
                 .filter(|(index, slot)| *index == 0 || **slot != slots[*index - 1] + 1)
                 .count();
             batch_metrics::count(Event::ReclaimedSlotRanges, ranges);
-            for page in reclaimed {
-                pool.free_data_page(page)?;
-                batch_metrics::count(Event::ReclaimedPages, 1);
-            }
+            pool.free_data_pages(&reclaimed)?;
+            batch_metrics::count(Event::ReclaimedPages, reclaimed.len());
         }
         Ok(())
     }

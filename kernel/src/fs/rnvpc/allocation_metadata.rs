@@ -581,18 +581,30 @@ impl AllocationMetadataCache {
     pub(crate) fn resident_groups(&self, fs_id: u64) -> Result<Vec<ResidentAllocationGroup>> {
         let mut groups = Vec::new();
         for reference in self.pool.committed_metadata_refs() {
-            if self.pool.persistent_metadata_kind(reference)?
-                != PersistentMetadataKind::AllocationGroupDirectory
-            {
+            let kind = match self.pool.persistent_metadata_kind(reference) {
+                Ok(kind) => kind,
+                Err(error) if error.error() == Errno::ESTALE => continue,
+                Err(error) => return Err(error),
+            };
+            if kind != PersistentMetadataKind::AllocationGroupDirectory {
                 continue;
             }
-            let key = self.pool.persistent_metadata_key(reference)?;
+            let key = match self.pool.persistent_metadata_key(reference) {
+                Ok(key) => key,
+                Err(error) if error.error() == Errno::ESTALE => continue,
+                Err(error) => return Err(error),
+            };
             if key.fs_id != fs_id || self.pool.current_metadata_ref(key) != Some(reference) {
                 continue;
             }
-            let directory = self
+            let directory = match self
                 .pool
-                .read_authoritative_metadata::<AllocationGroupDirectoryRecord>(reference)?;
+                .read_authoritative_metadata::<AllocationGroupDirectoryRecord>(reference)
+            {
+                Ok(directory) => directory,
+                Err(error) if error.error() == Errno::ESTALE => continue,
+                Err(error) => return Err(error),
+            };
             if directory.state()?.is_resident() {
                 groups.push(ResidentAllocationGroup {
                     group: directory.group(),

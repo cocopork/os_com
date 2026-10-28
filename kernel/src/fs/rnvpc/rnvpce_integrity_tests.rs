@@ -190,6 +190,39 @@ fn rnvpce_allocation_cache_recovers_selected_image() {
 }
 
 #[ktest]
+fn rnvpce_stale_allocation_snapshot_is_not_reported_as_corruption() {
+    let config = RnvpcConfig::from_bytes(
+        Some(32 * PAGE_SIZE),
+        Some(16 * PAGE_SIZE),
+        Some(16 * PAGE_SIZE),
+        Some(NvSimMode::Fast),
+    )
+    .unwrap()
+    .unwrap();
+    let backend: Arc<dyn NvMemoryBackend> =
+        Arc::new(DramNvBackend::allocate_with_chunk_pages(config, 2).unwrap());
+    let pool = Arc::new(Rnvpc::new(backend, config, None).unwrap());
+    let cache = AllocationMetadataCache::new(pool.clone());
+    let first = allocation_test_image(1, 0x35, 71);
+    let stale = cache
+        .publish_initial(ALLOCATION_TEST_FS_ID, ALLOCATION_TEST_GROUP, &first, None)
+        .unwrap();
+    let second = allocation_test_image(2, 0x53, 69);
+    cache
+        .publish_update(ALLOCATION_TEST_FS_ID, ALLOCATION_TEST_GROUP, &second, None)
+        .unwrap();
+
+    assert_eq!(
+        pool.persistent_metadata_kind(stale).unwrap_err().error(),
+        Errno::ESTALE
+    );
+    assert_eq!(
+        cache.resident_groups(ALLOCATION_TEST_FS_ID).unwrap().len(),
+        1
+    );
+}
+
+#[ktest]
 fn rnvpce_allocation_authority_handoff_requires_exact_generation() {
     let config = RnvpcConfig::from_bytes(
         Some(32 * PAGE_SIZE),

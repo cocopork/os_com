@@ -270,7 +270,11 @@ fn high_watermark_wakes_and_hard_limit_backpressures() {
 
     pool.free_data_page(pages.pop().unwrap()).unwrap();
     pages.push(pool.alloc_data_page().unwrap());
-    assert_eq!(wakes.load(Ordering::Relaxed), 2);
+    assert_eq!(
+        wakes.load(Ordering::Relaxed),
+        1,
+        "migration pressure must remain active until the low watermark"
+    );
     for page in pages {
         pool.free_data_page(page).unwrap();
     }

@@ -273,7 +273,7 @@ pub(crate) fn needs_flush_watermark() -> bool {
         return false;
     };
     let stats = pool.stats();
-    stats.free_pages <= stats.total_pages.saturating_sub(stats.high_water_pages)
+    stats.flush_pressure
 }
 
 /// rTIO v0：WAL 已满的 inode。

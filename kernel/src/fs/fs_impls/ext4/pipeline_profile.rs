@@ -104,6 +104,8 @@ pub(crate) static NV_EXTENT_OUTCOME_BUILD: Metric = Metric::new();
 pub(crate) static NV_EXTENT_LEDGER: Metric = Metric::new();
 pub(crate) static NV_EXTENT_RESULT: Metric = Metric::new();
 pub(crate) static NV_RECLAIM: Metric = Metric::new();
+pub(crate) static NV_RECLAIM_READY_WAIT: Metric = Metric::new();
+pub(crate) static NV_RECLAIM_HELP: Metric = Metric::new();
 
 pub(crate) fn dump_snapshot() {
     if !ENABLED
@@ -150,6 +152,8 @@ pub(crate) fn dump_snapshot() {
         ("nv_extent_ledger", &NV_EXTENT_LEDGER),
         ("nv_extent_result", &NV_EXTENT_RESULT),
         ("nv_reclaim", &NV_RECLAIM),
+        ("nv_reclaim_ready_wait", &NV_RECLAIM_READY_WAIT),
+        ("nv_reclaim_help", &NV_RECLAIM_HELP),
     ] {
         let mut histogram = String::new();
         histogram.push('[');

@@ -1,6 +1,16 @@
 # 017：NVPage 并行回收
 
-日期：2026-10-22。状态：Planned。
+日期：2026-10-22。状态：Implemented (runtime scheduling phase, performance acceptance not met, 2026-10-28)。
+
+实现说明：后续的 per-page descriptor redirection 设计已取代本文“混合 SSD/NV extent
+target”的数据格式假设。当前实现保留本文的调度协议：completion 在批次 flush 后发布
+generation-checked reclaim ticket；多个容量等待线程并行帮助发布 SSD baseline、清除精确
+redirect 并批量归还 NVPage；零或一个等待线程时由后台 helper 承担回收，避免单 writer 把
+publication 串入 write 调用；sync/unmount 同时 drain
+`io_in_flight` 和 `reclaim_pending`。per-CPU free-run cache 和分片 free pool 尚未实现，仍作为
+后续 allocator 优化。实测与剩余瓶颈见
+[`NVPAGE-PARALLEL-RECLAIM-2026-10-28.md`](../../../experiments/reports/NVPAGE-PARALLEL-RECLAIM-2026-10-28.md)。
+当前实现通过正确性回归，但只有 128 KiB/16 线程吞吐改善，单线程和随机写性能验收未通过。
 
 ## 1. 问题与目标
 

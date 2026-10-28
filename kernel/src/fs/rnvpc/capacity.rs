@@ -26,12 +26,15 @@ pub(crate) struct RnvpcStats {
     pub(crate) backpressure_events: u64,
     /// rTIO v0：回刷水线（`min(3/4·total, data_limit)`），已用 ≥ 它就该开始回刷。
     pub(crate) high_water_pages: usize,
+    pub(crate) low_water_pages: usize,
+    pub(crate) flush_pressure: bool,
 }
 
 pub(super) struct CapacityState {
     total_pages: usize,
     data_limit_pages: usize,
     high_water_pages: usize,
+    low_water_pages: usize,
     metadata_pages: usize,
     data_pages: usize,
     wal_pages: usize,
@@ -50,10 +53,12 @@ impl CapacityState {
         } else {
             total_high_water_pages.min(data_limit_pages)
         };
+        let low_water_pages = high_water_pages / 2;
         Self {
             total_pages,
             data_limit_pages,
             high_water_pages,
+            low_water_pages,
             metadata_pages: 0,
             data_pages: 0,
             wal_pages: 0,
@@ -93,7 +98,10 @@ impl CapacityState {
             PoolClass::Wal => self.wal_pages += 1,
         }
 
-        if !self.above_high_water && self.used_pages() >= self.high_water_pages {
+        if class == PoolClass::Data
+            && !self.above_high_water
+            && self.data_pages >= self.high_water_pages
+        {
             self.above_high_water = true;
             self.high_water_events += 1;
             true
@@ -114,7 +122,7 @@ impl CapacityState {
             PoolClass::Data => self.data_pages -= 1,
             PoolClass::Wal => self.wal_pages -= 1,
         }
-        if self.used_pages() < self.high_water_pages {
+        if class == PoolClass::Data && self.data_pages <= self.low_water_pages {
             self.above_high_water = false;
         }
     }
@@ -130,6 +138,8 @@ impl CapacityState {
             high_water_events: self.high_water_events,
             backpressure_events: self.backpressure_events,
             high_water_pages: self.high_water_pages,
+            low_water_pages: self.low_water_pages,
+            flush_pressure: self.above_high_water,
         }
     }
 

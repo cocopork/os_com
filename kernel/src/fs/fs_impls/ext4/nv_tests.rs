@@ -20,6 +20,8 @@ fn ext4_research_routes() {
         nv_route_rnvpce_nojournal_export_retries_metadata_errors,
         nv_route_rnvpce_rejects_unrecovered_journal,
         nv_route_rnvpce_reservation_abort_wakes_writer,
+        nv_route_rnvpce_reclaim_ready_queue_contract,
+        nv_route_rnvpce_completion_publishes_reclaim_ticket,
         nv_route_rnvpce_batch_allocation_durability,
         nv_route_rnvpce_recovers_unflushed_target_bitmap,
         nv_route_rnvpce_recovery_prefers_nv_allocation_bitmap,
@@ -35,6 +37,75 @@ fn ext4_research_routes() {
         nv_route_rnvpc_failed_allocation_flush_does_not_append_wal,
         nv_route_mount_rejects_switching_persistent_authority,
     );
+}
+
+fn nv_route_rnvpce_reclaim_ready_queue_contract() {
+    super::migration::assert_reclaim_queue_contract();
+}
+
+fn nv_route_rnvpce_completion_publishes_reclaim_ticket() {
+    crate::fs::rnvpc::init_for_ext4_tests();
+    crate::time::clocks::init_for_ktest();
+    let fixture = Ext4FixtureBuilder::new(2048, 256, 2048)
+        .with_block_bitmap_metadata_marked()
+        .with_uuid([0xca; 16])
+        .with_mount_options("rnvpce=on,rtio=off")
+        .build()
+        .unwrap();
+    fixture.write_raw_inode(11, &make_empty_file_inode());
+    let inode = fixture.ext4.read_inode(11).unwrap();
+    inode
+        .write_at(
+            0,
+            &mut VmReader::from([0x5a; 4 * PAGE_SIZE].as_slice()).to_fallible(),
+        )
+        .unwrap();
+
+    assert_eq!(fixture.ext4.migrate_nv_round(4).unwrap(), 4);
+    assert_eq!(fixture.ext4.process_nv_completions().unwrap(), 4);
+    assert_eq!(
+        fixture
+            .ext4
+            .nv_reclaim_pending
+            .load(core::sync::atomic::Ordering::Acquire),
+        4
+    );
+    let pool = crate::fs::rnvpc::pool().unwrap();
+    for page_index in 0..4 {
+        assert!(
+            crate::fs::rnvpc::write_transaction::mapped_nv_page_ref(
+                pool,
+                fixture.ext4.rnvpc_fs_id(),
+                11,
+                page_index,
+            )
+            .unwrap()
+            .is_some(),
+            "completion must leave the durable NV redirect for a helper"
+        );
+    }
+
+    assert_eq!(fixture.ext4.help_nv_reclaim(4).unwrap(), 4);
+    assert_eq!(
+        fixture
+            .ext4
+            .nv_reclaim_pending
+            .load(core::sync::atomic::Ordering::Acquire),
+        0
+    );
+    for page_index in 0..4 {
+        assert!(
+            crate::fs::rnvpc::write_transaction::mapped_nv_page_ref(
+                pool,
+                fixture.ext4.rnvpc_fs_id(),
+                11,
+                page_index,
+            )
+            .unwrap()
+            .is_none(),
+            "the helper must publish the SSD baseline and retire the redirect"
+        );
+    }
 }
 
 fn nv_route_rnvpce_same_group_migration_defers_until_completion() {

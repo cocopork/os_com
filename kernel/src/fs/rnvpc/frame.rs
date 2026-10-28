@@ -525,14 +525,28 @@ impl Rnvpc {
             .wait_until(|| (cancelled() || self.can_reserve_data_pages(pages)).then_some(()));
     }
 
+    pub(crate) fn wait_for_data_capacity_or(
+        &self,
+        pages: usize,
+        cancelled: impl Fn() -> bool,
+        alternative: impl Fn() -> bool,
+    ) {
+        DATA_CAPACITY_WAITERS.wait_until(|| {
+            (cancelled() || alternative() || self.can_reserve_data_pages(pages)).then_some(())
+        });
+    }
+
     pub(crate) fn wake_data_capacity_waiters(&self) {
         DATA_CAPACITY_WAITERS.wake_all();
         DATA_PAGE_LEASE_WAITERS.wake_all();
     }
 
+    pub(crate) fn wake_one_data_capacity_waiter(&self) {
+        DATA_CAPACITY_WAITERS.wake_one();
+    }
+
     pub(crate) fn foreground_write_must_throttle(&self) -> bool {
-        let stats = self.stats();
-        stats.free_pages <= stats.total_pages.saturating_sub(stats.high_water_pages)
+        self.stats().flush_pressure
     }
 
     pub(crate) fn new(
@@ -1019,6 +1033,29 @@ impl Rnvpc {
     }
 
     pub(crate) fn free_data_page(&self, id: NvPageId) -> Result<()> {
+        self.free_data_page_inner(id)?;
+        self.wake_data_capacity_waiters();
+        Ok(())
+    }
+
+    pub(crate) fn free_data_pages(&self, pages: &[NvPageId]) -> Result<()> {
+        let mut freed = 0usize;
+        for page in pages {
+            if let Err(error) = self.free_data_page_inner(*page) {
+                if freed != 0 {
+                    self.wake_one_data_capacity_waiter();
+                }
+                return Err(error);
+            }
+            freed += 1;
+        }
+        if freed != 0 {
+            self.wake_one_data_capacity_waiter();
+        }
+        Ok(())
+    }
+
+    fn free_data_page_inner(&self, id: NvPageId) -> Result<()> {
         let state = self.state.lock();
         let mut allocation = self.allocation.lock();
         let mut objects = self.objects.lock(id.index());
@@ -1049,7 +1086,6 @@ impl Rnvpc {
         drop(objects);
         drop(allocation);
         drop(state);
-        self.wake_data_capacity_waiters();
         Ok(())
     }
 
@@ -2723,13 +2759,7 @@ impl Rnvpc {
         self: &Arc<Self>,
         reference: PersistentObjectRef,
     ) -> Result<PersistentMetadataKind> {
-        let slot = reference.slot().ok_or_else(|| Error::new(Errno::EINVAL))?;
-        let slot = usize::try_from(slot).map_err(|_| Error::new(Errno::EINVAL))?;
-        let frame = NvFrameId::try_from(slot).map_err(|_| Error::new(Errno::EINVAL))?;
-        if self.persistent_metadata_ref(frame)? != reference {
-            return_errno_with_message!(Errno::ESTALE, "stale persistent metadata reference");
-        }
-        let pin = self.pin_frame(frame)?;
+        let pin = self.pin_persistent_metadata(reference)?;
         let mut page = [0u8; PAGE_SIZE];
         pin.read(&mut page)?;
         PersistentMetadataHeader::decode_kind(&page[..size_of::<PersistentMetadataHeader>()])
