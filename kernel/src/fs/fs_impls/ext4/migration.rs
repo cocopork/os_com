@@ -190,7 +190,11 @@ impl Ext4 {
         let Some(current) = cache.selected_image(self.rnvpc_fs_id(), victim.group)? else {
             return Ok(true);
         };
-        self.checkpoint_rnvpce_allocation_group(victim.group, current.generation())?;
+        match self.checkpoint_rnvpce_allocation_group(victim.group, current.generation()) {
+            Ok(()) => {}
+            Err(error) if error.error() == Errno::ESTALE => {}
+            Err(error) => return Err(error),
+        }
         Ok(true)
     }
 
@@ -748,12 +752,17 @@ impl Ext4 {
         let nr_groups = self.super_block().nr_block_groups();
         for group_id in 0..nr_groups {
             if let Some(image) = cache.selected_image(self.rnvpc_fs_id(), group_id)? {
-                checkpointed.push((group_id, image.generation()));
+                checkpointed.push((group_id, image.generation(), image.mutation_epoch()));
             }
         }
         self.persist_nv_allocations()?;
-        for (group, generation) in checkpointed {
-            cache.mark_checkpointed(self.rnvpc_fs_id(), group, generation)?;
+        for (group, generation, mutation_epoch) in checkpointed {
+            match self.mark_rnvpce_allocation_checkpoint_if_epoch(group, generation, mutation_epoch)
+            {
+                Ok(()) => {}
+                Err(error) if error.error() == Errno::ESTALE => {}
+                Err(error) => return Err(error),
+            }
         }
         batch_metrics::dump();
         Ok(())

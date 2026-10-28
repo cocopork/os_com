@@ -2350,10 +2350,12 @@ impl Ext4 {
                 .block_groups
                 .get(group)
                 .ok_or_else(|| Error::new(Errno::EINVAL))?;
-            let (bitmap, free_blocks) = block_group.allocation_bitmap_snapshot();
+            let (_allocation, bitmap, free_blocks, mutation_epoch) =
+                block_group.lock_allocation_bitmap_snapshot();
             cache.publish_dirty_bitmap(
                 self.rnvpc_fs_id,
                 u32::try_from(group).map_err(|_| Error::new(Errno::EOVERFLOW))?,
+                mutation_epoch,
                 bitmap,
                 free_blocks,
             )?;
@@ -2374,21 +2376,57 @@ impl Ext4 {
         let pool = crate::fs::rnvpc::pool().ok_or_else(|| Error::new(Errno::EINVAL))?;
         let cache =
             crate::fs::rnvpc::allocation_metadata::AllocationMetadataCache::new(pool.clone());
-        let selected = cache
+        let mut selected = cache
             .selected_image(self.rnvpc_fs_id, group)?
             .ok_or_else(|| Error::new(Errno::ESTALE))?;
         if selected.generation() != generation {
             return_errno_with_message!(Errno::ESTALE, "allocation checkpoint generation changed");
         }
-        self.block_groups
+        let block_group = self
+            .block_groups
             .get(usize::try_from(group).map_err(|_| Error::new(Errno::EOVERFLOW))?)
-            .ok_or_else(|| Error::new(Errno::EINVAL))?
-            .sync_metadata()?;
+            .ok_or_else(|| Error::new(Errno::EINVAL))?;
+        let (guard, epoch) = block_group.lock_allocation_epoch();
+        drop(guard);
+        if epoch != selected.mutation_epoch() {
+            let mut groups = BTreeSet::new();
+            groups.insert(usize::try_from(group).map_err(|_| Error::new(Errno::EOVERFLOW))?);
+            self.persist_rnvpce_allocation_metadata(&groups)?;
+            selected = cache
+                .selected_image(self.rnvpc_fs_id, group)?
+                .ok_or_else(|| Error::new(Errno::ESTALE))?;
+        }
+        block_group.sync_metadata()?;
         self.sync_superblock_metadata()?;
         if self.block_device.sync()? != BioStatus::Complete {
             return_errno_with_message!(Errno::EIO, "allocation checkpoint flush failed");
         }
-        cache.mark_checkpointed(self.rnvpc_fs_id, group, generation)
+        let (_guard, current_epoch) = block_group.lock_allocation_epoch();
+        if current_epoch != selected.mutation_epoch() {
+            return_errno_with_message!(Errno::ESTALE, "allocation changed during checkpoint");
+        }
+        cache.mark_checkpointed(self.rnvpc_fs_id, group, selected.generation())
+    }
+
+    /// Transfers allocation authority only if the SSD checkpoint still
+    /// represents the exact in-memory allocation epoch that was submitted.
+    pub(super) fn mark_rnvpce_allocation_checkpoint_if_epoch(
+        &self,
+        group: u32,
+        generation: u64,
+        mutation_epoch: u64,
+    ) -> Result<()> {
+        let block_group = self
+            .block_groups
+            .get(usize::try_from(group).map_err(|_| Error::new(Errno::EOVERFLOW))?)
+            .ok_or_else(|| Error::new(Errno::EINVAL))?;
+        let (_guard, current_epoch) = block_group.lock_allocation_epoch();
+        if current_epoch != mutation_epoch {
+            return_errno_with_message!(Errno::ESTALE, "allocation changed during checkpoint");
+        }
+        let pool = crate::fs::rnvpc::pool().ok_or_else(|| Error::new(Errno::EINVAL))?;
+        crate::fs::rnvpc::allocation_metadata::AllocationMetadataCache::new(pool.clone())
+            .mark_checkpointed(self.rnvpc_fs_id, group, generation)
     }
 
     fn sync_superblock_metadata(&self) -> Result<()> {

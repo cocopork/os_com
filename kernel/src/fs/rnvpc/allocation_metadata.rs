@@ -51,8 +51,9 @@ pub(crate) struct AllocationGroupDirectoryRecord {
     free_blocks: u32,
     bitmap_checksum: u32,
     checkpoint_generation: u64,
+    mutation_epoch: u64,
     chunks: [PersistentObjectRef; 2],
-    reserved: [u8; 64],
+    reserved: [u8; 56],
 }
 
 impl AllocationGroupDirectoryRecord {
@@ -62,6 +63,7 @@ impl AllocationGroupDirectoryRecord {
         generation: u64,
         free_blocks: u32,
         bitmap_checksum: u32,
+        mutation_epoch: u64,
     ) -> Result<Self> {
         Self::new(
             fs_id,
@@ -71,6 +73,7 @@ impl AllocationGroupDirectoryRecord {
             free_blocks,
             bitmap_checksum,
             generation,
+            mutation_epoch,
             [PersistentObjectRef::NONE; 2],
         )
     }
@@ -91,6 +94,7 @@ impl AllocationGroupDirectoryRecord {
             free_blocks,
             bitmap_checksum,
             0,
+            0,
             [
                 PersistentObjectRef::new(1, 1)?,
                 PersistentObjectRef::new(2, 1)?,
@@ -104,6 +108,7 @@ impl AllocationGroupDirectoryRecord {
         generation: u64,
         free_blocks: u32,
         bitmap_checksum: u32,
+        mutation_epoch: u64,
         chunks: [PersistentObjectRef; 2],
     ) -> Result<Self> {
         if chunks.iter().any(PersistentObjectRef::is_none) {
@@ -117,6 +122,7 @@ impl AllocationGroupDirectoryRecord {
             free_blocks,
             bitmap_checksum,
             0,
+            mutation_epoch,
             chunks,
         )
     }
@@ -130,6 +136,7 @@ impl AllocationGroupDirectoryRecord {
         free_blocks: u32,
         bitmap_checksum: u32,
         checkpoint_generation: u64,
+        mutation_epoch: u64,
         chunks: [PersistentObjectRef; 2],
     ) -> Result<Self> {
         if generation == 0 || checkpoint_generation > generation {
@@ -148,8 +155,9 @@ impl AllocationGroupDirectoryRecord {
             free_blocks,
             bitmap_checksum,
             checkpoint_generation,
+            mutation_epoch,
             chunks,
-            reserved: [0; 64],
+            reserved: [0; 56],
         };
         record.validate()?;
         Ok(record)
@@ -207,6 +215,10 @@ impl AllocationGroupDirectoryRecord {
 
     pub(crate) const fn checkpoint_generation(&self) -> u64 {
         self.checkpoint_generation
+    }
+
+    pub(crate) const fn mutation_epoch(&self) -> u64 {
+        self.mutation_epoch
     }
 
     pub(crate) const fn chunks(&self) -> [PersistentObjectRef; 2] {
@@ -346,6 +358,7 @@ impl AuthoritativeMetadataRecord for AllocationBitmapChunkRecord {}
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct AllocationGroupImage {
     generation: u64,
+    mutation_epoch: u64,
     bitmap: [u8; PAGE_SIZE],
     free_blocks: u32,
     checksum: u32,
@@ -397,6 +410,7 @@ impl AllocationMetadataCache {
             image.generation(),
             image.free_blocks(),
             image.checksum(),
+            image.mutation_epoch(),
             chunk_refs,
         )?;
         self.pool
@@ -456,6 +470,7 @@ impl AllocationMetadataCache {
             image.generation(),
             image.free_blocks(),
             image.checksum(),
+            image.mutation_epoch(),
             chunk_refs,
         )?;
         let new_directory_ref =
@@ -497,10 +512,22 @@ impl AllocationMetadataCache {
         }
         let first = self
             .pool
-            .read_authoritative_metadata::<AllocationBitmapChunkRecord>(chunk_refs[0])?;
+            .read_authoritative_metadata::<AllocationBitmapChunkRecord>(chunk_refs[0])
+            .map_err(|_| {
+                Error::with_message(
+                    Errno::EUCLEAN,
+                    "selected allocation bitmap chunk is missing or corrupt",
+                )
+            })?;
         let second = self
             .pool
-            .read_authoritative_metadata::<AllocationBitmapChunkRecord>(chunk_refs[1])?;
+            .read_authoritative_metadata::<AllocationBitmapChunkRecord>(chunk_refs[1])
+            .map_err(|_| {
+                Error::with_message(
+                    Errno::EUCLEAN,
+                    "selected allocation bitmap chunk is missing or corrupt",
+                )
+            })?;
         select_allocation_group_image(&directory, [&first, &second]).map(Some)
     }
 
@@ -510,6 +537,7 @@ impl AllocationMetadataCache {
         &self,
         fs_id: u64,
         group: u32,
+        mutation_epoch: u64,
         bitmap: [u8; PAGE_SIZE],
         free_blocks: u32,
     ) -> Result<u64> {
@@ -523,7 +551,8 @@ impl AllocationMetadataCache {
                 .checked_add(1)
                 .ok_or_else(|| Error::new(Errno::EOVERFLOW))
         })?;
-        let image = AllocationGroupImage::new(generation, bitmap, free_blocks)?;
+        let image =
+            AllocationGroupImage::new_with_epoch(generation, mutation_epoch, bitmap, free_blocks)?;
         if current.is_some() {
             self.publish_update(fs_id, group, &image, None)?;
         } else {
@@ -553,6 +582,7 @@ impl AllocationMetadataCache {
             generation,
             current.free_blocks(),
             current.bitmap_checksum(),
+            current.mutation_epoch(),
         )?;
         self.pool
             .replace_authoritative_metadata(current_ref, &clean, None)?;
@@ -592,12 +622,22 @@ impl AllocationMetadataCache {
 
 impl AllocationGroupImage {
     pub(crate) fn new(generation: u64, bitmap: [u8; PAGE_SIZE], free_blocks: u32) -> Result<Self> {
+        Self::new_with_epoch(generation, 0, bitmap, free_blocks)
+    }
+
+    pub(crate) fn new_with_epoch(
+        generation: u64,
+        mutation_epoch: u64,
+        bitmap: [u8; PAGE_SIZE],
+        free_blocks: u32,
+    ) -> Result<Self> {
         if generation == 0 {
             return_errno_with_message!(Errno::EINVAL, "allocation image generation is zero");
         }
         let checksum = allocation_bitmap_checksum(&bitmap);
         Ok(Self {
             generation,
+            mutation_epoch,
             bitmap,
             free_blocks,
             checksum,
@@ -610,6 +650,10 @@ impl AllocationGroupImage {
 
     pub(crate) const fn bitmap(&self) -> &[u8; PAGE_SIZE] {
         &self.bitmap
+    }
+
+    pub(crate) const fn mutation_epoch(&self) -> u64 {
+        self.mutation_epoch
     }
 
     pub(crate) const fn free_blocks(&self) -> u32 {
@@ -654,7 +698,12 @@ pub(crate) fn select_allocation_group_image(
         let start = chunk_index * ALLOCATION_BITMAP_CHUNK_BYTES;
         bitmap[start..start + ALLOCATION_BITMAP_CHUNK_BYTES].copy_from_slice(chunk.data());
     }
-    let image = AllocationGroupImage::new(generation, bitmap, directory.free_blocks())?;
+    let image = AllocationGroupImage::new_with_epoch(
+        generation,
+        directory.mutation_epoch(),
+        bitmap,
+        directory.free_blocks(),
+    )?;
     if image.checksum() != directory.bitmap_checksum() {
         return_errno_with_message!(Errno::EUCLEAN, "allocation bitmap checksum mismatch");
     }

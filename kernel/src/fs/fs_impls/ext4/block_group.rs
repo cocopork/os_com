@@ -39,7 +39,10 @@
 //!   locking (read then promote to write on miss). Never held while syncing an
 //!   inode (see [`BlockGroup::sync_inodes`]).
 
-use core::fmt;
+use core::{
+    fmt,
+    sync::atomic::{AtomicU64, Ordering},
+};
 
 use super::{
     allocator::free_space::FreeSpaceIndex,
@@ -401,6 +404,7 @@ pub(super) struct BlockGroup {
     metadata: RwMutex<BlockGroupMetadata>,
     /// Serializes pin snapshots against free bitmap-clear + pin publication.
     allocation_gate: Mutex<()>,
+    allocation_epoch: AtomicU64,
     /// Backing block device (shared with `Ext4` and other groups).
     block_device: Arc<dyn BlockDevice>,
     /// Cached geometry: first filesystem-wide block number of this group.
@@ -447,7 +451,7 @@ impl Debug for BlockGroup {
 }
 
 impl BlockGroup {
-    pub(super) fn lock_allocation(&self) -> ostd::sync::MutexGuard<'_, ()> {
+    pub(super) fn lock_allocation(&self) -> MutexGuard<'_, ()> {
         self.allocation_gate.lock()
     }
 
@@ -457,16 +461,36 @@ impl BlockGroup {
         let metadata = self.metadata.read();
         let mut bitmap = [0u8; BLOCK_SIZE];
         bitmap.copy_from_slice(metadata.block_bitmap.as_bytes());
-        AllocationGroupImage::new(generation, bitmap, metadata.desc.free_blocks_count())
+        AllocationGroupImage::new_with_epoch(
+            generation,
+            self.allocation_epoch.load(Ordering::Acquire),
+            bitmap,
+            metadata.desc.free_blocks_count(),
+        )
     }
 
-    /// Snapshots the allocation fields for one NVM-authority publication.
-    pub(super) fn allocation_bitmap_snapshot(&self) -> ([u8; BLOCK_SIZE], u32) {
-        let _allocation = self.allocation_gate.lock();
+    /// Snapshots the allocation fields and keeps allocation mutations excluded
+    /// until the caller commits this exact image to NVM.
+    pub(super) fn lock_allocation_bitmap_snapshot(
+        &self,
+    ) -> (MutexGuard<'_, ()>, [u8; BLOCK_SIZE], u32, u64) {
+        let allocation = self.allocation_gate.lock();
         let metadata = self.metadata.read();
         let mut bitmap = [0u8; BLOCK_SIZE];
         bitmap.copy_from_slice(metadata.block_bitmap.as_bytes());
-        (bitmap, metadata.desc.free_blocks_count())
+        let snapshot = (
+            bitmap,
+            metadata.desc.free_blocks_count(),
+            self.allocation_epoch.load(Ordering::Acquire),
+        );
+        drop(metadata);
+        (allocation, snapshot.0, snapshot.1, snapshot.2)
+    }
+
+    pub(super) fn lock_allocation_epoch(&self) -> (MutexGuard<'_, ()>, u64) {
+        let guard = self.allocation_gate.lock();
+        let epoch = self.allocation_epoch.load(Ordering::Acquire);
+        (guard, epoch)
     }
 
     /// Installs an NVM-authoritative block bitmap without accessing the device.
@@ -504,6 +528,8 @@ impl BlockGroup {
         metadata.desc.free_blocks_count = image.free_blocks();
         metadata.desc.flags &= !BG_BLOCK_UNINIT;
         metadata.free_index = None;
+        self.allocation_epoch
+            .store(image.mutation_epoch(), Ordering::Release);
         Ok(())
     }
 
@@ -543,6 +569,9 @@ impl BlockGroup {
         if metadata.desc.free_blocks_count() != free_blocks {
             metadata.desc.free_blocks_count = free_blocks;
             changed = true;
+        }
+        if changed {
+            self.allocation_epoch.fetch_add(1, Ordering::AcqRel);
         }
         Ok(changed)
     }
@@ -596,6 +625,7 @@ impl BlockGroup {
         Ok(Self {
             group_idx,
             allocation_gate: Mutex::new(()),
+            allocation_epoch: AtomicU64::new(0),
             metadata: RwMutex::new(BlockGroupMetadata {
                 desc: Dirty::new(desc),
                 block_bitmap: Dirty::new(block_bitmap),
@@ -1107,6 +1137,7 @@ impl BlockGroup {
 
         let range_start_block = self.first_block + range.start as Ext4Bid;
         let range_end_block = self.first_block + range.end as Ext4Bid;
+        self.allocation_epoch.fetch_add(1, Ordering::AcqRel);
         Ok(GroupBlockAlloc::Allocated(
             range_start_block..range_end_block,
         ))
@@ -1201,6 +1232,9 @@ impl BlockGroup {
             self.stamp_desc_csum_in_block(buf, &metadata);
         })?;
 
+        if actually_freed != 0 {
+            self.allocation_epoch.fetch_add(1, Ordering::AcqRel);
+        }
         Ok(actually_freed)
     }
 
@@ -1876,6 +1910,7 @@ mod tests {
             group_idx,
             metadata: RwMutex::new(metadata),
             allocation_gate: Mutex::new(()),
+            allocation_epoch: AtomicU64::new(0),
             block_device,
             first_block: 0,
             last_block: 32767,
