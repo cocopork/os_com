@@ -1417,6 +1417,36 @@ impl Ext4 {
         handle: Option<&journal::Handle>,
         intent: AllocIntent,
     ) -> Result<Range<Ext4Bid>> {
+        self.alloc_blocks_with_intent_in_groups(count, goal, handle, intent, None)
+    }
+
+    pub(super) fn alloc_rnvpce_blocks_in_groups(
+        &self,
+        count: u32,
+        groups: &BTreeSet<usize>,
+        handle: Option<&journal::Handle>,
+    ) -> Result<Range<Ext4Bid>> {
+        if groups.is_empty() || groups.iter().any(|group| *group >= self.block_groups.len()) {
+            return_errno_with_message!(Errno::EINVAL, "invalid rNVPCe allocation group set");
+        }
+        let goal = self.block_groups[*groups.first().unwrap()].first_block();
+        self.alloc_blocks_with_intent_in_groups(
+            count,
+            goal,
+            handle,
+            AllocIntent::RnvpceReserved,
+            Some(groups),
+        )
+    }
+
+    fn alloc_blocks_with_intent_in_groups(
+        &self,
+        count: u32,
+        goal: Ext4Bid,
+        handle: Option<&journal::Handle>,
+        intent: AllocIntent,
+        allowed_groups: Option<&BTreeSet<usize>>,
+    ) -> Result<Range<Ext4Bid>> {
         if count == 0 {
             return_errno_with_message!(Errno::EINVAL, "zero block allocation requested");
         }
@@ -1487,6 +1517,9 @@ impl Ext4 {
         for policy_pass in 0..2u8 {
             for group_search_offset in 0..nr_block_groups {
                 let group_idx = (goal_group + group_search_offset) % nr_block_groups;
+                if allowed_groups.is_some_and(|groups| !groups.contains(&group_idx)) {
+                    continue;
+                }
                 let group = &self.block_groups[group_idx];
                 let policy = if policy_pass == 0 {
                     AllocPolicy::FullRunOnly {

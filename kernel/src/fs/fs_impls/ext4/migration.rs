@@ -8,11 +8,7 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 use aster_block::bio::BioDirection;
 use ostd::sync::LocalIrqDisabled;
 
-use super::{
-    fs::{AllocIntent, Ext4},
-    pipeline_profile as pp,
-    prelude::*,
-};
+use super::{fs::Ext4, pipeline_profile as pp, prelude::*};
 use crate::fs::rnvpc::{
     self,
     baseline_generation::BaselineRangeToken,
@@ -54,6 +50,38 @@ impl MigrationGroupOwners {
     pub(super) fn contains(&self, group: usize) -> bool {
         self.active.contains(&group)
     }
+
+    fn try_acquire_for_allocation(
+        &mut self,
+        required: &BTreeSet<usize>,
+        candidates: &[(usize, u32)],
+        needed_blocks: usize,
+    ) -> Option<BTreeSet<usize>> {
+        if required.iter().any(|group| self.active.contains(group)) {
+            return None;
+        }
+        let mut selected = required.clone();
+        let mut available = candidates
+            .iter()
+            .filter(|(group, _)| selected.contains(group))
+            .map(|(_, free)| *free as usize)
+            .sum::<usize>();
+        for &(group, free) in candidates {
+            if available >= needed_blocks {
+                break;
+            }
+            if selected.contains(&group) || self.active.contains(&group) || free == 0 {
+                continue;
+            }
+            selected.insert(group);
+            available = available.saturating_add(free as usize);
+        }
+        if available < needed_blocks {
+            return None;
+        }
+        self.active.extend(selected.iter().copied());
+        Some(selected)
+    }
 }
 
 struct MigrationGroupReservation<'a> {
@@ -71,6 +99,12 @@ impl<'a> MigrationGroupReservation<'a> {
 
     fn transfer_to_batch(mut self) -> BTreeSet<usize> {
         self.groups.take().unwrap()
+    }
+
+    fn groups(&self) -> &BTreeSet<usize> {
+        self.groups
+            .as_ref()
+            .expect("live migration group reservation has groups")
     }
 }
 
@@ -602,9 +636,55 @@ impl Ext4 {
         Ok(submitted)
     }
 
+    fn reserve_nv_target_groups(
+        &self,
+        pages: &[PendingPage],
+    ) -> Result<MigrationGroupReservation<'_>> {
+        let required = pages
+            .iter()
+            .filter_map(|page| (page.target != 0).then_some(page.target))
+            .map(|target| self.block_group_index_for_block(target))
+            .collect::<Result<BTreeSet<_>>>()?;
+        let needed = pages.iter().filter(|page| page.target == 0).count();
+        let nr_groups = self.super_block().nr_block_groups() as usize;
+        let mut candidates = (0..nr_groups)
+            .map(|group| (group, self.block_group(group).free_blocks_count()))
+            .collect::<Vec<_>>();
+        candidates.sort_by(|(left_group, left_free), (right_group, right_free)| {
+            let left_fits = (*left_free as usize) >= needed;
+            let right_fits = (*right_free as usize) >= needed;
+            right_fits
+                .cmp(&left_fits)
+                .then_with(|| right_free.cmp(left_free))
+                .then_with(|| left_group.cmp(right_group))
+        });
+        let total_free = candidates
+            .iter()
+            .map(|(_, free)| *free as usize)
+            .sum::<usize>();
+        let mut owners = self.nv_migration_groups.lock();
+        if required.iter().any(|group| owners.contains(*group)) {
+            return_errno_with_message!(Errno::EBUSY, "allocation group is already migrating");
+        }
+        if total_free < needed {
+            return_errno!(Errno::ENOSPC);
+        }
+        let groups = owners
+            .try_acquire_for_allocation(&required, &candidates, needed)
+            .ok_or_else(|| Error::new(Errno::EBUSY))?;
+        drop(owners);
+        Ok(MigrationGroupReservation::new(
+            &self.nv_migration_groups,
+            groups,
+        ))
+    }
+
     /// Allocates SSD targets and publishes their identities in NVM.
-    /// EXT4 allocation metadata joins the later orderless batch barrier.
+    /// Group ownership precedes every bitmap/GDT mutation, and EXT4 allocation
+    /// metadata joins the later orderless batch barrier.
     fn prepare_nv_targets(&self, pages: &mut [PendingPage]) -> Result<BTreeSet<usize>> {
+        let group_reservation = self.reserve_nv_target_groups(pages)?;
+        let groups = group_reservation.groups().clone();
         let mut allocated = Vec::with_capacity(pages.len());
         let result = (|| {
             // Adjacent logical pages share a range allocation; preserve existing
@@ -627,12 +707,8 @@ impl Ext4 {
                 }
                 let op = self.begin_op(self.single_block_map_credits(0))?;
                 let started = batch_metrics::now();
-                let blocks = self.alloc_blocks_with_intent(
-                    (end - start) as u32,
-                    0,
-                    op.get(),
-                    AllocIntent::RnvpceReserved,
-                )?;
+                let blocks =
+                    self.alloc_rnvpce_blocks_in_groups((end - start) as u32, &groups, op.get())?;
                 batch_metrics::elapsed(Phase::Allocate, started);
                 batch_metrics::count(Event::AllocatedPages, (blocks.end - blocks.start) as usize);
                 for target in blocks {
@@ -661,24 +737,6 @@ impl Ext4 {
             }
             return Err(error);
         }
-        let groups = pages
-            .iter()
-            .filter_map(|page| (page.target != 0).then_some(page.target))
-            .chain(allocated.iter().map(|(_, target)| *target))
-            .map(|target| self.block_group_index_for_block(target))
-            .collect::<Result<BTreeSet<_>>>()?;
-        if !self.nv_migration_groups.lock().try_acquire(&groups) {
-            for (_, target) in &allocated {
-                let op = self.begin_op(self.single_block_map_credits(0))?;
-                self.free_blocks(
-                    super::journal::BlockFreeAuth::without_revoke_duty(*target, 1),
-                    op.get(),
-                )?;
-            }
-            return_errno_with_message!(Errno::EBUSY, "allocation group is already migrating");
-        }
-        let group_reservation =
-            MigrationGroupReservation::new(&self.nv_migration_groups, groups.clone());
         // NVM allocation authority is durable before any descriptor can name
         // a newly allocated SSD target. No bitmap/GDT/superblock SSD I/O occurs.
         if let Err(error) = self.persist_rnvpce_allocation_metadata(&groups) {
@@ -1173,5 +1231,27 @@ mod tests {
         assert!(owners.try_acquire(&disjoint));
         owners.release(&first);
         assert!(owners.try_acquire(&BTreeSet::from([5usize, 6])));
+    }
+
+    #[ktest]
+    fn rnvpce_reserves_target_groups_before_allocation() {
+        let mut owners = MigrationGroupOwners::default();
+        assert!(owners.try_acquire(&BTreeSet::from([1usize])));
+
+        let selected = owners
+            .try_acquire_for_allocation(&BTreeSet::new(), &[(1, 128), (2, 96), (3, 64)], 128)
+            .unwrap();
+        assert_eq!(selected, BTreeSet::from([2usize, 3]));
+        assert!(owners.contains(1));
+        assert!(owners.contains(2));
+        assert!(owners.contains(3));
+
+        owners.release(&selected);
+        let required = BTreeSet::from([1usize]);
+        assert!(
+            owners
+                .try_acquire_for_allocation(&required, &[(2, 128)], 1)
+                .is_none()
+        );
     }
 }
