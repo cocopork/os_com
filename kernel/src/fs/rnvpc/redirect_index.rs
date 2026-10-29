@@ -580,13 +580,22 @@ impl RedirectDirectory {
         if indexed.generation != lease.generation || indexed.extent != lease.extent {
             return_errno!(Errno::ESTALE);
         }
-        let indexed = state
-            .claimed_extents
-            .remove(&start_key)
-            .expect("claimed extent was checked");
-        state.dirty_extents.insert(start_key, indexed);
-        state.ready_extents.push_back(start_key);
-        Ok(())
+        state.claimed_extents.remove(&start_key);
+        Self::rebuild_partition_dirty_extents(&mut state, partition)
+    }
+
+    pub(crate) fn complete_extent(&self, lease: &MigrationExtentLease) -> Result<()> {
+        let partition = lease.extent.partition;
+        let start_key = lease.extent.start_key();
+        let mut state = self.partitions[partition].lock();
+        let Some(indexed) = state.claimed_extents.get(&start_key) else {
+            return_errno!(Errno::ESTALE);
+        };
+        if indexed.generation != lease.generation || indexed.extent != lease.extent {
+            return_errno!(Errno::ESTALE);
+        }
+        state.claimed_extents.remove(&start_key);
+        Self::rebuild_partition_dirty_extents(&mut state, partition)
     }
 
     pub(crate) fn validate_claimed_extent(&self, lease: &MigrationExtentLease) -> bool {

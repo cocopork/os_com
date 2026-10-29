@@ -96,12 +96,27 @@ impl Rnvpc {
                 return Err(error);
             }
         };
+        let pages = extent.pages().to_vec();
+        let fs_id = extent.fs_id();
+        let inode = extent.inode();
+        let logical_start = extent.logical_start();
+        let slot_len = extent.len();
+        let generation = logical_lease.generation();
         Ok(ClaimedDirtyExtent {
             pool: self.clone(),
-            logical_lease: Some(logical_lease),
-            slot_lease: Some(slot_lease),
-            baseline_claim: Some(baseline_claim),
-            baseline_token,
+            pages,
+            fs_id,
+            inode,
+            logical_start,
+            slot_base: base_slot,
+            slot_len,
+            generation,
+            leases: Mutex::new(ClaimedDirtyExtentLeases {
+                logical_lease: Some(logical_lease),
+                slot_lease: Some(slot_lease),
+                baseline_claim: Some(baseline_claim),
+            }),
+            baseline_token: Arc::new(baseline_token),
         })
     }
 

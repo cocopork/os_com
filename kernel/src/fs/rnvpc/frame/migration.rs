@@ -47,7 +47,7 @@ impl Rnvpc {
                         && entry.logical_version == expected.logical_version
                     {
                         entry.ssd_backing_block = *target;
-                        entry.state = NvObjectState::NvWriteback;
+                        entry.state = expected.state;
                     }
                 }
             }
@@ -106,13 +106,15 @@ impl Rnvpc {
     fn migration_slot(&self, reference: PersistentObjectRef, require_lease: bool) -> Result<usize> {
         let slot = usize::try_from(reference.slot().ok_or_else(|| Error::new(Errno::EINVAL))?)
             .map_err(|_| Error::new(Errno::EOVERFLOW))?;
+        let range_claimed = self.objects.migration_range_contains(slot);
         let state = self.objects.lock_checked(slot)?;
         let record = &state.records[slot];
+        let legacy_claimed =
+            record.kind == ObjectKind::Data(DataPageState::InFlight) && record.pins == 1;
         if !matches!(record.kind, ObjectKind::Data(_))
             || !record.committed
             || record.alloc_seq != reference.allocation_seq()
-            || (require_lease
-                && (record.kind != ObjectKind::Data(DataPageState::InFlight) || record.pins != 1))
+            || (require_lease && !legacy_claimed && !range_claimed)
         {
             return_errno!(Errno::ESTALE);
         }

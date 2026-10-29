@@ -413,70 +413,110 @@ pub(crate) struct ClaimedRedirectPage {
 
 pub(crate) struct ClaimedDirtyExtent {
     pool: Arc<Rnvpc>,
+    pages: Vec<DescriptorHandle>,
+    fs_id: u64,
+    inode: u64,
+    logical_start: u64,
+    slot_base: usize,
+    slot_len: usize,
+    generation: u64,
+    leases: Mutex<ClaimedDirtyExtentLeases>,
+    pub(crate) baseline_token: Arc<BaselineRangeToken>,
+}
+
+struct ClaimedDirtyExtentLeases {
     logical_lease: Option<MigrationExtentLease>,
     slot_lease: Option<NvSlotRangeLease>,
     baseline_claim: Option<BaselineRangeClaim>,
-    pub(crate) baseline_token: BaselineRangeToken,
 }
 
 impl ClaimedDirtyExtent {
     pub(crate) fn pages(&self) -> &[DescriptorHandle] {
-        self.logical_lease
-            .as_ref()
-            .expect("live dirty extent has a logical lease")
-            .extent()
-            .pages()
+        &self.pages
     }
 
     pub(crate) fn fs_id(&self) -> u64 {
-        self.logical_lease
-            .as_ref()
-            .expect("live dirty extent has a logical lease")
-            .extent()
-            .fs_id()
+        self.fs_id
     }
 
     pub(crate) fn inode(&self) -> u64 {
-        self.logical_lease
-            .as_ref()
-            .expect("live dirty extent has a logical lease")
-            .extent()
-            .inode()
+        self.inode
     }
 
     pub(crate) fn logical_start(&self) -> u64 {
-        self.logical_lease
-            .as_ref()
-            .expect("live dirty extent has a logical lease")
-            .extent()
-            .logical_start()
+        self.logical_start
+    }
+
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation
     }
 
     pub(crate) fn page_id(&self, offset: usize) -> Result<NvPageId> {
-        let lease = self
-            .slot_lease
-            .as_ref()
-            .ok_or_else(|| Error::new(Errno::ESTALE))?;
-        if offset >= lease.len() {
+        if offset >= self.slot_len {
             return_errno!(Errno::EINVAL);
         }
-        Ok(NvPageId::try_from(lease.base() + offset)?)
+        Ok(NvPageId::try_from(self.slot_base + offset)?)
     }
 
     pub(crate) fn dma_segment(&self, offset: usize) -> Result<USegment> {
         self.pool.backend.data_page_segment(self.page_id(offset)?)
     }
+
+    pub(crate) fn release_physical_for_completion(&self) -> Result<()> {
+        let lease = self
+            .leases
+            .lock()
+            .slot_lease
+            .take()
+            .ok_or_else(|| Error::new(Errno::ESTALE))?;
+        self.pool.objects.release_migration_range(lease)
+    }
+
+    pub(crate) fn complete_success(&self) -> Result<()> {
+        let (logical, baseline) = {
+            let mut leases = self.leases.lock();
+            if leases.slot_lease.is_some() {
+                return_errno_with_message!(Errno::EBUSY, "physical migration lease is active");
+            }
+            let logical = leases
+                .logical_lease
+                .take()
+                .ok_or_else(|| Error::new(Errno::ESTALE))?;
+            let baseline = leases
+                .baseline_claim
+                .take()
+                .ok_or_else(|| Error::new(Errno::ESTALE))?;
+            (logical, baseline)
+        };
+        if let Err(error) = self.pool.redirects.complete_extent(&logical) {
+            let mut leases = self.leases.lock();
+            leases.logical_lease = Some(logical);
+            leases.baseline_claim = Some(baseline);
+            return Err(error);
+        }
+        self.pool.baseline_generations.release_range(baseline);
+        note_data_page_lease_change();
+        Ok(())
+    }
 }
 
 impl Drop for ClaimedDirtyExtent {
     fn drop(&mut self) {
-        if let Some(claim) = self.baseline_claim.take() {
+        let (baseline, slot, logical) = {
+            let mut leases = self.leases.lock();
+            (
+                leases.baseline_claim.take(),
+                leases.slot_lease.take(),
+                leases.logical_lease.take(),
+            )
+        };
+        if let Some(claim) = baseline {
             self.pool.baseline_generations.release_range(claim);
         }
-        if let Some(lease) = self.slot_lease.take() {
+        if let Some(lease) = slot {
             let _ = self.pool.objects.release_migration_range(lease);
         }
-        if let Some(lease) = self.logical_lease.take() {
+        if let Some(lease) = logical {
             let _ = self.pool.redirects.requeue_extent(lease);
         }
         note_data_page_lease_change();

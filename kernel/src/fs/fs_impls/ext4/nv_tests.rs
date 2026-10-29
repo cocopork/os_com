@@ -118,15 +118,45 @@ fn nv_route_rnvpce_same_group_migration_defers_until_completion() {
         .build()
         .unwrap();
     fixture.write_raw_inode(11, &make_empty_file_inode());
-    let inode = fixture.ext4.read_inode(11).unwrap();
-    inode
+    fixture.write_raw_inode(12, &make_empty_file_inode());
+    fixture
+        .ext4
+        .read_inode(11)
+        .unwrap()
         .write_at(
             0,
-            &mut VmReader::from([0x4a; 2 * PAGE_SIZE].as_slice()).to_fallible(),
+            &mut VmReader::from([0x4a; PAGE_SIZE].as_slice()).to_fallible(),
+        )
+        .unwrap();
+    fixture
+        .ext4
+        .read_inode(12)
+        .unwrap()
+        .write_at(
+            0,
+            &mut VmReader::from([0x4b; PAGE_SIZE].as_slice()).to_fallible(),
         )
         .unwrap();
 
     assert_eq!(fixture.ext4.migrate_nv_round(1).unwrap(), 1);
+    let pool = crate::fs::rnvpc::pool().unwrap();
+    for inode in [11, 12] {
+        let handle = pool
+            .redirect_lookup(crate::fs::rnvpc::index::PageKey::new(
+                fixture.ext4.rnvpc_fs_id(),
+                inode,
+                0,
+            ))
+            .unwrap();
+        assert_eq!(
+            handle.state,
+            crate::fs::rnvpc::descriptor::NvObjectState::NvDirty
+        );
+        assert_eq!(
+            pool.persisted_redirect_state_for_test(handle).unwrap(),
+            crate::fs::rnvpc::descriptor::NvObjectState::NvDirty
+        );
+    }
     assert_eq!(
         fixture.ext4.migrate_nv_round(1).unwrap_err().error(),
         Errno::EAGAIN
