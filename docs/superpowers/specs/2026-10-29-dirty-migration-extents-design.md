@@ -2,7 +2,7 @@
 
 Date: 2026-10-29
 
-Status: Design ready for implementation review.
+Status: Implemented and measured on 2026-10-29.
 
 ## 1. Intent
 
@@ -90,7 +90,9 @@ reverse `NVPage -> extent` lookup.
 ## 4. Incremental Index Maintenance
 
 Descriptor publication, replacement, clearing, recovery, and state changes
-update only the affected logical neighborhood:
+update only the affected logical neighborhood.  The implementation keeps
+deduplicated ready page keys and materializes a bounded extent lazily when a
+key is selected; it does not eagerly reconstruct every extent after an update:
 
 - insert a page and merge left/right only when all invariant fields match;
 - cap a merge at 128 pages, leaving the remainder as an adjacent extent;
@@ -102,9 +104,11 @@ update only the affected logical neighborhood:
 - failed or stale claims are locally rebuilt from their exact descriptor
   handles and requeued without a global scan or sort.
 
-Recovery scans selected descriptors once, orders them per partition, and
-rebuilds extents under the same 128-page rule.  This startup work is allowed to
-be global; the steady-state candidate path is not.
+Recovery scans selected descriptors once and rebuilds each partition's ready
+keys.  This startup work is allowed to be global; the steady-state candidate
+path is not.  Completion may aggregate several separately locked 128-page
+extents for one SSD-baseline publication and NVPage-free batch.  Aggregation
+does not enlarge an extent lease or its foreground exclusion range.
 
 ## 5. Candidate Claim and Range Coordination
 
