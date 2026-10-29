@@ -646,7 +646,6 @@ impl Ext4 {
     }
 
     /// Returns a reference to the block group at `group_idx`.
-    #[cfg_attr(not(ktest), expect(dead_code))]
     pub(super) fn block_group(&self, group_idx: usize) -> &BlockGroup {
         &self.block_groups[group_idx]
     }

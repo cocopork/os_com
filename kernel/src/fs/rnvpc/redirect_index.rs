@@ -20,6 +20,7 @@ pub(crate) struct DescriptorHandle {
     pub(crate) migration_target: bool,
 }
 
+#[cfg(ktest)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct RedirectRange {
     pub(crate) fs_id: u64,
@@ -690,6 +691,7 @@ impl RedirectDirectory {
         self.candidate_extent_visits.load(Ordering::Relaxed)
     }
 
+    #[cfg(ktest)]
     pub(crate) fn dirty_ranges(&self, budget: usize) -> Vec<RedirectRange> {
         if budget == 0 {
             return Vec::new();

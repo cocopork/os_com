@@ -953,7 +953,6 @@ impl BlockGroup {
     }
 
     /// Returns the number of free blocks in this group.
-    #[cfg_attr(not(ktest), expect(dead_code))]
     pub(super) fn free_blocks_count(&self) -> u32 {
         self.metadata.read().desc.free_blocks_count()
     }

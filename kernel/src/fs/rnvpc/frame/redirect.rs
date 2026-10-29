@@ -4,6 +4,8 @@
 
 use super::*;
 use crate::fs::rnvpc::batch_metrics;
+#[cfg(ktest)]
+use crate::fs::rnvpc::redirect_index::RedirectRange;
 
 impl Rnvpc {
     #[cfg(ktest)]
@@ -444,6 +446,7 @@ impl Rnvpc {
         Ok(transitioned)
     }
 
+    #[cfg(ktest)]
     pub(crate) fn dirty_redirect_ranges(&self, fs_id: u64, budget: usize) -> Vec<RedirectRange> {
         self.redirects
             .dirty_ranges(budget)
@@ -452,6 +455,7 @@ impl Rnvpc {
             .collect()
     }
 
+    #[cfg(ktest)]
     pub(crate) fn claim_redirect_range(
         self: &Arc<Self>,
         snapshot: &RedirectRange,

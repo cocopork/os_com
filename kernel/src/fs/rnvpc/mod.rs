@@ -327,15 +327,6 @@ pub(crate) fn flush_candidates(
     out
 }
 
-pub(crate) fn rnvpce_redirect_ranges(
-    fs_id: u64,
-    budget: usize,
-) -> Vec<redirect_index::RedirectRange> {
-    pool()
-        .map(|pool| pool.dirty_redirect_ranges(fs_id, budget))
-        .unwrap_or_default()
-}
-
 /// rTIO v0：一页的 SSD 写已完成，推进 completion（两条路线各自退休/回收）。
 ///
 /// `flushed_page`/`flushed_generation` 一起标识刚写到 SSD 的那一版（页 id 会被复用，

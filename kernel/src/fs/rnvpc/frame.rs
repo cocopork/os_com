@@ -41,7 +41,7 @@ use super::{
     persist::PersistEngine,
     recover,
     redirect_index::{
-        DescriptorHandle, MigrationConflict, MigrationExtentLease, RedirectDirectory, RedirectRange,
+        DescriptorHandle, MigrationConflict, MigrationExtentLease, RedirectDirectory,
     },
 };
 use crate::{
@@ -401,11 +401,13 @@ pub(crate) struct ClaimedMigrationPage {
     pub(crate) eviction: EvictingDataPage,
 }
 
+#[cfg(ktest)]
 pub(crate) struct ClaimedRedirectRange {
     pub(crate) baseline_token: BaselineRangeToken,
     pub(crate) pages: Vec<ClaimedRedirectPage>,
 }
 
+#[cfg(ktest)]
 pub(crate) struct ClaimedRedirectPage {
     pub(crate) key: PageKey,
     pub(crate) handle: DescriptorHandle,

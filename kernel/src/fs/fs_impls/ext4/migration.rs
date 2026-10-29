@@ -33,6 +33,7 @@ pub(super) struct MigrationGroupOwners {
 }
 
 impl MigrationGroupOwners {
+    #[cfg(ktest)]
     fn try_acquire(&mut self, groups: &BTreeSet<usize>) -> bool {
         if groups.iter().any(|group| self.active.contains(group)) {
             return false;
