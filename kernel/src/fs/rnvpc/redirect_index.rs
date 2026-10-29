@@ -7,6 +7,7 @@ use crate::prelude::*;
 
 const REDIRECT_SHARD_COUNT: usize = 64;
 const REDIRECT_SHARD_PAGES: u64 = 256;
+pub(crate) const MAX_DIRTY_MIGRATION_EXTENT_PAGES: usize = 128;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct DescriptorHandle {
@@ -25,6 +26,127 @@ pub(crate) struct RedirectRange {
     pub(crate) pages: Vec<DescriptorHandle>,
     pub(crate) epoch: u64,
     shard: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct DirtyMigrationExtent {
+    fs_id: u64,
+    inode: u64,
+    logical_start: u64,
+    pages: Vec<DescriptorHandle>,
+    partition: usize,
+}
+
+impl DirtyMigrationExtent {
+    pub(crate) fn try_new(
+        partition: usize,
+        entries: Vec<(PageKey, DescriptorHandle)>,
+    ) -> Result<Self> {
+        let Some((first_key, first_handle)) = entries.first().copied() else {
+            return_errno_with_message!(Errno::EINVAL, "empty dirty migration extent");
+        };
+        if entries.len() > MAX_DIRTY_MIGRATION_EXTENT_PAGES {
+            return_errno_with_message!(Errno::E2BIG, "dirty migration extent is too large");
+        }
+        if first_handle.state != NvObjectState::NvDirty
+            || redirect_partition_index(first_key) != partition
+        {
+            return_errno_with_message!(Errno::EINVAL, "invalid dirty migration extent head");
+        }
+        for pair in entries.windows(2) {
+            if !dirty_entries_are_contiguous(pair[0], pair[1])
+                || redirect_partition_index(pair[1].0) != partition
+            {
+                return_errno_with_message!(
+                    Errno::EINVAL,
+                    "dirty migration extent is not contiguous"
+                );
+            }
+        }
+        Ok(Self {
+            fs_id: first_key.fs_id,
+            inode: first_key.inode,
+            logical_start: first_key.page_index,
+            pages: entries.into_iter().map(|(_, handle)| handle).collect(),
+            partition,
+        })
+    }
+
+    pub(crate) fn logical_start(&self) -> u64 {
+        self.logical_start
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.pages.len()
+    }
+
+    pub(crate) fn nv_base_slot(&self) -> u64 {
+        self.pages[0]
+            .reference
+            .slot()
+            .expect("a dirty redirect has an NVPage slot")
+    }
+}
+
+fn dirty_entries_are_contiguous(
+    previous: (PageKey, DescriptorHandle),
+    next: (PageKey, DescriptorHandle),
+) -> bool {
+    previous.0.fs_id == next.0.fs_id
+        && previous.0.inode == next.0.inode
+        && previous.0.page_index.checked_add(1) == Some(next.0.page_index)
+        && previous
+            .1
+            .reference
+            .slot()
+            .and_then(|slot| slot.checked_add(1))
+            == next.1.reference.slot()
+        && previous.1.state == NvObjectState::NvDirty
+        && next.1.state == NvObjectState::NvDirty
+        && previous.1.migration_target == next.1.migration_target
+        && ((previous.1.ssd_target == 0 && next.1.ssd_target == 0)
+            || previous
+                .1
+                .ssd_target
+                .checked_add(1)
+                .is_some_and(|target| target == next.1.ssd_target))
+}
+
+fn build_dirty_migration_extents(
+    entries: Vec<(PageKey, DescriptorHandle)>,
+) -> Result<Vec<DirtyMigrationExtent>> {
+    let mut extents = Vec::new();
+    let mut current = Vec::new();
+    for entry in entries {
+        let can_append = current.last().copied().is_some_and(|previous| {
+            current.len() < MAX_DIRTY_MIGRATION_EXTENT_PAGES
+                && dirty_entries_are_contiguous(previous, entry)
+                && redirect_partition_index(previous.0) == redirect_partition_index(entry.0)
+        });
+        if !current.is_empty() && !can_append {
+            let partition = redirect_partition_index(current[0].0);
+            extents.push(DirtyMigrationExtent::try_new(
+                partition,
+                core::mem::take(&mut current),
+            )?);
+        }
+        current.push(entry);
+    }
+    if !current.is_empty() {
+        let partition = redirect_partition_index(current[0].0);
+        extents.push(DirtyMigrationExtent::try_new(partition, current)?);
+    }
+    Ok(extents)
+}
+
+fn redirect_partition_index(key: PageKey) -> usize {
+    let owner = key
+        .fs_id
+        .wrapping_mul(0x9e37_79b9_7f4a_7c15)
+        .rotate_left(17)
+        ^ key.inode.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    (owner.wrapping_add(key.page_index / REDIRECT_SHARD_PAGES) % REDIRECT_SHARD_COUNT as u64)
+        as usize
 }
 
 #[derive(Debug)]
@@ -394,13 +516,7 @@ impl RedirectDirectory {
     }
 
     fn shard_index(&self, key: PageKey) -> usize {
-        let owner = key
-            .fs_id
-            .wrapping_mul(0x9e37_79b9_7f4a_7c15)
-            .rotate_left(17)
-            ^ key.inode.wrapping_mul(0xbf58_476d_1ce4_e5b9);
-        (owner.wrapping_add(key.page_index / REDIRECT_SHARD_PAGES) % REDIRECT_SHARD_COUNT as u64)
-            as usize
+        redirect_partition_index(key)
     }
 }
 
@@ -423,6 +539,126 @@ mod tests {
             ssd_target: target,
             migration_target: false,
         }
+    }
+
+    fn extent_entries(
+        fs_id: u64,
+        inode: u64,
+        logical_start: u64,
+        nv_slot_start: u64,
+        pages: usize,
+    ) -> Vec<(PageKey, DescriptorHandle)> {
+        (0..pages)
+            .map(|offset| {
+                let offset = offset as u64;
+                (
+                    PageKey::new(fs_id, inode, logical_start + offset),
+                    handle(
+                        nv_slot_start + offset,
+                        1000 + offset,
+                        1,
+                        10_000 + logical_start + offset,
+                    ),
+                )
+            })
+            .collect()
+    }
+
+    fn dirty_migration_extent_accepts_one_and_128_pages() {
+        for pages in [1, 128] {
+            let entries = extent_entries(1, 2, 0, 100, pages);
+            let partition = redirect_partition_index(entries[0].0);
+            let extent = DirtyMigrationExtent::try_new(partition, entries).unwrap();
+            assert_eq!(extent.logical_start(), 0);
+            assert_eq!(extent.len(), pages);
+            assert_eq!(extent.nv_base_slot(), 100);
+        }
+    }
+
+    fn dirty_migration_extent_rejects_zero_and_129_pages() {
+        assert_eq!(
+            DirtyMigrationExtent::try_new(0, Vec::new())
+                .unwrap_err()
+                .error(),
+            Errno::EINVAL
+        );
+        let entries = extent_entries(1, 2, 0, 100, 129);
+        let partition = redirect_partition_index(entries[0].0);
+        assert_eq!(
+            DirtyMigrationExtent::try_new(partition, entries)
+                .unwrap_err()
+                .error(),
+            Errno::E2BIG
+        );
+    }
+
+    fn dirty_migration_extent_rejects_discontinuities() {
+        let mut logical = extent_entries(1, 2, 0, 100, 3);
+        logical[1].0 = PageKey::new(1, 2, 7);
+        let partition = redirect_partition_index(logical[0].0);
+        assert!(DirtyMigrationExtent::try_new(partition, logical).is_err());
+
+        let mut physical = extent_entries(1, 2, 0, 100, 3);
+        physical[1].1.reference = PersistentObjectRef::new(900, 1001).unwrap();
+        let partition = redirect_partition_index(physical[0].0);
+        assert!(DirtyMigrationExtent::try_new(partition, physical).is_err());
+
+        let mut owner = extent_entries(1, 2, 0, 100, 3);
+        owner[1].0 = PageKey::new(1, 3, 1);
+        let partition = redirect_partition_index(owner[0].0);
+        assert!(DirtyMigrationExtent::try_new(partition, owner).is_err());
+    }
+
+    fn dirty_migration_extent_caps_merge_and_splits_on_a_hole() {
+        let entries = extent_entries(1, 2, 0, 100, 256);
+        let extents = build_dirty_migration_extents(entries.clone()).unwrap();
+        assert_eq!(
+            extents
+                .iter()
+                .map(DirtyMigrationExtent::len)
+                .collect::<Vec<_>>(),
+            vec![128, 128]
+        );
+
+        let first_extent: Vec<_> = entries.iter().copied().take(128).collect();
+        let without_middle = first_extent
+            .iter()
+            .copied()
+            .filter(|(key, _)| key.page_index != 64)
+            .collect();
+        let split = build_dirty_migration_extents(without_middle).unwrap();
+        assert_eq!(
+            split
+                .iter()
+                .map(DirtyMigrationExtent::len)
+                .collect::<Vec<_>>(),
+            vec![64, 63]
+        );
+
+        let rebuilt = build_dirty_migration_extents(first_extent).unwrap();
+        assert_eq!(
+            rebuilt
+                .iter()
+                .map(DirtyMigrationExtent::len)
+                .collect::<Vec<_>>(),
+            vec![128]
+        );
+    }
+
+    fn dirty_migration_extent_rejects_partition_crossing() {
+        let entries = extent_entries(1, 2, REDIRECT_SHARD_PAGES - 1, 100, 2);
+        let partition = redirect_partition_index(entries[0].0);
+        assert_ne!(partition, redirect_partition_index(entries[1].0));
+        assert!(DirtyMigrationExtent::try_new(partition, entries).is_err());
+    }
+
+    #[ktest]
+    fn rnvpce_dirty_migration_extents() {
+        dirty_migration_extent_accepts_one_and_128_pages();
+        dirty_migration_extent_rejects_zero_and_129_pages();
+        dirty_migration_extent_rejects_discontinuities();
+        dirty_migration_extent_caps_merge_and_splits_on_a_hole();
+        dirty_migration_extent_rejects_partition_crossing();
     }
 
     #[ktest]
