@@ -131,6 +131,17 @@ impl Rnvpc {
             .claimed_extent_overlaps(fs_id, inode, logical_start, pages)
     }
 
+    pub(crate) fn first_migration_overlap(
+        &self,
+        fs_id: u64,
+        inode: u64,
+        logical_start: u64,
+        pages: usize,
+    ) -> Option<MigrationConflict> {
+        self.redirects
+            .first_claimed_overlap(fs_id, inode, logical_start, pages)
+    }
+
     pub(crate) fn publish_redirect_batch(
         &self,
         pages: &[(NvPageId, PageKey, u64)],

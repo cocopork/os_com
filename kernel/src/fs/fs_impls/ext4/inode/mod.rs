@@ -1743,9 +1743,9 @@ impl Inode {
             .checked_mul(PAGE_SIZE)
             .and_then(|bytes| bytes.checked_sub(offset % PAGE_SIZE))
             .ok_or_else(|| Error::new(Errno::EOVERFLOW))?;
-        let write_len = reader.remain().min(max_write_len);
+        let mut write_len = reader.remain().min(max_write_len);
         reader.limit(write_len);
-        let end = offset
+        let mut end = offset
             .checked_add(write_len)
             .ok_or_else(|| Error::with_message(Errno::EINVAL, "write range overflow"))?;
         if end > fs.max_file_size() {
@@ -1758,6 +1758,29 @@ impl Inode {
         let fs_id = fs.rnvpc_fs_id();
         let inode_id = self.ino as u64;
         loop {
+            let lease_epoch = pool.data_page_lease_epoch();
+            let first_page = offset / PAGE_SIZE;
+            let last_page = end.div_ceil(PAGE_SIZE);
+            if let Some(conflict) = pool.first_migration_overlap(
+                fs_id,
+                inode_id,
+                first_page as u64,
+                last_page - first_page,
+            ) {
+                let conflict_offset = usize::try_from(conflict.logical_start)
+                    .ok()
+                    .and_then(|page| page.checked_mul(PAGE_SIZE))
+                    .ok_or_else(|| Error::new(Errno::EOVERFLOW))?;
+                if conflict_offset <= offset {
+                    fs.wait_for_nv_migration_progress(&pool, lease_epoch)?;
+                    continue;
+                }
+                write_len = write_len.min(conflict_offset - offset);
+                reader.limit(write_len);
+                end = offset
+                    .checked_add(write_len)
+                    .ok_or_else(|| Error::new(Errno::EOVERFLOW))?;
+            }
             let t_lock = read_ns();
             let mut inner = self.inner.write();
             LATENCY_STATS.rnvpce_write_inner_wait.record_since(t_lock);

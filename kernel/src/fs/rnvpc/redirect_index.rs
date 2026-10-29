@@ -125,6 +125,13 @@ pub(crate) struct MigrationExtentLease {
     generation: u64,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct MigrationConflict {
+    pub(crate) logical_start: u64,
+    pub(crate) logical_end: u64,
+    pub(crate) generation: u64,
+}
+
 impl MigrationExtentLease {
     pub(crate) fn extent(&self) -> &DirtyMigrationExtent {
         &self.extent
@@ -630,19 +637,52 @@ impl RedirectDirectory {
         logical_start: u64,
         pages: usize,
     ) -> bool {
-        let Some(logical_end) = logical_start.checked_add(pages as u64) else {
-            return true;
-        };
-        self.partitions.iter().any(|partition| {
-            partition.lock().claimed_extents.values().any(|indexed| {
+        self.first_claimed_overlap(fs_id, inode, logical_start, pages)
+            .is_some()
+    }
+
+    pub(crate) fn first_claimed_overlap(
+        &self,
+        fs_id: u64,
+        inode: u64,
+        logical_start: u64,
+        pages: usize,
+    ) -> Option<MigrationConflict> {
+        let logical_end = logical_start.checked_add(pages as u64)?;
+        let mut cursor = logical_start;
+        let mut first = None;
+        while cursor < logical_end {
+            let key = PageKey::new(fs_id, inode, cursor);
+            let partition = self.partition_index(key);
+            let state = self.partitions[partition].lock();
+            for indexed in state.claimed_extents.values() {
                 let extent = &indexed.extent;
                 let extent_end = extent.logical_start + extent.pages.len() as u64;
-                extent.fs_id == fs_id
+                if extent.fs_id == fs_id
                     && extent.inode == inode
                     && extent.logical_start < logical_end
                     && logical_start < extent_end
-            })
-        })
+                {
+                    let conflict = MigrationConflict {
+                        logical_start: extent.logical_start,
+                        logical_end: extent_end,
+                        generation: indexed.generation,
+                    };
+                    if first.is_none_or(|current: MigrationConflict| {
+                        conflict.logical_start < current.logical_start
+                    }) {
+                        first = Some(conflict);
+                    }
+                }
+            }
+            drop(state);
+            let next_boundary = cursor
+                .checked_div(REDIRECT_PARTITION_PAGES)?
+                .checked_add(1)?
+                .checked_mul(REDIRECT_PARTITION_PAGES)?;
+            cursor = next_boundary.min(logical_end);
+        }
+        first
     }
 
     #[cfg(ktest)]
@@ -974,6 +1014,12 @@ mod tests {
             .rebuild(extent_entries(0x88, 10, 0, 6000, 4))
             .unwrap();
         let lease = directory.claim_ready_extents(0x88, 4).unwrap().remove(0);
+        let conflict = directory
+            .first_claimed_overlap(0x88, 10, 0, 4)
+            .expect("claimed extent overlaps its exact range");
+        assert_eq!((conflict.logical_start, conflict.logical_end), (0, 4));
+        assert_eq!(conflict.generation, lease.generation());
+        assert!(directory.first_claimed_overlap(0x88, 10, 4, 4).is_none());
         assert_eq!(
             directory
                 .reserve_versions(&[PageKey::new(0x88, 10, 2)])

@@ -40,7 +40,9 @@ use super::{
     },
     persist::PersistEngine,
     recover,
-    redirect_index::{DescriptorHandle, MigrationExtentLease, RedirectDirectory, RedirectRange},
+    redirect_index::{
+        DescriptorHandle, MigrationConflict, MigrationExtentLease, RedirectDirectory, RedirectRange,
+    },
 };
 use crate::{
     fs::fs_impls::ext4::{LATENCY_ENABLED, LATENCY_STATS, read_ns},
