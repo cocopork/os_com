@@ -1157,16 +1157,43 @@ impl Rnvpc {
     }
 
     pub(crate) fn free_data_pages(&self, pages: &[NvPageId]) -> Result<()> {
+        if pages.is_empty() {
+            return Ok(());
+        }
+        let state = self.state.lock();
+        let referenced = state
+            .references
+            .values()
+            .filter(|entry| entry.published)
+            .map(|entry| entry.page)
+            .collect::<BTreeSet<_>>();
+        let mut allocation = self.allocation.lock();
         let mut freed = 0usize;
         for page in pages {
-            if let Err(error) = self.free_data_page_inner(*page) {
-                if freed != 0 {
-                    self.wake_one_data_capacity_waiter();
-                }
-                return Err(error);
+            let mut objects = self.objects.lock_checked(page.index())?;
+            let record = objects
+                .records
+                .get_mut(page.index())
+                .ok_or_else(|| Error::new(Errno::EINVAL))?;
+            let ObjectKind::Data(data_state) = record.kind else {
+                return_errno_with_message!(Errno::EINVAL, "RNVPC data page is not allocated");
+            };
+            if record.committed {
+                return_errno_with_message!(Errno::EBUSY, "RNVPC data page is still committed");
             }
+            if referenced.contains(page) {
+                return_errno_with_message!(Errno::EBUSY, "RNVPC data page is still referenced");
+            }
+            if record.pins != 0 || !data_state.can_free() {
+                return_errno_with_message!(Errno::EBUSY, "RNVPC data page cannot be freed");
+            }
+            record.kind = ObjectKind::Free;
+            allocation.free_ids.push(page.index());
+            allocation.capacity.account_free(PoolClass::Data);
             freed += 1;
         }
+        drop(allocation);
+        drop(state);
         if freed != 0 {
             self.wake_one_data_capacity_waiter();
         }

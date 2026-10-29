@@ -173,6 +173,14 @@ struct PendingPage {
     lease: MigrationLease,
 }
 
+struct RedirectReclaimPlan {
+    extent: Arc<ClaimedDirtyExtent>,
+    pages: Vec<PendingPage>,
+    exact: Vec<(rnvpc::index::PageKey, DescriptorHandle)>,
+    new_baselines: Vec<(u64, u64)>,
+    new_target_refs: Vec<PersistentObjectRef>,
+}
+
 enum MigrationLease {
     Legacy(EvictingDataPage),
     Redirect {
@@ -529,6 +537,9 @@ impl Ext4 {
             }
         }
         pp::NV_CANDIDATE_SELECT.record_since(candidate_started, pages.len());
+        if pages.is_empty() {
+            return Ok(0);
+        }
         let target_started = pp::now();
         let group_reservation = if self.rnvpc_extend_enabled() {
             match self.prepare_nv_targets(&mut pages) {
@@ -699,6 +710,10 @@ impl Ext4 {
     /// Group ownership precedes every bitmap/GDT mutation, and EXT4 allocation
     /// metadata joins the later orderless batch barrier.
     fn prepare_nv_targets(&self, pages: &mut [PendingPage]) -> Result<BTreeSet<usize>> {
+        debug_assert!(
+            !pages.is_empty(),
+            "empty migration rounds must skip target preparation"
+        );
         let group_reservation = self.reserve_nv_target_groups(pages)?;
         let groups = group_reservation.groups().clone();
         let mut allocated = Vec::with_capacity(pages.len());
@@ -965,8 +980,9 @@ impl Ext4 {
     }
 
     pub(super) fn help_nv_reclaim(&self, budget: usize) -> Result<usize> {
-        let mut reclaimed = 0usize;
-        while reclaimed < budget {
+        let mut tickets = Vec::new();
+        let mut page_total = 0usize;
+        while page_total < budget {
             let Some((ticket, pages_count)) = self.nv_reclaim_queue.claim() else {
                 break;
             };
@@ -976,27 +992,34 @@ impl Ext4 {
                 ready_at_ns,
             } = ticket;
             pp::NV_RECLAIM_READY_WAIT.record_since(ready_at_ns, pages_count);
-            let publish_started = pp::now();
-            let result = self.finish_redirect_pages(
-                rnvpc::pool().ok_or_else(|| Error::new(Errno::EINVAL))?,
-                pages,
-            );
-            if let Err(error) = result {
-                self.nv_reclaim_pending
-                    .fetch_sub(pages_count, Ordering::AcqRel);
-                batch.complete_ticket(self);
-                self.fail_nv_migration();
-                return Err(error);
-            }
-            pp::NV_EXTENT_PUBLISH.record_since(publish_started, pages_count);
-            pp::NV_RECLAIM_HELP.record_since(publish_started, pages_count);
+            page_total = page_total.saturating_add(pages_count);
+            tickets.push((pages, batch, pages_count));
+        }
+        if tickets.is_empty() {
+            return Ok(0);
+        }
+        let publish_started = pp::now();
+        let groups = tickets
+            .iter_mut()
+            .map(|(pages, _, _)| core::mem::take(pages))
+            .collect();
+        let result = self.finish_redirect_page_batches(
+            rnvpc::pool().ok_or_else(|| Error::new(Errno::EINVAL))?,
+            groups,
+        );
+        pp::NV_EXTENT_PUBLISH.record_since(publish_started, page_total);
+        pp::NV_RECLAIM_HELP.record_since(publish_started, page_total);
+        for (_, batch, pages_count) in tickets {
             self.nv_reclaim_pending
                 .fetch_sub(pages_count, Ordering::AcqRel);
             batch.complete_ticket(self);
-            reclaimed = reclaimed.saturating_add(pages_count);
-            self.nv_reclaim_trigger.wake_all();
         }
-        Ok(reclaimed)
+        if let Err(error) = result {
+            self.fail_nv_migration();
+            return Err(error);
+        }
+        self.nv_reclaim_trigger.wake_all();
+        Ok(page_total)
     }
 
     fn restore_failed_migration_jobs(
@@ -1090,82 +1113,106 @@ impl Ext4 {
         Ok(())
     }
 
-    fn finish_redirect_pages(
+    fn finish_redirect_page_batches(
         &self,
         pool: &Arc<rnvpc::frame::Rnvpc>,
-        pages: Vec<PendingPage>,
+        page_groups: Vec<Vec<PendingPage>>,
     ) -> Result<()> {
-        let extent = pages
-            .first()
-            .and_then(|page| page.lease.dirty_extent())
-            .cloned()
-            .ok_or_else(|| Error::new(Errno::EUCLEAN))?;
-        if pages.len() != extent.pages().len()
-            || pages.iter().any(|page| {
-                page.lease
-                    .dirty_extent()
-                    .is_none_or(|candidate| !Arc::ptr_eq(candidate, &extent))
-            })
-        {
-            return_errno_with_message!(Errno::EUCLEAN, "reclaim ticket mixes migration extents");
-        }
-        let mut exact = Vec::with_capacity(pages.len());
-        let mut new_baselines = Vec::new();
-        let mut new_target_refs = Vec::new();
-        let mut baseline_valid = true;
-        let compare_started = batch_metrics::now();
-        for page in &pages {
-            let (handle, token) = page
-                .redirect
-                .as_ref()
+        let mut plans = Vec::with_capacity(page_groups.len());
+        for pages in page_groups {
+            let extent = pages
+                .first()
+                .and_then(|page| page.lease.dirty_extent())
+                .cloned()
                 .ok_or_else(|| Error::new(Errno::EUCLEAN))?;
-            let handle = *handle;
-            let key = rnvpc::index::PageKey::new(self.rnvpc_fs_id(), page.inode, page.index);
-            let token_matches = token.target(page.index).is_some_and(|target| {
-                target
-                    == if handle.migration_target {
-                        0
-                    } else {
-                        handle.ssd_target
-                    }
-            });
-            let generation_matches = pool.validate_baseline_token(token);
-            if !generation_matches || !token_matches {
-                let resolved = rnvpc::write_transaction::current_page_mapping(
-                    pool,
-                    self.rnvpc_fs_id(),
-                    page.inode,
-                    page.index,
-                )?;
-                baseline_valid &= !page.needs_baseline
-                    && resolved.is_some_and(|mapping| {
-                        mapping.is_written() && mapping.ssd_block() == page.target
-                    });
+            if pages.len() != extent.pages().len()
+                || pages.iter().any(|page| {
+                    page.lease
+                        .dirty_extent()
+                        .is_none_or(|candidate| !Arc::ptr_eq(candidate, &extent))
+                })
+            {
+                return_errno_with_message!(
+                    Errno::EUCLEAN,
+                    "reclaim ticket mixes migration extents"
+                );
             }
-            exact.push((key, handle));
-            if page.needs_baseline {
-                if page.target == 0 {
-                    return_errno_with_message!(Errno::EUCLEAN, "migration has no SSD target");
+            let mut exact = Vec::with_capacity(pages.len());
+            let mut new_baselines = Vec::new();
+            let mut new_target_refs = Vec::new();
+            let mut baseline_valid = true;
+            let compare_started = batch_metrics::now();
+            for page in &pages {
+                let (handle, token) = page
+                    .redirect
+                    .as_ref()
+                    .ok_or_else(|| Error::new(Errno::EUCLEAN))?;
+                let handle = *handle;
+                let key = rnvpc::index::PageKey::new(self.rnvpc_fs_id(), page.inode, page.index);
+                let token_matches = token.target(page.index).is_some_and(|target| {
+                    target
+                        == if handle.migration_target {
+                            0
+                        } else {
+                            handle.ssd_target
+                        }
+                });
+                let generation_matches = pool.validate_baseline_token(token);
+                if !generation_matches || !token_matches {
+                    let resolved = rnvpc::write_transaction::current_page_mapping(
+                        pool,
+                        self.rnvpc_fs_id(),
+                        page.inode,
+                        page.index,
+                    )?;
+                    baseline_valid &= !page.needs_baseline
+                        && resolved.is_some_and(|mapping| {
+                            mapping.is_written() && mapping.ssd_block() == page.target
+                        });
                 }
-                new_baselines.push((page.index, page.target));
-                new_target_refs.push(handle.reference);
+                exact.push((key, handle));
+                if page.needs_baseline {
+                    if page.target == 0 {
+                        return_errno_with_message!(Errno::EUCLEAN, "migration has no SSD target");
+                    }
+                    new_baselines.push((page.index, page.target));
+                    new_target_refs.push(handle.reference);
+                }
+            }
+            batch_metrics::elapsed(Phase::CompletionCompare, compare_started);
+            batch_metrics::count(Event::CompletionComparisons, exact.len());
+            if !baseline_valid {
+                drop(pages);
+                continue;
+            }
+            plans.push(RedirectReclaimPlan {
+                extent,
+                pages,
+                exact,
+                new_baselines,
+                new_target_refs,
+            });
+        }
+
+        let mut publications: BTreeMap<u64, (Vec<(u64, u64)>, Vec<PersistentObjectRef>)> =
+            BTreeMap::new();
+        for plan in &plans {
+            if !plan.new_baselines.is_empty() {
+                let publication = publications.entry(plan.pages[0].inode).or_default();
+                publication.0.extend(plan.new_baselines.iter().copied());
+                publication.1.extend(plan.new_target_refs.iter().copied());
             }
         }
-        batch_metrics::elapsed(Phase::CompletionCompare, compare_started);
-        batch_metrics::count(Event::CompletionComparisons, exact.len());
-        if !baseline_valid {
-            drop(pages);
-            return Ok(());
-        }
-        if !new_baselines.is_empty() {
+        for (inode, (mut new_baselines, new_target_refs)) in publications {
             new_baselines.sort_unstable_by_key(|(logical, _)| *logical);
-            let inode = pages[0].inode;
+            let baseline_started = pp::now();
             rnvpc::write_transaction::publish_claimed_ssd_baseline_batch(
                 pool,
                 self.rnvpc_fs_id(),
                 inode,
                 &new_baselines,
             )?;
+            pp::NV_EXTENT_PREPARE.record_since(baseline_started, new_baselines.len());
             let mut releasable = Vec::with_capacity(new_target_refs.len());
             for reference in new_target_refs {
                 if !pool.persistent_data_has_migration_target(reference)? {
@@ -1191,34 +1238,37 @@ impl Ext4 {
                 self.release_rnvpce_blocks(releasable.len() as u64)?;
             }
         }
-        extent.release_physical_for_completion()?;
-        for chunk in exact.chunks(128) {
-            let reclaimed = loop {
-                let lease_epoch = pool.data_page_lease_epoch();
-                match pool.clear_redirects_exact(chunk, None) {
-                    Ok(reclaimed) => break reclaimed,
-                    Err(error) if error.error() == Errno::EBUSY => {
-                        pool.wait_for_data_page_lease_change(lease_epoch);
+
+        for plan in plans {
+            plan.extent.release_physical_for_completion()?;
+            for chunk in plan.exact.chunks(128) {
+                let reclaimed = loop {
+                    let lease_epoch = pool.data_page_lease_epoch();
+                    match pool.clear_redirects_exact(chunk, None) {
+                        Ok(reclaimed) => break reclaimed,
+                        Err(error) if error.error() == Errno::EBUSY => {
+                            pool.wait_for_data_page_lease_change(lease_epoch);
+                        }
+                        Err(error) => return Err(error),
                     }
-                    Err(error) => return Err(error),
-                }
-            };
-            let mut slots = reclaimed
-                .iter()
-                .map(|page| page.index())
-                .collect::<Vec<_>>();
-            slots.sort_unstable();
-            let ranges = slots
-                .iter()
-                .enumerate()
-                .filter(|(index, slot)| *index == 0 || **slot != slots[*index - 1] + 1)
-                .count();
-            batch_metrics::count(Event::ReclaimedSlotRanges, ranges);
-            pool.free_data_pages(&reclaimed)?;
-            batch_metrics::count(Event::ReclaimedPages, reclaimed.len());
+                };
+                let mut slots = reclaimed
+                    .iter()
+                    .map(|page| page.index())
+                    .collect::<Vec<_>>();
+                slots.sort_unstable();
+                let ranges = slots
+                    .iter()
+                    .enumerate()
+                    .filter(|(index, slot)| *index == 0 || **slot != slots[*index - 1] + 1)
+                    .count();
+                batch_metrics::count(Event::ReclaimedSlotRanges, ranges);
+                pool.free_data_pages(&reclaimed)?;
+                batch_metrics::count(Event::ReclaimedPages, reclaimed.len());
+            }
+            plan.extent.complete_success()?;
+            drop(plan.pages);
         }
-        extent.complete_success()?;
-        drop(pages);
         Ok(())
     }
 }

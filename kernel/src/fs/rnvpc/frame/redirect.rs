@@ -698,10 +698,10 @@ impl Rnvpc {
             batch_metrics::count(batch_metrics::Event::DescriptorClearBatches, 1);
         }
         let mut reclaimed = Vec::with_capacity(prepared.len());
-        for (slot, key, handle) in prepared {
-            let page = NvPageId::try_from(slot)?;
-            let mut objects = self.objects.lock(slot);
-            let record = &mut objects.records[slot];
+        for (slot, _, _) in &prepared {
+            let page = NvPageId::try_from(*slot)?;
+            let mut objects = self.objects.lock(*slot);
+            let record = &mut objects.records[*slot];
             record.kind = ObjectKind::Data(DataPageState::Synced);
             record.pins = 0;
             record.persisting = false;
@@ -710,7 +710,14 @@ impl Rnvpc {
             record.version = 0;
             self.account_unpin();
             drop(objects);
-            self.redirects.compare_remove(key, handle);
+            reclaimed.push(page);
+        }
+        let exact = prepared
+            .iter()
+            .map(|(_, key, handle)| (*key, *handle))
+            .collect::<Vec<_>>();
+        self.redirects.compare_remove_batch(&exact);
+        for (_, key, handle) in prepared {
             let mut legacy = self.state.lock();
             if legacy.index.lookup(key).is_some_and(|entry| {
                 entry.reference == handle.reference
@@ -718,7 +725,6 @@ impl Rnvpc {
             }) {
                 legacy.index.remove(key);
             }
-            reclaimed.push(page);
         }
         if !reclaimed.is_empty() {
             note_data_page_lease_change();

@@ -222,8 +222,8 @@ struct RedirectPartition {
     committed: BTreeMap<PageKey, DescriptorHandle>,
     pending: BTreeMap<PageKey, BTreeSet<u64>>,
     dirty: BTreeSet<PageKey>,
-    dirty_extents: BTreeMap<PageKey, IndexedDirtyExtent>,
-    ready_extents: VecDeque<PageKey>,
+    ready_pages: VecDeque<PageKey>,
+    ready_set: BTreeSet<PageKey>,
     claimed_extents: BTreeMap<PageKey, IndexedDirtyExtent>,
     next_extent_generation: u64,
     epoch: u64,
@@ -233,6 +233,8 @@ pub(crate) struct RedirectDirectory {
     partitions: Box<[SpinLock<RedirectPartition>]>,
     next_candidate_partition: AtomicUsize,
     candidate_extent_visits: AtomicUsize,
+    #[cfg(ktest)]
+    dirty_extent_rebuilds: AtomicUsize,
 }
 
 impl RedirectDirectory {
@@ -248,6 +250,8 @@ impl RedirectDirectory {
             partitions: partitions.into_boxed_slice(),
             next_candidate_partition: AtomicUsize::new(0),
             candidate_extent_visits: AtomicUsize::new(0),
+            #[cfg(ktest)]
+            dirty_extent_rebuilds: AtomicUsize::new(0),
         })
     }
 
@@ -423,11 +427,9 @@ impl RedirectDirectory {
             {
                 state.committed.insert(*key, handle);
                 Self::set_dirty(state, *key, handle.state);
+                Self::refresh_ready_key(state, *key);
                 state.epoch = state.epoch.wrapping_add(1);
             }
-        }
-        for (partition, state) in &mut guards {
-            Self::rebuild_partition_dirty_extents(state, *partition)?;
         }
         Ok(())
     }
@@ -454,8 +456,8 @@ impl RedirectDirectory {
         }
         state.committed.insert(key, handle);
         Self::set_dirty(&mut state, key, handle.state);
+        Self::refresh_ready_key(&mut state, key);
         state.epoch = state.epoch.wrapping_add(1);
-        Self::rebuild_partition_dirty_extents(&mut state, self.partition_index(key))?;
         Ok(true)
     }
 
@@ -476,23 +478,40 @@ impl RedirectDirectory {
         }
         state.committed.insert(key, replacement);
         Self::set_dirty(&mut state, key, replacement.state);
+        Self::refresh_ready_key(&mut state, key);
         state.epoch = state.epoch.wrapping_add(1);
-        Self::rebuild_partition_dirty_extents(&mut state, self.partition_index(key))
-            .expect("committed redirects form valid dirty extents");
         true
     }
 
     pub(crate) fn compare_remove(&self, key: PageKey, expected: DescriptorHandle) -> bool {
-        let mut state = self.partitions[self.partition_index(key)].lock();
-        if state.committed.get(&key) != Some(&expected) {
-            return false;
+        self.compare_remove_batch(&[(key, expected)]) == 1
+    }
+
+    pub(crate) fn compare_remove_batch(&self, expected: &[(PageKey, DescriptorHandle)]) -> usize {
+        let keys = expected.iter().map(|(key, _)| *key).collect::<Vec<_>>();
+        let partition_ids = self.partitions_for(&keys);
+        let mut guards = partition_ids
+            .iter()
+            .map(|partition| (*partition, self.partitions[*partition].lock()))
+            .collect::<Vec<_>>();
+        let mut removed = 0;
+        for (key, handle) in expected {
+            let partition = self.partition_index(*key);
+            let state = guards
+                .iter_mut()
+                .find(|(index, _)| *index == partition)
+                .map(|(_, state)| state)
+                .expect("requested redirect partition is locked");
+            if state.committed.get(key) != Some(handle) {
+                continue;
+            }
+            state.committed.remove(key);
+            state.dirty.remove(key);
+            state.ready_set.remove(key);
+            state.epoch = state.epoch.wrapping_add(1);
+            removed += 1;
         }
-        state.committed.remove(&key);
-        state.dirty.remove(&key);
-        state.epoch = state.epoch.wrapping_add(1);
-        Self::rebuild_partition_dirty_extents(&mut state, self.partition_index(key))
-            .expect("committed redirects form valid dirty extents");
-        true
+        removed
     }
 
     pub(crate) fn rebuild<I>(&self, entries: I) -> Result<()>
@@ -513,8 +532,8 @@ impl RedirectDirectory {
             state.committed.clear();
             state.pending.clear();
             state.dirty.clear();
-            state.dirty_extents.clear();
-            state.ready_extents.clear();
+            state.ready_pages.clear();
+            state.ready_set.clear();
             state.claimed_extents.clear();
             state.epoch = state.epoch.wrapping_add(1);
         }
@@ -524,7 +543,7 @@ impl RedirectDirectory {
             Self::set_dirty(state, key, handle.state);
         }
         for (partition, state) in guards.iter_mut().enumerate() {
-            Self::rebuild_partition_dirty_extents(state, partition)?;
+            self.rebuild_partition_ready_pages(state, partition)?;
         }
         Ok(())
     }
@@ -547,27 +566,42 @@ impl RedirectDirectory {
         for offset in 0..self.partitions.len() {
             let partition = (start + offset) % self.partitions.len();
             let mut state = self.partitions[partition].lock();
-            let queued = state.ready_extents.len();
+            let queued = state.ready_pages.len();
             for _ in 0..queued {
-                let Some(start_key) = state.ready_extents.pop_front() else {
+                let Some(seed) = state.ready_pages.pop_front() else {
                     break;
                 };
-                let Some(indexed) = state.dirty_extents.get(&start_key) else {
-                    continue;
-                };
-                self.candidate_extent_visits.fetch_add(1, Ordering::Relaxed);
-                if indexed.extent.fs_id() != fs_id || indexed.extent.len() > remaining {
-                    state.ready_extents.push_back(start_key);
+                if !state.ready_set.remove(&seed) {
                     continue;
                 }
-                let indexed = state
-                    .dirty_extents
-                    .remove(&start_key)
-                    .expect("ready extent was checked");
-                remaining -= indexed.extent.len();
+                self.candidate_extent_visits.fetch_add(1, Ordering::Relaxed);
+                let Some(extent) = Self::extent_from_seed(&state, partition, seed)? else {
+                    continue;
+                };
+                if extent.fs_id() != fs_id || extent.len() > remaining {
+                    Self::enqueue_ready_key(&mut state, seed);
+                    continue;
+                }
+                state.next_extent_generation = state
+                    .next_extent_generation
+                    .checked_add(1)
+                    .ok_or_else(|| Error::new(Errno::EOVERFLOW))?;
+                let indexed = IndexedDirtyExtent {
+                    extent: extent.clone(),
+                    generation: state.next_extent_generation,
+                };
+                for offset in 0..extent.len() {
+                    state.ready_set.remove(&PageKey::new(
+                        extent.fs_id(),
+                        extent.inode(),
+                        extent.logical_start() + offset as u64,
+                    ));
+                }
+                let start_key = extent.start_key();
+                remaining -= extent.len();
                 state.claimed_extents.insert(start_key, indexed.clone());
                 leases.push(MigrationExtentLease {
-                    extent: indexed.extent,
+                    extent,
                     generation: indexed.generation,
                 });
                 if remaining == 0 {
@@ -589,7 +623,17 @@ impl RedirectDirectory {
             return_errno!(Errno::ESTALE);
         }
         state.claimed_extents.remove(&start_key);
-        Self::rebuild_partition_dirty_extents(&mut state, partition)
+        for offset in 0..lease.extent.len() {
+            Self::refresh_ready_key(
+                &mut state,
+                PageKey::new(
+                    lease.extent.fs_id(),
+                    lease.extent.inode(),
+                    lease.extent.logical_start() + offset as u64,
+                ),
+            );
+        }
+        Ok(())
     }
 
     pub(crate) fn complete_extent(&self, lease: &MigrationExtentLease) -> Result<()> {
@@ -603,7 +647,7 @@ impl RedirectDirectory {
             return_errno!(Errno::ESTALE);
         }
         state.claimed_extents.remove(&start_key);
-        Self::rebuild_partition_dirty_extents(&mut state, partition)
+        Ok(())
     }
 
     pub(crate) fn validate_claimed_extent(&self, lease: &MigrationExtentLease) -> bool {
@@ -761,49 +805,122 @@ impl RedirectDirectory {
         }
     }
 
-    fn rebuild_partition_dirty_extents(
+    fn key_is_claimed(state: &RedirectPartition, key: PageKey) -> bool {
+        state
+            .claimed_extents
+            .values()
+            .any(|indexed| indexed.extent.contains(key))
+    }
+
+    fn enqueue_ready_key(state: &mut RedirectPartition, key: PageKey) {
+        if state.ready_set.insert(key) {
+            state.ready_pages.push_back(key);
+        }
+    }
+
+    fn refresh_ready_key(state: &mut RedirectPartition, key: PageKey) {
+        if state.dirty.contains(&key) && !Self::key_is_claimed(state, key) {
+            Self::enqueue_ready_key(state, key);
+        } else {
+            state.ready_set.remove(&key);
+        }
+    }
+
+    fn extent_from_seed(
+        state: &RedirectPartition,
+        partition: usize,
+        seed: PageKey,
+    ) -> Result<Option<DirtyMigrationExtent>> {
+        if !state.dirty.contains(&seed) || Self::key_is_claimed(state, seed) {
+            return Ok(None);
+        }
+        let Some(first) = state.committed.get(&seed).copied() else {
+            return Ok(None);
+        };
+        if first.state != NvObjectState::NvDirty {
+            return Ok(None);
+        }
+        let mut component_start = seed;
+        while let Some(page_index) = component_start.page_index.checked_sub(1) {
+            let previous_key = PageKey::new(seed.fs_id, seed.inode, page_index);
+            if redirect_partition_index(previous_key) != partition
+                || !state.dirty.contains(&previous_key)
+                || Self::key_is_claimed(state, previous_key)
+            {
+                break;
+            }
+            let Some(previous_handle) = state.committed.get(&previous_key).copied() else {
+                break;
+            };
+            let current_handle = state
+                .committed
+                .get(&component_start)
+                .copied()
+                .expect("dirty extent component has committed redirects");
+            if !dirty_entries_are_contiguous(
+                (previous_key, previous_handle),
+                (component_start, current_handle),
+            ) {
+                break;
+            }
+            component_start = previous_key;
+        }
+        if !(seed.page_index - component_start.page_index)
+            .is_multiple_of(MAX_DIRTY_MIGRATION_EXTENT_PAGES as u64)
+        {
+            return Ok(None);
+        }
+        let mut entries = vec![(seed, first)];
+        while entries.len() < MAX_DIRTY_MIGRATION_EXTENT_PAGES {
+            let previous = *entries.last().expect("migration extent has a seed");
+            let Some(page_index) = previous.0.page_index.checked_add(1) else {
+                break;
+            };
+            let key = PageKey::new(seed.fs_id, seed.inode, page_index);
+            if redirect_partition_index(key) != partition
+                || !state.dirty.contains(&key)
+                || Self::key_is_claimed(state, key)
+            {
+                break;
+            }
+            let Some(handle) = state.committed.get(&key).copied() else {
+                break;
+            };
+            if !dirty_entries_are_contiguous(previous, (key, handle)) {
+                break;
+            }
+            entries.push((key, handle));
+        }
+        Ok(Some(DirtyMigrationExtent::try_new(partition, entries)?))
+    }
+
+    fn rebuild_partition_ready_pages(
+        &self,
         state: &mut RedirectPartition,
         partition: usize,
     ) -> Result<()> {
-        let entries = state
-            .dirty
-            .iter()
-            .filter(|key| {
-                !state
-                    .claimed_extents
-                    .values()
-                    .any(|indexed| indexed.extent.contains(**key))
-            })
-            .filter_map(|key| {
-                state
-                    .committed
-                    .get(key)
-                    .copied()
-                    .map(|handle| (*key, handle))
-            })
-            .collect();
-        let extents = build_dirty_migration_extents(entries)?;
-        state.dirty_extents.clear();
-        state.ready_extents.clear();
-        for extent in extents {
-            if extent.partition != partition {
+        #[cfg(ktest)]
+        self.dirty_extent_rebuilds.fetch_add(1, Ordering::Relaxed);
+        state.ready_pages.clear();
+        state.ready_set.clear();
+        let dirty = state.dirty.iter().copied().collect::<Vec<_>>();
+        for key in dirty {
+            if redirect_partition_index(key) != partition {
                 return_errno_with_message!(Errno::EUCLEAN, "dirty extent partition mismatch");
             }
-            state.next_extent_generation = state
-                .next_extent_generation
-                .checked_add(1)
-                .ok_or_else(|| Error::new(Errno::EOVERFLOW))?;
-            let start_key = extent.start_key();
-            state.dirty_extents.insert(
-                start_key,
-                IndexedDirtyExtent {
-                    extent,
-                    generation: state.next_extent_generation,
-                },
-            );
-            state.ready_extents.push_back(start_key);
+            Self::refresh_ready_key(state, key);
         }
         Ok(())
+    }
+
+    #[cfg(ktest)]
+    fn reset_dirty_extent_rebuilds_for_test(&self) {
+        self.dirty_extent_rebuilds.store(0, Ordering::Relaxed);
+    }
+
+    #[cfg(ktest)]
+    fn dirty_extent_rebuilds_for_test(&self) -> usize {
+        self.dirty_extent_rebuilds.load(Ordering::Relaxed)
     }
 
     fn partitions_for(&self, keys: &[PageKey]) -> Vec<usize> {
@@ -999,6 +1116,17 @@ mod tests {
         assert_eq!(directory.candidate_extent_visits_for_test(), 1);
     }
 
+    fn dirty_extent_batch_remove_does_not_rebuild_partition() {
+        let directory = RedirectDirectory::new().unwrap();
+        let entries = extent_entries(0x67, 8, 0, 2100, 32);
+        directory.rebuild(entries.clone()).unwrap();
+        directory.reset_dirty_extent_rebuilds_for_test();
+
+        assert_eq!(directory.compare_remove_batch(&entries), entries.len());
+        assert_eq!(directory.dirty_extent_rebuilds_for_test(), 0);
+        assert!(directory.claim_ready_extents(0x67, 128).unwrap().is_empty());
+    }
+
     fn dirty_extent_recovery_rebuild_is_order_independent() {
         let directory = RedirectDirectory::new().unwrap();
         let mut shuffled = extent_entries(0x77, 9, 0, 5000, 128);
@@ -1040,6 +1168,7 @@ mod tests {
     fn rnvpce_dirty_extent_index() {
         dirty_extent_index_claims_without_page_scan_or_split();
         dirty_extent_index_updates_only_affected_partition();
+        dirty_extent_batch_remove_does_not_rebuild_partition();
         dirty_extent_recovery_rebuild_is_order_independent();
         dirty_extent_lease_blocks_only_its_logical_range();
     }

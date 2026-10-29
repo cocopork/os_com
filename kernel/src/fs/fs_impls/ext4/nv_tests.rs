@@ -28,6 +28,7 @@ fn ext4_research_routes() {
         nv_route_rnvpce_sync_transfers_allocation_authority_to_ssd,
         nv_route_rnvpce_fragmented_batch_and_partial_rollback,
         nv_route_rnvpce_same_group_migration_defers_until_completion,
+        nv_route_rnvpce_empty_round_skips_target_preparation,
         nv_route_rnvpce_round_budget_is_independent_of_global_in_flight,
         nv_route_rnvpce_capacity_wait_releases_inode_lock,
         nv_route_rnvpce_direct_partial_write_and_deferred_export,
@@ -164,6 +165,19 @@ fn nv_route_rnvpce_same_group_migration_defers_until_completion() {
     fixture.ext4.drain_nv_in_flight().unwrap();
     assert_eq!(fixture.ext4.migrate_nv_round(1).unwrap(), 1);
     fixture.ext4.drain_nv_in_flight().unwrap();
+}
+
+fn nv_route_rnvpce_empty_round_skips_target_preparation() {
+    crate::fs::rnvpc::init_for_ext4_tests();
+    crate::time::clocks::init_for_ktest();
+    let fixture = Ext4FixtureBuilder::new(2048, 256, 2048)
+        .with_block_bitmap_metadata_marked()
+        .with_uuid([0xcb; 16])
+        .with_mount_options("rnvpce=on,rtio=off")
+        .build()
+        .unwrap();
+
+    assert_eq!(fixture.ext4.migrate_nv_round(64).unwrap(), 0);
 }
 
 fn nv_route_rnvpce_sync_transfers_allocation_authority_to_ssd() {
