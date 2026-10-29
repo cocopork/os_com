@@ -6,6 +6,116 @@ use super::*;
 use crate::fs::rnvpc::batch_metrics;
 
 impl Rnvpc {
+    #[cfg(ktest)]
+    pub(crate) fn persisted_redirect_state_for_test(
+        &self,
+        handle: DescriptorHandle,
+    ) -> Result<NvObjectState> {
+        let slot = handle
+            .reference
+            .slot()
+            .and_then(|slot| usize::try_from(slot).ok())
+            .ok_or_else(|| Error::new(Errno::EINVAL))?;
+        self.persist
+            .read_entry(slot)?
+            .ok_or_else(|| Error::new(Errno::ESTALE))?
+            .state()
+    }
+
+    pub(crate) fn claim_ready_dirty_extents(
+        &self,
+        fs_id: u64,
+        page_budget: usize,
+    ) -> Result<Vec<MigrationExtentLease>> {
+        self.redirects.claim_ready_extents(fs_id, page_budget)
+    }
+
+    pub(crate) fn claim_dirty_extent(
+        self: &Arc<Self>,
+        logical_lease: MigrationExtentLease,
+    ) -> Result<ClaimedDirtyExtent> {
+        if !self.redirects.validate_claimed_extent(&logical_lease) {
+            let _ = self.redirects.requeue_extent(logical_lease);
+            return_errno!(Errno::ESTALE);
+        }
+        let extent = logical_lease.extent();
+        let base_slot =
+            usize::try_from(extent.nv_base_slot()).map_err(|_| Error::new(Errno::EOVERFLOW))?;
+        let slot_lease = match self.objects.claim_migration_range(base_slot, extent.len()) {
+            Ok(lease) => lease,
+            Err(error) => {
+                let _ = self.redirects.requeue_extent(logical_lease);
+                return Err(error);
+            }
+        };
+        let keys = (0..extent.len())
+            .map(|offset| {
+                PageKey::new(
+                    extent.fs_id(),
+                    extent.inode(),
+                    extent.logical_start() + offset as u64,
+                )
+            })
+            .collect::<Vec<_>>();
+        let baseline_claim = match self.baseline_generations.try_claim_range(&keys) {
+            Ok(claim) => claim,
+            Err(error) => {
+                let _ = self.objects.release_migration_range(slot_lease);
+                let _ = self.redirects.requeue_extent(logical_lease);
+                return Err(error);
+            }
+        };
+        if !self.redirects.validate_claimed_extent(&logical_lease) {
+            self.baseline_generations.release_range(baseline_claim);
+            let _ = self.objects.release_migration_range(slot_lease);
+            let _ = self.redirects.requeue_extent(logical_lease);
+            return_errno!(Errno::ESTALE);
+        }
+        let token_pages = keys
+            .iter()
+            .zip(baseline_claim.generations())
+            .zip(extent.pages())
+            .map(|((key, generation), handle)| {
+                (
+                    *key,
+                    *generation,
+                    if handle.migration_target {
+                        0
+                    } else {
+                        handle.ssd_target
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+        let baseline_token = match self.baseline_generations.claimed_token(&token_pages) {
+            Ok(token) => token,
+            Err(error) => {
+                self.baseline_generations.release_range(baseline_claim);
+                let _ = self.objects.release_migration_range(slot_lease);
+                let _ = self.redirects.requeue_extent(logical_lease);
+                return Err(error);
+            }
+        };
+        Ok(ClaimedDirtyExtent {
+            pool: self.clone(),
+            logical_lease: Some(logical_lease),
+            slot_lease: Some(slot_lease),
+            baseline_claim: Some(baseline_claim),
+            baseline_token,
+        })
+    }
+
+    pub(crate) fn migration_overlap(
+        &self,
+        fs_id: u64,
+        inode: u64,
+        logical_start: u64,
+        pages: usize,
+    ) -> bool {
+        self.redirects
+            .claimed_extent_overlaps(fs_id, inode, logical_start, pages)
+    }
+
     pub(crate) fn publish_redirect_batch(
         &self,
         pages: &[(NvPageId, PageKey, u64)],
@@ -515,6 +625,10 @@ impl Rnvpc {
                 .slot()
                 .and_then(|slot| usize::try_from(slot).ok())
                 .ok_or_else(|| Error::new(Errno::EINVAL))?;
+            if self.objects.migration_range_contains(slot) {
+                self.release_clear_pins(&prepared);
+                return_errno_with_message!(Errno::EBUSY, "redirect range is migrating");
+            }
             if !slots.insert(slot) {
                 self.release_clear_pins(&prepared);
                 return_errno!(Errno::EINVAL);

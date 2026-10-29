@@ -17,7 +17,9 @@ use ostd::{mm::USegment, sync::WaitQueue};
 use super::index::ReverseExtentRef;
 use super::{
     backend::NvMemoryBackend,
-    baseline_generation::{BaselineGenerationMap, BaselineMutationGuard, BaselineRangeToken},
+    baseline_generation::{
+        BaselineGenerationMap, BaselineMutationGuard, BaselineRangeClaim, BaselineRangeToken,
+    },
     capacity::{CapacityState, PoolClass, RnvpcStats},
     config::RnvpcConfig,
     data_page::DataPageState,
@@ -38,7 +40,7 @@ use super::{
     },
     persist::PersistEngine,
     recover,
-    redirect_index::{DescriptorHandle, RedirectDirectory, RedirectRange},
+    redirect_index::{DescriptorHandle, MigrationExtentLease, RedirectDirectory, RedirectRange},
 };
 use crate::{
     fs::fs_impls::ext4::{LATENCY_ENABLED, LATENCY_STATS, read_ns},
@@ -56,7 +58,7 @@ pub(crate) use pcache::{PersistentDataRef, PersistentFrameUpdate};
 mod migration;
 mod object_table;
 mod redirect;
-use object_table::ObjectTable;
+use object_table::{NvSlotRangeLease, ObjectTable};
 mod publication;
 pub(crate) use publication::InodePublication;
 mod repair_workspace;
@@ -407,6 +409,78 @@ pub(crate) struct ClaimedRedirectPage {
     pub(crate) handle: DescriptorHandle,
     pub(crate) pin: PinnedDataPage,
     pub(crate) baseline_generation: u64,
+}
+
+pub(crate) struct ClaimedDirtyExtent {
+    pool: Arc<Rnvpc>,
+    logical_lease: Option<MigrationExtentLease>,
+    slot_lease: Option<NvSlotRangeLease>,
+    baseline_claim: Option<BaselineRangeClaim>,
+    pub(crate) baseline_token: BaselineRangeToken,
+}
+
+impl ClaimedDirtyExtent {
+    pub(crate) fn pages(&self) -> &[DescriptorHandle] {
+        self.logical_lease
+            .as_ref()
+            .expect("live dirty extent has a logical lease")
+            .extent()
+            .pages()
+    }
+
+    pub(crate) fn fs_id(&self) -> u64 {
+        self.logical_lease
+            .as_ref()
+            .expect("live dirty extent has a logical lease")
+            .extent()
+            .fs_id()
+    }
+
+    pub(crate) fn inode(&self) -> u64 {
+        self.logical_lease
+            .as_ref()
+            .expect("live dirty extent has a logical lease")
+            .extent()
+            .inode()
+    }
+
+    pub(crate) fn logical_start(&self) -> u64 {
+        self.logical_lease
+            .as_ref()
+            .expect("live dirty extent has a logical lease")
+            .extent()
+            .logical_start()
+    }
+
+    pub(crate) fn page_id(&self, offset: usize) -> Result<NvPageId> {
+        let lease = self
+            .slot_lease
+            .as_ref()
+            .ok_or_else(|| Error::new(Errno::ESTALE))?;
+        if offset >= lease.len() {
+            return_errno!(Errno::EINVAL);
+        }
+        Ok(NvPageId::try_from(lease.base() + offset)?)
+    }
+
+    pub(crate) fn dma_segment(&self, offset: usize) -> Result<USegment> {
+        self.pool.backend.data_page_segment(self.page_id(offset)?)
+    }
+}
+
+impl Drop for ClaimedDirtyExtent {
+    fn drop(&mut self) {
+        if let Some(claim) = self.baseline_claim.take() {
+            self.pool.baseline_generations.release_range(claim);
+        }
+        if let Some(lease) = self.slot_lease.take() {
+            let _ = self.pool.objects.release_migration_range(lease);
+        }
+        if let Some(lease) = self.logical_lease.take() {
+            let _ = self.pool.redirects.requeue_extent(lease);
+        }
+        note_data_page_lease_change();
+    }
 }
 
 #[cfg(ktest)]

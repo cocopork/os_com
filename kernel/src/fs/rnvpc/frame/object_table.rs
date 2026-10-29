@@ -13,6 +13,30 @@ use crate::prelude::*;
 
 pub(super) struct ObjectTable {
     slots: Vec<SlotEntry>,
+    migration_ranges: SpinLock<MigrationRangeState>,
+}
+
+#[derive(Default)]
+struct MigrationRangeState {
+    active: BTreeMap<usize, (usize, u64)>,
+    next_generation: u64,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub(super) struct NvSlotRangeLease {
+    base: usize,
+    end: usize,
+    generation: u64,
+}
+
+impl NvSlotRangeLease {
+    pub(super) fn base(&self) -> usize {
+        self.base
+    }
+
+    pub(super) fn len(&self) -> usize {
+        self.end - self.base
+    }
 }
 
 struct SlotEntry {
@@ -52,7 +76,62 @@ impl ObjectTable {
                 metadata_mutation_waiters: WaitQueue::new(),
             });
         }
-        Ok(Self { slots })
+        Ok(Self {
+            slots,
+            migration_ranges: SpinLock::new(MigrationRangeState::default()),
+        })
+    }
+
+    pub(super) fn claim_migration_range(
+        &self,
+        base: usize,
+        len: usize,
+    ) -> Result<NvSlotRangeLease> {
+        if len == 0 || len > 128 {
+            return_errno!(Errno::EINVAL);
+        }
+        let end = base
+            .checked_add(len)
+            .filter(|end| *end <= self.slots.len())
+            .ok_or_else(|| Error::new(Errno::EINVAL))?;
+        let mut state = self.migration_ranges.lock();
+        if state
+            .active
+            .range(..end)
+            .next_back()
+            .is_some_and(|(_, (active_end, _))| *active_end > base)
+        {
+            return_errno_with_message!(Errno::EBUSY, "NVPage range is already migrating");
+        }
+        state.next_generation = state
+            .next_generation
+            .checked_add(1)
+            .ok_or_else(|| Error::new(Errno::EOVERFLOW))?;
+        let generation = state.next_generation;
+        state.active.insert(base, (end, generation));
+        Ok(NvSlotRangeLease {
+            base,
+            end,
+            generation,
+        })
+    }
+
+    pub(super) fn release_migration_range(&self, lease: NvSlotRangeLease) -> Result<()> {
+        let mut state = self.migration_ranges.lock();
+        if state.active.get(&lease.base) != Some(&(lease.end, lease.generation)) {
+            return_errno!(Errno::ESTALE);
+        }
+        state.active.remove(&lease.base);
+        Ok(())
+    }
+
+    pub(super) fn migration_range_contains(&self, slot: usize) -> bool {
+        self.migration_ranges
+            .lock()
+            .active
+            .range(..=slot)
+            .next_back()
+            .is_some_and(|(_, (end, _))| slot < *end)
     }
 
     // Lock order: pool control state, allocation state, then one slot. Never
@@ -192,5 +271,21 @@ mod tests {
         assert!(!table.try_claim_metadata_mutation(0, 7).unwrap());
         table.release_metadata_mutation(0, 7).unwrap();
         assert!(table.try_claim_metadata_mutation(0, 7).unwrap());
+    }
+
+    #[ostd::prelude::ktest]
+    fn nv_slot_range_lease_excludes_only_overlapping_slots() {
+        let table = ObjectTable::new(512).unwrap();
+        let first = table.claim_migration_range(100, 128).unwrap();
+        assert_eq!(
+            table.claim_migration_range(127, 2).unwrap_err().error(),
+            Errno::EBUSY
+        );
+        let disjoint = table.claim_migration_range(228, 128).unwrap();
+        assert!(table.migration_range_contains(100));
+        assert!(!table.migration_range_contains(99));
+        table.release_migration_range(disjoint).unwrap();
+        table.release_migration_range(first).unwrap();
+        assert!(!table.migration_range_contains(100));
     }
 }

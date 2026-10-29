@@ -129,6 +129,10 @@ impl MigrationExtentLease {
     pub(crate) fn extent(&self) -> &DirtyMigrationExtent {
         &self.extent
     }
+
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation
+    }
 }
 
 fn dirty_entries_are_contiguous(
@@ -272,6 +276,13 @@ impl RedirectDirectory {
                 .find(|(index, _)| *index == partition)
                 .map(|(_, state)| state)
                 .expect("requested redirect partition is locked");
+            if state
+                .claimed_extents
+                .values()
+                .any(|indexed| indexed.extent.contains(*key))
+            {
+                return_errno_with_message!(Errno::EBUSY, "redirect range is migrating");
+            }
             if state.pending.contains_key(key) {
                 return_errno_with_message!(
                     Errno::EBUSY,
@@ -415,6 +426,13 @@ impl RedirectDirectory {
 
     pub(crate) fn install_committed(&self, key: PageKey, handle: DescriptorHandle) -> Result<bool> {
         let mut state = self.partitions[self.partition_index(key)].lock();
+        if state
+            .claimed_extents
+            .values()
+            .any(|indexed| indexed.extent.contains(key))
+        {
+            return_errno_with_message!(Errno::EBUSY, "redirect range is migrating");
+        }
         if let Some(current) = state.committed.get(&key) {
             if current.logical_version > handle.logical_version {
                 return Ok(false);
@@ -569,6 +587,53 @@ impl RedirectDirectory {
         state.dirty_extents.insert(start_key, indexed);
         state.ready_extents.push_back(start_key);
         Ok(())
+    }
+
+    pub(crate) fn validate_claimed_extent(&self, lease: &MigrationExtentLease) -> bool {
+        let partition = lease.extent.partition;
+        let start_key = lease.extent.start_key();
+        let state = self.partitions[partition].lock();
+        let Some(indexed) = state.claimed_extents.get(&start_key) else {
+            return false;
+        };
+        if indexed.generation != lease.generation || indexed.extent != lease.extent {
+            return false;
+        }
+        lease
+            .extent
+            .pages
+            .iter()
+            .enumerate()
+            .all(|(offset, handle)| {
+                let key = PageKey::new(
+                    lease.extent.fs_id,
+                    lease.extent.inode,
+                    lease.extent.logical_start + offset as u64,
+                );
+                state.committed.get(&key) == Some(handle)
+            })
+    }
+
+    pub(crate) fn claimed_extent_overlaps(
+        &self,
+        fs_id: u64,
+        inode: u64,
+        logical_start: u64,
+        pages: usize,
+    ) -> bool {
+        let Some(logical_end) = logical_start.checked_add(pages as u64) else {
+            return true;
+        };
+        self.partitions.iter().any(|partition| {
+            partition.lock().claimed_extents.values().any(|indexed| {
+                let extent = &indexed.extent;
+                let extent_end = extent.logical_start + extent.pages.len() as u64;
+                extent.fs_id == fs_id
+                    && extent.inode == inode
+                    && extent.logical_start < logical_end
+                    && logical_start < extent_end
+            })
+        })
     }
 
     #[cfg(ktest)]
@@ -894,11 +959,32 @@ mod tests {
         assert_eq!(claimed[0].extent().len(), 128);
     }
 
+    fn dirty_extent_lease_blocks_only_its_logical_range() {
+        let directory = RedirectDirectory::new().unwrap();
+        directory
+            .rebuild(extent_entries(0x88, 10, 0, 6000, 4))
+            .unwrap();
+        let lease = directory.claim_ready_extents(0x88, 4).unwrap().remove(0);
+        assert_eq!(
+            directory
+                .reserve_versions(&[PageKey::new(0x88, 10, 2)])
+                .unwrap_err()
+                .error(),
+            Errno::EBUSY
+        );
+        let outside = directory
+            .reserve_versions(&[PageKey::new(0x88, 10, 8)])
+            .unwrap();
+        directory.abort_reserved(&outside).unwrap();
+        directory.requeue_extent(lease).unwrap();
+    }
+
     #[ktest]
     fn rnvpce_dirty_extent_index() {
         dirty_extent_index_claims_without_page_scan_or_split();
         dirty_extent_index_updates_only_affected_partition();
         dirty_extent_recovery_rebuild_is_order_independent();
+        dirty_extent_lease_blocks_only_its_logical_range();
     }
 
     #[ktest]

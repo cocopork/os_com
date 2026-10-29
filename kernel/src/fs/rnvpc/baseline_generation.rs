@@ -37,6 +37,22 @@ pub(crate) struct BaselineMutationGuard<'a> {
     keys: Vec<PageKey>,
 }
 
+#[derive(Debug)]
+pub(crate) struct BaselineRangeClaim {
+    keys: Vec<PageKey>,
+    generations: Vec<u64>,
+}
+
+impl BaselineRangeClaim {
+    pub(crate) fn generations(&self) -> &[u64] {
+        &self.generations
+    }
+
+    pub(crate) fn keys(&self) -> &[PageKey] {
+        &self.keys
+    }
+}
+
 impl Drop for BaselineMutationGuard<'_> {
     fn drop(&mut self) {
         let mut state = self.map.state.lock();
@@ -137,6 +153,41 @@ impl BaselineGenerationMap {
             return None;
         }
         Some(state.generations.get(&key).copied().unwrap_or(0))
+    }
+
+    pub(crate) fn try_claim_range(&self, keys: &[PageKey]) -> Result<BaselineRangeClaim> {
+        let Some(first) = keys.first().copied() else {
+            return_errno!(Errno::EINVAL);
+        };
+        if keys.iter().enumerate().any(|(offset, key)| {
+            (key.fs_id, key.inode) != (first.fs_id, first.inode)
+                || first.page_index.checked_add(offset as u64) != Some(key.page_index)
+        }) {
+            return_errno_with_message!(Errno::EINVAL, "baseline claim is not contiguous");
+        }
+        let mut state = self.state.lock();
+        if keys
+            .iter()
+            .any(|key| state.mutations.contains(key) || state.migrations.contains(key))
+        {
+            return_errno_with_message!(Errno::EBUSY, "SSD baseline range is already owned");
+        }
+        let generations = keys
+            .iter()
+            .map(|key| state.generations.get(key).copied().unwrap_or(0))
+            .collect();
+        state.migrations.extend(keys.iter().copied());
+        Ok(BaselineRangeClaim {
+            keys: keys.to_vec(),
+            generations,
+        })
+    }
+
+    pub(crate) fn release_range(&self, claim: BaselineRangeClaim) {
+        let mut state = self.state.lock();
+        for key in claim.keys {
+            state.migrations.remove(&key);
+        }
     }
 
     pub(crate) fn begin_mutation(&self, keys: &[PageKey]) -> Result<BaselineMutationGuard<'_>> {
@@ -256,5 +307,21 @@ mod tests {
         let state = generations.state.lock();
         assert_eq!(state.generations.get(&first), Some(&7));
         assert_eq!(state.generations.get(&overflow), Some(&u64::MAX));
+    }
+
+    #[ktest]
+    fn baseline_range_claim_is_atomic_and_releasable() {
+        let generations = BaselineGenerationMap::new().unwrap();
+        let keys = (10..14)
+            .map(|page| PageKey::new(1, 2, page))
+            .collect::<Vec<_>>();
+        let claim = generations.try_claim_range(&keys).unwrap();
+        assert_eq!(claim.generations(), &[0, 0, 0, 0]);
+        assert_eq!(
+            generations.try_claim_range(&keys).unwrap_err().error(),
+            Errno::EBUSY
+        );
+        generations.release_range(claim);
+        assert!(generations.try_claim_range(&keys).is_ok());
     }
 }

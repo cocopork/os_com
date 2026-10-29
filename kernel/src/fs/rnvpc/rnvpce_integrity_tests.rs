@@ -1367,6 +1367,49 @@ fn publish_test_redirect_range(pool: &Arc<Rnvpc>, fs_id: u64, inode: u64, pages:
 }
 
 #[ktest]
+fn rnvpce_dirty_extent_claim_is_dram_only_and_requeues_on_drop() {
+    const FS_ID: u64 = 0xa204;
+    const INODE: u64 = 44;
+    let pool = test_pool(16, 2, 14, None);
+    publish_test_redirect_range(&pool, FS_ID, INODE, 4);
+
+    let lease = pool.claim_ready_dirty_extents(FS_ID, 4).unwrap().remove(0);
+    let claimed = pool.claim_dirty_extent(lease).unwrap();
+    assert_eq!(claimed.pages().len(), 4);
+    assert!(pool.migration_overlap(FS_ID, INODE, 0, 4));
+    assert!(!pool.migration_overlap(FS_ID, INODE, 4, 4));
+    for page in 0..4 {
+        let handle = pool
+            .redirect_lookup(PageKey::new(FS_ID, INODE, page))
+            .unwrap();
+        assert_eq!(handle.state, NvObjectState::NvDirty);
+        assert_eq!(
+            pool.persisted_redirect_state_for_test(handle).unwrap(),
+            NvObjectState::NvDirty
+        );
+    }
+    let first_key = PageKey::new(FS_ID, INODE, 0);
+    let first_handle = pool.redirect_lookup(first_key).unwrap();
+    assert_eq!(
+        pool.clear_redirects_exact(&[(first_key, first_handle)], None)
+            .unwrap_err()
+            .error(),
+        Errno::EBUSY
+    );
+    drop(claimed);
+
+    assert!(!pool.migration_overlap(FS_ID, INODE, 0, 4));
+    assert_eq!(
+        pool.claim_ready_dirty_extents(FS_ID, 4)
+            .unwrap()
+            .remove(0)
+            .extent()
+            .len(),
+        4
+    );
+}
+
+#[ktest]
 fn rnvpce_redirect_claim_claims_32_pages_with_one_range_snapshot() {
     let pool = test_pool(48, 8, 40, None);
     publish_test_redirect_range(&pool, 0xa205, 45, 32);
