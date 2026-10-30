@@ -1303,9 +1303,9 @@ impl ExtentMutation {
         replacement: ExtentRecordEntry,
         fault: Option<FaultPoint>,
     ) -> Result<bool> {
-        let ExtentDataRef::Nv(_) = replacement.data_ref()? else {
-            return Ok(false);
-        };
+        if matches!(replacement.data_ref()?, ExtentDataRef::Ssd(_)) {
+            return self.try_append_or_extend_ssd_extent(routed, replacement, fault);
+        }
         let logical = replacement.logical_block();
         let replacement_end = entry_end(&replacement)?;
         let Some((old_index, old)) =
@@ -1427,6 +1427,98 @@ impl ExtentMutation {
             )?;
         drop(guards);
         self.install_extent_reverse(routed.reference, target_index, replacement)?;
+        self.pool.note_extent_mutation();
+        Ok(true)
+    }
+
+    fn try_append_or_extend_ssd_extent(
+        &self,
+        routed: &RoutedLeaf,
+        replacement: ExtentRecordEntry,
+        fault: Option<FaultPoint>,
+    ) -> Result<bool> {
+        let ExtentDataRef::Ssd(physical_start) = replacement.data_ref()? else {
+            return Ok(false);
+        };
+        let logical_start = replacement.logical_block();
+        let replacement_end = entry_end(&replacement)?;
+        let entries = routed.record.entries()?;
+        if entries.iter().any(|entry| {
+            entry_end(entry).map_or(true, |end| {
+                entry.logical_block() < replacement_end && logical_start < end
+            })
+        }) || routed
+            .upper_bound
+            .is_some_and(|upper| replacement_end > upper)
+        {
+            return Ok(false);
+        }
+
+        let tail = entries
+            .iter()
+            .copied()
+            .enumerate()
+            .max_by_key(|(_, entry)| entry.logical_block());
+        let guards = self.node_guards.borrow();
+        let guard = guards
+            .iter()
+            .find(|(reference, _)| *reference == routed.reference)
+            .map(|(_, guard)| guard)
+            .ok_or_else(|| Error::new(Errno::EUCLEAN))?;
+        let level_count_flags = routed.record.level_count_flags_word(
+            u16::try_from(routed.record.entry_count()).map_err(|_| Error::new(Errno::EOVERFLOW))?,
+        );
+
+        if let Some((tail_index, tail_entry)) = tail {
+            let tail_end = entry_end(&tail_entry)?;
+            let mergeable = match tail_entry.data_ref()? {
+                ExtentDataRef::Ssd(tail_physical) => {
+                    tail_end == logical_start
+                        && tail_physical.checked_add(u64::from(tail_entry.length()))
+                            == Some(physical_start)
+                        && tail_entry.is_unwritten() == replacement.is_unwritten()
+                }
+                ExtentDataRef::Nv(_) => false,
+            };
+            if mergeable {
+                let length = tail_entry
+                    .length()
+                    .checked_add(replacement.length())
+                    .ok_or_else(|| Error::new(Errno::EOVERFLOW))?;
+                self.pool
+                    .persist_prevalidated_extent_leaf_update_with_guard(
+                        guard,
+                        routed.reference,
+                        routed.record.entry_count(),
+                        level_count_flags,
+                        [None, None],
+                        Some((tail_index, u64::from(length))),
+                        None,
+                        fault,
+                    )?;
+                drop(guards);
+                self.pool.note_extent_mutation();
+                return Ok(true);
+            }
+            if logical_start < tail_end {
+                return Ok(false);
+            }
+        }
+        if routed.record.entry_count() == EXTENT_NODE_ENTRY_CAPACITY {
+            return Ok(false);
+        }
+        self.pool
+            .persist_prevalidated_extent_leaf_update_with_guard(
+                guard,
+                routed.reference,
+                routed.record.entry_count(),
+                level_count_flags,
+                [Some(replacement), None],
+                None,
+                None,
+                fault,
+            )?;
+        drop(guards);
         self.pool.note_extent_mutation();
         Ok(true)
     }

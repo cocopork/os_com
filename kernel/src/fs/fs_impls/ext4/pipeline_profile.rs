@@ -77,6 +77,12 @@ pub(crate) static NATIVE_COMPLETION_WAIT: Metric = Metric::new();
 pub(crate) static NATIVE_METADATA_FINISH: Metric = Metric::new();
 
 pub(crate) static NV_FOREGROUND_TOTAL: Metric = Metric::new();
+pub(crate) static NV_FOREGROUND_SSD_ALLOCATE: Metric = Metric::new();
+pub(crate) static NV_FOREGROUND_GROUP_RESERVE: Metric = Metric::new();
+pub(crate) static NV_FOREGROUND_BLOCK_ALLOCATE: Metric = Metric::new();
+pub(crate) static NV_FOREGROUND_ALLOCATION_METADATA: Metric = Metric::new();
+pub(crate) static NV_FOREGROUND_ALLOCATION_RECORD_PUBLISH: Metric = Metric::new();
+pub(crate) static NV_FOREGROUND_ALLOCATION_RECORD_RECLAIM: Metric = Metric::new();
 pub(crate) static NV_FOREGROUND_PERSIST: Metric = Metric::new();
 pub(crate) static NV_CAPACITY_WAIT: Metric = Metric::new();
 pub(crate) static NV_FLUSH_TOTAL: Metric = Metric::new();
@@ -125,6 +131,24 @@ pub(crate) fn dump_snapshot() {
         ("native_completion_wait", &NATIVE_COMPLETION_WAIT),
         ("native_metadata_finish", &NATIVE_METADATA_FINISH),
         ("nv_foreground_total", &NV_FOREGROUND_TOTAL),
+        ("nv_foreground_ssd_allocate", &NV_FOREGROUND_SSD_ALLOCATE),
+        ("nv_foreground_group_reserve", &NV_FOREGROUND_GROUP_RESERVE),
+        (
+            "nv_foreground_block_allocate",
+            &NV_FOREGROUND_BLOCK_ALLOCATE,
+        ),
+        (
+            "nv_foreground_allocation_metadata",
+            &NV_FOREGROUND_ALLOCATION_METADATA,
+        ),
+        (
+            "nv_foreground_allocation_record_publish",
+            &NV_FOREGROUND_ALLOCATION_RECORD_PUBLISH,
+        ),
+        (
+            "nv_foreground_allocation_record_reclaim",
+            &NV_FOREGROUND_ALLOCATION_RECORD_RECLAIM,
+        ),
         ("nv_foreground_persist", &NV_FOREGROUND_PERSIST),
         ("nv_capacity_wait", &NV_CAPACITY_WAIT),
         ("nv_flush_total", &NV_FLUSH_TOTAL),

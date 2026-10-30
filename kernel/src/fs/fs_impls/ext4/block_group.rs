@@ -42,7 +42,7 @@
 use core::fmt;
 
 use super::{
-    allocator::free_space::FreeSpaceIndex,
+    allocator::{free_space::FreeSpaceIndex, group_selector::AllocationGroupSummary},
     checksum::{self, FsCsumSeed},
     fs::Ext4,
     inode::{Inode, InodeDesc, RawInode},
@@ -50,7 +50,7 @@ use super::{
     prelude::*,
     super_block::SuperBlock,
 };
-use crate::fs::rnvpc::allocation_metadata::AllocationGroupImage;
+use crate::fs::rnvpc::{allocation_metadata::AllocationGroupImage, metadata::PersistentObjectRef};
 
 /// `bg_flags` bit: the group's inode bitmap and inode table are uninitialized
 /// (`EXT4_BG_INODE_UNINIT`). No inode has ever been allocated here; the on-disk
@@ -400,7 +400,8 @@ pub(super) struct BlockGroup {
     /// lock.
     metadata: RwMutex<BlockGroupMetadata>,
     /// Serializes pin snapshots against free bitmap-clear + pin publication.
-    allocation_gate: Mutex<AllocationWritebackState>,
+    allocation_gate: Arc<Mutex<AllocationWritebackState>>,
+    allocation_summary: Arc<AllocationGroupSummary>,
     /// Backing block device (shared with `Ext4` and other groups).
     block_device: Arc<dyn BlockDevice>,
     /// Cached geometry: first filesystem-wide block number of this group.
@@ -443,14 +444,22 @@ pub(super) struct BlockGroup {
 #[derive(Debug)]
 pub(super) struct AllocationWritebackState {
     dirty: bool,
-    writeback: bool,
+    writeback_generation: Option<u64>,
+    next_writeback_generation: u64,
+    data_migration_owner: Option<u64>,
+    next_owner_generation: u64,
+    resident_chunks: Option<[PersistentObjectRef; 2]>,
 }
 
 impl AllocationWritebackState {
-    const fn new_clean() -> Self {
+    pub(super) const fn new_clean() -> Self {
         Self {
             dirty: false,
-            writeback: false,
+            writeback_generation: None,
+            next_writeback_generation: 1,
+            data_migration_owner: None,
+            next_owner_generation: 1,
+            resident_chunks: None,
         }
     }
 
@@ -458,7 +467,11 @@ impl AllocationWritebackState {
     const fn new_dirty() -> Self {
         Self {
             dirty: true,
-            writeback: false,
+            writeback_generation: None,
+            next_writeback_generation: 1,
+            data_migration_owner: None,
+            next_owner_generation: 1,
+            resident_chunks: None,
         }
     }
 
@@ -467,34 +480,125 @@ impl AllocationWritebackState {
     }
 
     pub(super) const fn is_writeback(&self) -> bool {
-        self.writeback
+        self.writeback_generation.is_some()
     }
 
     pub(super) fn mark_dirty(&mut self) {
         self.dirty = true;
     }
 
-    /// Arms one writeback and clears DIRTY so later mutations redirty it.
-    pub(super) fn begin(&mut self) -> bool {
-        if self.writeback {
-            return false;
-        }
-        self.dirty = false;
-        self.writeback = true;
-        true
+    pub(super) const fn resident_chunks(&self) -> Option<[PersistentObjectRef; 2]> {
+        self.resident_chunks
     }
 
-    /// Ends one writeback. True permits the NVM-to-SSD authority handoff.
-    pub(super) fn finish(&mut self) -> bool {
-        debug_assert!(self.writeback);
-        self.writeback = false;
-        !self.dirty
+    pub(super) fn set_resident_chunks(&mut self, chunks: [PersistentObjectRef; 2]) {
+        self.resident_chunks = Some(chunks);
+    }
+
+    pub(super) fn clear_resident_chunks(&mut self) {
+        self.resident_chunks = None;
+    }
+
+    pub(super) const fn has_migration_owner(&self) -> bool {
+        self.data_migration_owner.is_some()
+    }
+
+    pub(super) const fn permits_foreground_allocation(&self) -> bool {
+        self.data_migration_owner.is_none()
+    }
+
+    pub(super) const fn permits_migration_allocation(&self) -> bool {
+        self.writeback_generation.is_none() && self.data_migration_owner.is_some()
+    }
+
+    fn try_claim_migration(&mut self) -> Result<u64> {
+        if self.writeback_generation.is_some() || self.data_migration_owner.is_some() {
+            return_errno_with_message!(Errno::EBUSY, "allocation group is already owned");
+        }
+        let generation = self.next_owner_generation;
+        self.next_owner_generation = generation
+            .checked_add(1)
+            .ok_or_else(|| Error::new(Errno::EOVERFLOW))?;
+        self.data_migration_owner = Some(generation);
+        Ok(generation)
+    }
+
+    pub(super) fn release_migration(&mut self, generation: u64) {
+        if self.data_migration_owner == Some(generation) {
+            self.data_migration_owner = None;
+        }
+    }
+
+    /// Arms one writeback and clears DIRTY so later mutations redirty it.
+    pub(super) fn begin(&mut self) -> Option<u64> {
+        if self.writeback_generation.is_some() || self.data_migration_owner.is_some() {
+            return None;
+        }
+        let generation = self.next_writeback_generation;
+        self.next_writeback_generation = generation
+            .checked_add(1)
+            .expect("allocation writeback generation exhausted");
+        self.dirty = false;
+        self.writeback_generation = Some(generation);
+        Some(generation)
+    }
+
+    pub(super) fn is_writeback_generation(&self, generation: u64) -> bool {
+        self.writeback_generation == Some(generation)
+    }
+
+    /// Ends one matching writeback. `None` identifies a stale completion.
+    pub(super) fn finish(&mut self, generation: u64) -> Option<bool> {
+        if !self.is_writeback_generation(generation) {
+            return None;
+        }
+        self.writeback_generation = None;
+        Some(!self.dirty)
     }
 
     /// Preserves NVM authority when submission, I/O, or handoff fails.
-    pub(super) fn abort(&mut self) {
+    pub(super) fn abort(&mut self, generation: u64) -> bool {
+        if !self.is_writeback_generation(generation) {
+            return false;
+        }
         self.dirty = true;
-        self.writeback = false;
+        self.writeback_generation = None;
+        true
+    }
+}
+
+pub(super) struct AllocationGroupLease {
+    group: usize,
+    generation: u64,
+    state: Arc<Mutex<AllocationWritebackState>>,
+}
+
+impl AllocationGroupLease {
+    pub(super) fn try_claim(
+        group: usize,
+        state: Arc<Mutex<AllocationWritebackState>>,
+    ) -> Result<Self> {
+        let generation = state.lock().try_claim_migration()?;
+        Ok(Self {
+            group,
+            generation,
+            state,
+        })
+    }
+
+    pub(super) const fn group(&self) -> usize {
+        self.group
+    }
+
+    #[cfg(ktest)]
+    pub(super) const fn generation(&self) -> u64 {
+        self.generation
+    }
+}
+
+impl Drop for AllocationGroupLease {
+    fn drop(&mut self) {
+        self.state.lock().release_migration(self.generation);
     }
 }
 
@@ -507,16 +611,53 @@ impl Debug for BlockGroup {
 }
 
 impl BlockGroup {
+    fn allocation_bitmap_image(&self, metadata: &BlockGroupMetadata) -> [u8; BLOCK_SIZE] {
+        let mut bitmap = [0u8; BLOCK_SIZE];
+        bitmap.copy_from_slice(metadata.block_bitmap.as_bytes());
+        let capacity = usize::try_from(self.last_block - self.first_block + 1)
+            .expect("EXT4 group capacity fits usize");
+        let byte = capacity / 8;
+        let bit = capacity % 8;
+        if bit != 0 {
+            bitmap[byte] |= !((1u8 << bit) - 1);
+            bitmap[byte + 1..].fill(u8::MAX);
+        } else {
+            bitmap[byte..].fill(u8::MAX);
+        }
+        bitmap
+    }
+
+    pub(super) fn try_claim_migration(&self) -> Result<AllocationGroupLease> {
+        AllocationGroupLease::try_claim(self.group_idx, self.allocation_gate.clone())
+    }
+
+    pub(super) fn allocation_summary(&self) -> Arc<AllocationGroupSummary> {
+        self.allocation_summary.clone()
+    }
+
+    fn refresh_allocation_summary(&self, metadata: &mut BlockGroupMetadata) {
+        let BlockGroupMetadata {
+            block_bitmap,
+            free_index,
+            ..
+        } = metadata;
+        let index = free_index.get_or_insert_with(|| FreeSpaceIndex::new(block_bitmap));
+        self.allocation_summary.update(
+            u32::from(block_bitmap.free_count()),
+            index.longest_free_run(),
+        );
+    }
+
     pub(super) fn lock_allocation(&self) -> MutexGuard<'_, AllocationWritebackState> {
         self.allocation_gate.lock()
     }
 
     /// Returns a complete NVM-authoritative block-allocation image without I/O.
+    #[cfg(ktest)]
     pub(super) fn allocation_image(&self, generation: u64) -> Result<AllocationGroupImage> {
         let _allocation = self.allocation_gate.lock();
         let metadata = self.metadata.read();
-        let mut bitmap = [0u8; BLOCK_SIZE];
-        bitmap.copy_from_slice(metadata.block_bitmap.as_bytes());
+        let bitmap = self.allocation_bitmap_image(&metadata);
         AllocationGroupImage::new(generation, bitmap, metadata.desc.free_blocks_count())
     }
 
@@ -531,11 +672,146 @@ impl BlockGroup {
     ) {
         let allocation = self.allocation_gate.lock();
         let metadata = self.metadata.read();
-        let mut bitmap = [0u8; BLOCK_SIZE];
-        bitmap.copy_from_slice(metadata.block_bitmap.as_bytes());
+        let bitmap = self.allocation_bitmap_image(&metadata);
         let free_blocks = metadata.desc.free_blocks_count();
         drop(metadata);
         (allocation, bitmap, free_blocks)
+    }
+
+    /// Builds a full immutable after-image without changing the live DRAM
+    /// bitmap. Used to persist a clear-before-release rollback safely.
+    pub(super) fn lock_allocation_bitmap_snapshot_with_override(
+        &self,
+        blocks: Range<Ext4Bid>,
+        allocated: bool,
+    ) -> Result<(
+        MutexGuard<'_, AllocationWritebackState>,
+        [u8; BLOCK_SIZE],
+        u32,
+    )> {
+        if blocks.is_empty() || blocks.start < self.first_block || blocks.end > self.last_block + 1
+        {
+            return_errno_with_message!(Errno::EINVAL, "allocation range crosses block group");
+        }
+        let (guard, mut bitmap, mut free_blocks) = self.lock_allocation_bitmap_snapshot();
+        for block in blocks {
+            let bit = usize::try_from(block - self.first_block)
+                .map_err(|_| Error::new(Errno::EOVERFLOW))?;
+            let byte = bit / 8;
+            let mask = 1 << (bit % 8);
+            let was_allocated = bitmap[byte] & mask != 0;
+            if was_allocated == allocated {
+                continue;
+            }
+            if allocated {
+                bitmap[byte] |= mask;
+                free_blocks = free_blocks
+                    .checked_sub(1)
+                    .ok_or_else(|| Error::new(Errno::EUCLEAN))?;
+            } else {
+                bitmap[byte] &= !mask;
+                free_blocks = free_blocks
+                    .checked_add(1)
+                    .ok_or_else(|| Error::new(Errno::EOVERFLOW))?;
+            }
+        }
+        Ok((guard, bitmap, free_blocks))
+    }
+
+    /// Writes the immutable block-allocation after-image captured by the
+    /// pager. Concurrent in-memory allocation may redirty the group, but
+    /// cannot change these bytes.
+    pub(super) fn write_allocation_bitmap_snapshot(
+        &self,
+        bitmap: &[u8; BLOCK_SIZE],
+        free_blocks: u32,
+    ) -> Result<()> {
+        let block_bitmap_bid = self.metadata.read().desc.block_bitmap_bid();
+        self.block_device
+            .write_bytes(Bid::new(block_bitmap_bid).to_offset(), bitmap)
+            .map_err(|_| Error::with_message(Errno::EIO, "failed to write block bitmap"))?;
+
+        let wide = self.desc_size as usize >= size_of::<RawBlockGroup64>();
+        if wide {
+            let mut raw = self
+                .block_device
+                .read_val::<RawBlockGroup64>(self.desc_offset)
+                .map_err(|_| Error::with_message(Errno::EIO, "failed to read group descriptor"))?;
+            raw.lo.free_blocks_count_lo = free_blocks as u16;
+            raw.lo.flags &= !BG_BLOCK_UNINIT;
+            if let Some(seed) = self.csum_seed {
+                let len = (self.nr_blocks_per_group / 8) as usize;
+                let checksum = BlockGroupDesc::bitmap_checksum(seed, bitmap, len);
+                raw.lo.block_bitmap_csum_lo = checksum as u16;
+                raw.hi.block_bitmap_csum_hi = (checksum >> 16) as u16;
+                raw.lo.checksum = BlockGroupDesc::group_desc_checksum(
+                    &raw.lo,
+                    Some(&raw.hi),
+                    self.group_idx as u32,
+                    seed,
+                );
+            }
+            self.block_device
+                .write_val(self.desc_offset, &raw)
+                .map_err(|_| Error::with_message(Errno::EIO, "failed to write group descriptor"))?;
+        } else {
+            let mut raw = self
+                .block_device
+                .read_val::<RawBlockGroup>(self.desc_offset)
+                .map_err(|_| Error::with_message(Errno::EIO, "failed to read group descriptor"))?;
+            raw.free_blocks_count_lo = free_blocks as u16;
+            raw.flags &= !BG_BLOCK_UNINIT;
+            if let Some(seed) = self.csum_seed {
+                let len = (self.nr_blocks_per_group / 8) as usize;
+                raw.block_bitmap_csum_lo =
+                    BlockGroupDesc::bitmap_checksum(seed, bitmap, len) as u16;
+                raw.checksum =
+                    BlockGroupDesc::group_desc_checksum(&raw, None, self.group_idx as u32, seed);
+            }
+            self.block_device
+                .write_val(self.desc_offset, &raw)
+                .map_err(|_| Error::with_message(Errno::EIO, "failed to write group descriptor"))?;
+        }
+        Ok(())
+    }
+
+    /// Copies only the bitmap words covering `blocks` while excluding every
+    /// allocator and the allocation-metadata pager for this group.
+    pub(super) fn lock_allocation_bitmap_words(
+        &self,
+        blocks: Range<Ext4Bid>,
+        desired_allocated: Option<bool>,
+    ) -> Result<(
+        MutexGuard<'_, AllocationWritebackState>,
+        Range<u16>,
+        Vec<u8>,
+    )> {
+        if blocks.is_empty() || blocks.start < self.first_block || blocks.end > self.last_block + 1
+        {
+            return_errno_with_message!(Errno::EINVAL, "allocation range crosses block group");
+        }
+        let allocation = self.allocation_gate.lock();
+        let metadata = self.metadata.read();
+        let bits = u16::try_from(blocks.start - self.first_block)
+            .map_err(|_| Error::new(Errno::EOVERFLOW))?
+            ..u16::try_from(blocks.end - self.first_block)
+                .map_err(|_| Error::new(Errno::EOVERFLOW))?;
+        let byte_start = usize::from(bits.start) / 64 * size_of::<u64>();
+        let byte_end = usize::from(bits.end).div_ceil(64) * size_of::<u64>();
+        let mut words = metadata.block_bitmap.as_bytes()[byte_start..byte_end].to_vec();
+        if let Some(allocated) = desired_allocated {
+            for bit in bits.clone() {
+                let byte = usize::from(bit) / 8 - byte_start;
+                let mask = 1 << (usize::from(bit) % 8);
+                if allocated {
+                    words[byte] |= mask;
+                } else {
+                    words[byte] &= !mask;
+                }
+            }
+        }
+        drop(metadata);
+        Ok((allocation, bits, words))
     }
 
     /// Installs an NVM-authoritative block bitmap without accessing the device.
@@ -572,52 +848,36 @@ impl BlockGroup {
         metadata.block_bitmap = bitmap;
         metadata.desc.free_blocks_count = image.free_blocks();
         metadata.desc.flags &= !BG_BLOCK_UNINIT;
-        metadata.free_index = None;
+        metadata.free_index = Some(FreeSpaceIndex::new(&metadata.block_bitmap));
+        self.refresh_allocation_summary(&mut metadata);
         allocation.mark_dirty();
         Ok(())
     }
 
-    /// Protects one NVM-owned migration target while mounting rNVPCe.
-    /// Returns true when recovery changed the bitmap or its derived count.
-    pub(super) fn protect_recovered_block(&self, block: Ext4Bid) -> Result<bool> {
+    /// Validates that an already-published migration target was allocated in
+    /// the NVM-authoritative bitmap before its descriptor became durable.
+    pub(super) fn validate_recovered_block(&self, block: Ext4Bid) -> Result<()> {
         if block < self.first_block || block > self.last_block {
             return_errno_with_message!(Errno::EINVAL, "recovered block belongs to another group");
         }
-        let mut allocation = self.allocation_gate.lock();
-        let mut metadata = self.metadata.write();
+        let _allocation = self.allocation_gate.lock();
+        let metadata = self.metadata.read();
         let bit =
             u16::try_from(block - self.first_block).map_err(|_| Error::new(Errno::EOVERFLOW))?;
         if self.overlaps_system_zone_with(&metadata.desc, block..block + 1) {
             return_errno_with_message!(Errno::EUCLEAN, "migration target overlaps EXT4 metadata");
         }
-        let mut changed = false;
         if !metadata.block_bitmap.is_allocated(bit) {
-            metadata
-                .block_bitmap
-                .alloc_exact_at(bit, 1)
-                .ok_or_else(|| Error::new(Errno::EUCLEAN))?;
-            if metadata.desc.is_block_uninit() {
-                metadata.desc.flags &= !BG_BLOCK_UNINIT;
-            }
-            let BlockGroupMetadata {
-                block_bitmap,
-                free_index,
-                ..
-            } = &mut *metadata;
-            if let Some(index) = free_index {
-                index.refresh(block_bitmap, bit..bit + 1);
-            }
-            changed = true;
+            return_errno_with_message!(
+                Errno::EUCLEAN,
+                "migration target is free in NVM allocation authority"
+            );
         }
         let free_blocks = u32::from(metadata.block_bitmap.free_count());
         if metadata.desc.free_blocks_count() != free_blocks {
-            metadata.desc.free_blocks_count = free_blocks;
-            changed = true;
+            return_errno_with_message!(Errno::EUCLEAN, "allocation count mismatches bitmap");
         }
-        if changed {
-            allocation.mark_dirty();
-        }
-        Ok(changed)
+        Ok(())
     }
 
     /// Loads a block group from the descriptor table.
@@ -666,14 +926,20 @@ impl BlockGroup {
             Self::load_block_bitmap(device.as_ref(), first_block, last_block, &desc)?;
         let inode_bitmap = Self::load_inode_bitmap(device.as_ref(), nr_inodes_per_group, &desc)?;
 
+        let free_index = FreeSpaceIndex::new(&block_bitmap);
+        let allocation_summary = Arc::new(AllocationGroupSummary::new(
+            u32::from(block_bitmap.free_count()),
+            free_index.longest_free_run(),
+        ));
         Ok(Self {
             group_idx,
-            allocation_gate: Mutex::new(AllocationWritebackState::new_clean()),
+            allocation_gate: Arc::new(Mutex::new(AllocationWritebackState::new_clean())),
+            allocation_summary,
             metadata: RwMutex::new(BlockGroupMetadata {
                 desc: Dirty::new(desc),
                 block_bitmap: Dirty::new(block_bitmap),
                 inode_bitmap: Dirty::new(inode_bitmap),
-                free_index: None,
+                free_index: Some(free_index),
             }),
             block_device: device,
             first_block,
@@ -752,7 +1018,8 @@ impl BlockGroup {
         metadata.desc = Dirty::new(desc);
         metadata.block_bitmap = Dirty::new(block_bitmap);
         metadata.inode_bitmap = Dirty::new(inode_bitmap);
-        metadata.free_index = None;
+        metadata.free_index = Some(FreeSpaceIndex::new(&metadata.block_bitmap));
+        self.refresh_allocation_summary(&mut metadata);
         Ok(())
     }
 
@@ -1162,6 +1429,7 @@ impl BlockGroup {
 
         let new_free = metadata.desc.free_blocks_count() - alloc_count;
         metadata.desc.free_blocks_count = new_free;
+        self.refresh_allocation_summary(&mut metadata);
         // First data allocation into a lazily-initialized group: the reconstructed
         // in-memory bitmap is now authoritative, so drop BLOCK_UNINIT (persisted by
         // `patch_into` below). A later mount must then read the real bitmap rather
@@ -1265,6 +1533,7 @@ impl BlockGroup {
             .checked_add(actually_freed)
             .ok_or_else(|| Error::with_message(Errno::EIO, "free block count overflow in group"))?;
         metadata.desc.free_blocks_count = new_free;
+        self.refresh_allocation_summary(&mut metadata);
 
         let desc_block_bid = (self.desc_offset / BLOCK_SIZE) as Ext4Bid;
         bitmap_access.patch(|buf| buf.copy_from_slice(metadata.block_bitmap.as_bytes()))?;
@@ -1661,26 +1930,55 @@ mod tests {
     fn ext4_allocation_writeback_state() {
         let mut state = AllocationWritebackState::new_dirty();
         assert!(state.is_dirty());
-        assert!(state.begin());
+        let first = state.begin().unwrap();
         assert!(!state.is_dirty());
         assert!(state.is_writeback());
-        assert!(!state.begin(), "one group permits only one writeback");
+        assert!(
+            state.begin().is_none(),
+            "one group permits only one writeback"
+        );
+        assert!(
+            state.permits_foreground_allocation(),
+            "foreground allocation may redirty an in-flight immutable snapshot"
+        );
 
         state.mark_dirty();
         assert!(
-            !state.finish(),
+            !state.finish(first).unwrap(),
             "redirtied metadata remains NVM-authoritative"
         );
         assert!(state.is_dirty());
         assert!(!state.is_writeback());
 
-        assert!(state.begin());
+        let second = state.begin().unwrap();
         assert!(
-            state.finish(),
+            state.finish(second).unwrap(),
             "an unmodified writeback may hand authority to SSD"
         );
         assert!(!state.is_dirty());
         assert!(!state.is_writeback());
+    }
+
+    #[ktest]
+    fn rnvpce_pager_group_foreground_redirties_inflight_snapshot() {
+        let mut state = AllocationWritebackState::new_dirty();
+        let generation = state.begin().unwrap();
+        assert!(state.permits_foreground_allocation());
+        state.mark_dirty();
+        assert!(!state.finish(generation).unwrap());
+        assert!(state.is_dirty());
+    }
+
+    #[ktest]
+    fn rnvpce_pager_group_old_completion_cannot_finish_new_writeback() {
+        let mut state = AllocationWritebackState::new_dirty();
+        let old = state.begin().unwrap();
+        assert!(state.abort(old));
+        let current = state.begin().unwrap();
+        assert_ne!(old, current);
+        assert_eq!(state.finish(old), None);
+        assert!(state.is_writeback_generation(current));
+        assert!(state.finish(current).unwrap());
     }
 
     #[ktest]
@@ -1973,7 +2271,8 @@ mod tests {
         let bg = BlockGroup {
             group_idx,
             metadata: RwMutex::new(metadata),
-            allocation_gate: Mutex::new(AllocationWritebackState::new_clean()),
+            allocation_gate: Arc::new(Mutex::new(AllocationWritebackState::new_clean())),
+            allocation_summary: Arc::new(AllocationGroupSummary::new(0, 0)),
             block_device,
             first_block: 0,
             last_block: 32767,

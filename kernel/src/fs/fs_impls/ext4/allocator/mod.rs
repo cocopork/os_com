@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MPL-2.0
 
 pub(super) mod free_space;
+pub(super) mod group_selector;
 pub(super) mod metrics;
 
 use super::prelude::*;
@@ -136,6 +137,10 @@ impl Capacity {
             .checked_add(count)
             .ok_or_else(|| Error::new(Errno::EIO))?;
         Ok(())
+    }
+
+    pub(super) fn physical_free(&self) -> u64 {
+        self.state.lock().physical_free
     }
 
     pub(super) fn reconcile_rnvpce(&self, count: u64) {

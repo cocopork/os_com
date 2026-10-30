@@ -6,9 +6,9 @@
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 use aster_block::bio::BioDirection;
-use ostd::sync::LocalIrqDisabled;
+use ostd::{cpu::CpuId, sync::LocalIrqDisabled, util::id_set::Id};
 
-use super::{fs::Ext4, pipeline_profile as pp, prelude::*};
+use super::{block_group::AllocationGroupLease, fs::Ext4, pipeline_profile as pp, prelude::*};
 use crate::fs::rnvpc::{
     self,
     baseline_generation::BaselineRangeToken,
@@ -16,6 +16,7 @@ use crate::fs::rnvpc::{
     frame::{ClaimedDirtyExtent, EvictingDataPage},
     metadata::PersistentObjectRef,
     redirect_index::DescriptorHandle,
+    write_transaction::SsdBaselineExtent,
 };
 
 mod batch;
@@ -27,95 +28,6 @@ use reclaim::ReclaimReadyQueue;
 const MIGRATION_BATCH_PAGES: usize = super::writeback::WRITEBACK_BATCH;
 pub(super) type CompletionQueue = Arc<SpinLock<VecDeque<Arc<MigrationBatch>>, LocalIrqDisabled>>;
 
-#[derive(Default)]
-pub(super) struct MigrationGroupOwners {
-    active: BTreeSet<usize>,
-}
-
-impl MigrationGroupOwners {
-    #[cfg(ktest)]
-    fn try_acquire(&mut self, groups: &BTreeSet<usize>) -> bool {
-        if groups.iter().any(|group| self.active.contains(group)) {
-            return false;
-        }
-        self.active.extend(groups.iter().copied());
-        true
-    }
-
-    fn release(&mut self, groups: &BTreeSet<usize>) {
-        for group in groups {
-            self.active.remove(group);
-        }
-    }
-
-    pub(super) fn contains(&self, group: usize) -> bool {
-        self.active.contains(&group)
-    }
-
-    fn try_acquire_for_allocation(
-        &mut self,
-        required: &BTreeSet<usize>,
-        candidates: &[(usize, u32)],
-        needed_blocks: usize,
-    ) -> Option<BTreeSet<usize>> {
-        if required.iter().any(|group| self.active.contains(group)) {
-            return None;
-        }
-        let mut selected = required.clone();
-        let mut available = candidates
-            .iter()
-            .filter(|(group, _)| selected.contains(group))
-            .map(|(_, free)| *free as usize)
-            .sum::<usize>();
-        for &(group, free) in candidates {
-            if available >= needed_blocks {
-                break;
-            }
-            if selected.contains(&group) || self.active.contains(&group) || free == 0 {
-                continue;
-            }
-            selected.insert(group);
-            available = available.saturating_add(free as usize);
-        }
-        if available < needed_blocks {
-            return None;
-        }
-        self.active.extend(selected.iter().copied());
-        Some(selected)
-    }
-}
-
-struct MigrationGroupReservation<'a> {
-    owners: &'a Mutex<MigrationGroupOwners>,
-    groups: Option<BTreeSet<usize>>,
-}
-
-impl<'a> MigrationGroupReservation<'a> {
-    fn new(owners: &'a Mutex<MigrationGroupOwners>, groups: BTreeSet<usize>) -> Self {
-        Self {
-            owners,
-            groups: Some(groups),
-        }
-    }
-
-    fn transfer_to_batch(mut self) -> BTreeSet<usize> {
-        self.groups.take().unwrap()
-    }
-
-    fn groups(&self) -> &BTreeSet<usize> {
-        self.groups
-            .as_ref()
-            .expect("live migration group reservation has groups")
-    }
-}
-
-impl Drop for MigrationGroupReservation<'_> {
-    fn drop(&mut self) {
-        if let Some(groups) = self.groups.take() {
-            self.owners.lock().release(&groups);
-        }
-    }
-}
 pub(super) struct CompletionJob {
     status: BioStatus,
     pages: Vec<PendingPage>,
@@ -139,23 +51,18 @@ pub(super) struct ReclaimTicket {
 
 struct ReclaimBatch {
     remaining_tickets: AtomicUsize,
-    migration_groups: BTreeSet<usize>,
 }
 
 impl ReclaimBatch {
-    fn new(tickets: usize, migration_groups: BTreeSet<usize>) -> Arc<Self> {
+    fn new(tickets: usize) -> Arc<Self> {
         debug_assert!(tickets != 0);
         Arc::new(Self {
             remaining_tickets: AtomicUsize::new(tickets),
-            migration_groups,
         })
     }
 
     fn complete_ticket(&self, fs: &Ext4) {
         if self.remaining_tickets.fetch_sub(1, Ordering::AcqRel) == 1 {
-            fs.nv_migration_groups
-                .lock()
-                .release(&self.migration_groups);
             fs.request_nv_migration();
         }
     }
@@ -177,7 +84,7 @@ struct RedirectReclaimPlan {
     extent: Arc<ClaimedDirtyExtent>,
     pages: Vec<PendingPage>,
     exact: Vec<(rnvpc::index::PageKey, DescriptorHandle)>,
-    new_baselines: Vec<(u64, u64)>,
+    new_baseline: Option<SsdBaselineExtent>,
     new_target_refs: Vec<PersistentObjectRef>,
 }
 
@@ -206,6 +113,33 @@ impl MigrationLease {
 }
 
 impl Ext4 {
+    fn release_unpublished_rnvpce_range(
+        &self,
+        range: Range<Ext4Bid>,
+        nvm_allocated: bool,
+    ) -> Result<()> {
+        if nvm_allocated {
+            return self
+                .persist_rnvpce_free_before_release(range)
+                .map_err(|failure| failure.into_error());
+        }
+        let op = self.begin_op(self.single_block_map_credits(0))?;
+        self.free_blocks(
+            super::journal::BlockFreeAuth::without_revoke_duty(
+                range.start,
+                u32::try_from(range.end - range.start).map_err(|_| Error::new(Errno::EOVERFLOW))?,
+            ),
+            op.get(),
+        )
+    }
+
+    fn rollback_unpublished_rnvpce_ranges(&self, ranges: &[Range<Ext4Bid>]) -> Result<()> {
+        for range in ranges.iter().rev() {
+            self.release_unpublished_rnvpce_range(range.clone(), true)?;
+        }
+        Ok(())
+    }
+
     pub(super) fn start_nv_migration(self: &Arc<Self>) {
         if !self.nv_migration_enabled() {
             return;
@@ -541,13 +475,9 @@ impl Ext4 {
             return Ok(0);
         }
         let target_started = pp::now();
-        let group_reservation = if self.rnvpc_extend_enabled() {
+        let migration_leases = if self.rnvpc_extend_enabled() {
             match self.prepare_nv_targets(&mut pages) {
-                Ok(groups) if groups.is_empty() => None,
-                Ok(groups) => Some(MigrationGroupReservation::new(
-                    &self.nv_migration_groups,
-                    groups,
-                )),
+                Ok(leases) => leases,
                 Err(error) if error.error() == Errno::EBUSY => {
                     let pool = rnvpc::pool().ok_or_else(|| Error::new(Errno::EINVAL))?;
                     self.restore_failed_migration_jobs(
@@ -575,12 +505,12 @@ impl Ext4 {
                 }
             }
         } else {
-            None
+            Vec::new()
         };
         pp::NV_TARGET_PREPARE.record_since(target_started, pages.len());
         let submitted = pages.len();
         if submitted == 0 {
-            debug_assert!(group_reservation.is_none());
+            debug_assert!(migration_leases.is_empty());
             return Ok(0);
         }
         let data_submit_started = pp::now();
@@ -611,12 +541,7 @@ impl Ext4 {
             }
             submissions.push((target, segments, run));
         }
-        let batch = MigrationBatch::new(
-            submissions.len(),
-            submitted,
-            group_reservation
-                .map_or_else(BTreeSet::new, |reservation| reservation.transfer_to_batch()),
-        );
+        let batch = MigrationBatch::new(submissions.len(), submitted, migration_leases);
         self.nv_in_flight.fetch_add(submitted, Ordering::AcqRel);
         let mut submit_error = None;
         for (target, segments, run) in submissions {
@@ -663,60 +588,183 @@ impl Ext4 {
         Ok(submitted)
     }
 
-    fn reserve_nv_target_groups(
-        &self,
-        pages: &[PendingPage],
-    ) -> Result<MigrationGroupReservation<'_>> {
+    fn reserve_nv_target_groups(&self, pages: &[PendingPage]) -> Result<Vec<AllocationGroupLease>> {
         let required = pages
             .iter()
             .filter_map(|page| (page.target != 0).then_some(page.target))
             .map(|target| self.block_group_index_for_block(target))
             .collect::<Result<BTreeSet<_>>>()?;
         let needed = pages.iter().filter(|page| page.target == 0).count();
-        let nr_groups = self.super_block().nr_block_groups() as usize;
-        let mut candidates = (0..nr_groups)
-            .map(|group| (group, self.block_group(group).free_blocks_count()))
-            .collect::<Vec<_>>();
-        candidates.sort_by(|(left_group, left_free), (right_group, right_free)| {
-            let left_fits = (*left_free as usize) >= needed;
-            let right_fits = (*right_free as usize) >= needed;
-            right_fits
-                .cmp(&left_fits)
-                .then_with(|| right_free.cmp(left_free))
-                .then_with(|| left_group.cmp(right_group))
-        });
-        let total_free = candidates
-            .iter()
-            .map(|(_, free)| *free as usize)
-            .sum::<usize>();
-        let mut owners = self.nv_migration_groups.lock();
-        if required.iter().any(|group| owners.contains(*group)) {
-            return_errno_with_message!(Errno::EBUSY, "allocation group is already migrating");
+        self.reserve_nv_allocation_groups(&required, needed)
+    }
+
+    fn reserve_nv_allocation_groups(
+        &self,
+        required: &BTreeSet<usize>,
+        needed: usize,
+    ) -> Result<Vec<AllocationGroupLease>> {
+        let cpu = CpuId::current_racy().as_usize();
+        let mut leases = Vec::new();
+        let mut selected = BTreeSet::new();
+        let mut available = 0usize;
+        for &group in required {
+            let lease = self.block_group(group).try_claim_migration()?;
+            available =
+                available.saturating_add(self.block_group(group).free_blocks_count() as usize);
+            selected.insert(group);
+            leases.push(lease);
         }
-        if total_free < needed {
-            return_errno!(Errno::ENOSPC);
+        let mut saw_busy = false;
+        if available < needed {
+            for group in
+                self.allocation_group_selector
+                    .candidates(cpu, required.first().copied(), 1)
+            {
+                if selected.contains(&group) {
+                    continue;
+                }
+                match self.block_group(group).try_claim_migration() {
+                    Ok(lease) => {
+                        available = available
+                            .saturating_add(self.block_group(group).free_blocks_count() as usize);
+                        selected.insert(group);
+                        leases.push(lease);
+                        if available >= needed {
+                            break;
+                        }
+                    }
+                    Err(error) if error.error() == Errno::EBUSY => saw_busy = true,
+                    Err(error) => return Err(error),
+                }
+            }
         }
-        let groups = owners
-            .try_acquire_for_allocation(&required, &candidates, needed)
-            .ok_or_else(|| Error::new(Errno::EBUSY))?;
-        drop(owners);
-        Ok(MigrationGroupReservation::new(
-            &self.nv_migration_groups,
-            groups,
-        ))
+        if available < needed {
+            return Err(Error::new(if saw_busy {
+                Errno::EBUSY
+            } else {
+                Errno::ENOSPC
+            }));
+        }
+        Ok(leases)
+    }
+
+    /// Allocates first-write SSD homes before the foreground transaction
+    /// publishes its redirects and baseline extent. Allocation metadata is
+    /// NVM-authoritative before any file mapping can name the returned blocks.
+    pub(super) fn allocate_rnvpce_foreground_blocks(
+        &self,
+        count: u32,
+        goal: Option<Ext4Bid>,
+    ) -> Result<Vec<Range<Ext4Bid>>> {
+        if count == 0 {
+            return Ok(Vec::new());
+        }
+        let group_started = pp::now();
+        let cpu = CpuId::current_racy().as_usize();
+        let goal_group = goal
+            .map(|block| self.block_group_index_for_block(block))
+            .transpose()?;
+        pp::NV_FOREGROUND_GROUP_RESERVE.record_since(group_started, count as usize);
+        let mut ranges = Vec::new();
+        let allocation_result = (|| {
+            let mut remaining = count;
+            let mut next_goal = goal;
+            while remaining != 0 {
+                let mut allocated_range = None;
+                let mut saw_busy = false;
+                for group in self.allocation_group_selector.candidates(
+                    cpu,
+                    next_goal
+                        .map(|block| self.block_group_index_for_block(block))
+                        .transpose()?
+                        .or(goal_group),
+                    1,
+                ) {
+                    let op = self.begin_op(self.single_block_map_credits(0))?;
+                    let block_started = pp::now();
+                    let allowed = BTreeSet::from([group]);
+                    let allocation_goal = next_goal
+                        .filter(|block| {
+                            self.block_group_index_for_block(*block).ok() == Some(group)
+                        })
+                        .unwrap_or_else(|| self.block_group(group).first_block());
+                    match self.alloc_rnvpce_blocks_at_in_groups(
+                        remaining,
+                        allocation_goal,
+                        &allowed,
+                        op.get(),
+                    ) {
+                        Ok(range) => {
+                            pp::NV_FOREGROUND_BLOCK_ALLOCATE
+                                .record_since(block_started, (range.end - range.start) as usize);
+                            allocated_range = Some((group, range));
+                            break;
+                        }
+                        Err(error) if error.error() == Errno::EBUSY => {
+                            super::allocator::metrics::GROUP_BUSY_RETRIES.record(1);
+                            saw_busy = true;
+                        }
+                        Err(error) if error.error() == Errno::ENOSPC => {
+                            super::allocator::metrics::SUMMARY_FALSE_POSITIVES.record(1);
+                        }
+                        Err(error) => return Err(error),
+                    }
+                }
+                let (group, range) = allocated_range.ok_or_else(|| {
+                    Error::new(if saw_busy {
+                        Errno::EBUSY
+                    } else {
+                        Errno::ENOSPC
+                    })
+                })?;
+                let allocated = u32::try_from(range.end - range.start)
+                    .map_err(|_| Error::new(Errno::EOVERFLOW))?;
+                if allocated == 0 || allocated > remaining {
+                    return_errno_with_message!(Errno::EUCLEAN, "invalid foreground allocation");
+                }
+                remaining -= allocated;
+                next_goal = Some(range.end);
+                self.allocation_group_selector.record_success(cpu, group);
+                let metadata_started = pp::now();
+                if let Err(failure) = self.persist_rnvpce_allocation_range(range.clone(), true) {
+                    let uncertain = failure.is_uncertain();
+                    let error = failure.into_error();
+                    if !uncertain {
+                        self.release_unpublished_rnvpce_range(range, false)?;
+                    }
+                    return Err(error);
+                }
+                pp::NV_FOREGROUND_ALLOCATION_METADATA
+                    .record_since(metadata_started, allocated as usize);
+                ranges.push(range);
+            }
+            Ok(())
+        })();
+        if let Err(error) = allocation_result {
+            if let Err(rollback_error) = self.rollback_unpublished_rnvpce_ranges(&ranges) {
+                self.fail_nv_migration();
+                error!("foreground SSD allocation rollback failed: {rollback_error:?}");
+            }
+            return Err(error);
+        }
+        Ok(ranges)
     }
 
     /// Allocates SSD targets and publishes their identities in NVM.
     /// Group ownership precedes every bitmap/GDT mutation, and EXT4 allocation
     /// metadata joins the later orderless batch barrier.
-    fn prepare_nv_targets(&self, pages: &mut [PendingPage]) -> Result<BTreeSet<usize>> {
+    fn prepare_nv_targets(&self, pages: &mut [PendingPage]) -> Result<Vec<AllocationGroupLease>> {
         debug_assert!(
             !pages.is_empty(),
             "empty migration rounds must skip target preparation"
         );
         let group_reservation = self.reserve_nv_target_groups(pages)?;
-        let groups = group_reservation.groups().clone();
+        let groups = group_reservation
+            .iter()
+            .map(AllocationGroupLease::group)
+            .collect::<BTreeSet<_>>();
         let mut allocated = Vec::with_capacity(pages.len());
+        let mut durable_ranges = Vec::new();
         let result = (|| {
             // Adjacent logical pages share a range allocation; preserve existing
             // overwrite targets and consume partial returns under fragmentation.
@@ -742,6 +790,15 @@ impl Ext4 {
                     self.alloc_rnvpce_blocks_in_groups((end - start) as u32, &groups, op.get())?;
                 batch_metrics::elapsed(Phase::Allocate, started);
                 batch_metrics::count(Event::AllocatedPages, (blocks.end - blocks.start) as usize);
+                if let Err(failure) = self.persist_rnvpce_allocation_range(blocks.clone(), true) {
+                    let uncertain = failure.is_uncertain();
+                    let error = failure.into_error();
+                    if !uncertain {
+                        self.release_unpublished_rnvpce_range(blocks, false)?;
+                    }
+                    return Err(error);
+                }
+                durable_ranges.push(blocks.clone());
                 for target in blocks {
                     allocated.push((cursor, target));
                     cursor += 1;
@@ -750,42 +807,14 @@ impl Ext4 {
             Ok(())
         })();
         if let Err(error) = result {
-            // No NV descriptor names these targets yet. Roll back every
-            // private allocation, including a partially prepared round.
-            let rollback = (|| {
-                for (_, target) in &allocated {
-                    let op = self.begin_op(self.single_block_map_credits(0))?;
-                    self.free_blocks(
-                        super::journal::BlockFreeAuth::without_revoke_duty(*target, 1),
-                        op.get(),
-                    )?;
-                }
-                Ok::<(), Error>(())
-            })();
-            if let Err(rollback_error) = rollback {
+            if let Err(rollback_error) = self.rollback_unpublished_rnvpce_ranges(&durable_ranges) {
                 self.fail_nv_migration();
-                error!("NV target rollback durability failed: {rollback_error:?}");
+                error!("migration SSD allocation rollback failed: {rollback_error:?}");
             }
             return Err(error);
         }
-        // NVM allocation authority is durable before any descriptor can name
-        // a newly allocated SSD target. No bitmap/GDT/superblock SSD I/O occurs.
-        if let Err(error) = self.persist_rnvpce_allocation_metadata(&groups) {
-            for (_, target) in &allocated {
-                let op = self.begin_op(self.single_block_map_credits(0))?;
-                self.free_blocks(
-                    super::journal::BlockFreeAuth::without_revoke_duty(*target, 1),
-                    op.get(),
-                )?;
-            }
-            // A partially published generation may have committed before the
-            // error. Publish the rolled-back bitmap as the next authority.
-            if let Err(rollback_error) = self.persist_rnvpce_allocation_metadata(&groups) {
-                self.fail_nv_migration();
-                error!("NV allocation rollback publication failed: {rollback_error:?}");
-            }
-            return Err(error);
-        }
+        // Every allocated bitmap word is NVM-authoritative before any NV
+        // descriptor can name its SSD target. No bitmap/GDT SSD I/O occurs.
         let targets: Result<Vec<_>> = allocated
             .iter()
             .map(|(index, target)| {
@@ -798,12 +827,16 @@ impl Ext4 {
             })
             .collect();
         let Some(pool) = rnvpc::pool() else {
+            self.rollback_unpublished_rnvpce_ranges(&durable_ranges)?;
             return_errno!(Errno::EINVAL);
         };
         let started = batch_metrics::now();
         let targets = match targets {
             Ok(targets) => targets,
-            Err(error) => return Err(error),
+            Err(error) => {
+                self.rollback_unpublished_rnvpce_ranges(&durable_ranges)?;
+                return Err(error);
+            }
         };
         for targets in targets.chunks(rnvpc::write_transaction::SSD_MIGRATION_BATCH_PAGES) {
             if let Err(error) = pool.assign_migration_targets(targets, None) {
@@ -821,7 +854,7 @@ impl Ext4 {
                 handle.migration_target = true;
             }
         }
-        Ok(group_reservation.transfer_to_batch())
+        Ok(group_reservation)
     }
 
     pub(super) fn process_nv_completions(&self) -> Result<usize> {
@@ -839,12 +872,10 @@ impl Ext4 {
             .sum::<usize>();
         let mut failure = None;
         while let Some(batch) = drained.pop_front() {
-            let groups = batch.migration_groups().clone();
             match self.finish_nv_completion_batch(batch) {
                 Ok(true) => {}
-                Ok(false) => self.nv_migration_groups.lock().release(&groups),
+                Ok(false) => {}
                 Err(error) => {
-                    self.nv_migration_groups.lock().release(&groups);
                     failure = Some(error);
                 }
             }
@@ -901,6 +932,7 @@ impl Ext4 {
         }
         if self.rnvpc_extend_enabled() {
             if groups.is_empty() {
+                drop(batch.take_migration_leases());
                 pp::NV_COMPLETION_TOTAL.record_since(completion_started, page_count);
                 return Ok(false);
             }
@@ -913,7 +945,8 @@ impl Ext4 {
                     "rNVPCe migration reached a legacy extent candidate"
                 );
             }
-            let reclaim_batch = ReclaimBatch::new(groups.len(), batch.migration_groups().clone());
+            drop(batch.take_migration_leases());
+            let reclaim_batch = ReclaimBatch::new(groups.len());
             for (_identity, pages) in groups {
                 let pages_count = pages.len();
                 self.nv_reclaim_pending
@@ -1119,7 +1152,7 @@ impl Ext4 {
         page_groups: Vec<Vec<PendingPage>>,
     ) -> Result<()> {
         let mut plans = Vec::with_capacity(page_groups.len());
-        for pages in page_groups {
+        for mut pages in page_groups {
             let extent = pages
                 .first()
                 .and_then(|page| page.lease.dirty_extent())
@@ -1137,16 +1170,27 @@ impl Ext4 {
                     "reclaim ticket mixes migration extents"
                 );
             }
+            pages.sort_unstable_by_key(|page| page.index);
             let mut exact = Vec::with_capacity(pages.len());
-            let mut new_baselines = Vec::new();
             let mut new_target_refs = Vec::new();
             let mut baseline_valid = true;
             let compare_started = batch_metrics::now();
+            let baseline_token = pages
+                .first()
+                .and_then(|page| page.redirect.as_ref().map(|(_, token)| token.clone()))
+                .ok_or_else(|| Error::new(Errno::EUCLEAN))?;
+            let generation_matches = pool.validate_baseline_token(&baseline_token);
             for page in &pages {
                 let (handle, token) = page
                     .redirect
                     .as_ref()
                     .ok_or_else(|| Error::new(Errno::EUCLEAN))?;
+                if !Arc::ptr_eq(token, &baseline_token) {
+                    return_errno_with_message!(
+                        Errno::EUCLEAN,
+                        "migration extent mixes baseline tokens"
+                    );
+                }
                 let handle = *handle;
                 let key = rnvpc::index::PageKey::new(self.rnvpc_fs_id(), page.inode, page.index);
                 let token_matches = token.target(page.index).is_some_and(|target| {
@@ -1157,7 +1201,6 @@ impl Ext4 {
                             handle.ssd_target
                         }
                 });
-                let generation_matches = pool.validate_baseline_token(token);
                 if !generation_matches || !token_matches {
                     let resolved = rnvpc::write_transaction::current_page_mapping(
                         pool,
@@ -1175,7 +1218,6 @@ impl Ext4 {
                     if page.target == 0 {
                         return_errno_with_message!(Errno::EUCLEAN, "migration has no SSD target");
                     }
-                    new_baselines.push((page.index, page.target));
                     new_target_refs.push(handle.reference);
                 }
             }
@@ -1185,44 +1227,79 @@ impl Ext4 {
                 drop(pages);
                 continue;
             }
+            let new_baseline = if new_target_refs.is_empty() {
+                None
+            } else {
+                if new_target_refs.len() != pages.len() {
+                    return_errno_with_message!(
+                        Errno::EUCLEAN,
+                        "migration extent mixes new and existing SSD baselines"
+                    );
+                }
+                let physical_start = pages[0].target;
+                if pages.iter().enumerate().any(|(offset, page)| {
+                    page.index != extent.logical_start() + offset as u64
+                        || physical_start.checked_add(offset as u64) != Some(page.target)
+                }) {
+                    return_errno_with_message!(
+                        Errno::EUCLEAN,
+                        "migration extent has a discontinuous SSD target"
+                    );
+                }
+                Some(SsdBaselineExtent::new(
+                    extent.logical_start(),
+                    u32::try_from(pages.len()).map_err(|_| Error::new(Errno::EOVERFLOW))?,
+                    physical_start,
+                )?)
+            };
             plans.push(RedirectReclaimPlan {
                 extent,
                 pages,
                 exact,
-                new_baselines,
+                new_baseline,
                 new_target_refs,
             });
         }
 
-        let mut publications: BTreeMap<u64, (Vec<(u64, u64)>, Vec<PersistentObjectRef>)> =
-            BTreeMap::new();
-        for plan in &plans {
-            if !plan.new_baselines.is_empty() {
-                let publication = publications.entry(plan.pages[0].inode).or_default();
-                publication.0.extend(plan.new_baselines.iter().copied());
-                publication.1.extend(plan.new_target_refs.iter().copied());
+        let mut publication_sessions = BTreeMap::<u64, Vec<usize>>::new();
+        for (index, plan) in plans.iter().enumerate() {
+            if plan.new_baseline.is_some() {
+                publication_sessions
+                    .entry(plan.extent.inode())
+                    .or_default()
+                    .push(index);
             }
         }
-        for (inode, (mut new_baselines, new_target_refs)) in publications {
-            new_baselines.sort_unstable_by_key(|(logical, _)| *logical);
+        for (inode, plan_indexes) in publication_sessions {
+            let mut baselines = plan_indexes
+                .iter()
+                .map(|index| plans[*index].new_baseline.unwrap())
+                .collect::<Vec<_>>();
+            baselines.sort_unstable_by_key(|baseline| baseline.logical_start());
+            let page_count = plan_indexes
+                .iter()
+                .map(|index| plans[*index].pages.len())
+                .sum();
             let baseline_started = pp::now();
-            rnvpc::write_transaction::publish_claimed_ssd_baseline_batch(
+            rnvpc::write_transaction::publish_claimed_ssd_baseline_extents(
                 pool,
                 self.rnvpc_fs_id(),
                 inode,
-                &new_baselines,
+                &baselines,
             )?;
-            pp::NV_EXTENT_PREPARE.record_since(baseline_started, new_baselines.len());
-            let mut releasable = Vec::with_capacity(new_target_refs.len());
-            for reference in new_target_refs {
-                if !pool.persistent_data_has_migration_target(reference)? {
-                    return_errno_with_message!(
-                        Errno::EUCLEAN,
-                        "published SSD baseline has no migration target"
-                    );
-                }
-                if !pool.persistent_data_migration_credit_released(reference)? {
-                    releasable.push(reference);
+            pp::NV_EXTENT_PREPARE.record_since(baseline_started, page_count);
+            let mut releasable = Vec::with_capacity(page_count);
+            for plan_index in plan_indexes {
+                for reference in &plans[plan_index].new_target_refs {
+                    if !pool.persistent_data_has_migration_target(*reference)? {
+                        return_errno_with_message!(
+                            Errno::EUCLEAN,
+                            "published SSD baseline has no migration target"
+                        );
+                    }
+                    if !pool.persistent_data_migration_credit_released(*reference)? {
+                        releasable.push(*reference);
+                    }
                 }
             }
             for references in releasable.chunks(128) {
@@ -1278,38 +1355,66 @@ mod tests {
     use ostd::prelude::ktest;
 
     use super::*;
+    use crate::fs::fs_impls::ext4::{
+        allocator::group_selector::AllocationGroupSelector, block_group::AllocationWritebackState,
+    };
 
     #[ktest]
-    fn rnvpce_block_group_has_one_migration_owner() {
-        let mut owners = MigrationGroupOwners::default();
-        let first = BTreeSet::from([2usize, 5]);
-        let disjoint = BTreeSet::from([7usize]);
-        assert!(owners.try_acquire(&first));
-        assert!(!owners.try_acquire(&BTreeSet::from([5usize, 6])));
-        assert!(owners.try_acquire(&disjoint));
-        owners.release(&first);
-        assert!(owners.try_acquire(&BTreeSet::from([5usize, 6])));
+    fn rnvpce_group_lease_disjoint_groups_progress_concurrently() {
+        let first = AllocationGroupLease::try_claim(
+            1,
+            Arc::new(Mutex::new(AllocationWritebackState::new_clean())),
+        )
+        .unwrap();
+        let second = AllocationGroupLease::try_claim(
+            2,
+            Arc::new(Mutex::new(AllocationWritebackState::new_clean())),
+        )
+        .unwrap();
+        assert_ne!(first.group(), second.group());
     }
 
     #[ktest]
-    fn rnvpce_reserves_target_groups_before_allocation() {
-        let mut owners = MigrationGroupOwners::default();
-        assert!(owners.try_acquire(&BTreeSet::from([1usize])));
+    fn rnvpce_group_lease_same_group_has_one_migration_owner() {
+        let state = Arc::new(Mutex::new(AllocationWritebackState::new_clean()));
+        let first = AllocationGroupLease::try_claim(1, state.clone()).unwrap();
+        assert!(AllocationGroupLease::try_claim(1, state.clone()).is_err());
+        drop(first);
+        assert!(AllocationGroupLease::try_claim(1, state).is_ok());
+    }
 
-        let selected = owners
-            .try_acquire_for_allocation(&BTreeSet::new(), &[(1, 128), (2, 96), (3, 64)], 128)
+    #[ktest]
+    fn rnvpce_group_lease_stale_lease_cannot_release_new_owner() {
+        let state = Arc::new(Mutex::new(AllocationWritebackState::new_clean()));
+        let first = AllocationGroupLease::try_claim(1, state.clone()).unwrap();
+        let stale_generation = first.generation();
+        drop(first);
+        let second = AllocationGroupLease::try_claim(1, state.clone()).unwrap();
+        assert_ne!(stale_generation, second.generation());
+        state.lock().release_migration(stale_generation);
+        assert!(state.lock().has_migration_owner());
+    }
+
+    #[ktest]
+    fn rnvpce_group_lease_writeback_defers_owned_group() {
+        let state = Arc::new(Mutex::new(AllocationWritebackState::new_clean()));
+        let _lease = AllocationGroupLease::try_claim(1, state.clone()).unwrap();
+        assert!(state.lock().begin().is_none());
+    }
+
+    #[ktest]
+    fn rnvpce_group_lease_busy_goal_retries_another_candidate() {
+        let selector = AllocationGroupSelector::new(4, 2);
+        selector.update_summary(0, 32, 32);
+        selector.update_summary(2, 32, 32);
+        let states = (0..4)
+            .map(|_| Arc::new(Mutex::new(AllocationWritebackState::new_clean())))
+            .collect::<Vec<_>>();
+        let _busy = AllocationGroupLease::try_claim(0, states[0].clone()).unwrap();
+        let selected = selector
+            .candidates(0, Some(0), 1)
+            .find_map(|group| AllocationGroupLease::try_claim(group, states[group].clone()).ok())
             .unwrap();
-        assert_eq!(selected, BTreeSet::from([2usize, 3]));
-        assert!(owners.contains(1));
-        assert!(owners.contains(2));
-        assert!(owners.contains(3));
-
-        owners.release(&selected);
-        let required = BTreeSet::from([1usize]);
-        assert!(
-            owners
-                .try_acquire_for_allocation(&required, &[(2, 128)], 1)
-                .is_none()
-        );
+        assert_eq!(selected.group(), 2);
     }
 }

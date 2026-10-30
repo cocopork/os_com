@@ -2,6 +2,8 @@
 
 //! DRAM-backed implementation of RNVPC memory.
 
+#[cfg(ktest)]
+use core::sync::atomic::AtomicI64;
 use core::sync::atomic::{AtomicU64, Ordering, compiler_fence};
 
 use ostd::mm::{
@@ -22,6 +24,8 @@ const DEFAULT_CHUNK_PAGES: usize = 512;
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct DramNvBackendStats {
     pub(crate) persist_calls: u64,
+    #[cfg(ktest)]
+    pub(crate) persist_bytes: u64,
     pub(crate) fence_calls: u64,
     #[cfg(ktest)]
     pub(crate) full_page_reads: u64,
@@ -164,11 +168,15 @@ struct DramNvImageInner {
     control_bytes: usize,
     epoch: AtomicU64,
     persist_calls: AtomicU64,
+    #[cfg(ktest)]
+    persist_bytes: AtomicU64,
     fence_calls: AtomicU64,
     #[cfg(ktest)]
     full_page_reads: AtomicU64,
     #[cfg(ktest)]
     range_reads: AtomicU64,
+    #[cfg(ktest)]
+    fail_data_persist_after: AtomicI64,
     // Only crash-model fixtures serialize snapshots; ordinary access uses caller leases.
     #[cfg(ktest)]
     io_lock: Mutex<()>,
@@ -212,11 +220,15 @@ impl DramNvImage {
                 control_bytes,
                 epoch: AtomicU64::new(0),
                 persist_calls: AtomicU64::new(0),
+                #[cfg(ktest)]
+                persist_bytes: AtomicU64::new(0),
                 fence_calls: AtomicU64::new(0),
                 #[cfg(ktest)]
                 full_page_reads: AtomicU64::new(0),
                 #[cfg(ktest)]
                 range_reads: AtomicU64::new(0),
+                #[cfg(ktest)]
+                fail_data_persist_after: AtomicI64::new(-1),
                 #[cfg(ktest)]
                 io_lock: Mutex::new(()),
             }),
@@ -293,12 +305,22 @@ impl DramNvBackend {
     pub(crate) fn stats(&self) -> DramNvBackendStats {
         DramNvBackendStats {
             persist_calls: self.image.inner.persist_calls.load(Ordering::Relaxed),
+            #[cfg(ktest)]
+            persist_bytes: self.image.inner.persist_bytes.load(Ordering::Relaxed),
             fence_calls: self.image.inner.fence_calls.load(Ordering::Relaxed),
             #[cfg(ktest)]
             full_page_reads: self.image.inner.full_page_reads.load(Ordering::Relaxed),
             #[cfg(ktest)]
             range_reads: self.image.inner.range_reads.load(Ordering::Relaxed),
         }
+    }
+
+    #[cfg(ktest)]
+    pub(super) fn fail_data_persist_after(&self, successful_calls: i64) {
+        self.image
+            .inner
+            .fail_data_persist_after
+            .store(successful_calls, Ordering::Release);
     }
 
     fn check_epoch(&self) -> Result<()> {
@@ -728,6 +750,27 @@ impl NvMemoryBackend for DramNvBackend {
     fn persist(&self, offset: usize, len: usize) -> Result<()> {
         self.validate_data_range(offset, len)?;
         super::batch_metrics::count(super::batch_metrics::Event::DataPersist, 1);
+        #[cfg(ktest)]
+        {
+            let remaining = self
+                .image
+                .inner
+                .fail_data_persist_after
+                .load(Ordering::Acquire);
+            if remaining == 0 {
+                self.image
+                    .inner
+                    .fail_data_persist_after
+                    .store(-1, Ordering::Release);
+                return_errno_with_message!(Errno::EIO, "injected NVDIMM data persist failure");
+            }
+            if remaining > 0 {
+                self.image
+                    .inner
+                    .fail_data_persist_after
+                    .store(remaining - 1, Ordering::Release);
+            }
+        }
         if self.image.inner.skip_persistence {
             return Ok(());
         }
@@ -745,6 +788,11 @@ impl NvMemoryBackend for DramNvBackend {
             .inner
             .persist_calls
             .fetch_add(1, Ordering::Relaxed);
+        #[cfg(ktest)]
+        self.image
+            .inner
+            .persist_bytes
+            .fetch_add(len as u64, Ordering::Relaxed);
         Ok(())
     }
 

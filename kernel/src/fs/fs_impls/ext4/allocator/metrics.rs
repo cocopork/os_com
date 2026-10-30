@@ -62,6 +62,12 @@ pub(in crate::fs::fs_impls::ext4) static PUBLISH_WAIT: Metric = Metric::new();
 pub(in crate::fs::fs_impls::ext4) static PUBLISH_HOLD: Metric = Metric::new();
 pub(in crate::fs::fs_impls::ext4) static GROUP_VISITS: Metric = Metric::new();
 pub(in crate::fs::fs_impls::ext4) static PINNED_DENIALS: Metric = Metric::new();
+pub(in crate::fs::fs_impls::ext4) static SELECTOR_HOME_CANDIDATES: Metric = Metric::new();
+pub(in crate::fs::fs_impls::ext4) static SELECTOR_STEAL_CANDIDATES: Metric = Metric::new();
+pub(in crate::fs::fs_impls::ext4) static GROUP_BUSY_RETRIES: Metric = Metric::new();
+pub(in crate::fs::fs_impls::ext4) static SUMMARY_FALSE_POSITIVES: Metric = Metric::new();
+pub(in crate::fs::fs_impls::ext4) static BITMAP_PERSIST_CALLS: Metric = Metric::new();
+pub(in crate::fs::fs_impls::ext4) static BITMAP_WORDS: Metric = Metric::new();
 
 pub(in crate::fs::fs_impls::ext4) fn dump() {
     if !ENABLED {
@@ -76,6 +82,12 @@ pub(in crate::fs::fs_impls::ext4) fn dump() {
         ("publish_hold", &PUBLISH_HOLD),
         ("group_visits", &GROUP_VISITS),
         ("pinned_denials", &PINNED_DENIALS),
+        ("selector_home_candidates", &SELECTOR_HOME_CANDIDATES),
+        ("selector_steal_candidates", &SELECTOR_STEAL_CANDIDATES),
+        ("group_busy_retries", &GROUP_BUSY_RETRIES),
+        ("summary_false_positives", &SUMMARY_FALSE_POSITIVES),
+        ("bitmap_persist_calls", &BITMAP_PERSIST_CALLS),
+        ("bitmap_words", &BITMAP_WORDS),
     ] {
         ostd::info!(
             "EXT4_ALLOC_METRIC name={} count={} total={} max={}",

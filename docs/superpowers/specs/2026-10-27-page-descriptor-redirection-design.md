@@ -2,7 +2,8 @@
 
 Date: 2026-10-27
 
-Status: Design approved for planning; not implemented.
+Status: Implemented in the current rNVPCe branch; foreground first-write
+baseline publication validated on 2026-10-29.
 
 ## 1. Intent
 
@@ -189,9 +190,26 @@ NVPage granularity: it publishes a new descriptor version and leaves the pinned
 old generation for completion. Thus foreground write does not wait for an
 extent-wide migration lease.
 
-Hole writes, file extension, unwritten conversion, truncate, and hole punch are
-not ordinary residency changes. They also update persistent file/SSD allocation
-state using the structural protocol described in section 9.
+For a first write into a hole, the foreground transaction performs the genuine
+structural work before returning:
+
+1. reserve and allocate the SSD home as a range, then publish the affected
+   bitmap/GDT image as NVM-authoritative allocation metadata;
+2. persist the NVPage data and selected redirect descriptors, including their
+   preallocated SSD targets;
+3. insert the SSD mapping into the NVM-authoritative extent tree as one extent
+   per contiguous allocation range;
+4. publish the inode root, size, and block count; and
+5. enqueue the selected descriptors in the volatile dirty-extent index.
+
+The SSD baseline is structurally present after step 4, but it is not yet the
+data authority: redirect-first lookup continues to select the NVPage until the
+exact redirect generation is cleared after a successful device flush. Thus an
+early SSD extent never exposes unwritten SSD data. Allocation or tree-split
+failure is reported by the foreground write, not deferred to completion.
+
+Unwritten conversion, truncate, and hole punch remain genuine structural
+operations and use the structural protocol described in section 9.
 
 ## 7. rTIO Candidate Selection
 
@@ -249,26 +267,36 @@ page range:
 The SSD now contains the submitted version. If a newer NVM redirect exists, it
 still overrides that SSD content and will be migrated later.
 
-### New or changed SSD baseline
+### Foreground-prepublished SSD baseline
 
-For a hole, delayed allocation, unwritten conversion, or relocated target:
+Normal first-write migration does not publish or split the extent tree. The
+foreground transaction has already established both the NVM-authoritative SSD
+allocation metadata and the logical-to-SSD baseline. rTIO therefore:
 
-1. Persist allocation ownership in the NVPage descriptors/allocation ledger
-   before submitting SSD metadata that can expose those blocks.
-2. SSD data and metadata requests complete and the batch device flush succeeds.
-3. Publish the confirmed NVM baseline using the structural extent protocol and
-   advance its runtime range generation.
-4. Persistently release the allocation credit. Recovery can reconstruct a
-   credit whose release record lags the confirmed baseline.
-5. Clear matching per-page redirect selectors in bounded batches.
-6. Reclaim their slots only after selector durability and reader/pin quiescence.
+1. submits data and allocation-metadata writeback without an ordering dependency;
+2. waits for all requests and one batch device flush;
+3. compares the exact descriptor and baseline generations;
+4. marks the exact dirty extent SSD-durable and publishes a reclaim ticket; and
+5. clears only matching redirect selectors before reclaiming their slots.
 
-Publishing the baseline before releasing credit and clearing redirects prevents
-a page from becoming unreachable or an SSD allocation from losing its owner. A
-crash before baseline publication retains the NVM redirect and retries
-migration. A crash after baseline publication but before redirect clearing
-still reads the NVM redirect; recovery may safely finish credit and redirect
-cleanup.
+The normal completion/reclaim path does not route from the inode root, read an
+extent leaf, acquire an inode publication guard, or split a leaf. Recovery and
+legacy descriptors that still have no preallocated target retain the old
+structural fallback only as a compatibility path; new foreground writes must
+not create that state.
+
+Foreground physical allocation follows the preceding logical page's SSD block
+when possible. This preserves extent locality across separate write syscalls
+instead of rotating every request to the block group with the largest free
+count.
+
+The persistent allocation ownership record is transient. It protects the
+interval between updating the NVM-authoritative allocation bitmap and
+publishing the inode's SSD baseline. Once that baseline names every allocated
+block, the baseline plus allocation bitmap are the recoverable ownership proof,
+so the transaction reclaims the temporary records. A crash before reclamation
+may leave a conservative stale record for recovery to scan, but normal writes
+must not retain one 4 KiB metadata object per syscall.
 
 Overlapping writes to the same SSD target are serialized by PageKey migration
 ownership. A newer descriptor may be published while an older I/O is in flight,
@@ -277,7 +305,8 @@ completed. This prevents an older orderless BIO from overwriting a newer value.
 
 ## 9. Remaining Role of FAST/FAIR
 
-FAST/FAIR remains necessary for genuine persistent extent-tree changes:
+FAST/FAIR remains necessary for genuine persistent extent-tree changes, which
+the initiating foreground operation owns:
 
 - allocating SSD blocks for holes or delayed allocation;
 - inserting, deleting, splitting, and merging SSD extents;
@@ -331,9 +360,8 @@ overwrites, and their migration only.
 | --- | --- | --- |
 | NV data written, descriptor selector not published | old redirect or SSD baseline | reclaim unreachable slot |
 | new descriptor selected, old descriptor retained | highest logical version | rebuild index with new version; retire old when unpinned |
-| migration target stored, SSD batch not flushed | NV descriptor | resubmit or allocate a replacement target |
-| SSD batch flushed, confirmed NVM baseline unchanged | NV descriptor | repeat baseline publication or migration cleanup |
-| new SSD baseline published, redirect retained | NV descriptor | verify matching version, then clear redirect |
+| foreground SSD baseline published, SSD batch not flushed | NV descriptor | resubmit to the preallocated target |
+| SSD batch flushed, foreground baseline retained | NV descriptor | verify matching version, then clear redirect |
 | redirect selector cleared, slot not returned to free pool | SSD baseline | recover slot as free after reachability scan |
 | old completion arrives after a newer write | newer descriptor | retire only exact old generation; never clear current redirect |
 

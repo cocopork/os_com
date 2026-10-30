@@ -338,6 +338,37 @@ struct PoolState {
     migration_freezes: BTreeMap<(u64, u64), Vec<Range<u64>>>,
 }
 
+/// Failure classification for an in-place persistent metadata range update.
+///
+/// Once the backend write is attempted, callers must assume that any subset
+/// of the range may survive a crash and must not make the old allocation
+/// state reusable in DRAM.
+#[derive(Debug)]
+pub(crate) enum MetadataRangePersistFailure {
+    BeforeMutation(Error),
+    Uncertain(Error),
+}
+
+impl MetadataRangePersistFailure {
+    fn before(error: Error) -> Self {
+        Self::BeforeMutation(error)
+    }
+
+    fn uncertain(error: Error) -> Self {
+        Self::Uncertain(error)
+    }
+
+    pub(crate) fn into_error(self) -> Error {
+        match self {
+            Self::BeforeMutation(error) | Self::Uncertain(error) => error,
+        }
+    }
+
+    pub(crate) const fn is_uncertain(&self) -> bool {
+        matches!(self, Self::Uncertain(_))
+    }
+}
+
 pub(crate) struct Rnvpc {
     backend: Arc<dyn NvMemoryBackend>,
     persist: PersistEngine,
@@ -367,6 +398,10 @@ pub(crate) struct Rnvpc {
     extent_tree_routes: AtomicU64,
     #[cfg(ktest)]
     migration_claim_leaf_reads: AtomicU64,
+    #[cfg(ktest)]
+    authoritative_metadata_reads: AtomicU64,
+    #[cfg(ktest)]
+    extent_tree_lookups: AtomicU64,
     high_water_wake: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
@@ -719,6 +754,10 @@ impl Rnvpc {
             extent_tree_routes: AtomicU64::new(0),
             #[cfg(ktest)]
             migration_claim_leaf_reads: AtomicU64::new(0),
+            #[cfg(ktest)]
+            authoritative_metadata_reads: AtomicU64::new(0),
+            #[cfg(ktest)]
+            extent_tree_lookups: AtomicU64::new(0),
             high_water_wake,
         })
     }
@@ -755,6 +794,21 @@ impl Rnvpc {
     #[cfg(ktest)]
     pub(crate) fn migration_claim_leaf_reads(&self) -> u64 {
         self.migration_claim_leaf_reads.load(Ordering::Acquire)
+    }
+
+    #[cfg(ktest)]
+    pub(crate) fn authoritative_metadata_reads(&self) -> u64 {
+        self.authoritative_metadata_reads.load(Ordering::Acquire)
+    }
+
+    #[cfg(ktest)]
+    pub(crate) fn extent_tree_lookups(&self) -> u64 {
+        self.extent_tree_lookups.load(Ordering::Acquire)
+    }
+
+    #[cfg(ktest)]
+    pub(crate) fn note_extent_tree_lookup(&self) {
+        self.extent_tree_lookups.fetch_add(1, Ordering::Relaxed);
     }
 
     pub(crate) fn format(
@@ -1442,20 +1496,22 @@ impl Rnvpc {
             let selected = if pages == 1 {
                 vec![allocation.free_ids.pop().unwrap()]
             } else {
-                allocation
-                    .free_ids
-                    .sort_unstable_by(|left, right| right.cmp(left));
+                allocation.free_ids.sort_unstable();
                 let contiguous_start = allocation.free_ids.windows(pages).position(|window| {
                     window
                         .windows(2)
-                        .all(|pair| pair[0].checked_sub(1) == Some(pair[1]))
+                        .all(|pair| pair[0].checked_add(1) == Some(pair[1]))
                 });
-                if let Some(start) = contiguous_start {
+                let mut selected: Vec<usize> = if let Some(start) = contiguous_start {
                     allocation.free_ids.drain(start..start + pages).collect()
                 } else {
-                    let split_at = allocation.free_ids.len() - pages;
-                    allocation.free_ids.split_off(split_at)
-                }
+                    allocation.free_ids.drain(..pages).collect()
+                };
+                // CapacityReservation consumes from the tail. Store the
+                // selected interval in reverse so callers receive increasing
+                // physical page IDs across this and later range reservations.
+                selected.reverse();
+                selected
             };
             for index in &selected {
                 NvPageId::try_from(*index).map_err(|_| Error::new(Errno::EOVERFLOW))?;
@@ -4233,6 +4289,9 @@ impl Rnvpc {
     where
         T: AuthoritativeMetadataRecord,
     {
+        #[cfg(ktest)]
+        self.authoritative_metadata_reads
+            .fetch_add(1, Ordering::Relaxed);
         self.decode_metadata_pin(self.pin_persistent_metadata(reference)?)
     }
 
@@ -4243,7 +4302,61 @@ impl Rnvpc {
     where
         T: AuthoritativeMetadataRecord,
     {
+        #[cfg(ktest)]
+        self.authoritative_metadata_reads
+            .fetch_add(1, Ordering::Relaxed);
         self.decode_metadata_pin_boxed(self.pin_persistent_metadata(reference)?)
+    }
+
+    pub(crate) fn persist_authoritative_metadata_range(
+        self: &Arc<Self>,
+        reference: PersistentObjectRef,
+        offset: usize,
+        bytes: &[u8],
+    ) -> core::result::Result<(), MetadataRangePersistFailure> {
+        let end = offset
+            .checked_add(bytes.len())
+            .filter(|end| *end <= PAGE_SIZE)
+            .ok_or_else(|| MetadataRangePersistFailure::before(Error::new(Errno::EINVAL)))?;
+        if end == offset
+            || !offset.is_multiple_of(size_of::<u64>())
+            || !bytes.len().is_multiple_of(size_of::<u64>())
+        {
+            return Err(MetadataRangePersistFailure::before(Error::with_message(
+                Errno::EINVAL,
+                "metadata range persist is not word aligned",
+            )));
+        }
+        let _mutation = self
+            .lock_metadata_mutation(reference)
+            .map_err(MetadataRangePersistFailure::before)?;
+        let (frame, _) = self
+            .metadata_identity(reference)
+            .map_err(MetadataRangePersistFailure::before)?;
+        self.begin_exclusive_metadata_update(frame, reference.allocation_seq())
+            .map_err(MetadataRangePersistFailure::before)?;
+        let result = (|| {
+            self.backend
+                .write_page_range(self.page_id(frame), offset, bytes)?;
+            let absolute = frame
+                .index()
+                .checked_mul(PAGE_SIZE)
+                .and_then(|base| base.checked_add(offset))
+                .ok_or_else(|| Error::new(Errno::EOVERFLOW))?;
+            self.backend.persist(absolute, bytes.len())
+        })()
+        .map_err(MetadataRangePersistFailure::uncertain);
+        let mut state = self.objects.lock(frame.index());
+        state.records[frame.index()].pins -= 1;
+        state.records[frame.index()].persisting = false;
+        self.account_unpin();
+        drop(state);
+        note_metadata_pin_change();
+        result
+    }
+
+    pub(crate) fn finish_authoritative_metadata_range_persist(&self) -> Result<()> {
+        self.backend.fence()
     }
 
     fn validate_metadata_identity<T>(key: PageKey, record: &T) -> Result<()>

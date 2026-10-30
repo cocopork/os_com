@@ -1870,7 +1870,7 @@ impl Inode {
                     newly_allocated,
                 )?);
             }
-            let request = crate::fs::rnvpc::write_transaction::RangeWriteBatch::new(
+            let provisional_request = crate::fs::rnvpc::write_transaction::RangeWriteBatch::new(
                 authority
                     .generation()
                     .checked_add(1)
@@ -1893,7 +1893,10 @@ impl Inode {
                 continue;
             }
             let needed = crate::fs::rnvpc::write_transaction::range_write_new_pages(
-                &pool, fs_id, inode_id, &request,
+                &pool,
+                fs_id,
+                inode_id,
+                &provisional_request,
             )?;
             let reservation = match pool.reserve_data_pages(needed) {
                 Ok(reservation) => reservation,
@@ -1909,6 +1912,93 @@ impl Inode {
                 Err(error) => return Err(error),
             };
             fs.reserve_rnvpce_blocks(newly_reserved)?;
+            let allocation_goal = spans
+                .first()
+                .and_then(|page| page.logical_block().checked_sub(1))
+                .map(|logical_block| {
+                    crate::fs::rnvpc::write_transaction::current_page_mapping(
+                        &pool,
+                        fs_id,
+                        inode_id,
+                        logical_block,
+                    )
+                })
+                .transpose()?
+                .flatten()
+                .map(|mapping| {
+                    mapping
+                        .ssd_block()
+                        .checked_add(1)
+                        .ok_or_else(|| Error::new(Errno::EOVERFLOW))
+                })
+                .transpose()?;
+            let allocation_started = pp::now();
+            let allocation_count =
+                u32::try_from(newly_reserved).map_err(|_| Error::new(Errno::EOVERFLOW))?;
+            let allocation_units =
+                usize::try_from(allocation_count).map_err(|_| Error::new(Errno::EOVERFLOW))?;
+            let allocated_ranges =
+                match fs.allocate_rnvpce_foreground_blocks(allocation_count, allocation_goal) {
+                    Ok(ranges) => {
+                        pp::NV_FOREGROUND_SSD_ALLOCATE
+                            .record_since(allocation_started, allocation_units);
+                        ranges
+                    }
+                    Err(error) if error.error() == Errno::EBUSY => {
+                        pp::NV_FOREGROUND_SSD_ALLOCATE.record_since(allocation_started, 0);
+                        fs.release_rnvpce_blocks(newly_reserved)?;
+                        drop(mutation);
+                        drop(inner);
+                        fs.wait_for_nv_migration_progress(&pool, lease_epoch)?;
+                        continue;
+                    }
+                    Err(error) => {
+                        pp::NV_FOREGROUND_SSD_ALLOCATE.record_since(allocation_started, 0);
+                        fs.release_rnvpce_blocks(newly_reserved)?;
+                        return Err(error);
+                    }
+                };
+            let mut allocations = Vec::new();
+            allocations
+                .try_reserve_exact(allocated_ranges.len())
+                .map_err(|_| Error::new(Errno::ENOMEM))?;
+            let mut unassigned = spans.iter_mut().filter(|page| page.needs_ssd_block());
+            for range in &allocated_ranges {
+                let block_count = u32::try_from(range.end - range.start)
+                    .map_err(|_| Error::new(Errno::EOVERFLOW))?;
+                let block_group = u32::try_from(fs.block_group_index_for_block(range.start)?)
+                    .map_err(|_| Error::new(Errno::EOVERFLOW))?;
+                allocations.push(crate::fs::rnvpc::write_transaction::WriteAllocation::new(
+                    block_group,
+                    range.start,
+                    block_count,
+                )?);
+                for target in range.clone() {
+                    unassigned
+                        .next()
+                        .ok_or_else(|| Error::new(Errno::EUCLEAN))?
+                        .assign_new_ssd_block(target)?;
+                }
+            }
+            if unassigned.next().is_some() {
+                return_errno_with_message!(Errno::EUCLEAN, "foreground SSD allocation is short");
+            }
+            // Physical allocation and its NVM-authoritative bitmap now replace
+            // the earlier count-only admission promise.
+            fs.release_rnvpce_blocks(newly_reserved)?;
+            let request = crate::fs::rnvpc::write_transaction::RangeWriteBatch::new(
+                authority
+                    .generation()
+                    .checked_add(1)
+                    .ok_or_else(|| Error::new(Errno::EOVERFLOW))?,
+                offset as u64,
+                write_len,
+                &allocations,
+                &spans,
+                authority.file_size(),
+                authority.block_count(),
+                (BLOCK_SIZE / 512) as u64,
+            )?;
             let persist_started = pp::now();
             let result = crate::fs::rnvpc::write_transaction::commit_range_write_with_mutation(
                 pool.clone(),
@@ -1936,9 +2026,6 @@ impl Inode {
             );
             return match result {
                 Ok(committed) => {
-                    fs.release_rnvpce_blocks(
-                        newly_reserved.saturating_sub(committed.reserved_blocks()),
-                    )?;
                     inner.set_file_size(old_size.max(offset + committed.copied()));
                     let state = crate::fs::rnvpc::write_transaction::authoritative_inode_state(
                         &pool, fs_id, inode_id,
@@ -1951,7 +2038,6 @@ impl Inode {
                     Ok(committed.copied())
                 }
                 Err(error) if error.error() == Errno::EAGAIN => {
-                    fs.release_rnvpce_blocks(newly_reserved)?;
                     drop(inner);
                     fs.wait_for_nv_migration_progress(&pool, lease_epoch)?;
                     continue;

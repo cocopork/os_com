@@ -353,6 +353,34 @@
   git commit -m "feat(rnvpce): reclaim redirects without leaf publication"
   ```
 
+### Task 6A: Publish First-Write SSD Baselines in the Foreground
+
+**Status:** Implemented and covered by `ext4_research_routes` on 2026-10-29.
+
+**Interfaces:**
+- `Ext4::allocate_rnvpce_foreground_blocks(count)` allocates contiguous ranges
+  under allocation-group ownership and publishes the resulting bitmap/GDT
+  image to NVM without SSD I/O.
+- `RangeWritePage::assign_new_ssd_block(target)` binds each new logical page to
+  its foreground allocation before `commit_range_write_with_mutation`.
+- `RangeWriteBatch.allocations` persists allocation ownership; its coalesced
+  replacements publish the SSD baseline in the same foreground transaction as
+  the redirect and inode state.
+
+- [x] Add a failing EXT4 route test proving that a first write previously
+  returned with no SSD baseline.
+- [x] Allocate and persist SSD targets before foreground redirect publication;
+  roll back every private range if allocation or bitmap publication fails.
+- [x] Publish one baseline extent per contiguous allocation range while keeping
+  redirect-first reads authoritative until device flush and exact clear.
+- [x] Prove migration/completion performs zero structural baseline mutations
+  for a new foreground write.
+- [x] Update fragmented-allocation, failed-flush, and allocation-durability
+  scenarios for the new responsibility boundary.
+
+The target-allocation branch in migration remains only for recovery of legacy
+descriptors with `ssd_target == 0`; normal foreground writes cannot create one.
+
 ### Task 7: Remove Data Reverse Locators and Mixed NV Extent Residency
 
 **Files:**

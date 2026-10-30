@@ -87,6 +87,10 @@ impl FreeSpaceIndex {
         }
     }
 
+    pub(in crate::fs::fs_impls::ext4) fn longest_free_run(&self) -> u32 {
+        u32::from(self.tree[1].longest)
+    }
+
     pub(in crate::fs::fs_impls::ext4) fn exclude(&mut self, range: Range<u16>) {
         if range.is_empty() {
             return;
@@ -210,9 +214,11 @@ mod tests {
     fn group_index_goal_fragment_merge_and_tail() {
         let mut bitmap = bitmap(131);
         let mut index = FreeSpaceIndex::new(&bitmap);
+        assert_eq!(index.longest_free_run(), 131);
         assert_eq!(index.find(70, 60, false), Some(60..130));
         bitmap.alloc_exact_at(60, 70).unwrap();
         index.refresh(&bitmap, 60..130);
+        assert_eq!(index.longest_free_run(), 60);
         assert_eq!(index.find(61, 0, false), None);
         assert_eq!(index.find(90, 0, true), Some(0..60));
         bitmap.free_consecutive(60..130);
@@ -221,6 +227,7 @@ mod tests {
         index.exclude(0..130);
         assert_eq!(index.find(2, 0, true), Some(130..131));
         index.refresh(&bitmap, 0..131);
+        assert_eq!(index.longest_free_run(), 131);
         assert_eq!(index.find(131, 1, false), Some(0..131));
     }
 

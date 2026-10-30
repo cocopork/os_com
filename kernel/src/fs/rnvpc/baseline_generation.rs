@@ -2,6 +2,9 @@
 
 //! Volatile generations and ownership for confirmed SSD baseline mappings.
 
+#[cfg(ktest)]
+use core::sync::atomic::{AtomicUsize, Ordering};
+
 use super::index::PageKey;
 use crate::prelude::*;
 
@@ -30,6 +33,8 @@ struct BaselineState {
 
 pub(crate) struct BaselineGenerationMap {
     state: SpinLock<BaselineState>,
+    #[cfg(ktest)]
+    validation_calls: AtomicUsize,
 }
 
 pub(crate) struct BaselineMutationGuard<'a> {
@@ -66,6 +71,8 @@ impl BaselineGenerationMap {
     pub(crate) fn new() -> Result<Self> {
         Ok(Self {
             state: SpinLock::new(BaselineState::default()),
+            #[cfg(ktest)]
+            validation_calls: AtomicUsize::new(0),
         })
     }
 
@@ -126,6 +133,8 @@ impl BaselineGenerationMap {
     }
 
     pub(crate) fn validate(&self, token: &BaselineRangeToken) -> bool {
+        #[cfg(ktest)]
+        self.validation_calls.fetch_add(1, Ordering::Relaxed);
         if token.generations.len() != token.targets.len() {
             return false;
         }
@@ -145,6 +154,16 @@ impl BaselineGenerationMap {
                     .unwrap_or(0)
                     == *expected
             })
+    }
+
+    #[cfg(ktest)]
+    pub(crate) fn reset_validation_calls(&self) {
+        self.validation_calls.store(0, Ordering::Relaxed);
+    }
+
+    #[cfg(ktest)]
+    pub(crate) fn validation_calls(&self) -> usize {
+        self.validation_calls.load(Ordering::Relaxed)
     }
 
     pub(crate) fn try_claim_migration(&self, key: PageKey) -> Option<u64> {

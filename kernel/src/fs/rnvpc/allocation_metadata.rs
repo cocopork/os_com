@@ -2,6 +2,8 @@
 
 //! NVM-authoritative EXT4 block-allocation metadata.
 
+use core::ops::Range;
+
 use super::{
     fault::FaultPoint,
     frame::Rnvpc,
@@ -16,6 +18,38 @@ use crate::prelude::*;
 pub(crate) const ALLOCATION_BITMAP_CHUNK_BYTES: usize = PAGE_SIZE / 2;
 const ALLOCATION_BITMAP_CHUNKS: u16 = 2;
 const ALLOCATION_METADATA_LOGICAL_INDEX_TAG: u64 = 1 << 59;
+
+#[derive(Debug)]
+pub(crate) enum AllocationRangePersistFailure {
+    BeforeMutation(Error),
+    Uncertain(Error),
+}
+
+impl AllocationRangePersistFailure {
+    pub(crate) fn before(error: Error) -> Self {
+        Self::BeforeMutation(error)
+    }
+
+    pub(crate) fn uncertain(error: Error) -> Self {
+        Self::Uncertain(error)
+    }
+
+    pub(crate) fn into_error(self) -> Error {
+        match self {
+            Self::BeforeMutation(error) | Self::Uncertain(error) => error,
+        }
+    }
+
+    pub(crate) const fn is_uncertain(&self) -> bool {
+        matches!(self, Self::Uncertain(_))
+    }
+
+    pub(crate) fn errno(&self) -> Errno {
+        match self {
+            Self::BeforeMutation(error) | Self::Uncertain(error) => error.error(),
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u32)]
@@ -277,6 +311,19 @@ impl AllocationBitmapChunkRecord {
         Ok(record)
     }
 
+    fn new_mutable(
+        fs_id: u64,
+        group: u32,
+        generation: u64,
+        chunk_index: u16,
+        data: &[u8],
+    ) -> Result<Self> {
+        let mut record = Self::new(fs_id, group, generation, chunk_index, data)?;
+        record.checksum = 0;
+        record.validate()?;
+        Ok(record)
+    }
+
     pub(crate) fn validate(&self) -> Result<()> {
         self.header.validate(
             PersistentMetadataKind::AllocationBitmapChunk,
@@ -287,7 +334,7 @@ impl AllocationBitmapChunkRecord {
             || self.chunk_index >= ALLOCATION_BITMAP_CHUNKS
             || self.chunk_count != ALLOCATION_BITMAP_CHUNKS
             || self.data_len as usize != ALLOCATION_BITMAP_CHUNK_BYTES
-            || self.checksum != allocation_bitmap_checksum(&self.data)
+            || (self.checksum != 0 && self.checksum != allocation_bitmap_checksum(&self.data))
         {
             return_errno_with_message!(Errno::EUCLEAN, "invalid allocation bitmap chunk");
         }
@@ -317,6 +364,10 @@ impl AllocationBitmapChunkRecord {
 
     pub(crate) const fn data(&self) -> &[u8; ALLOCATION_BITMAP_CHUNK_BYTES] {
         &self.data
+    }
+
+    const fn is_mutable(&self) -> bool {
+        self.checksum == 0
     }
 
     #[cfg(ktest)]
@@ -363,6 +414,147 @@ pub(crate) struct ResidentAllocationGroup {
 impl AllocationMetadataCache {
     pub(crate) fn new(pool: Arc<Rnvpc>) -> Self {
         Self { pool }
+    }
+
+    pub(crate) fn resident_chunk_refs(
+        &self,
+        fs_id: u64,
+        group: u32,
+    ) -> Result<[PersistentObjectRef; 2]> {
+        let reference = self
+            .pool
+            .current_metadata_ref(allocation_metadata_key(fs_id, group, 0)?)
+            .ok_or_else(|| Error::new(Errno::ENOENT))?;
+        let directory = self
+            .pool
+            .read_authoritative_metadata::<AllocationGroupDirectoryRecord>(reference)?;
+        if !directory.state()?.is_resident() {
+            return_errno_with_message!(Errno::ESTALE, "allocation group is not resident");
+        }
+        Ok(directory.chunks())
+    }
+
+    pub(crate) fn persist_allocated_range(
+        &self,
+        fs_id: u64,
+        group: u32,
+        bits: Range<u16>,
+        words: &[u8],
+    ) -> core::result::Result<(), AllocationRangePersistFailure> {
+        if bits.is_empty() || usize::from(bits.end) > PAGE_SIZE * 8 {
+            return Err(AllocationRangePersistFailure::before(Error::with_message(
+                Errno::EINVAL,
+                "allocation bitmap range is invalid",
+            )));
+        }
+        let byte_start = usize::from(bits.start) / 64 * size_of::<u64>();
+        let byte_end = usize::from(bits.end).div_ceil(64) * size_of::<u64>();
+        if words.len() != byte_end - byte_start {
+            return Err(AllocationRangePersistFailure::before(Error::with_message(
+                Errno::EINVAL,
+                "allocation bitmap word image has the wrong length",
+            )));
+        }
+        let chunk_refs = self
+            .resident_chunk_refs(fs_id, group)
+            .map_err(AllocationRangePersistFailure::before)?;
+        self.persist_allocated_range_with_chunks(fs_id, group, bits, words, chunk_refs)
+    }
+
+    pub(crate) fn persist_allocated_range_with_chunks(
+        &self,
+        fs_id: u64,
+        group: u32,
+        bits: Range<u16>,
+        words: &[u8],
+        chunk_refs: [PersistentObjectRef; 2],
+    ) -> core::result::Result<(), AllocationRangePersistFailure> {
+        if bits.is_empty() || usize::from(bits.end) > PAGE_SIZE * 8 {
+            return Err(AllocationRangePersistFailure::before(Error::with_message(
+                Errno::EINVAL,
+                "allocation bitmap range is invalid",
+            )));
+        }
+        let byte_start = usize::from(bits.start) / 64 * size_of::<u64>();
+        let byte_end = usize::from(bits.end).div_ceil(64) * size_of::<u64>();
+        if words.len() != byte_end - byte_start {
+            return Err(AllocationRangePersistFailure::before(Error::with_message(
+                Errno::EINVAL,
+                "allocation bitmap word image has the wrong length",
+            )));
+        }
+        let mut cursor = byte_start;
+        let mut mutated = false;
+        while cursor < byte_end {
+            let chunk = cursor / ALLOCATION_BITMAP_CHUNK_BYTES;
+            let chunk_offset = cursor % ALLOCATION_BITMAP_CHUNK_BYTES;
+            let len = (byte_end - cursor).min(ALLOCATION_BITMAP_CHUNK_BYTES - chunk_offset);
+            let chunk_index = u64::try_from(chunk + 1)
+                .map_err(|_| AllocationRangePersistFailure::before(Error::new(Errno::EOVERFLOW)))?;
+            let expected_key = allocation_metadata_key(fs_id, group, chunk_index)
+                .map_err(AllocationRangePersistFailure::before)?;
+            let actual_key = self
+                .pool
+                .persistent_metadata_key(chunk_refs[chunk])
+                .map_err(|error| {
+                    if mutated {
+                        AllocationRangePersistFailure::uncertain(error)
+                    } else {
+                        AllocationRangePersistFailure::before(error)
+                    }
+                })?;
+            if actual_key != expected_key {
+                let error =
+                    Error::with_message(Errno::EUCLEAN, "allocation bitmap chunk identity changed");
+                return Err(if mutated {
+                    AllocationRangePersistFailure::uncertain(error)
+                } else {
+                    AllocationRangePersistFailure::before(error)
+                });
+            }
+            let record_offset =
+                core::mem::offset_of!(AllocationBitmapChunkRecord, data) + chunk_offset;
+            let result = self.pool.persist_authoritative_metadata_range(
+                chunk_refs[chunk],
+                record_offset,
+                &words[cursor - byte_start..cursor - byte_start + len],
+            );
+            if let Err(failure) = result {
+                let uncertain = mutated || failure.is_uncertain();
+                let error = failure.into_error();
+                return Err(if uncertain {
+                    AllocationRangePersistFailure::uncertain(error)
+                } else {
+                    AllocationRangePersistFailure::before(error)
+                });
+            }
+            mutated = true;
+            cursor += len;
+        }
+        self.pool
+            .finish_authoritative_metadata_range_persist()
+            .map_err(AllocationRangePersistFailure::uncertain)
+    }
+
+    pub(crate) fn persist_freed_range(
+        &self,
+        fs_id: u64,
+        group: u32,
+        bits: Range<u16>,
+        words: &[u8],
+    ) -> core::result::Result<(), AllocationRangePersistFailure> {
+        self.persist_allocated_range(fs_id, group, bits, words)
+    }
+
+    pub(crate) fn persist_freed_range_with_chunks(
+        &self,
+        fs_id: u64,
+        group: u32,
+        bits: Range<u16>,
+        words: &[u8],
+        chunk_refs: [PersistentObjectRef; 2],
+    ) -> core::result::Result<(), AllocationRangePersistFailure> {
+        self.persist_allocated_range_with_chunks(fs_id, group, bits, words, chunk_refs)
     }
 
     pub(crate) fn publish_initial(
@@ -561,13 +753,19 @@ impl AllocationMetadataCache {
         if current.header().generation() != generation || !current.state()?.is_resident() {
             return_errno_with_message!(Errno::ESTALE, "allocation writeback generation changed");
         }
+        let selected = self
+            .selected_image(fs_id, group)?
+            .ok_or_else(|| Error::new(Errno::ESTALE))?;
+        if selected.generation() != generation {
+            return_errno_with_message!(Errno::ESTALE, "allocation writeback generation changed");
+        }
         let chunks = current.chunks();
         let clean = AllocationGroupDirectoryRecord::clean_on_ssd(
             fs_id,
             group,
             generation,
-            current.free_blocks(),
-            current.bitmap_checksum(),
+            selected.free_blocks(),
+            selected.checksum(),
         )?;
         self.pool
             .replace_authoritative_metadata(current_ref, &clean, None)?;
@@ -606,10 +804,13 @@ impl AllocationMetadataCache {
                 Err(error) => return Err(error),
             };
             if directory.state()?.is_resident() {
+                let selected = self
+                    .selected_image(fs_id, directory.group())?
+                    .ok_or_else(|| Error::new(Errno::ESTALE))?;
                 groups.push(ResidentAllocationGroup {
                     group: directory.group(),
                     generation: directory.header().generation(),
-                    free_blocks: directory.free_blocks(),
+                    free_blocks: selected.free_blocks(),
                 });
             }
         }
@@ -665,6 +866,7 @@ pub(crate) fn select_allocation_group_image(
     let mut bitmap = [0u8; PAGE_SIZE];
     let mut selected_chunks = [false; ALLOCATION_BITMAP_CHUNKS as usize];
     let generation = directory.header().generation();
+    let mutable = chunks.iter().all(|chunk| chunk.is_mutable());
     for chunk in chunks {
         chunk.validate().map_err(|_| Error::new(Errno::EUCLEAN))?;
         if chunk.header().fs_id() != directory.header().fs_id()
@@ -681,8 +883,13 @@ pub(crate) fn select_allocation_group_image(
         let start = chunk_index * ALLOCATION_BITMAP_CHUNK_BYTES;
         bitmap[start..start + ALLOCATION_BITMAP_CHUNK_BYTES].copy_from_slice(chunk.data());
     }
-    let image = AllocationGroupImage::new(generation, bitmap, directory.free_blocks())?;
-    if image.checksum() != directory.bitmap_checksum() {
+    let free_blocks = if mutable {
+        bitmap.iter().map(|byte| byte.count_zeros()).sum()
+    } else {
+        directory.free_blocks()
+    };
+    let image = AllocationGroupImage::new(generation, bitmap, free_blocks)?;
+    if !mutable && image.checksum() != directory.bitmap_checksum() {
         return_errno_with_message!(Errno::EUCLEAN, "allocation bitmap checksum mismatch");
     }
     Ok(image)
@@ -703,14 +910,14 @@ fn allocation_chunk_records(
     image: &AllocationGroupImage,
 ) -> Result<[AllocationBitmapChunkRecord; 2]> {
     Ok([
-        AllocationBitmapChunkRecord::new(
+        AllocationBitmapChunkRecord::new_mutable(
             fs_id,
             group,
             image.generation(),
             0,
             &image.bitmap()[..ALLOCATION_BITMAP_CHUNK_BYTES],
         )?,
-        AllocationBitmapChunkRecord::new(
+        AllocationBitmapChunkRecord::new_mutable(
             fs_id,
             group,
             image.generation(),

@@ -27,8 +27,9 @@ structural invariant, not merely an I/O batching hint.
    belong to one index partition.
 3. A 129-page compatible range is represented as at least two extents.  Local
    merge and split operations must never create a longer extent.
-4. The persistent per-page descriptor remains authoritative until SSD baseline
-   publication completes and that exact descriptor generation is cleared.
+4. The foreground first-write transaction publishes the SSD baseline before
+   returning, but the persistent per-page descriptor remains the data authority
+   until SSD I/O completes and that exact descriptor generation is cleared.
 5. Candidate claim and SSD I/O state are DRAM-only.  Selection must not persist
    `NvDirty -> NvWriteback` for every page.
 6. A claimed extent blocks foreground updates only in its logical range.  Other
@@ -106,9 +107,10 @@ key is selected; it does not eagerly reconstruct every extent after an update:
 
 Recovery scans selected descriptors once and rebuilds each partition's ready
 keys.  This startup work is allowed to be global; the steady-state candidate
-path is not.  Completion may aggregate several separately locked 128-page
-extents for one SSD-baseline publication and NVPage-free batch.  Aggregation
-does not enlarge an extent lease or its foreground exclusion range.
+path is not. Completion may aggregate several separately locked 128-page
+extents for one descriptor-clear and NVPage-free batch. It does not publish
+SSD baselines for normal writes. Aggregation does not enlarge an extent lease
+or its foreground exclusion range.
 
 ## 5. Candidate Claim and Range Coordination
 
@@ -126,9 +128,10 @@ The claim performs range-oriented operations:
    `[nv_base_slot, nv_base_slot + len)`; all descriptor replacement, clearing,
    and NVPage reuse paths must consult this lease;
 3. batch-claim the confirmed SSD baseline generations for the whole range;
-4. reserve an available EXT4 allocation group before mutating allocation
-   metadata;
-5. allocate targets from the reserved group and submit BIOs;
+4. use the SSD targets and baseline mappings already published by the
+   foreground first-write transaction;
+5. reserve a group and allocate a target only for a recovered legacy descriptor
+   that predates foreground target publication, then submit BIOs;
 6. create a ticket containing the lease, exact descriptors, targets, and
    baseline generations.
 
@@ -165,9 +168,10 @@ boundary.
 ## 7. Completion, Reclaim, and Failure
 
 Completion first checks the ticket generation, exact descriptor handles, and
-baseline generations.  It then publishes the SSD baseline result in a batch.
-Only after the required device flush and NVM ordering point may the exact
-descriptors become reclaimable or be cleared.
+baseline generations. After the required device flush it marks the exact dirty
+extent SSD-durable and publishes a reclaim ticket. The normal path does not
+route or mutate the extent tree. Only then may the exact descriptors become
+reclaimable or be cleared.
 
 Parallel reclaim remains compatible with plan 017: completion may mark exact
 NVPages reclaimable, while foreground allocators reclaim clean pages through
@@ -199,7 +203,8 @@ not visible file data.
   descriptor persistence.
 - Completion uses ticket identity and exact descriptor handles, not extent-tree
   routing or reverse lookup.
-- Crash tests at claim, BIO, flush, baseline publication, and descriptor clear
+- Crash tests at foreground baseline publication, claim, BIO, flush, and
+  descriptor clear
   always recover either the old SSD baseline plus NV authority or the fully
   published SSD result, never a dangling authoritative SSD reference.
 

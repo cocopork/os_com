@@ -16,7 +16,7 @@ use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering
 use device_id::DeviceId;
 
 use super::{
-    allocator::{Capacity, metrics as allocation_metrics},
+    allocator::{Capacity, group_selector::AllocationGroupSelector, metrics as allocation_metrics},
     block_group::{AllocPolicy, BlockGroup, GroupBlockAlloc},
     checksum::FsCsumSeed,
     feature::FeatureIncompatSet,
@@ -29,7 +29,10 @@ use super::{
 };
 use crate::{
     fs::{
-        rnvpc::mode::{RnvpcMode, RnvpcModeConfig, parse_onoff},
+        rnvpc::{
+            allocation_metadata::AllocationRangePersistFailure,
+            mode::{RnvpcMode, RnvpcModeConfig, parse_onoff},
+        },
         vfs::file_system::FsEventSubscriberStats,
     },
     process::posix_thread::AsPosixThread,
@@ -100,7 +103,8 @@ pub(super) enum AllocIntent {
     /// (or its `ZERO_RANGE` mirror) forces. May draw the reserve down to empty
     /// (Linux `EXT4_GET_BLOCKS_METADATA_NOFAIL` → `EXT4_MB_USE_RESERVED`).
     MetadataReserve,
-    RnvpceReserved,
+    RnvpceForeground,
+    RnvpceMigration,
 }
 
 /// Policy for how `statfs` reports the total block count (`f_blocks`).
@@ -193,6 +197,7 @@ pub struct Ext4 {
     super_block: RwMutex<Dirty<SuperBlock>>,
     /// Per-group block-side metadata (descriptor + block bitmap).
     block_groups: Vec<BlockGroup>,
+    pub(super) allocation_group_selector: AllocationGroupSelector,
     /// Inodes per group, cached once at mount to avoid locking `super_block` on
     /// the inode read path.
     nr_inodes_per_group: u32,
@@ -238,7 +243,6 @@ pub struct Ext4 {
     rnvpc_mode: RnvpcModeConfig,
     pub(super) cache_pressure: Arc<super::writeback::CachePressure>,
     pub(super) nv_migration_lock: Mutex<()>,
-    pub(super) nv_migration_groups: Mutex<super::migration::MigrationGroupOwners>,
     pub(super) nv_migration_trigger: Arc<ostd::sync::WaitQueue>,
     pub(super) nv_migration_epoch: AtomicUsize,
     pub(super) nv_capacity_waiters: AtomicUsize,
@@ -333,27 +337,19 @@ impl Ext4 {
     fn reconcile_rnvpce_migration_targets(&self) -> Result<()> {
         let pool = crate::fs::rnvpc::pool().ok_or_else(|| Error::new(Errno::EINVAL))?;
         let targets = pool.pending_migration_targets(self.rnvpc_fs_id)?;
-        let mut groups = BTreeSet::new();
         for target in targets {
             let group = self.block_group_index_for_block(target)?;
-            if self.block_groups[group].protect_recovered_block(target)? {
-                groups.insert(group);
-            }
+            self.block_groups[group].validate_recovered_block(target)?;
         }
         let free_blocks = self.block_groups.iter().try_fold(0u64, |total, group| {
             total
                 .checked_add(u64::from(group.free_blocks_count()))
                 .ok_or_else(|| Error::new(Errno::EOVERFLOW))
         })?;
-        let super_changed = self
-            .super_block
+        self.super_block
             .write()
             .reconcile_free_blocks(free_blocks)?;
-        if groups.is_empty() && !super_changed {
-            return Ok(());
-        }
         self.block_capacity.reset(free_blocks);
-        self.persist_rnvpce_allocation_metadata(&groups)?;
         Ok(())
     }
 
@@ -412,6 +408,13 @@ impl Ext4 {
         let total_inodes = super_block.total_inodes();
 
         let block_groups = Self::load_block_groups(device.clone(), &super_block)?;
+        let allocation_group_selector = AllocationGroupSelector::from_summaries(
+            block_groups
+                .iter()
+                .map(BlockGroup::allocation_summary)
+                .collect(),
+            ostd::cpu::num_cpus(),
+        );
 
         let initial_free_blocks = super_block.free_blocks_count();
         let allocation_geometry = (
@@ -423,6 +426,7 @@ impl Ext4 {
             block_device: device,
             super_block: RwMutex::new(Dirty::new(super_block)),
             block_groups,
+            allocation_group_selector,
             nr_inodes_per_group,
             total_inodes,
             next_generation: AtomicU32::new(utils::now().as_secs() as u32),
@@ -433,7 +437,6 @@ impl Ext4 {
             rnvpc_mode,
             cache_pressure: super::writeback::CachePressure::new(),
             nv_migration_lock: Mutex::new(()),
-            nv_migration_groups: Mutex::new(Default::default()),
             nv_migration_trigger: Arc::new(ostd::sync::WaitQueue::new()),
             nv_migration_epoch: AtomicUsize::new(0),
             nv_capacity_waiters: AtomicUsize::new(0),
@@ -635,7 +638,11 @@ impl Ext4 {
 
     /// Returns a read guard of the superblock.
     pub(super) fn free_blocks_count(&self) -> u64 {
-        self.super_block().free_blocks_count()
+        if self.rnvpc_mode() == RnvpcMode::RnvpcExtend {
+            self.block_capacity.physical_free()
+        } else {
+            self.super_block().free_blocks_count()
+        }
     }
     pub(super) fn free_inodes_count(&self) -> u32 {
         self.super_block().free_inodes_count()
@@ -1425,17 +1432,47 @@ impl Ext4 {
         groups: &BTreeSet<usize>,
         handle: Option<&journal::Handle>,
     ) -> Result<Range<Ext4Bid>> {
+        let goal = self.block_groups[*groups.first().unwrap()].first_block();
+        self.alloc_rnvpce_blocks_at_in_groups_with_intent(
+            count,
+            goal,
+            groups,
+            handle,
+            AllocIntent::RnvpceMigration,
+        )
+    }
+
+    pub(super) fn alloc_rnvpce_blocks_at_in_groups(
+        &self,
+        count: u32,
+        goal: Ext4Bid,
+        groups: &BTreeSet<usize>,
+        handle: Option<&journal::Handle>,
+    ) -> Result<Range<Ext4Bid>> {
         if groups.is_empty() || groups.iter().any(|group| *group >= self.block_groups.len()) {
             return_errno_with_message!(Errno::EINVAL, "invalid rNVPCe allocation group set");
         }
-        let goal = self.block_groups[*groups.first().unwrap()].first_block();
-        self.alloc_blocks_with_intent_in_groups(
+        self.alloc_rnvpce_blocks_at_in_groups_with_intent(
             count,
             goal,
+            groups,
             handle,
-            AllocIntent::RnvpceReserved,
-            Some(groups),
+            AllocIntent::RnvpceForeground,
         )
+    }
+
+    fn alloc_rnvpce_blocks_at_in_groups_with_intent(
+        &self,
+        count: u32,
+        goal: Ext4Bid,
+        groups: &BTreeSet<usize>,
+        handle: Option<&journal::Handle>,
+        intent: AllocIntent,
+    ) -> Result<Range<Ext4Bid>> {
+        if groups.is_empty() || groups.iter().any(|group| *group >= self.block_groups.len()) {
+            return_errno_with_message!(Errno::EINVAL, "invalid rNVPCe allocation group set");
+        }
+        self.alloc_blocks_with_intent_in_groups(count, goal, handle, intent, Some(groups))
     }
 
     fn alloc_blocks_with_intent_in_groups(
@@ -1513,16 +1550,27 @@ impl Ext4 {
         // The halved rescans this replaces handed a nearly-full goal group a
         // 1-block fragment instead of moving to the next group's open run.
         let mut pinned_blocked = false;
+        let mut owner_blocked = false;
+        let allowed_order = allowed_groups.map(|groups| {
+            groups
+                .range(goal_group..)
+                .chain(groups.range(..goal_group))
+                .copied()
+                .collect::<Vec<_>>()
+        });
+        let groups_to_visit = allowed_order
+            .as_ref()
+            .map_or(nr_block_groups, |groups| groups.len());
         for policy_pass in 0..2u8 {
-            for group_search_offset in 0..nr_block_groups {
-                let group_idx = (goal_group + group_search_offset) % nr_block_groups;
-                if allowed_groups.is_some_and(|groups| !groups.contains(&group_idx)) {
-                    continue;
-                }
+            for group_search_offset in 0..groups_to_visit {
+                let group_idx = allowed_order.as_ref().map_or_else(
+                    || (goal_group + group_search_offset) % nr_block_groups,
+                    |groups| groups[group_search_offset],
+                );
                 let group = &self.block_groups[group_idx];
                 let policy = if policy_pass == 0 {
                     AllocPolicy::FullRunOnly {
-                        goal_offset: if group_search_offset == 0 {
+                        goal_offset: if group_idx == goal_group {
                             goal_offset_in_group
                         } else {
                             None
@@ -1537,6 +1585,17 @@ impl Ext4 {
                 let mut gate = group.lock_allocation();
                 drop(waiting);
                 let holding = allocation_metrics::Span::new(&allocation_metrics::GROUP_HOLD);
+                let owner_permits = match intent {
+                    AllocIntent::RnvpceForeground => gate.permits_foreground_allocation(),
+                    AllocIntent::RnvpceMigration => gate.permits_migration_allocation(),
+                    _ => true,
+                };
+                if !owner_permits {
+                    owner_blocked = true;
+                    drop(gate);
+                    drop(holding);
+                    continue;
+                }
                 let pinned_frees = journal
                     .as_ref()
                     .map_or_else(Vec::new, |journal| journal.pinned_frees_snapshot());
@@ -1560,6 +1619,16 @@ impl Ext4 {
                 match allocated {
                     GroupBlockAlloc::Allocated(range) => {
                         let allocated_count = range.end - range.start;
+                        if matches!(
+                            intent,
+                            AllocIntent::RnvpceForeground | AllocIntent::RnvpceMigration
+                        ) {
+                            // The capacity ledger is the live rNVPCe aggregate.
+                            // The allocation-metadata pager batches the derived
+                            // superblock count with the group SSD writeback.
+                            reservation.consume(allocated_count)?;
+                            return Ok(range);
+                        }
                         // No group lock is held across superblock publication.
                         // Model A admission keeps this handle's typed updates in
                         // one transaction until both group and count are captured.
@@ -1588,6 +1657,14 @@ impl Ext4 {
             }
         }
 
+        if owner_blocked
+            && matches!(
+                intent,
+                AllocIntent::RnvpceForeground | AllocIntent::RnvpceMigration
+            )
+        {
+            return_errno_with_message!(Errno::EBUSY, "rNVPCe allocation groups are owned");
+        }
         if pinned_blocked {
             // Everything left is pinned. Force-request a commit of the
             // running transaction (asynchronous — waiting here, under the
@@ -1761,10 +1838,11 @@ impl Ext4 {
             drop(gate);
             let run_result = run_result.and_then(|freed_count| {
                 if freed_count != 0 {
-                    let mut sb = self.super_block.write();
-                    sb.inc_free_blocks(freed_count as u64)?;
-                    sb.journal_capture(handle, sb.last_orphan())?;
-                    drop(sb);
+                    if self.rnvpc_mode() != RnvpcMode::RnvpcExtend {
+                        let mut sb = self.super_block.write();
+                        sb.inc_free_blocks(freed_count as u64)?;
+                        sb.journal_capture(handle, sb.last_orphan())?;
+                    }
                     self.block_capacity.credit(freed_count as u64)?;
                 }
                 Ok(())
@@ -2379,33 +2457,159 @@ impl Ext4 {
         self.sync_superblock_metadata()
     }
 
-    /// Publishes touched allocation groups to NVM without issuing SSD I/O.
-    pub(super) fn persist_rnvpce_allocation_metadata(
+    /// Persists only the allocation bitmap words covering one same-group
+    /// range. The group gate remains held through the NVM update, preventing a
+    /// same-word allocator or pager handoff from losing this mutation.
+    pub(super) fn persist_rnvpce_allocation_range(
         &self,
-        groups: &BTreeSet<usize>,
-    ) -> Result<()> {
-        self.ensure_not_shutdown()?;
-        if self.journal().is_some() {
-            return_errno_with_message!(Errno::EUCLEAN, "rNVPCe allocation metadata has a journal");
+        blocks: Range<Ext4Bid>,
+        allocated: bool,
+    ) -> core::result::Result<(), AllocationRangePersistFailure> {
+        self.persist_rnvpce_allocation_range_image(blocks, allocated, None, false)
+    }
+
+    /// Persists the free after-image before releasing the live bitmap range.
+    pub(super) fn persist_rnvpce_free_before_release(
+        &self,
+        blocks: Range<Ext4Bid>,
+    ) -> core::result::Result<(), AllocationRangePersistFailure> {
+        self.persist_rnvpce_allocation_range_image(blocks, false, Some(false), true)
+    }
+
+    fn persist_rnvpce_allocation_range_image(
+        &self,
+        blocks: Range<Ext4Bid>,
+        allocated: bool,
+        desired_allocated: Option<bool>,
+        release_after_persist: bool,
+    ) -> core::result::Result<(), AllocationRangePersistFailure> {
+        self.ensure_not_shutdown()
+            .map_err(AllocationRangePersistFailure::before)?;
+        if blocks.is_empty() || self.journal().is_some() {
+            return Err(AllocationRangePersistFailure::before(Error::with_message(
+                Errno::EINVAL,
+                "invalid rNVPCe allocation range",
+            )));
         }
-        let pool = crate::fs::rnvpc::pool().ok_or_else(|| Error::new(Errno::EINVAL))?;
+        let group = self
+            .block_group_index_for_block(blocks.start)
+            .map_err(AllocationRangePersistFailure::before)?;
+        if self
+            .block_group_index_for_block(blocks.end - 1)
+            .map_err(AllocationRangePersistFailure::before)?
+            != group
+        {
+            return Err(AllocationRangePersistFailure::before(Error::with_message(
+                Errno::EINVAL,
+                "allocation range crosses block group",
+            )));
+        }
+        let group_u32 = u32::try_from(group)
+            .map_err(|_| AllocationRangePersistFailure::before(Error::new(Errno::EOVERFLOW)))?;
+        let pool = crate::fs::rnvpc::pool()
+            .ok_or_else(|| AllocationRangePersistFailure::before(Error::new(Errno::EINVAL)))?;
         let cache =
             crate::fs::rnvpc::allocation_metadata::AllocationMetadataCache::new(pool.clone());
-        for &group in groups {
-            let block_group = self
-                .block_groups
-                .get(group)
-                .ok_or_else(|| Error::new(Errno::EINVAL))?;
-            let (_allocation, bitmap, free_blocks) = block_group.lock_allocation_bitmap_snapshot();
-            cache.publish_dirty_bitmap(
-                self.rnvpc_fs_id,
-                u32::try_from(group).map_err(|_| Error::new(Errno::EOVERFLOW))?,
-                bitmap,
-                free_blocks,
-            )?;
+        let block_group = &self.block_groups[group];
+
+        loop {
+            let (mut gate, bits, words) = block_group
+                .lock_allocation_bitmap_words(blocks.clone(), desired_allocated)
+                .map_err(AllocationRangePersistFailure::before)?;
+            if let Some(chunks) = gate.resident_chunks() {
+                allocation_metrics::BITMAP_PERSIST_CALLS.record(1);
+                allocation_metrics::BITMAP_WORDS
+                    .record(u64::try_from(words.len() / size_of::<u64>()).unwrap_or(u64::MAX));
+                let result = if allocated {
+                    cache.persist_allocated_range_with_chunks(
+                        self.rnvpc_fs_id,
+                        group_u32,
+                        bits.clone(),
+                        &words,
+                        chunks,
+                    )
+                } else {
+                    cache.persist_freed_range_with_chunks(
+                        self.rnvpc_fs_id,
+                        group_u32,
+                        bits.clone(),
+                        &words,
+                        chunks,
+                    )
+                };
+                match result {
+                    Ok(()) => {
+                        if release_after_persist {
+                            self.release_rnvpce_range_locked(block_group, &bits, &mut gate)?;
+                        }
+                        break;
+                    }
+                    Err(failure)
+                        if !failure.is_uncertain()
+                            && matches!(failure.errno(), Errno::ENOENT | Errno::ESTALE) =>
+                    {
+                        gate.clear_resident_chunks();
+                        continue;
+                    }
+                    Err(failure) => return Err(failure),
+                }
+            }
+
+            drop(gate);
+            let (mut gate, bitmap, free_blocks) = if let Some(desired) = desired_allocated {
+                block_group
+                    .lock_allocation_bitmap_snapshot_with_override(blocks.clone(), desired)
+                    .map_err(AllocationRangePersistFailure::before)?
+            } else {
+                block_group.lock_allocation_bitmap_snapshot()
+            };
+            if gate.resident_chunks().is_some() {
+                continue;
+            }
+            cache
+                .publish_dirty_bitmap(self.rnvpc_fs_id, group_u32, bitmap, free_blocks)
+                .map_err(AllocationRangePersistFailure::uncertain)?;
+            let chunks = cache
+                .resident_chunk_refs(self.rnvpc_fs_id, group_u32)
+                .map_err(AllocationRangePersistFailure::uncertain)?;
+            gate.set_resident_chunks(chunks);
+            allocation_metrics::BITMAP_PERSIST_CALLS.record(1);
+            allocation_metrics::BITMAP_WORDS.record((BLOCK_SIZE / size_of::<u64>()) as u64);
+            if release_after_persist {
+                let bits =
+                    u16::try_from(blocks.start - block_group.first_block()).map_err(|_| {
+                        AllocationRangePersistFailure::uncertain(Error::new(Errno::EOVERFLOW))
+                    })?
+                        ..u16::try_from(blocks.end - block_group.first_block()).map_err(|_| {
+                            AllocationRangePersistFailure::uncertain(Error::new(Errno::EOVERFLOW))
+                        })?;
+                self.release_rnvpce_range_locked(block_group, &bits, &mut gate)?;
+            }
+            break;
         }
         self.request_allocation_writeback();
         Ok(())
+    }
+
+    fn release_rnvpce_range_locked(
+        &self,
+        block_group: &BlockGroup,
+        bits: &Range<u16>,
+        gate: &mut super::block_group::AllocationWritebackState,
+    ) -> core::result::Result<(), AllocationRangePersistFailure> {
+        let expected = u32::from(bits.end - bits.start);
+        let freed = block_group
+            .free_blocks(u32::from(bits.start)..u32::from(bits.end), None)
+            .map_err(AllocationRangePersistFailure::uncertain)?;
+        if freed != expected {
+            return Err(AllocationRangePersistFailure::uncertain(
+                Error::with_message(Errno::EUCLEAN, "rollback freed the wrong block count"),
+            ));
+        }
+        gate.mark_dirty();
+        self.block_capacity
+            .credit(u64::from(freed))
+            .map_err(AllocationRangePersistFailure::uncertain)
     }
 
     /// Writes one exact allocation generation back from the pager context.
@@ -2430,35 +2634,14 @@ impl Ext4 {
             .block_groups
             .get(usize::try_from(group).map_err(|_| Error::new(Errno::EOVERFLOW))?)
             .ok_or_else(|| Error::new(Errno::EINVAL))?;
-        if self
-            .nv_migration_groups
-            .lock()
-            .contains(usize::try_from(group).map_err(|_| Error::new(Errno::EOVERFLOW))?)
-        {
-            return_errno_with_message!(
-                Errno::EBUSY,
-                "allocation group has an active data migration"
-            );
-        }
         let (mut state, bitmap, free_blocks) = block_group.lock_allocation_bitmap_snapshot();
-        if !state.begin() {
-            return_errno_with_message!(
-                Errno::EBUSY,
-                "allocation group writeback is already active"
-            );
-        }
-        let writeback_generation =
-            match cache.publish_dirty_bitmap(self.rnvpc_fs_id, group, bitmap, free_blocks) {
-                Ok(generation) => generation,
-                Err(error) => {
-                    state.abort();
-                    return Err(error);
-                }
-            };
+        let writeback_generation = state.begin().ok_or_else(|| {
+            Error::with_message(Errno::EBUSY, "allocation group writeback is already active")
+        })?;
         drop(state);
 
         let write_result = (|| {
-            block_group.sync_metadata()?;
+            block_group.write_allocation_bitmap_snapshot(&bitmap, free_blocks)?;
             self.sync_superblock_metadata()?;
             if self.block_device.sync()? != BioStatus::Complete {
                 return_errno_with_message!(
@@ -2469,31 +2652,36 @@ impl Ext4 {
             Ok(())
         })();
         if let Err(error) = write_result {
-            block_group.lock_allocation().abort();
+            block_group.lock_allocation().abort(writeback_generation);
             return Err(error);
         }
 
         let mut state = block_group.lock_allocation();
+        if !state.is_writeback_generation(writeback_generation) {
+            return_errno_with_message!(Errno::ESTALE, "allocation writeback completion is stale");
+        }
         if state.is_dirty() {
-            let handed_off = state.finish();
+            let handed_off = state.finish(writeback_generation).unwrap_or(false);
             debug_assert!(!handed_off);
             drop(state);
             self.request_allocation_writeback();
             return_errno_with_message!(Errno::ESTALE, "allocation changed during writeback");
         }
-        if let Err(error) =
-            cache.finish_authority_handoff(self.rnvpc_fs_id, group, writeback_generation)
-        {
-            state.abort();
+        if let Err(error) = cache.finish_authority_handoff(self.rnvpc_fs_id, group, generation) {
+            state.abort(writeback_generation);
             return Err(error);
         }
-        let handed_off = state.finish();
+        state.clear_resident_chunks();
+        let handed_off = state.finish(writeback_generation).unwrap_or(false);
         debug_assert!(handed_off);
         Ok(())
     }
 
     fn sync_superblock_metadata(&self) -> Result<()> {
         let mut sb = self.super_block.write();
+        if self.rnvpc_mode() == RnvpcMode::RnvpcExtend {
+            sb.reconcile_free_blocks(self.block_capacity.physical_free())?;
+        }
         if sb.is_dirty() {
             // RMW the on-disk superblock: patch only the free-block and
             // free-inode counters and the incompatible-feature bits so every

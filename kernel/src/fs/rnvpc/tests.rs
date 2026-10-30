@@ -232,6 +232,23 @@ fn capacity_policy_preserves_metadata_progress() {
 }
 
 #[ktest]
+fn consecutive_range_reservations_continue_one_physical_nv_extent() {
+    let pool = test_pool(32, 4, 28, None);
+    let mut pages = Vec::new();
+    for _ in 0..2 {
+        let mut reservation = pool.reserve_data_pages(4).unwrap();
+        for _ in 0..4 {
+            pages.push(pool.take_reserved_page(&mut reservation).unwrap().index());
+        }
+    }
+
+    assert!(
+        pages.windows(2).all(|pair| pair[0] + 1 == pair[1]),
+        "sequential range reservations fragmented at {pages:?}"
+    );
+}
+
+#[ktest]
 fn metadata_can_borrow_unused_data_capacity() {
     let pool = test_pool(8, 2, 6, None);
     let mut frames = Vec::new();

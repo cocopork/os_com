@@ -25,10 +25,8 @@ use super::{
 use super::{
     extent_mutation::SsdExtentUpdate, frame::MigrationExtentIdentity, index::ReverseExtentRef,
 };
-#[cfg(ktest)]
-use crate::fs::fs_impls::ext4::pipeline_profile as pp;
 use crate::{
-    fs::fs_impls::ext4::{LATENCY_STATS, read_ns},
+    fs::fs_impls::ext4::{LATENCY_STATS, pipeline_profile as pp, read_ns},
     prelude::*,
 };
 
@@ -817,6 +815,22 @@ impl RangeWritePage {
             newly_allocated,
         })
     }
+
+    pub(crate) fn assign_new_ssd_block(&mut self, ssd_block: u64) -> Result<()> {
+        if !self.newly_allocated || self.ssd_block != 0 || ssd_block == 0 {
+            return_errno_with_message!(Errno::EINVAL, "invalid first-write SSD target");
+        }
+        self.ssd_block = ssd_block;
+        Ok(())
+    }
+
+    pub(crate) const fn needs_ssd_block(&self) -> bool {
+        self.newly_allocated && self.ssd_block == 0
+    }
+
+    pub(crate) const fn logical_block(&self) -> u64 {
+        self.logical_block
+    }
 }
 
 #[derive(Debug)]
@@ -944,6 +958,10 @@ pub(crate) fn range_write_new_pages(
     inode: u64,
     request: &RangeWriteBatch<'_>,
 ) -> Result<usize> {
+    if request.pages.iter().all(|page| page.newly_allocated) {
+        return Ok(request.pages.len());
+    }
+
     let mut existing_baseline = true;
     for page in request.pages {
         let mapping = current_page_mapping(pool, fs_id, inode, page.logical_block)?;
@@ -1048,7 +1066,14 @@ where
         {
             return_errno_with_message!(Errno::EINVAL, "new SSD target is not allocated by batch");
         }
-        let entry = lookup_tree_extent(&pool, fs_id, inode, current_root, page.logical_block)?;
+        // Planning established that a newly allocated logical page has no
+        // baseline while this mutation's publication guard was already held.
+        // Re-routing the immutable tree for every page only repeats that fact.
+        let entry = if page.newly_allocated {
+            None
+        } else {
+            lookup_tree_extent(&pool, fs_id, inode, current_root, page.logical_block)?
+        };
         let existing = match entry {
             Some(entry) => match entry.data_ref()? {
                 ExtentDataRef::Nv(_) => return_errno_with_message!(
@@ -1086,6 +1111,7 @@ where
         .try_reserve_exact(request.allocations.len())
         .map_err(|_| Error::new(Errno::ENOMEM))?;
     if !request.allocations.is_empty() {
+        let allocation_record_started = pp::now();
         for (index, allocation) in request.allocations.iter().enumerate() {
             let record = AllocationRecord::new(
                 fs_id,
@@ -1102,6 +1128,14 @@ where
                 &record,
             )?);
         }
+        pp::NV_FOREGROUND_ALLOCATION_RECORD_PUBLISH.record_since(
+            allocation_record_started,
+            request
+                .allocations
+                .iter()
+                .map(|allocation| allocation.block_count as usize)
+                .sum(),
+        );
     }
 
     LATENCY_STATS.fg_allocate.record_since(started);
@@ -1241,6 +1275,25 @@ where
         block_count,
         inode_fault,
     )?;
+    if !request.allocations.is_empty() {
+        // These ownership records protect the interval between allocating the
+        // NVM-authoritative bitmap and publishing the SSD baseline. The
+        // baseline now names every allocated block, so retaining one metadata
+        // page per write would leak the metadata reserve.
+        let allocation_record_reclaim_started = pp::now();
+        for reference in &allocation_refs {
+            pool.reclaim_committed_metadata(*reference)?;
+        }
+        pp::NV_FOREGROUND_ALLOCATION_RECORD_RECLAIM.record_since(
+            allocation_record_reclaim_started,
+            request
+                .allocations
+                .iter()
+                .map(|allocation| allocation.block_count as usize)
+                .sum(),
+        );
+        allocation_refs.clear();
+    }
     LATENCY_STATS.fg_inode_publish.record_since(started);
     LATENCY_STATS.fg_enqueue.record_events(0);
     LATENCY_STATS.fg_body.record_since(body_started);
@@ -1664,13 +1717,161 @@ pub(crate) fn publish_ssd_baseline_batch(
     publish_ssd_baseline_batch_inner(pool, fs_id, inode, mappings, false)
 }
 
-pub(crate) fn publish_claimed_ssd_baseline_batch(
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct SsdBaselineExtent {
+    logical_start: u64,
+    length: u32,
+    physical_start: u64,
+}
+
+impl SsdBaselineExtent {
+    pub(crate) fn new(logical_start: u64, length: u32, physical_start: u64) -> Result<Self> {
+        if length == 0 {
+            return_errno_with_message!(Errno::EINVAL, "SSD baseline extent is empty");
+        }
+        if physical_start == 0 {
+            return_errno_with_message!(Errno::EINVAL, "SSD baseline target is block zero");
+        }
+        logical_start
+            .checked_add(u64::from(length))
+            .ok_or_else(|| Error::new(Errno::EOVERFLOW))?;
+        physical_start
+            .checked_add(u64::from(length))
+            .ok_or_else(|| Error::new(Errno::EOVERFLOW))?;
+        Ok(Self {
+            logical_start,
+            length,
+            physical_start,
+        })
+    }
+
+    pub(crate) const fn logical_start(self) -> u64 {
+        self.logical_start
+    }
+}
+
+/// Publishes multiple completed dirty extents through one inode publication
+/// session. Extent boundaries are preserved; this API never coalesces them.
+pub(crate) fn publish_ssd_baseline_extents(
     pool: &Arc<Rnvpc>,
     fs_id: u64,
     inode: u64,
-    mappings: &[(u64, u64)],
+    extents: &[SsdBaselineExtent],
 ) -> Result<()> {
-    publish_ssd_baseline_batch_inner(pool, fs_id, inode, mappings, true)
+    publish_ssd_baseline_extents_inner(pool, fs_id, inode, extents, false)
+}
+
+pub(crate) fn publish_claimed_ssd_baseline_extents(
+    pool: &Arc<Rnvpc>,
+    fs_id: u64,
+    inode: u64,
+    extents: &[SsdBaselineExtent],
+) -> Result<()> {
+    publish_ssd_baseline_extents_inner(pool, fs_id, inode, extents, true)
+}
+
+/// Publishes one contiguous SSD baseline extent in the NVM authority tree.
+pub(crate) fn publish_ssd_baseline_extent(
+    pool: &Arc<Rnvpc>,
+    fs_id: u64,
+    inode: u64,
+    logical_start: u64,
+    length: u32,
+    physical_start: u64,
+) -> Result<()> {
+    publish_ssd_baseline_extent_inner(
+        pool,
+        fs_id,
+        inode,
+        logical_start,
+        length,
+        physical_start,
+        false,
+    )
+}
+
+fn baseline_range_keys(
+    fs_id: u64,
+    inode: u64,
+    logical_start: u64,
+    length: u32,
+) -> Result<Vec<PageKey>> {
+    if length == 0 {
+        return_errno_with_message!(Errno::EINVAL, "SSD baseline extent is empty");
+    }
+    (0..u64::from(length))
+        .map(|offset| {
+            logical_start
+                .checked_add(offset)
+                .map(|logical| PageKey::new(fs_id, inode, logical))
+                .ok_or_else(|| Error::new(Errno::EOVERFLOW))
+        })
+        .collect()
+}
+
+fn publish_ssd_baseline_extent_inner(
+    pool: &Arc<Rnvpc>,
+    fs_id: u64,
+    inode: u64,
+    logical_start: u64,
+    length: u32,
+    physical_start: u64,
+    claimed: bool,
+) -> Result<()> {
+    let extent = SsdBaselineExtent::new(logical_start, length, physical_start)?;
+    publish_ssd_baseline_extents_inner(pool, fs_id, inode, &[extent], claimed)
+}
+
+fn publish_ssd_baseline_extents_inner(
+    pool: &Arc<Rnvpc>,
+    fs_id: u64,
+    inode: u64,
+    extents: &[SsdBaselineExtent],
+    claimed: bool,
+) -> Result<()> {
+    if extents.is_empty() {
+        return Ok(());
+    }
+    let page_count = extents.iter().try_fold(0usize, |count, extent| {
+        count
+            .checked_add(extent.length as usize)
+            .ok_or_else(|| Error::new(Errno::EOVERFLOW))
+    })?;
+    let mut keys = Vec::new();
+    let mut replacements = Vec::new();
+    keys.try_reserve_exact(page_count)
+        .map_err(|_| Error::new(Errno::ENOMEM))?;
+    replacements
+        .try_reserve_exact(extents.len())
+        .map_err(|_| Error::new(Errno::ENOMEM))?;
+    let mut previous_end = None;
+    for extent in extents {
+        if previous_end.is_some_and(|end| extent.logical_start < end) {
+            return_errno_with_message!(
+                Errno::EINVAL,
+                "SSD baseline extents overlap or are unsorted"
+            );
+        }
+        previous_end = Some(
+            extent
+                .logical_start
+                .checked_add(u64::from(extent.length))
+                .ok_or_else(|| Error::new(Errno::EOVERFLOW))?,
+        );
+        keys.extend(baseline_range_keys(
+            fs_id,
+            inode,
+            extent.logical_start,
+            extent.length,
+        )?);
+        replacements.push(ExtentRecordEntry::leaf(
+            extent.logical_start,
+            extent.length,
+            extent.physical_start,
+            false,
+        )?);
+    }
+    publish_ssd_baseline_entries_inner(pool, fs_id, inode, &keys, &replacements, claimed)
 }
 
 fn publish_ssd_baseline_batch_inner(
@@ -1686,37 +1887,49 @@ fn publish_ssd_baseline_batch_inner(
     if mappings.iter().any(|(_, block)| *block == 0) {
         return_errno_with_message!(Errno::EINVAL, "SSD baseline target is block zero");
     }
-    let metrics_started = super::batch_metrics::now();
-    let mutation = ExtentMutation::new(pool.clone(), fs_id, inode)?;
     let keys = mappings
         .iter()
         .map(|(logical, _)| PageKey::new(fs_id, inode, *logical))
         .collect::<Vec<_>>();
+    let replacements = coalesce_ssd_extent_entries(mappings)?;
+    publish_ssd_baseline_entries_inner(pool, fs_id, inode, &keys, &replacements, claimed)
+}
+
+fn publish_ssd_baseline_entries_inner(
+    pool: &Arc<Rnvpc>,
+    fs_id: u64,
+    inode: u64,
+    keys: &[PageKey],
+    replacements: &[ExtentRecordEntry],
+    claimed: bool,
+) -> Result<()> {
+    let metrics_started = super::batch_metrics::now();
+    let mutation = ExtentMutation::new(pool.clone(), fs_id, inode)?;
     let _baseline_guard = if claimed {
-        pool.advance_claimed_baseline(&keys)?;
+        pool.advance_claimed_baseline(keys)?;
         None
     } else {
-        Some(pool.begin_baseline_mutation(&keys)?)
+        Some(pool.begin_baseline_mutation(keys)?)
     };
     let inode_ref =
         authoritative_inode_ref(pool, fs_id, inode)?.ok_or_else(|| Error::new(Errno::ESTALE))?;
     let inode_record = pool.read_authoritative_metadata::<InodeRecord>(inode_ref)?;
-    let replacements = coalesce_ssd_extent_entries(mappings)?;
-    let new_root =
-        mutation.replace_tree_extents(inode_record.extent_root(), &replacements, None)?;
-    mutation.publish_inode_state_with_generation(
-        inode_ref,
-        new_root.reference(),
-        &new_root,
-        inode_record
-            .header()
-            .generation()
-            .checked_add(1)
-            .ok_or_else(|| Error::new(Errno::EOVERFLOW))?,
-        inode_record.file_size(),
-        inode_record.block_count(),
-        None,
-    )?;
+    let new_root = mutation.replace_tree_extents(inode_record.extent_root(), replacements, None)?;
+    if new_root.reference() != inode_record.extent_root() {
+        mutation.publish_inode_state_with_generation(
+            inode_ref,
+            new_root.reference(),
+            &new_root,
+            inode_record
+                .header()
+                .generation()
+                .checked_add(1)
+                .ok_or_else(|| Error::new(Errno::EOVERFLOW))?,
+            inode_record.file_size(),
+            inode_record.block_count(),
+            None,
+        )?;
+    }
     super::batch_metrics::count(super::batch_metrics::Event::StructuralBaselineMutations, 1);
     super::batch_metrics::elapsed(
         super::batch_metrics::Phase::StructuralBaseline,
@@ -2481,6 +2694,17 @@ fn reclaim_unused_allocations(pool: &Arc<Rnvpc>, fs_id: u64, inode: u64) -> Resu
     Ok(())
 }
 
+#[cfg(ktest)]
+pub(crate) fn allocation_record_count(pool: &Arc<Rnvpc>) -> usize {
+    pool.committed_metadata_refs()
+        .into_iter()
+        .filter(|reference| {
+            pool.persistent_metadata_kind(*reference).ok()
+                == Some(super::metadata::PersistentMetadataKind::Allocation)
+        })
+        .count()
+}
+
 fn lookup_tree_extent(
     pool: &Arc<Rnvpc>,
     fs_id: u64,
@@ -2488,6 +2712,8 @@ fn lookup_tree_extent(
     root: PersistentObjectRef,
     logical_block: u64,
 ) -> Result<Option<ExtentRecordEntry>> {
+    #[cfg(ktest)]
+    pool.note_extent_tree_lookup();
     let mut current = root;
     let mut expected_level = None;
     loop {

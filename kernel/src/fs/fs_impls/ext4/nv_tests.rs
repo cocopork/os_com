@@ -22,6 +22,8 @@ fn ext4_research_routes() {
         nv_route_rnvpce_reservation_abort_wakes_writer,
         nv_route_rnvpce_reclaim_ready_queue_contract,
         nv_route_rnvpce_completion_publishes_reclaim_ticket,
+        nv_route_rnvpce_first_write_publishes_ssd_baseline,
+        nv_route_rnvpce_foreground_allocation_waits_for_group,
         nv_route_rnvpce_batch_allocation_durability,
         nv_route_rnvpce_recovers_unflushed_target_bitmap,
         nv_route_rnvpce_recovery_prefers_nv_allocation_bitmap,
@@ -38,6 +40,139 @@ fn ext4_research_routes() {
         nv_route_rnvpc_failed_allocation_flush_does_not_append_wal,
         nv_route_mount_rejects_switching_persistent_authority,
     );
+}
+
+fn nv_route_rnvpce_first_write_publishes_ssd_baseline() {
+    crate::fs::rnvpc::init_for_ext4_tests();
+    crate::time::clocks::init_for_ktest();
+    let fixture = Ext4FixtureBuilder::new(2048, 256, 2048)
+        .with_block_bitmap_metadata_marked()
+        .with_free_blocks(128)
+        .with_uuid([0xcc; 16])
+        .with_mount_options("rnvpce=on,rtio=off")
+        .build()
+        .unwrap();
+    fixture.write_raw_inode(11, &make_empty_file_inode());
+    let inode = fixture.ext4.read_inode(11).unwrap();
+    let pool = crate::fs::rnvpc::pool().unwrap();
+    let allocation_records_before =
+        crate::fs::rnvpc::write_transaction::allocation_record_count(pool);
+    let input = vec![0x57; 4 * PAGE_SIZE];
+    inode
+        .write_at(0, &mut VmReader::from(input.as_slice()).to_fallible())
+        .unwrap();
+    inode
+        .write_at(
+            4 * PAGE_SIZE,
+            &mut VmReader::from(input.as_slice()).to_fallible(),
+        )
+        .unwrap();
+
+    let mut targets = Vec::new();
+    for logical in 0..8 {
+        let mapping = crate::fs::rnvpc::write_transaction::current_page_mapping(
+            pool,
+            fixture.ext4.rnvpc_fs_id(),
+            11,
+            logical,
+        )
+        .unwrap()
+        .expect("foreground first write must publish its SSD baseline");
+        assert!(mapping.is_written());
+        targets.push(mapping.ssd_block());
+        assert!(
+            crate::fs::rnvpc::write_transaction::mapped_nv_page_ref(
+                pool,
+                fixture.ext4.rnvpc_fs_id(),
+                11,
+                logical,
+            )
+            .unwrap()
+            .is_some(),
+            "the NV redirect remains authoritative before migration completes"
+        );
+    }
+    assert!(targets.windows(2).all(|pair| pair[1] == pair[0] + 1));
+    assert_eq!(
+        crate::fs::rnvpc::write_transaction::allocation_record_count(pool),
+        allocation_records_before,
+        "foreground allocation ownership ends when the SSD baseline is published"
+    );
+
+    crate::fs::rnvpc::batch_metrics::reset_for_test();
+    let routes = pool.extent_tree_routes();
+    assert_eq!(fixture.ext4.migrate_nv_round(64).unwrap(), 8);
+    fixture.ext4.drain_nv_in_flight().unwrap();
+    assert_eq!(pool.extent_tree_routes(), routes);
+    assert_eq!(
+        crate::fs::rnvpc::batch_metrics::event_count(
+            crate::fs::rnvpc::batch_metrics::Event::StructuralBaselineMutations,
+        ),
+        0
+    );
+}
+
+fn nv_route_rnvpce_foreground_allocation_waits_for_group() {
+    use core::sync::atomic::{AtomicUsize, Ordering};
+
+    crate::fs::rnvpc::init_for_ext4_tests();
+    crate::time::clocks::init_for_ktest();
+    let fixture = Ext4FixtureBuilder::new(2048, 256, 2048)
+        .with_block_bitmap_metadata_marked()
+        .with_free_blocks(128)
+        .with_uuid([0xcd; 16])
+        .with_mount_options("rnvpce=on,rtio=on")
+        .build()
+        .unwrap();
+    fixture.write_raw_inode(11, &make_empty_file_inode());
+    fixture.write_raw_inode(12, &make_empty_file_inode());
+    fixture
+        .ext4
+        .read_inode(11)
+        .unwrap()
+        .write_at(
+            0,
+            &mut VmReader::from([0x31; PAGE_SIZE].as_slice()).to_fallible(),
+        )
+        .unwrap();
+    assert_eq!(fixture.ext4.migrate_nv_round(1).unwrap(), 1);
+    let completion = fixture.ext4.nv_completion_lock.lock();
+
+    let state = Arc::new(AtomicUsize::new(0));
+    let worker_state = state.clone();
+    let worker_inode = fixture.ext4.read_inode(12).unwrap();
+    let worker = crate::thread::kernel_thread::ThreadOptions::new(move || {
+        worker_state.store(1, Ordering::Release);
+        let result = worker_inode.write_at(
+            0,
+            &mut VmReader::from([0x32; PAGE_SIZE].as_slice()).to_fallible(),
+        );
+        worker_state.store(
+            match result {
+                Ok(_) => 2,
+                Err(error) if error.error() == Errno::EBUSY => 3,
+                Err(_) => 4,
+            },
+            Ordering::Release,
+        );
+    })
+    .spawn();
+    while state.load(Ordering::Acquire) == 0 {
+        crate::thread::Thread::yield_now();
+    }
+    for _ in 0..32 {
+        crate::thread::Thread::yield_now();
+    }
+    assert_eq!(
+        state.load(Ordering::Acquire),
+        1,
+        "a busy allocation group must make the first write wait outside inode state"
+    );
+
+    drop(completion);
+    fixture.ext4.drain_nv_in_flight().unwrap();
+    worker.join();
+    assert_eq!(state.load(Ordering::Acquire), 2);
 }
 
 fn nv_route_rnvpce_reclaim_ready_queue_contract() {
@@ -86,7 +221,13 @@ fn nv_route_rnvpce_completion_publishes_reclaim_ticket() {
         );
     }
 
+    pool.reset_baseline_validation_calls_for_test();
     assert_eq!(fixture.ext4.help_nv_reclaim(4).unwrap(), 4);
+    assert_eq!(
+        pool.baseline_validation_calls_for_test(),
+        1,
+        "one migration extent must validate its shared baseline token once"
+    );
     assert_eq!(
         fixture
             .ext4
@@ -262,13 +403,13 @@ fn nv_route_rnvpce_recovery_prefers_nv_allocation_bitmap() {
         .build()
         .unwrap();
     let group = fixture.ext4.block_group(0);
-    let target = (group.first_block()..=group.last_block())
+    let goal = (group.first_block()..=group.last_block())
         .find(|block| {
             let bit = u16::try_from(*block - group.first_block()).unwrap();
             !group.metadata().block_bitmap.is_allocated(bit)
         })
         .expect("fixture must contain a free data block");
-    assert!(group.protect_recovered_block(target).unwrap());
+    let target = fixture.ext4.alloc_blocks(1, goal, None).unwrap().start;
     let image = group.allocation_image(1).unwrap();
     AllocationMetadataCache::new(crate::fs::rnvpc::pool().unwrap().clone())
         .publish_initial(fixture.ext4.rnvpc_fs_id(), 0, &image, None)
@@ -983,11 +1124,13 @@ fn nv_route_rnvpce_batch_allocation_durability() {
     fixture.write_raw_inode(11, &make_empty_file_inode());
     let inode = fixture.ext4.read_inode(11).unwrap();
     let bytes = vec![0x59u8; 32 * PAGE_SIZE];
+    // One contiguous first-write range must require one foreground allocator
+    // call. Leave the injected second-call failure armed through migration to
+    // prove rTIO does not allocate the same targets again.
+    fixture.ext4.arm_alloc_blocks_enospc(1);
     inode
         .write_at(0, &mut VmReader::from(bytes.as_slice()).to_fallible())
         .unwrap();
-    // One contiguous range must require one allocator call, not 32 calls.
-    fixture.ext4.arm_alloc_blocks_enospc(1);
     let before = fixture.disk.flush_count();
     let migrated = fixture.ext4.migrate_nv_round(64);
     fixture.ext4.arm_alloc_blocks_enospc(-1);
@@ -1037,7 +1180,7 @@ fn nv_route_rnvpce_batch_allocation_durability() {
         Errno::EIO
     );
     failed.disk.set_fail_flushes(false);
-    assert_eq!(failed.ext4.free_blocks_count(), free_before - 32);
+    assert_eq!(failed.ext4.free_blocks_count(), free_before);
     let pool = crate::fs::rnvpc::pool().unwrap();
     let mut protected_targets = Vec::new();
     for index in 0..32 {
@@ -1050,7 +1193,7 @@ fn nv_route_rnvpce_batch_allocation_durability() {
         .unwrap()
         .unwrap();
         let target = pool.persistent_data_ssd_backing(reference).unwrap();
-        assert_ne!(target, 0, "failed flush must retain the migration target");
+        assert_ne!(target, 0, "failed flush must retain the foreground target");
         protected_targets.push(target);
         assert_eq!(
             crate::fs::rnvpc::write_transaction::mapped_nv_page_ref(
@@ -1063,7 +1206,7 @@ fn nv_route_rnvpce_batch_allocation_durability() {
             Some(reference),
             "failed completion flush must retain NV authority"
         );
-        assert!(
+        assert_eq!(
             crate::fs::rnvpc::write_transaction::current_page_mapping(
                 pool,
                 failed.ext4.rnvpc_fs_id(),
@@ -1071,13 +1214,15 @@ fn nv_route_rnvpce_batch_allocation_durability() {
                 index,
             )
             .unwrap()
-            .is_none(),
-            "failed device flush must leave the SSD baseline absent"
+            .unwrap()
+            .ssd_block(),
+            target,
+            "failed device flush keeps the prepublished baseline behind NV authority"
         );
     }
     assert_eq!(failed.ext4.migrate_nv_round(64).unwrap(), 32);
     failed.ext4.drain_nv_in_flight().unwrap();
-    assert_eq!(failed.ext4.free_blocks_count(), free_before - 32);
+    assert_eq!(failed.ext4.free_blocks_count(), free_before);
     for (index, target) in protected_targets.into_iter().enumerate() {
         let mapping = crate::fs::rnvpc::write_transaction::current_page_mapping(
             pool,
@@ -1123,7 +1268,7 @@ fn nv_route_rnvpce_recovers_unflushed_target_bitmap() {
         fixture
             .ext4
             .block_group(0)
-            .protect_recovered_block(bitmap_block)
+            .validate_recovered_block(bitmap_block)
             .unwrap_err()
             .error(),
         Errno::EUCLEAN,
@@ -1255,7 +1400,7 @@ fn nv_route_rnvpce_fragmented_batch_and_partial_rollback() {
         .unwrap();
     let held = fixture
         .ext4
-        .alloc_blocks_with_intent(128, 0, None, AllocIntent::RnvpceReserved)
+        .alloc_blocks_with_intent(128, 0, None, AllocIntent::RnvpceForeground)
         .unwrap();
     assert_eq!(held.end - held.start, 128);
     for block in held.clone().step_by(2) {
@@ -1271,18 +1416,22 @@ fn nv_route_rnvpce_fragmented_batch_and_partial_rollback() {
     for (index, page) in bytes.chunks_mut(PAGE_SIZE).enumerate() {
         page.fill(0x30 + index as u8);
     }
-    inode
-        .write_at(0, &mut VmReader::from(bytes.as_slice()).to_fallible())
-        .unwrap();
     // No run can exceed one block. Fail after the first partial return and
-    // require rollback of every private block before retrying the same pages.
+    // require foreground rollback of every private block before retrying.
     fixture.ext4.arm_alloc_blocks_enospc(1);
     assert_eq!(
-        fixture.ext4.migrate_nv_round(64).unwrap_err().error(),
+        inode
+            .write_at(0, &mut VmReader::from(bytes.as_slice()).to_fallible())
+            .unwrap_err()
+            .error(),
         Errno::ENOSPC
     );
     fixture.ext4.arm_alloc_blocks_enospc(-1);
     assert_eq!(fixture.ext4.free_blocks_count(), 64);
+    inode
+        .write_at(0, &mut VmReader::from(bytes.as_slice()).to_fallible())
+        .unwrap();
+    assert_eq!(fixture.ext4.free_blocks_count(), 56);
     let pool = crate::fs::rnvpc::pool().unwrap();
     for logical in 0..8 {
         let reference = crate::fs::rnvpc::write_transaction::mapped_nv_page_ref(
@@ -1293,7 +1442,17 @@ fn nv_route_rnvpce_fragmented_batch_and_partial_rollback() {
         )
         .unwrap()
         .unwrap();
-        assert_eq!(pool.persistent_data_ssd_backing(reference).unwrap(), 0);
+        assert_ne!(pool.persistent_data_ssd_backing(reference).unwrap(), 0);
+        assert!(
+            crate::fs::rnvpc::write_transaction::current_page_mapping(
+                pool,
+                fixture.ext4.rnvpc_fs_id(),
+                11,
+                logical,
+            )
+            .unwrap()
+            .is_some()
+        );
     }
     assert_eq!(fixture.ext4.migrate_nv_round(64).unwrap(), 8);
     fixture.ext4.drain_nv_in_flight().unwrap();

@@ -29,10 +29,11 @@ use super::{
     },
     redirect_index::DescriptorHandle,
     write_transaction::{
-        AuthoritySnapshot, RangeWriteBatch, RangeWritePage, SsdMigrationPage,
+        AuthoritySnapshot, RangeWriteBatch, RangeWritePage, SsdBaselineExtent, SsdMigrationPage,
         authoritative_inode_state, bootstrap_inode_authority, commit_range_write,
         consume_ssd_capacity_locked, current_page_mapping, mapped_nv_page_ref,
-        publish_ssd_baseline_batch, reserve_ssd_capacity, space_reservation,
+        publish_ssd_baseline_batch, publish_ssd_baseline_extent, publish_ssd_baseline_extents,
+        range_write_new_pages, reserve_ssd_capacity, space_reservation,
         test_release_migration_credit_with, visit_ssd_extents,
     },
 };
@@ -187,6 +188,208 @@ fn rnvpce_allocation_cache_recovers_selected_image() {
         .unwrap()
         .unwrap();
     assert_eq!(actual, expected);
+}
+
+#[ktest]
+fn rnvpce_allocation_bitmap_updates_only_touched_words_and_keeps_chunk_refs() {
+    let config = RnvpcConfig::from_bytes(
+        Some(32 * PAGE_SIZE),
+        Some(16 * PAGE_SIZE),
+        Some(16 * PAGE_SIZE),
+        Some(NvSimMode::Model),
+    )
+    .unwrap()
+    .unwrap();
+    let backend = Arc::new(DramNvBackend::allocate_with_chunk_pages(config, 2).unwrap());
+    let pool = Arc::new(Rnvpc::new(backend.clone(), config, None).unwrap());
+    let cache = AllocationMetadataCache::new(pool.clone());
+    let image = allocation_test_image(1, 0, 32768);
+    cache
+        .publish_initial(ALLOCATION_TEST_FS_ID, ALLOCATION_TEST_GROUP, &image, None)
+        .unwrap();
+    let before_refs = cache
+        .resident_chunk_refs(ALLOCATION_TEST_FS_ID, ALLOCATION_TEST_GROUP)
+        .unwrap();
+    let before = backend.stats();
+    let reads = pool.authoritative_metadata_reads();
+
+    let mut bitmap = *image.bitmap();
+    bitmap[8] = 0xff;
+    cache
+        .persist_allocated_range_with_chunks(
+            ALLOCATION_TEST_FS_ID,
+            ALLOCATION_TEST_GROUP,
+            64..72,
+            &bitmap[8..16],
+            before_refs,
+        )
+        .unwrap();
+
+    assert_eq!(backend.stats().persist_bytes - before.persist_bytes, 8);
+    assert_eq!(
+        pool.authoritative_metadata_reads() - reads,
+        0,
+        "stable chunk refs must avoid full-page validation reads on the hot path"
+    );
+    assert_eq!(
+        cache
+            .resident_chunk_refs(ALLOCATION_TEST_FS_ID, ALLOCATION_TEST_GROUP)
+            .unwrap(),
+        before_refs
+    );
+    let selected = cache
+        .selected_image(ALLOCATION_TEST_FS_ID, ALLOCATION_TEST_GROUP)
+        .unwrap()
+        .unwrap();
+    assert_eq!(selected.bitmap()[8], 0xff);
+    assert_eq!(selected.free_blocks(), 32760);
+}
+
+#[ktest]
+fn rnvpce_allocation_bitmap_multiword_partial_persist_is_only_a_leak() {
+    let config = RnvpcConfig::from_bytes(
+        Some(32 * PAGE_SIZE),
+        Some(16 * PAGE_SIZE),
+        Some(16 * PAGE_SIZE),
+        Some(NvSimMode::Model),
+    )
+    .unwrap()
+    .unwrap();
+    let image = DramNvImage::allocate_model(config).unwrap();
+    let backend = Arc::new(image.attach());
+    let pool = Arc::new(Rnvpc::format(backend.clone(), config, None).unwrap());
+    let cache = AllocationMetadataCache::new(pool);
+    let initial = allocation_test_image(1, 0, 32768);
+    cache
+        .publish_initial(ALLOCATION_TEST_FS_ID, ALLOCATION_TEST_GROUP, &initial, None)
+        .unwrap();
+    let chunks = cache
+        .resident_chunk_refs(ALLOCATION_TEST_FS_ID, ALLOCATION_TEST_GROUP)
+        .unwrap();
+
+    // This range crosses the two stable 2 KiB bitmap chunks. Persist the
+    // first word, fail the second, then crash away the unpersisted working
+    // image. Recovery may retain the first half as a leak, never the inverse.
+    let mut bitmap = *initial.bitmap();
+    bitmap[2047] = 0xf0;
+    bitmap[2048] = 0x0f;
+    backend.fail_data_persist_after(1);
+    let failure = cache
+        .persist_allocated_range_with_chunks(
+            ALLOCATION_TEST_FS_ID,
+            ALLOCATION_TEST_GROUP,
+            16380..16388,
+            &bitmap[2040..2056],
+            chunks,
+        )
+        .unwrap_err();
+    assert!(failure.is_uncertain());
+
+    drop(cache);
+    drop(backend);
+    image.simulate_crash();
+    let recovered = Arc::new(Rnvpc::recover(Arc::new(image.attach()), config, None).unwrap());
+    let selected = AllocationMetadataCache::new(recovered)
+        .selected_image(ALLOCATION_TEST_FS_ID, ALLOCATION_TEST_GROUP)
+        .unwrap()
+        .unwrap();
+    assert_eq!(selected.bitmap()[2047], 0xf0);
+    assert_eq!(selected.bitmap()[2048], 0);
+    assert_eq!(selected.free_blocks(), 32764);
+}
+
+#[ktest]
+fn rnvpce_allocation_bitmap_free_persist_failure_keeps_range_allocated() {
+    let config = RnvpcConfig::from_bytes(
+        Some(32 * PAGE_SIZE),
+        Some(16 * PAGE_SIZE),
+        Some(16 * PAGE_SIZE),
+        Some(NvSimMode::Model),
+    )
+    .unwrap()
+    .unwrap();
+    let image = DramNvImage::allocate_model(config).unwrap();
+    let backend = Arc::new(image.attach());
+    let pool = Arc::new(Rnvpc::format(backend.clone(), config, None).unwrap());
+    let cache = AllocationMetadataCache::new(pool);
+    let initial = allocation_test_image(1, 0, 32768);
+    cache
+        .publish_initial(ALLOCATION_TEST_FS_ID, ALLOCATION_TEST_GROUP, &initial, None)
+        .unwrap();
+    let chunks = cache
+        .resident_chunk_refs(ALLOCATION_TEST_FS_ID, ALLOCATION_TEST_GROUP)
+        .unwrap();
+    let mut allocated_word = [0u8; 8];
+    allocated_word[0] = 1;
+    cache
+        .persist_allocated_range_with_chunks(
+            ALLOCATION_TEST_FS_ID,
+            ALLOCATION_TEST_GROUP,
+            0..1,
+            &allocated_word,
+            chunks,
+        )
+        .unwrap();
+
+    backend.fail_data_persist_after(0);
+    let failure = cache
+        .persist_freed_range_with_chunks(
+            ALLOCATION_TEST_FS_ID,
+            ALLOCATION_TEST_GROUP,
+            0..1,
+            &[0; 8],
+            chunks,
+        )
+        .unwrap_err();
+    assert!(failure.is_uncertain());
+
+    drop(cache);
+    drop(backend);
+    image.simulate_crash();
+    let recovered = Arc::new(Rnvpc::recover(Arc::new(image.attach()), config, None).unwrap());
+    let selected = AllocationMetadataCache::new(recovered)
+        .selected_image(ALLOCATION_TEST_FS_ID, ALLOCATION_TEST_GROUP)
+        .unwrap()
+        .unwrap();
+    assert_eq!(selected.bitmap()[0] & 1, 1);
+    assert_eq!(selected.free_blocks(), 32767);
+}
+
+#[ktest]
+fn rnvpce_allocation_bitmap_recovery_derives_count_from_words() {
+    let config = RnvpcConfig::from_bytes(
+        Some(32 * PAGE_SIZE),
+        Some(16 * PAGE_SIZE),
+        Some(16 * PAGE_SIZE),
+        Some(NvSimMode::Model),
+    )
+    .unwrap()
+    .unwrap();
+    let persistent_image = DramNvImage::allocate_model(config).unwrap();
+    let pool = Arc::new(Rnvpc::format(Arc::new(persistent_image.attach()), config, None).unwrap());
+    let cache = AllocationMetadataCache::new(pool);
+    let image = allocation_test_image(1, 0, 32768);
+    cache
+        .publish_initial(ALLOCATION_TEST_FS_ID, ALLOCATION_TEST_GROUP, &image, None)
+        .unwrap();
+    let mut bitmap = *image.bitmap();
+    bitmap[0] = 0x0f;
+    cache
+        .persist_allocated_range(
+            ALLOCATION_TEST_FS_ID,
+            ALLOCATION_TEST_GROUP,
+            0..4,
+            &bitmap[..8],
+        )
+        .unwrap();
+
+    let recovered =
+        Arc::new(Rnvpc::recover(Arc::new(persistent_image.attach()), config, None).unwrap());
+    let selected = AllocationMetadataCache::new(recovered)
+        .selected_image(ALLOCATION_TEST_FS_ID, ALLOCATION_TEST_GROUP)
+        .unwrap()
+        .unwrap();
+    assert_eq!(selected.free_blocks(), 32764);
 }
 
 #[ktest]
@@ -1353,6 +1556,78 @@ fn rnvpce_redirect_io_128k_overwrite_publishes_one_redirect_range() {
     assert_eq!(ranges[0].pages.len(), 32);
 }
 
+#[ktest]
+fn rnvpce_initial_range_capacity_count_does_not_reread_extent_tree() {
+    const FS_ID: u64 = 0xa20a;
+    const INODE: u64 = 49;
+    let pool = test_pool(64, 8, 56, None);
+    let snapshot = AuthoritySnapshot::new(1, &[], 0, 0, 0o100644, 0).unwrap();
+    bootstrap_inode_authority(pool.clone(), FS_ID, INODE, &snapshot, None).unwrap();
+    let spans = (0..32)
+        .map(|page| RangeWritePage::new(page, 0, 0, PAGE_SIZE, true).unwrap())
+        .collect::<Vec<_>>();
+    let request = RangeWriteBatch::new(
+        2,
+        0,
+        32 * PAGE_SIZE,
+        &[],
+        &spans,
+        0,
+        0,
+        (PAGE_SIZE / 512) as u64,
+    )
+    .unwrap();
+    let reads = pool.authoritative_metadata_reads();
+
+    assert_eq!(
+        range_write_new_pages(&pool, FS_ID, INODE, &request).unwrap(),
+        32
+    );
+    assert_eq!(pool.authoritative_metadata_reads() - reads, 0);
+}
+
+#[ktest]
+fn rnvpce_initial_range_commit_does_not_revalidate_each_page() {
+    const FS_ID: u64 = 0xa20b;
+    const INODE: u64 = 50;
+    let pool = test_pool(64, 8, 56, None);
+    let snapshot = AuthoritySnapshot::new(1, &[], 0, 0, 0o100644, 0).unwrap();
+    bootstrap_inode_authority(pool.clone(), FS_ID, INODE, &snapshot, None).unwrap();
+    let spans = (0..32)
+        .map(|page| RangeWritePage::new(page, 50_000 + page, 0, PAGE_SIZE, true).unwrap())
+        .collect::<Vec<_>>();
+    let request = RangeWriteBatch::new(
+        2,
+        0,
+        32 * PAGE_SIZE,
+        &[],
+        &spans,
+        0,
+        0,
+        (PAGE_SIZE / 512) as u64,
+    )
+    .unwrap();
+    let lookups = pool.extent_tree_lookups();
+    let input = [0xe2; 32 * PAGE_SIZE];
+
+    commit_range_write(
+        pool.clone(),
+        FS_ID,
+        INODE,
+        &request,
+        &mut VmReader::from(input.as_slice()).to_fallible(),
+        |_, _| panic!("full initial write must not load SSD"),
+        None,
+    )
+    .unwrap();
+
+    assert_eq!(
+        pool.extent_tree_lookups() - lookups,
+        0,
+        "initial range commit reread the extent tree once per page"
+    );
+}
+
 fn publish_test_redirect_range(pool: &Arc<Rnvpc>, fs_id: u64, inode: u64, pages: usize) {
     let staged = (0..pages)
         .map(|page| {
@@ -2254,6 +2529,95 @@ fn rnvpce_existing_baseline_overwrite_uses_no_extent_update_session() {
             SSD_START + logical,
         );
     }
+}
+
+#[ktest]
+fn rnvpce_new_ssd_baseline_is_published_as_one_dirty_extent() {
+    const FS_ID: u64 = 0x9929;
+    const INODE: u64 = 39;
+    const LOGICAL_START: u64 = 64;
+    const EXTENT_PAGES: u32 = 32;
+    const SSD_START: u64 = 90_000;
+    let (_image, _config, pool) = restartable_pool(128);
+    let snapshot = AuthoritySnapshot::new(1, &[], 0, 0, 0o100644, 0).unwrap();
+    bootstrap_inode_authority(pool.clone(), FS_ID, INODE, &snapshot, None).unwrap();
+    let field_updates = pool.extent_field_update_sessions();
+
+    publish_ssd_baseline_extent(&pool, FS_ID, INODE, LOGICAL_START, EXTENT_PAGES, SSD_START)
+        .unwrap();
+
+    let mut extents = Vec::new();
+    visit_ssd_extents(&pool, FS_ID, INODE, |entry| {
+        extents.push(entry);
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(extents.len(), 1);
+    assert_eq!(extents[0].logical_block(), LOGICAL_START);
+    assert_eq!(extents[0].length(), EXTENT_PAGES);
+    assert_eq!(
+        extents[0].data_ref().unwrap(),
+        ExtentDataRef::Ssd(SSD_START)
+    );
+    publish_ssd_baseline_extent(
+        &pool,
+        FS_ID,
+        INODE,
+        LOGICAL_START + u64::from(EXTENT_PAGES),
+        EXTENT_PAGES,
+        SSD_START + u64::from(EXTENT_PAGES),
+    )
+    .unwrap();
+    extents.clear();
+    visit_ssd_extents(&pool, FS_ID, INODE, |entry| {
+        extents.push(entry);
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(extents.len(), 1);
+    assert_eq!(extents[0].length(), EXTENT_PAGES * 2);
+    assert_eq!(pool.extent_field_update_sessions() - field_updates, 2);
+    assert_eq!(
+        authoritative_inode_state(&pool, FS_ID, INODE)
+            .unwrap()
+            .unwrap()
+            .generation(),
+        1,
+        "an in-place baseline append must not republish an unchanged inode root"
+    );
+}
+
+#[ktest]
+fn rnvpce_ready_dirty_extents_share_one_baseline_session() {
+    const FS_ID: u64 = 0x992a;
+    const INODE: u64 = 40;
+    let (_image, _config, pool) = restartable_pool(128);
+    let snapshot = AuthoritySnapshot::new(1, &[], 0, 0, 0o100644, 0).unwrap();
+    bootstrap_inode_authority(pool.clone(), FS_ID, INODE, &snapshot, None).unwrap();
+    let field_updates = pool.extent_field_update_sessions();
+    let extents = [
+        SsdBaselineExtent::new(0, 4, 100_000).unwrap(),
+        SsdBaselineExtent::new(8, 4, 200_000).unwrap(),
+    ];
+
+    publish_ssd_baseline_extents(&pool, FS_ID, INODE, &extents).unwrap();
+
+    let mut mappings = Vec::new();
+    visit_ssd_extents(&pool, FS_ID, INODE, |entry| {
+        mappings.push((entry.logical_block(), entry.length(), entry.ssd_block()?));
+        Ok(())
+    })
+    .unwrap();
+    mappings.sort_unstable_by_key(|mapping| mapping.0);
+    assert_eq!(mappings, vec![(0, 4, 100_000), (8, 4, 200_000)]);
+    assert_eq!(pool.extent_field_update_sessions() - field_updates, 2);
+    assert_eq!(
+        authoritative_inode_state(&pool, FS_ID, INODE)
+            .unwrap()
+            .unwrap()
+            .generation(),
+        1
+    );
 }
 
 #[ktest]

@@ -590,6 +590,16 @@ impl Rnvpc {
         self.baseline_generations.validate(token)
     }
 
+    #[cfg(ktest)]
+    pub(crate) fn reset_baseline_validation_calls_for_test(&self) {
+        self.baseline_generations.reset_validation_calls();
+    }
+
+    #[cfg(ktest)]
+    pub(crate) fn baseline_validation_calls_for_test(&self) -> usize {
+        self.baseline_generations.validation_calls()
+    }
+
     pub(crate) fn release_baseline_migration(&self, key: PageKey) {
         self.baseline_generations.release_migration(key);
     }
