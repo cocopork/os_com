@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: MPL-2.0
 
+use core::ops::Range;
+
 use aster_block::BLOCK_SIZE;
 
 use crate::prelude::*;
@@ -7,8 +9,166 @@ use crate::prelude::*;
 pub(crate) const NV_DESCRIPTOR_MAGIC: u64 = 0x4e56_4445_5343_3032;
 /// 描述符版本。
 pub(crate) const NV_DESCRIPTOR_VERSION: u32 = 1;
+pub(crate) const NV_REDIRECT_EXTENT_MAGIC: u64 = 0x4e56_5245_5854_3031;
+pub(crate) const NV_REDIRECT_EXTENT_VERSION: u32 = 1;
 const NV_DESCRIPTOR_MIGRATION_TARGET: u16 = 1 << 0;
 const NV_DESCRIPTOR_MIGRATION_CREDIT_RELEASED: u16 = 1 << 1;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub(crate) enum NvRedirectAuthority {
+    NvAuthoritative = 1,
+    SsdAuthoritativePendingFree = 2,
+}
+
+impl NvRedirectAuthority {
+    fn from_u8(value: u8) -> Result<Self> {
+        match value {
+            1 => Ok(Self::NvAuthoritative),
+            2 => Ok(Self::SsdAuthoritativePendingFree),
+            _ => return_errno_with_message!(Errno::EINVAL, "invalid NV redirect authority"),
+        }
+    }
+}
+
+/// One persistent redirect for equal-length contiguous logical, NV, and SSD ranges.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Pod)]
+pub(crate) struct NvRedirectExtentRecord {
+    magic: u64,
+    version: u32,
+    page_count: u16,
+    authority: u8,
+    selector: u8,
+    fs_id: u64,
+    inode: u64,
+    logical_start: u64,
+    nv_slot_start: u64,
+    ssd_block_start: u64,
+    reserved: u64,
+}
+
+const _: () = {
+    assert!(size_of::<NvRedirectExtentRecord>() == 64);
+    assert!(align_of::<NvRedirectExtentRecord>() == 8);
+};
+
+impl NvRedirectExtentRecord {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        fs_id: u64,
+        inode: u64,
+        logical_start: u64,
+        page_count: u16,
+        nv_slot_start: u64,
+        ssd_block_start: u64,
+        authority: NvRedirectAuthority,
+    ) -> Result<Self> {
+        if page_count == 0 {
+            return_errno_with_message!(Errno::EINVAL, "empty NV redirect extent");
+        }
+        if usize::from(page_count) > 128 {
+            return_errno_with_message!(Errno::E2BIG, "NV redirect extent exceeds 128 pages");
+        }
+        let length = u64::from(page_count);
+        if logical_start.checked_add(length).is_none()
+            || nv_slot_start.checked_add(length).is_none()
+            || ssd_block_start.checked_add(length).is_none()
+        {
+            return_errno_with_message!(Errno::EOVERFLOW, "NV redirect extent range overflow");
+        }
+        Ok(Self {
+            magic: NV_REDIRECT_EXTENT_MAGIC,
+            version: NV_REDIRECT_EXTENT_VERSION,
+            page_count,
+            authority: authority as u8,
+            selector: 1,
+            fs_id,
+            inode,
+            logical_start,
+            nv_slot_start,
+            ssd_block_start,
+            reserved: 0,
+        })
+    }
+
+    pub(crate) const fn fs_id(&self) -> u64 {
+        self.fs_id
+    }
+
+    pub(crate) const fn inode(&self) -> u64 {
+        self.inode
+    }
+
+    pub(crate) const fn logical_start(&self) -> u64 {
+        self.logical_start
+    }
+
+    pub(crate) const fn page_count(&self) -> u16 {
+        self.page_count
+    }
+
+    pub(crate) const fn nv_slot_start(&self) -> u64 {
+        self.nv_slot_start
+    }
+
+    pub(crate) const fn ssd_block_start(&self) -> u64 {
+        self.ssd_block_start
+    }
+
+    pub(crate) fn authority(&self) -> Result<NvRedirectAuthority> {
+        NvRedirectAuthority::from_u8(self.authority)
+    }
+
+    pub(crate) const fn selector_is_valid(&self) -> bool {
+        self.selector == 1
+    }
+
+    pub(crate) fn logical_range(&self) -> Result<Range<u64>> {
+        Ok(self.logical_start
+            ..self
+                .logical_start
+                .checked_add(u64::from(self.page_count))
+                .ok_or_else(|| Error::new(Errno::EOVERFLOW))?)
+    }
+
+    pub(crate) fn nv_slot_range(&self) -> Result<Range<u64>> {
+        Ok(self.nv_slot_start
+            ..self
+                .nv_slot_start
+                .checked_add(u64::from(self.page_count))
+                .ok_or_else(|| Error::new(Errno::EOVERFLOW))?)
+    }
+
+    pub(crate) fn ssd_block_range(&self) -> Result<Range<u64>> {
+        Ok(self.ssd_block_start
+            ..self
+                .ssd_block_start
+                .checked_add(u64::from(self.page_count))
+                .ok_or_else(|| Error::new(Errno::EOVERFLOW))?)
+    }
+
+    pub(crate) fn validate(&self) -> Result<()> {
+        let rebuilt = Self::new(
+            self.fs_id,
+            self.inode,
+            self.logical_start,
+            self.page_count,
+            self.nv_slot_start,
+            self.ssd_block_start,
+            self.authority()?,
+        )?;
+        if self.magic != NV_REDIRECT_EXTENT_MAGIC
+            || self.version != NV_REDIRECT_EXTENT_VERSION
+            || !self.selector_is_valid()
+            || self.reserved != 0
+            || rebuilt.page_count != self.page_count
+        {
+            return_errno_with_message!(Errno::EINVAL, "invalid NV redirect extent record");
+        }
+        Ok(())
+    }
+}
 
 /// 对象种类（`design.md §2.1/§2.2`）。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

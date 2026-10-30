@@ -2,9 +2,18 @@
 
 //! Volatile exact-page redirect and contiguous-page-range indexes for rNVPCe.
 
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::{
+    ops::Range,
+    sync::atomic::{AtomicU8, AtomicUsize, Ordering},
+};
 
-use super::{descriptor::NvObjectState, index::PageKey, metadata::PersistentObjectRef};
+use ostd::sync::WaitQueue;
+
+use super::{
+    descriptor::{NvObjectState, NvRedirectAuthority, NvRedirectExtentRecord},
+    index::PageKey,
+    metadata::PersistentObjectRef,
+};
 use crate::prelude::*;
 
 const REDIRECT_PARTITION_COUNT: usize = 64;
@@ -18,6 +27,123 @@ pub(crate) struct DescriptorHandle {
     pub(crate) state: NvObjectState,
     pub(crate) ssd_target: u64,
     pub(crate) migration_target: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub(crate) enum NvExtentEntryState {
+    Dirty = 1,
+    Migrating = 2,
+    IoComplete = 3,
+    Reclaiming = 4,
+    Reclaimed = 5,
+}
+
+impl NvExtentEntryState {
+    fn from_u8(value: u8) -> Self {
+        match value {
+            1 => Self::Dirty,
+            2 => Self::Migrating,
+            3 => Self::IoComplete,
+            4 => Self::Reclaiming,
+            5 => Self::Reclaimed,
+            _ => panic!("invalid NV extent entry state"),
+        }
+    }
+}
+
+pub(crate) struct DirtyNvExtentEntry {
+    record: NvRedirectExtentRecord,
+    state: AtomicU8,
+    readers: AtomicUsize,
+    waiters: WaitQueue,
+}
+
+impl DirtyNvExtentEntry {
+    pub(crate) fn new(record: NvRedirectExtentRecord) -> Result<Self> {
+        record.validate()?;
+        if record.authority()? != NvRedirectAuthority::NvAuthoritative {
+            return_errno_with_message!(Errno::EINVAL, "dirty entry is not NV authoritative");
+        }
+        Ok(Self {
+            record,
+            state: AtomicU8::new(NvExtentEntryState::Dirty as u8),
+            readers: AtomicUsize::new(0),
+            waiters: WaitQueue::new(),
+        })
+    }
+
+    pub(crate) const fn record(&self) -> &NvRedirectExtentRecord {
+        &self.record
+    }
+
+    pub(crate) fn state(&self) -> NvExtentEntryState {
+        NvExtentEntryState::from_u8(self.state.load(Ordering::Acquire))
+    }
+
+    pub(crate) const fn fs_id(&self) -> u64 {
+        self.record.fs_id()
+    }
+
+    pub(crate) const fn inode(&self) -> u64 {
+        self.record.inode()
+    }
+
+    pub(crate) const fn logical_start(&self) -> u64 {
+        self.record.logical_start()
+    }
+
+    pub(crate) const fn page_count(&self) -> u16 {
+        self.record.page_count()
+    }
+
+    pub(crate) fn logical_range(&self) -> Range<u64> {
+        self.record
+            .logical_range()
+            .expect("validated dirty entry has a bounded logical range")
+    }
+
+    pub(crate) fn nv_slot_range(&self) -> Range<u64> {
+        self.record
+            .nv_slot_range()
+            .expect("validated dirty entry has a bounded NV range")
+    }
+
+    pub(crate) fn ssd_block_range(&self) -> Range<u64> {
+        self.record
+            .ssd_block_range()
+            .expect("validated dirty entry has a bounded SSD range")
+    }
+
+    fn transition(&self, from: NvExtentEntryState, to: NvExtentEntryState) -> Result<()> {
+        self.state
+            .compare_exchange(from as u8, to as u8, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| Error::new(Errno::ESTALE))?;
+        self.waiters.wake_all();
+        Ok(())
+    }
+}
+
+pub(crate) struct NvExtentEntryLease {
+    entry: Arc<DirtyNvExtentEntry>,
+}
+
+impl NvExtentEntryLease {
+    pub(crate) fn entry(&self) -> &Arc<DirtyNvExtentEntry> {
+        &self.entry
+    }
+}
+
+impl Drop for NvExtentEntryLease {
+    fn drop(&mut self) {
+        let _ = self.entry.state.compare_exchange(
+            NvExtentEntryState::Migrating as u8,
+            NvExtentEntryState::Dirty as u8,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+        self.entry.waiters.wake_all();
+    }
 }
 
 #[cfg(ktest)]
@@ -226,6 +352,8 @@ struct RedirectPartition {
     ready_set: BTreeSet<PageKey>,
     claimed_extents: BTreeMap<PageKey, IndexedDirtyExtent>,
     next_extent_generation: u64,
+    dirty_entry_members: BTreeMap<PageKey, Arc<DirtyNvExtentEntry>>,
+    owned_dirty_entries: BTreeMap<PageKey, Arc<DirtyNvExtentEntry>>,
     epoch: u64,
 }
 
@@ -261,6 +389,99 @@ impl RedirectDirectory {
             .committed
             .get(&key)
             .copied()
+    }
+
+    pub(crate) fn publish_dirty_entry(&self, entry: Arc<DirtyNvExtentEntry>) -> Result<()> {
+        if entry.state() != NvExtentEntryState::Dirty {
+            return_errno_with_message!(Errno::EINVAL, "published NV extent entry is not dirty");
+        }
+        let keys = entry
+            .logical_range()
+            .map(|page| PageKey::new(entry.fs_id(), entry.inode(), page))
+            .collect::<Vec<_>>();
+        let partition_ids = self.partitions_for(&keys);
+        let owner_partition = self.partition_index(keys[0]);
+        let mut guards = Vec::new();
+        for partition in partition_ids {
+            guards.push((partition, self.partitions[partition].lock()));
+        }
+        if keys.iter().any(|key| {
+            guards
+                .iter()
+                .find(|(partition, _)| *partition == self.partition_index(*key))
+                .is_some_and(|(_, state)| state.dirty_entry_members.contains_key(key))
+        }) {
+            return_errno_with_message!(Errno::EBUSY, "NV extent entry overlaps an existing entry");
+        }
+        for key in &keys {
+            guards
+                .iter_mut()
+                .find(|(partition, _)| *partition == self.partition_index(*key))
+                .expect("entry member partition is locked")
+                .1
+                .dirty_entry_members
+                .insert(*key, entry.clone());
+        }
+        guards
+            .iter_mut()
+            .find(|(partition, _)| *partition == owner_partition)
+            .expect("entry owner partition is locked")
+            .1
+            .owned_dirty_entries
+            .insert(keys[0], entry);
+        Ok(())
+    }
+
+    pub(crate) fn lookup_dirty_entry(&self, key: PageKey) -> Option<Arc<DirtyNvExtentEntry>> {
+        self.partitions[self.partition_index(key)]
+            .lock()
+            .dirty_entry_members
+            .get(&key)
+            .cloned()
+    }
+
+    pub(crate) fn claim_ready_entries(
+        &self,
+        fs_id: u64,
+        page_budget: usize,
+    ) -> Result<Vec<NvExtentEntryLease>> {
+        if page_budget == 0 {
+            return Ok(Vec::new());
+        }
+        let start = self
+            .next_candidate_partition
+            .fetch_add(1, Ordering::Relaxed)
+            % self.partitions.len();
+        let mut claimed_pages = 0usize;
+        let mut leases = Vec::new();
+        for offset in 0..self.partitions.len() {
+            let partition = (start + offset) % self.partitions.len();
+            let state = self.partitions[partition].lock();
+            for entry in state.owned_dirty_entries.values() {
+                if entry.fs_id() != fs_id
+                    || entry
+                        .transition(NvExtentEntryState::Dirty, NvExtentEntryState::Migrating)
+                        .is_err()
+                {
+                    continue;
+                }
+                claimed_pages = claimed_pages.saturating_add(usize::from(entry.page_count()));
+                leases.push(NvExtentEntryLease {
+                    entry: entry.clone(),
+                });
+                if claimed_pages >= page_budget {
+                    return Ok(leases);
+                }
+            }
+        }
+        Ok(leases)
+    }
+
+    pub(crate) fn complete_entry(&self, lease: &NvExtentEntryLease) -> Result<()> {
+        lease.entry.transition(
+            NvExtentEntryState::Migrating,
+            NvExtentEntryState::IoComplete,
+        )
     }
 
     pub(crate) fn reserve_versions(&self, keys: &[PageKey]) -> Result<PendingRedirectBatch> {
@@ -941,6 +1162,138 @@ mod tests {
     use ostd::prelude::ktest;
 
     use super::*;
+    fn dirty_entry(
+        fs_id: u64,
+        inode: u64,
+        logical_start: u64,
+        page_count: u16,
+        nv_slot_start: u64,
+        ssd_block_start: u64,
+    ) -> Arc<DirtyNvExtentEntry> {
+        Arc::new(
+            DirtyNvExtentEntry::new(
+                NvRedirectExtentRecord::new(
+                    fs_id,
+                    inode,
+                    logical_start,
+                    page_count,
+                    nv_slot_start,
+                    ssd_block_start,
+                    NvRedirectAuthority::NvAuthoritative,
+                )
+                .unwrap(),
+            )
+            .unwrap(),
+        )
+    }
+
+    fn dirty_nv_entry_preserves_persistent_entry_boundaries() {
+        let directory = RedirectDirectory::new().unwrap();
+        let first = dirty_entry(0x91, 7, 0, 4, 100, 1000);
+        let second = dirty_entry(0x91, 7, 4, 4, 104, 1004);
+        directory.publish_dirty_entry(first.clone()).unwrap();
+        directory.publish_dirty_entry(second.clone()).unwrap();
+
+        let claimed = directory.claim_ready_entries(0x91, 8).unwrap();
+        assert_eq!(claimed.len(), 2);
+        assert!(Arc::ptr_eq(claimed[0].entry(), &first));
+        assert!(Arc::ptr_eq(claimed[1].entry(), &second));
+    }
+
+    fn dirty_nv_entry_crosses_redirect_partition_without_split() {
+        let directory = RedirectDirectory::new().unwrap();
+        let entry = dirty_entry(0x92, 8, REDIRECT_PARTITION_PAGES - 1, 2, 200, 2000);
+        directory.publish_dirty_entry(entry.clone()).unwrap();
+
+        assert!(Arc::ptr_eq(
+            &directory
+                .lookup_dirty_entry(PageKey::new(0x92, 8, REDIRECT_PARTITION_PAGES))
+                .unwrap(),
+            &entry
+        ));
+        let claimed = directory.claim_ready_entries(0x92, 1).unwrap();
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].entry().page_count(), 2);
+    }
+
+    fn dirty_nv_entry_budget_never_splits_entry() {
+        let directory = RedirectDirectory::new().unwrap();
+        directory
+            .publish_dirty_entry(dirty_entry(0x93, 9, 0, 32, 300, 3000))
+            .unwrap();
+
+        let claimed = directory.claim_ready_entries(0x93, 8).unwrap();
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].entry().logical_range(), 0..32);
+    }
+
+    fn adjacent_nv_entries_remain_distinct() {
+        let directory = RedirectDirectory::new().unwrap();
+        directory
+            .publish_dirty_entry(dirty_entry(0x94, 10, 0, 2, 400, 4000))
+            .unwrap();
+        directory
+            .publish_dirty_entry(dirty_entry(0x94, 10, 2, 2, 402, 4002))
+            .unwrap();
+
+        let claimed = directory.claim_ready_entries(0x94, 4).unwrap();
+        assert_eq!(claimed.len(), 2);
+        assert_eq!(claimed[0].entry().logical_range(), 0..2);
+        assert_eq!(claimed[1].entry().logical_range(), 2..4);
+    }
+
+    fn dirty_nv_entry_splits_at_ssd_discontinuity() {
+        let directory = RedirectDirectory::new().unwrap();
+        directory
+            .publish_dirty_entry(dirty_entry(0x95, 11, 0, 2, 500, 5000))
+            .unwrap();
+        directory
+            .publish_dirty_entry(dirty_entry(0x95, 11, 2, 2, 502, 9000))
+            .unwrap();
+
+        let claimed = directory.claim_ready_entries(0x95, 4).unwrap();
+        assert_eq!(claimed.len(), 2);
+        assert_eq!(claimed[0].entry().ssd_block_range(), 5000..5002);
+        assert_eq!(claimed[1].entry().ssd_block_range(), 9000..9002);
+    }
+
+    fn dirty_nv_entry_rejects_more_than_128_pages() {
+        assert_eq!(
+            NvRedirectExtentRecord::new(
+                1,
+                2,
+                0,
+                129,
+                100,
+                1000,
+                NvRedirectAuthority::NvAuthoritative,
+            )
+            .unwrap_err()
+            .error(),
+            Errno::E2BIG
+        );
+    }
+
+    fn nv_redirect_extent_record_has_fixed_layout() {
+        assert_eq!(size_of::<NvRedirectExtentRecord>(), 64);
+        let record =
+            NvRedirectExtentRecord::new(1, 2, 3, 2, 10, 20, NvRedirectAuthority::NvAuthoritative)
+                .unwrap();
+        assert_eq!(record.logical_range().unwrap(), 3..5);
+        assert_eq!(record.nv_slot_range().unwrap(), 10..12);
+        assert_eq!(record.ssd_block_range().unwrap(), 20..22);
+    }
+
+    #[ktest]
+    fn rnvpce_dirty_nv_entry_index() {
+        dirty_nv_entry_preserves_persistent_entry_boundaries();
+        dirty_nv_entry_crosses_redirect_partition_without_split();
+        dirty_nv_entry_budget_never_splits_entry();
+        adjacent_nv_entries_remain_distinct();
+        dirty_nv_entry_splits_at_ssd_discontinuity();
+        dirty_nv_entry_rejects_more_than_128_pages();
+        nv_redirect_extent_record_has_fixed_layout();
+    }
 
     fn handle(
         slot: u64,
