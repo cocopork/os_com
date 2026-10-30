@@ -4,13 +4,12 @@
 
 use core::mem::offset_of;
 
-use super::descriptor::NvDescriptor;
+use super::descriptor::{NvDescriptor, NvRedirectExtentRecord};
 use crate::prelude::*;
 
 pub(super) const NV_IMAGE_MAGIC: u64 = 0x4e56_504f_4f4c_3031;
-/// Version 5 makes extent leaves SSD-only; selected data descriptors carry all
-/// temporary NV residency. Older mixed-residency images require conversion.
-pub(super) const NV_IMAGE_VERSION: u32 = 6;
+/// Version 7 adds a range redirect beside each selected descriptor copy.
+pub(super) const NV_IMAGE_VERSION: u32 = 7;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Pod)]
@@ -30,6 +29,7 @@ pub(crate) struct NvImageHeader {
 #[derive(Clone, Copy, Debug, Pod)]
 pub(crate) struct DescriptorCopy {
     pub(super) descriptor: NvDescriptor,
+    pub(super) redirect_extent: NvRedirectExtentRecord,
     reserved: [u8; 56],
 }
 
@@ -45,8 +45,8 @@ pub(crate) struct NvEntry {
 
 const _: () = {
     assert!(size_of::<NvImageHeader>() == 64);
-    assert!(size_of::<DescriptorCopy>() == 128);
-    assert!(size_of::<NvEntry>() == 320);
+    assert!(size_of::<DescriptorCopy>() == 192);
+    assert!(size_of::<NvEntry>() == 448);
     assert!(offset_of!(NvEntry, commit_word) == 0);
     assert!(offset_of!(NvEntry, copies) == 64);
 };
@@ -60,6 +60,12 @@ pub(super) fn descriptor_offset(index: usize, selector: u64) -> Result<usize> {
         .and_then(|offset| {
             offset.checked_add(((selector - 1) % 2) as usize * size_of::<DescriptorCopy>())
         })
+        .ok_or_else(|| Error::new(Errno::EOVERFLOW))
+}
+
+pub(super) fn redirect_extent_offset(index: usize, selector: u64) -> Result<usize> {
+    descriptor_offset(index, selector)?
+        .checked_add(offset_of!(DescriptorCopy, redirect_extent))
         .ok_or_else(|| Error::new(Errno::EOVERFLOW))
 }
 

@@ -124,6 +124,10 @@ impl NvRedirectExtentRecord {
         self.selector == 1
     }
 
+    pub(crate) const fn is_empty(&self) -> bool {
+        self.magic == 0 && self.selector == 0
+    }
+
     pub(crate) fn logical_range(&self) -> Result<Range<u64>> {
         Ok(self.logical_start
             ..self

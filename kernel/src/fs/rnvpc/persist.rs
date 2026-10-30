@@ -6,11 +6,11 @@ use core::sync::atomic::{AtomicBool, Ordering};
 
 use super::{
     backend::NvMemoryBackend,
-    descriptor::NvDescriptor,
+    descriptor::{NvDescriptor, NvRedirectExtentRecord},
     fault::{FaultPoint, inject},
     layout::{
         NV_IMAGE_MAGIC, NV_IMAGE_VERSION, NvEntry, NvImageHeader, commit_offset, control_len,
-        descriptor_offset,
+        descriptor_offset, redirect_extent_offset,
     },
 };
 use crate::prelude::*;
@@ -90,6 +90,75 @@ impl PersistEngine {
             return Ok(Some(descriptor));
         }
         return_errno!(Errno::EBUSY)
+    }
+
+    pub(super) fn read_redirect_extent(
+        &self,
+        index: usize,
+    ) -> Result<Option<NvRedirectExtentRecord>> {
+        self.check_index(index)?;
+        for _ in 0..16 {
+            let selector = self.backend.load_control_u64(commit_offset(index)?)?;
+            if selector == 0 {
+                return Ok(None);
+            }
+            let mut record = NvRedirectExtentRecord::default();
+            self.backend.read_control(
+                redirect_extent_offset(index, selector)?,
+                record.as_mut_bytes(),
+            )?;
+            if self.backend.load_control_u64(commit_offset(index)?)? != selector {
+                continue;
+            }
+            if record.is_empty() {
+                return Ok(None);
+            }
+            record.validate()?;
+            return Ok(Some(record));
+        }
+        return_errno!(Errno::EBUSY)
+    }
+
+    pub(super) fn publish_redirect_extent(
+        &self,
+        record: &NvRedirectExtentRecord,
+        fault: Option<FaultPoint>,
+    ) -> Result<()> {
+        self.ensure_writable()?;
+        record.validate()?;
+        let index =
+            usize::try_from(record.nv_slot_start()).map_err(|_| Error::new(Errno::EOVERFLOW))?;
+        self.check_index(index)?;
+        let descriptor = self
+            .read_entry(index)?
+            .ok_or_else(|| Error::new(Errno::ESTALE))?;
+        if descriptor.fs_id != record.fs_id()
+            || descriptor.inode != record.inode()
+            || descriptor.logical_index != record.logical_start()
+            || descriptor.ssd_backing_block != record.ssd_block_start()
+        {
+            return_errno_with_message!(Errno::ESTALE, "redirect extent head descriptor changed");
+        }
+        let old = self.backend.load_control_u64(commit_offset(index)?)?;
+        let next = old
+            .checked_add(1)
+            .ok_or_else(|| Error::new(Errno::EOVERFLOW))?;
+        let descriptor_offset = descriptor_offset(index, next)?;
+        let record_offset = redirect_extent_offset(index, next)?;
+        self.backend
+            .write_control(descriptor_offset, descriptor.as_bytes())?;
+        self.backend
+            .persist_control(descriptor_offset, size_of::<NvDescriptor>())?;
+        self.backend
+            .write_control(record_offset, record.as_bytes())?;
+        self.backend
+            .persist_control(record_offset, size_of::<NvRedirectExtentRecord>())?;
+        self.backend.fence()?;
+        inject(fault, FaultPoint::AfterContentPersist)?;
+        let commit = commit_offset(index)?;
+        self.backend.store_control_u64(commit, next)?;
+        self.backend.persist_control(commit, size_of::<u64>())?;
+        self.backend.fence()
     }
 
     /// Persists changed data before publishing a descriptor. Existing selected
@@ -176,19 +245,34 @@ impl PersistEngine {
             let next = old
                 .checked_add(1)
                 .ok_or_else(|| Error::new(Errno::EOVERFLOW))?;
-            selected.push((*index, next));
+            let redirect = if old == 0 {
+                NvRedirectExtentRecord::default()
+            } else {
+                let mut redirect = NvRedirectExtentRecord::default();
+                self.backend.read_control(
+                    redirect_extent_offset(*index, old)?,
+                    redirect.as_mut_bytes(),
+                )?;
+                redirect
+            };
+            selected.push((*index, next, redirect));
         }
         inject(fault, FaultPoint::BeforeContentPersist)?;
-        for ((index, descriptor), (_, next)) in updates.iter().zip(&selected) {
+        for ((index, descriptor), (_, next, redirect)) in updates.iter().zip(&selected) {
             let offset = descriptor_offset(*index, *next)?;
             self.backend.write_control(offset, descriptor.as_bytes())?;
             self.backend
                 .persist_control(offset, size_of::<NvDescriptor>())?;
+            let redirect_offset = redirect_extent_offset(*index, *next)?;
+            self.backend
+                .write_control(redirect_offset, redirect.as_bytes())?;
+            self.backend
+                .persist_control(redirect_offset, size_of::<NvRedirectExtentRecord>())?;
         }
         self.backend.fence()?;
         inject(fault, FaultPoint::AfterContentPersist)?;
         let publication = (|| {
-            for (index, next) in selected {
+            for (index, next, _) in selected {
                 let offset = commit_offset(index)?;
                 self.backend.store_control_u64(offset, next)?;
                 inject(fault, FaultPoint::AfterCommitStore)?;

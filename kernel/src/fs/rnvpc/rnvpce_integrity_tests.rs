@@ -15,7 +15,7 @@ use super::{
     backend::NvMemoryBackend,
     config::{NvSimMode, RnvpcConfig},
     data_page::DataPageState,
-    descriptor::{NvDescriptor, NvObjectState},
+    descriptor::{NvDescriptor, NvObjectState, NvRedirectAuthority},
     dram::{DramNvBackend, DramNvImage},
     extent_mutation::ExtentMutation,
     fault::FaultPoint,
@@ -1639,6 +1639,281 @@ fn publish_test_redirect_range(pool: &Arc<Rnvpc>, fs_id: u64, inode: u64, pages:
         })
         .collect::<Vec<_>>();
     pool.publish_redirect_batch(&staged, None).unwrap();
+}
+
+fn dirty_nv_entry_foreground_publishes_one_triple_contiguous_entry() {
+    const FS_ID: u64 = 0xb201;
+    const INODE: u64 = 71;
+    let pool = test_pool(48, 8, 40, None);
+    publish_test_redirect_range(&pool, FS_ID, INODE, 32);
+
+    let claimed = pool.claim_ready_nv_entries(FS_ID, 8).unwrap();
+    assert_eq!(claimed.len(), 1);
+    let entry = claimed[0].entry();
+    assert_eq!(entry.logical_range(), 0..32);
+    let nv_range = entry.nv_slot_range();
+    assert_eq!(nv_range.end - nv_range.start, 32);
+    assert_eq!(entry.ssd_block_range(), 60_000..60_032);
+    let persisted = pool
+        .persisted_redirect_extent_for_test(entry.nv_slot_range().start as usize)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        persisted.authority().unwrap(),
+        NvRedirectAuthority::NvAuthoritative
+    );
+    assert_eq!(persisted.logical_range().unwrap(), 0..32);
+}
+
+fn dirty_nv_entry_foreground_splits_at_nv_and_ssd_discontinuities() {
+    const FS_ID: u64 = 0xb202;
+    const INODE: u64 = 72;
+    let pool = test_pool(24, 4, 20, None);
+    let first = staged_redirect_page(&pool, 1);
+    let gap = staged_redirect_page(&pool, 2);
+    let third = staged_redirect_page(&pool, 3);
+    pool.publish_redirect_batch(
+        &[
+            (first, PageKey::new(FS_ID, INODE, 0), 70_000),
+            (third, PageKey::new(FS_ID, INODE, 1), 70_001),
+        ],
+        None,
+    )
+    .unwrap();
+    pool.abort_data_page(gap).unwrap();
+
+    let nv_fragmented = pool.claim_ready_nv_entries(FS_ID, 8).unwrap();
+    assert_eq!(nv_fragmented.len(), 2);
+    drop(nv_fragmented);
+
+    let fourth = staged_redirect_page(&pool, 4);
+    let fifth = staged_redirect_page(&pool, 5);
+    pool.publish_redirect_batch(
+        &[
+            (fourth, PageKey::new(FS_ID, INODE, 2), 80_000),
+            (fifth, PageKey::new(FS_ID, INODE, 3), 90_000),
+        ],
+        None,
+    )
+    .unwrap();
+    let all = pool.claim_ready_nv_entries(FS_ID, 16).unwrap();
+    assert_eq!(all.len(), 4);
+}
+
+fn dirty_nv_entry_foreground_preserves_publication_boundaries() {
+    const FS_ID: u64 = 0xb203;
+    const INODE: u64 = 73;
+    let pool = test_pool(16, 2, 14, None);
+    publish_test_redirect_range(&pool, FS_ID, INODE, 2);
+    let second = [
+        (
+            staged_redirect_page(&pool, 3),
+            PageKey::new(FS_ID, INODE, 2),
+            60_002,
+        ),
+        (
+            staged_redirect_page(&pool, 4),
+            PageKey::new(FS_ID, INODE, 3),
+            60_003,
+        ),
+    ];
+    pool.publish_redirect_batch(&second, None).unwrap();
+
+    let claimed = pool.claim_ready_nv_entries(FS_ID, 4).unwrap();
+    assert_eq!(claimed.len(), 2);
+    assert_eq!(claimed[0].entry().logical_range(), 0..2);
+    assert_eq!(claimed[1].entry().logical_range(), 2..4);
+}
+
+fn dirty_nv_entry_foreground_failure_exposes_no_entry() {
+    const FS_ID: u64 = 0xb204;
+    let pool = test_pool(8, 2, 6, None);
+    let page = staged_redirect_page(&pool, 1);
+    assert!(
+        pool.publish_redirect_batch(
+            &[(page, PageKey::new(FS_ID, 74, 0), 91_000)],
+            Some(FaultPoint::BeforeContentPersist),
+        )
+        .is_err()
+    );
+    assert!(pool.claim_ready_nv_entries(FS_ID, 1).unwrap().is_empty());
+}
+
+fn partial_overwrite_redirects_whole_pages_without_splitting_ssd_extent() {
+    const FS_ID: u64 = 0xb205;
+    const INODE: u64 = 75;
+    const SSD_START: u64 = 100_000;
+    let pool = test_pool(24, 4, 20, None);
+    let baseline = [ExtentRecordEntry::leaf(0, 4, SSD_START, false).unwrap()];
+    let snapshot = AuthoritySnapshot::new(
+        1,
+        &baseline,
+        (4 * PAGE_SIZE) as u64,
+        (4 * PAGE_SIZE / 512) as u64,
+        0o100644,
+        0,
+    )
+    .unwrap();
+    bootstrap_inode_authority(pool.clone(), FS_ID, INODE, &snapshot, None).unwrap();
+    let pages = [
+        RangeWritePage::new(1, SSD_START + 1, 0, PAGE_SIZE, false).unwrap(),
+        RangeWritePage::new(2, SSD_START + 2, 0, PAGE_SIZE / 2, false).unwrap(),
+    ];
+    let request = RangeWriteBatch::new(
+        2,
+        PAGE_SIZE as u64,
+        PAGE_SIZE + PAGE_SIZE / 2,
+        &[],
+        &pages,
+        (4 * PAGE_SIZE) as u64,
+        (4 * PAGE_SIZE / 512) as u64,
+        (PAGE_SIZE / 512) as u64,
+    )
+    .unwrap();
+    let input = vec![0xa1; PAGE_SIZE + PAGE_SIZE / 2];
+    let ssd_reads = AtomicUsize::new(0);
+    commit_range_write(
+        pool.clone(),
+        FS_ID,
+        INODE,
+        &request,
+        &mut VmReader::from(input.as_slice()).to_fallible(),
+        |block, staging| {
+            assert_eq!(block, SSD_START + 2);
+            ssd_reads.fetch_add(1, Ordering::Relaxed);
+            staging.write_all(&[0x22; PAGE_SIZE])
+        },
+        None,
+    )
+    .unwrap();
+    assert_eq!(ssd_reads.load(Ordering::Relaxed), 1);
+
+    let claimed = pool.claim_ready_nv_entries(FS_ID, 1).unwrap();
+    assert_eq!(claimed.len(), 1);
+    assert_eq!(claimed[0].entry().logical_range(), 1..3);
+    assert_eq!(
+        claimed[0].entry().ssd_block_range(),
+        SSD_START + 1..SSD_START + 3
+    );
+    drop(claimed);
+
+    for (logical, expected_tail) in [(1, 0xa1), (2, 0x22)] {
+        let reference = mapped_nv_page_ref(&pool, FS_ID, INODE, logical)
+            .unwrap()
+            .unwrap();
+        let page = NvPageId::try_from(reference.slot().unwrap() as usize).unwrap();
+        let pin = pool.pin_data_page(page).unwrap();
+        let mut bytes = [0; PAGE_SIZE];
+        pin.read(&mut bytes).unwrap();
+        assert!(bytes[..PAGE_SIZE / 2].iter().all(|byte| *byte == 0xa1));
+        assert!(
+            bytes[PAGE_SIZE / 2..]
+                .iter()
+                .all(|byte| *byte == expected_tail)
+        );
+    }
+
+    let mut extents = Vec::new();
+    visit_ssd_extents(&pool, FS_ID, INODE, |entry| {
+        extents.push((entry.logical_block(), entry.length(), entry.ssd_block()?));
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(extents, vec![(0, 4, SSD_START)]);
+}
+
+#[ktest]
+fn rnvpce_existing_nv_entry_overwrite_reuses_owned_pages() {
+    const FS_ID: u64 = 0xb206;
+    const INODE: u64 = 76;
+    const SSD_START: u64 = 110_000;
+    let pool = test_pool(16, 2, 14, None);
+    let baseline = [ExtentRecordEntry::leaf(0, 2, SSD_START, false).unwrap()];
+    let snapshot = AuthoritySnapshot::new(
+        1,
+        &baseline,
+        (2 * PAGE_SIZE) as u64,
+        (2 * PAGE_SIZE / 512) as u64,
+        0o100644,
+        0,
+    )
+    .unwrap();
+    bootstrap_inode_authority(pool.clone(), FS_ID, INODE, &snapshot, None).unwrap();
+    let pages = [
+        RangeWritePage::new(0, SSD_START, 0, PAGE_SIZE, false).unwrap(),
+        RangeWritePage::new(1, SSD_START + 1, 0, PAGE_SIZE, false).unwrap(),
+    ];
+    let first = RangeWriteBatch::new(
+        2,
+        0,
+        2 * PAGE_SIZE,
+        &[],
+        &pages,
+        (2 * PAGE_SIZE) as u64,
+        (2 * PAGE_SIZE / 512) as u64,
+        (PAGE_SIZE / 512) as u64,
+    )
+    .unwrap();
+    commit_range_write(
+        pool.clone(),
+        FS_ID,
+        INODE,
+        &first,
+        &mut VmReader::from([0x31; 2 * PAGE_SIZE].as_slice()).to_fallible(),
+        |_, _| panic!("full overwrite must not load SSD"),
+        None,
+    )
+    .unwrap();
+    let before = pages.map(|page| {
+        pool.redirect_lookup(PageKey::new(FS_ID, INODE, page.logical_block()))
+            .unwrap()
+            .reference
+    });
+
+    let second = RangeWriteBatch::new(
+        3,
+        0,
+        2 * PAGE_SIZE,
+        &[],
+        &pages,
+        (2 * PAGE_SIZE) as u64,
+        (2 * PAGE_SIZE / 512) as u64,
+        (PAGE_SIZE / 512) as u64,
+    )
+    .unwrap();
+    assert_eq!(range_write_new_pages(&pool, FS_ID, INODE, &second).unwrap(), 0);
+    commit_range_write(
+        pool.clone(),
+        FS_ID,
+        INODE,
+        &second,
+        &mut VmReader::from([0x72; 2 * PAGE_SIZE].as_slice()).to_fallible(),
+        |_, _| panic!("NV overwrite must not load SSD"),
+        None,
+    )
+    .unwrap();
+
+    for (page, expected_reference) in pages.iter().zip(before) {
+        let key = PageKey::new(FS_ID, INODE, page.logical_block());
+        let handle = pool.redirect_lookup(key).unwrap();
+        assert_eq!(handle.reference, expected_reference);
+        let pin = pool.pin_redirect(key, handle).unwrap();
+        let mut bytes = [0; PAGE_SIZE];
+        pin.read(&mut bytes).unwrap();
+        assert!(bytes.iter().all(|byte| *byte == 0x72));
+    }
+    let claimed = pool.claim_ready_nv_entries(FS_ID, 2).unwrap();
+    assert_eq!(claimed.len(), 1);
+    assert_eq!(claimed[0].entry().logical_range(), 0..2);
+}
+
+#[ktest]
+fn rnvpce_dirty_nv_entry_foreground() {
+    dirty_nv_entry_foreground_publishes_one_triple_contiguous_entry();
+    dirty_nv_entry_foreground_splits_at_nv_and_ssd_discontinuities();
+    dirty_nv_entry_foreground_preserves_publication_boundaries();
+    dirty_nv_entry_foreground_failure_exposes_no_entry();
+    partial_overwrite_redirects_whole_pages_without_splitting_ssd_extent();
 }
 
 #[ktest]

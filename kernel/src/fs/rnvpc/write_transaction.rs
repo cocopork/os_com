@@ -11,6 +11,7 @@
 
 use super::{
     data_page::DataPageState,
+    descriptor::NvObjectState,
     extent_mutation::ExtentMutation,
     fault::FaultPoint,
     frame::Rnvpc,
@@ -971,7 +972,12 @@ pub(crate) fn range_write_new_pages(
             });
     }
     if existing_baseline {
-        return Ok(request.pages.len());
+        return request.pages.iter().try_fold(0usize, |pages, page| {
+            Ok(pages
+                + usize::from(
+                    mapped_nv_page_ref(pool, fs_id, inode, page.logical_block)?.is_none(),
+                ))
+        });
     }
     let mut pages = 0;
     for page in request.pages {
@@ -1350,21 +1356,33 @@ where
     pending
         .try_reserve_exact(request.pages.len())
         .map_err(|_| Error::new(Errno::ENOMEM))?;
-    let mut old_redirects = Vec::new();
     let mut copied = 0usize;
     let staging_result = (|| -> Result<()> {
         for page in request.pages {
             let key = PageKey::new(fs_id, inode, page.logical_block);
             let previous = pool.redirect_lookup(key);
+            if let Some(handle) = previous {
+                if handle.state != NvObjectState::NvDirty || handle.migration_target {
+                    return_errno_with_message!(Errno::EBUSY, "NV redirect is being migrated");
+                }
+                let data = pool.begin_persistent_data_mutation(handle.reference)?;
+                let amount = data.copy_from_reader(page.page_offset, reader, page.len, None)?;
+                data.finish();
+                if amount == 0 {
+                    return_errno_with_message!(Errno::EFAULT, "write copied no user bytes");
+                }
+                copied = copied
+                    .checked_add(amount)
+                    .ok_or_else(|| Error::new(Errno::EOVERFLOW))?;
+                if amount != page.len {
+                    break;
+                }
+                continue;
+            }
             let mut staging = pool.begin_reserved_data_page(reservation)?;
             let full_overwrite = page.page_offset == 0 && page.len == PAGE_SIZE;
             if full_overwrite {
                 staging.zero_all()?;
-            } else if let Some(handle) = previous {
-                let pin = pool.pin_redirect(key, handle)?;
-                let mut bytes = [0; PAGE_SIZE];
-                pin.read(&mut bytes)?;
-                staging.write_all(&bytes)?;
             } else {
                 staging.zero_all()?;
                 load_ssd_page(page.ssd_block, &mut staging)?;
@@ -1376,9 +1394,6 @@ where
             let id = staging.finish()?;
             pool.transition_data_page(id, DataPageState::Staged, DataPageState::NvDirty)?;
             pending.push((id, key, page.ssd_block));
-            if let Some(handle) = previous {
-                old_redirects.push((key, handle));
-            }
             copied = copied
                 .checked_add(amount)
                 .ok_or_else(|| Error::new(Errno::EOVERFLOW))?;
@@ -1417,16 +1432,6 @@ where
         request.old_block_count,
         inode_fault,
     )?;
-    // A newly selected descriptor is already authoritative. Retire unpinned
-    // predecessors opportunistically; in-flight generations remain for their
-    // exact completion path.
-    for old in old_redirects {
-        if let Ok(pages) = pool.clear_redirects_exact(&[old], None) {
-            for page in pages {
-                let _ = pool.free_data_page(page);
-            }
-        }
-    }
     Ok(Some(CommittedRangeWrite {
         copied,
         inode: inode_ref,

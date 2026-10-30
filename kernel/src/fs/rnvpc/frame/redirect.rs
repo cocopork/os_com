@@ -9,6 +9,22 @@ use crate::fs::rnvpc::redirect_index::RedirectRange;
 
 impl Rnvpc {
     #[cfg(ktest)]
+    pub(crate) fn persisted_redirect_extent_for_test(
+        &self,
+        head_slot: usize,
+    ) -> Result<Option<NvRedirectExtentRecord>> {
+        self.persist.read_redirect_extent(head_slot)
+    }
+
+    pub(crate) fn claim_ready_nv_entries(
+        &self,
+        fs_id: u64,
+        page_budget: usize,
+    ) -> Result<Vec<NvExtentEntryLease>> {
+        self.redirects.claim_ready_entries(fs_id, page_budget)
+    }
+
+    #[cfg(ktest)]
     pub(crate) fn persisted_redirect_state_for_test(
         &self,
         handle: DescriptorHandle,
@@ -157,6 +173,10 @@ impl Rnvpc {
         }
         let metrics_started = batch_metrics::now();
         let keys: Vec<_> = pages.iter().map(|(_, key, _)| *key).collect();
+        let was_unmapped = keys
+            .iter()
+            .map(|key| self.redirects.lookup(*key).is_none())
+            .collect::<Vec<_>>();
         let mut prepared = Vec::new();
         prepared
             .try_reserve_exact(pages.len())
@@ -256,8 +276,46 @@ impl Rnvpc {
             record.version = handle.logical_version;
             self.account_unpin();
         }
+        let mut new_entries = Vec::new();
+        let mut range_start = 0usize;
+        while range_start < prepared.len() {
+            if !was_unmapped[range_start] {
+                range_start += 1;
+                continue;
+            }
+            let mut range_end = range_start + 1;
+            while range_end < prepared.len()
+                && was_unmapped[range_end]
+                && range_end - range_start < 128
+                && prepared[range_end].1.fs_id == prepared[range_end - 1].1.fs_id
+                && prepared[range_end].1.inode == prepared[range_end - 1].1.inode
+                && prepared[range_end - 1].1.page_index.checked_add(1)
+                    == Some(prepared[range_end].1.page_index)
+                && prepared[range_end - 1].0.index().checked_add(1)
+                    == Some(prepared[range_end].0.index())
+                && prepared[range_end - 1].2.checked_add(1) == Some(prepared[range_end].2)
+            {
+                range_end += 1;
+            }
+            let (head_page, head_key, head_ssd, _) = prepared[range_start];
+            let record = NvRedirectExtentRecord::new(
+                head_key.fs_id,
+                head_key.inode,
+                head_key.page_index,
+                u16::try_from(range_end - range_start).map_err(|_| Error::new(Errno::EOVERFLOW))?,
+                head_page.index() as u64,
+                head_ssd,
+                NvRedirectAuthority::NvAuthoritative,
+            )?;
+            self.persist.publish_redirect_extent(&record, None)?;
+            new_entries.push(Arc::new(DirtyNvExtentEntry::new(record)?));
+            range_start = range_end;
+        }
         self.redirects
             .commit_reserved(&reservation, &redirect_updates)?;
+        for entry in new_entries {
+            self.redirects.publish_dirty_entry(entry)?;
+        }
 
         let mut legacy = self.state.lock();
         for (page, key, ssd_target, handle) in &prepared {

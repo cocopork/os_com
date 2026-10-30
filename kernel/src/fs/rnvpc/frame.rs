@@ -23,7 +23,9 @@ use super::{
     capacity::{CapacityState, PoolClass, RnvpcStats},
     config::RnvpcConfig,
     data_page::DataPageState,
-    descriptor::{NvDescriptor, NvObjectKind, NvObjectState},
+    descriptor::{
+        NvDescriptor, NvObjectKind, NvObjectState, NvRedirectAuthority, NvRedirectExtentRecord,
+    },
     extent_target::ExtentTarget,
     fault::{FaultPoint, inject},
     id::{NvFrameId, NvPageId},
@@ -41,7 +43,8 @@ use super::{
     persist::PersistEngine,
     recover,
     redirect_index::{
-        DescriptorHandle, MigrationConflict, MigrationExtentLease, RedirectDirectory,
+        DescriptorHandle, DirtyNvExtentEntry, MigrationConflict, MigrationExtentLease,
+        NvExtentEntryLease, RedirectDirectory,
     },
 };
 use crate::{
@@ -1493,7 +1496,9 @@ impl Rnvpc {
             // Keep a large write physically contiguous whenever the free space
             // contains a suitable run. The reservation remains authoritative:
             // callers still coalesce the slots they actually receive.
-            let selected = if pages == 1 {
+            let selected = if pages == 0 {
+                Vec::new()
+            } else if pages == 1 {
                 vec![allocation.free_ids.pop().unwrap()]
             } else {
                 allocation.free_ids.sort_unstable();
