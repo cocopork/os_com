@@ -44,7 +44,7 @@ use super::{
     recover,
     redirect_index::{
         DescriptorHandle, DirtyNvExtentEntry, MigrationConflict, MigrationExtentLease,
-        NvExtentEntryLease, RedirectDirectory,
+        NvExtentEntryLease, NvExtentReadGuard, RedirectDirectory,
     },
 };
 use crate::{
@@ -853,7 +853,27 @@ impl Rnvpc {
             wal_data,
             mut data,
             max_allocation_seq,
+            redirect_extents,
         } = recovered;
+        for record in &redirect_extents {
+            match record.authority()? {
+                NvRedirectAuthority::NvAuthoritative => {}
+                NvRedirectAuthority::SsdAuthoritativePendingFree => {
+                    if record.logical_range()?.any(|logical| {
+                        data.selected.contains_key(&PageKey::new(
+                            record.fs_id(),
+                            record.inode(),
+                            logical,
+                        ))
+                    }) {
+                        return_errno_with_message!(
+                            Errno::EUCLEAN,
+                            "pending-free redirect has another selected data owner"
+                        );
+                    }
+                }
+            }
+        }
         let obsolete_data = data.obsolete;
         let mut normalized = Vec::new();
         for entry in data.selected.values_mut() {
@@ -892,6 +912,13 @@ impl Rnvpc {
                 })
                 .collect::<Result<Vec<_>>>()?,
         )?;
+        for record in redirect_extents
+            .iter()
+            .filter(|record| record.authority().ok() == Some(NvRedirectAuthority::NvAuthoritative))
+        {
+            pool.redirects
+                .publish_dirty_entry(Arc::new(DirtyNvExtentEntry::new(*record)?))?;
+        }
         metadata.extend(wal_data);
         metadata.extend(data.selected.into_values());
         {
@@ -962,6 +989,13 @@ impl Rnvpc {
         for obsolete in obsolete_data.chunks(128) {
             let slots: Vec<_> = obsolete.iter().map(|entry| entry.index).collect();
             persist.clear_frames(&slots, None)?;
+        }
+        for record in redirect_extents.iter().filter(|record| {
+            record.authority().ok() == Some(NvRedirectAuthority::SsdAuthoritativePendingFree)
+        }) {
+            let head = usize::try_from(record.nv_slot_start())
+                .map_err(|_| Error::new(Errno::EOVERFLOW))?;
+            persist.clear_frame(head, None)?;
         }
         pool.persist = persist;
         let pool = Arc::new(pool);
@@ -2660,7 +2694,19 @@ impl Rnvpc {
     ) -> Result<u64> {
         let slot = reference.slot().ok_or_else(|| Error::new(Errno::EINVAL))?;
         let slot = usize::try_from(slot).map_err(|_| Error::new(Errno::EINVAL))?;
-        self.validate_persistent_data_ref(reference)?;
+        let key = self.validate_persistent_data_ref(reference)?;
+        if let Some(entry) = self.lookup_dirty_nv_entry(key) {
+            let offset = key
+                .page_index
+                .checked_sub(entry.logical_start())
+                .filter(|offset| *offset < u64::from(entry.page_count()))
+                .ok_or_else(|| Error::new(Errno::EUCLEAN))?;
+            return entry
+                .ssd_block_range()
+                .start
+                .checked_add(offset)
+                .ok_or_else(|| Error::new(Errno::EOVERFLOW));
+        }
         self.persist
             .read_entry(slot)?
             .filter(|descriptor| descriptor.allocation_seq() == reference.allocation_seq())

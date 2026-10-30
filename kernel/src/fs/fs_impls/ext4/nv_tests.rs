@@ -21,15 +21,15 @@ fn ext4_research_routes() {
         nv_route_rnvpce_rejects_unrecovered_journal,
         nv_route_rnvpce_reservation_abort_wakes_writer,
         nv_route_rnvpce_reclaim_ready_queue_contract,
-        nv_route_rnvpce_completion_publishes_reclaim_ticket,
+        nv_route_rnvpce_completion_publishes_reclaim_work_item,
         nv_route_rnvpce_first_write_publishes_ssd_baseline,
-        nv_route_rnvpce_foreground_allocation_waits_for_group,
+        nv_route_rnvpce_foreground_allocation_is_independent_of_completion,
         nv_route_rnvpce_batch_allocation_durability,
         nv_route_rnvpce_recovers_unflushed_target_bitmap,
         nv_route_rnvpce_recovery_prefers_nv_allocation_bitmap,
         nv_route_rnvpce_sync_transfers_allocation_authority_to_ssd,
         nv_route_rnvpce_fragmented_batch_and_partial_rollback,
-        nv_route_rnvpce_same_group_migration_defers_until_completion,
+        nv_route_rnvpce_same_group_entries_submit_independently,
         nv_route_rnvpce_empty_round_skips_target_preparation,
         nv_route_rnvpce_round_budget_is_independent_of_global_in_flight,
         nv_route_rnvpce_capacity_wait_releases_inode_lock,
@@ -112,7 +112,7 @@ fn nv_route_rnvpce_first_write_publishes_ssd_baseline() {
     );
 }
 
-fn nv_route_rnvpce_foreground_allocation_waits_for_group() {
+fn nv_route_rnvpce_foreground_allocation_is_independent_of_completion() {
     use core::sync::atomic::{AtomicUsize, Ordering};
 
     crate::fs::rnvpc::init_for_ext4_tests();
@@ -160,13 +160,16 @@ fn nv_route_rnvpce_foreground_allocation_waits_for_group() {
     while state.load(Ordering::Acquire) == 0 {
         crate::thread::Thread::yield_now();
     }
-    for _ in 0..32 {
+    for _ in 0..256 {
+        if state.load(Ordering::Acquire) != 1 {
+            break;
+        }
         crate::thread::Thread::yield_now();
     }
     assert_eq!(
         state.load(Ordering::Acquire),
-        1,
-        "a busy allocation group must make the first write wait outside inode state"
+        2,
+        "entry migration must not hold an allocation-group lease needed by another writer"
     );
 
     drop(completion);
@@ -179,7 +182,7 @@ fn nv_route_rnvpce_reclaim_ready_queue_contract() {
     super::migration::assert_reclaim_queue_contract();
 }
 
-fn nv_route_rnvpce_completion_publishes_reclaim_ticket() {
+fn nv_route_rnvpce_completion_publishes_reclaim_work_item() {
     crate::fs::rnvpc::init_for_ext4_tests();
     crate::time::clocks::init_for_ktest();
     let fixture = Ext4FixtureBuilder::new(2048, 256, 2048)
@@ -225,8 +228,8 @@ fn nv_route_rnvpce_completion_publishes_reclaim_ticket() {
     assert_eq!(fixture.ext4.help_nv_reclaim(4).unwrap(), 4);
     assert_eq!(
         pool.baseline_validation_calls_for_test(),
-        1,
-        "one migration extent must validate its shared baseline token once"
+        0,
+        "entry reclaim must not validate a per-page or shared baseline token"
     );
     assert_eq!(
         fixture
@@ -250,7 +253,7 @@ fn nv_route_rnvpce_completion_publishes_reclaim_ticket() {
     }
 }
 
-fn nv_route_rnvpce_same_group_migration_defers_until_completion() {
+fn nv_route_rnvpce_same_group_entries_submit_independently() {
     crate::fs::rnvpc::init_for_ext4_tests();
     crate::time::clocks::init_for_ktest();
     let fixture = Ext4FixtureBuilder::new(2048, 256, 2048)
@@ -282,28 +285,17 @@ fn nv_route_rnvpce_same_group_migration_defers_until_completion() {
 
     assert_eq!(fixture.ext4.migrate_nv_round(1).unwrap(), 1);
     let pool = crate::fs::rnvpc::pool().unwrap();
-    for inode in [11, 12] {
-        let handle = pool
-            .redirect_lookup(crate::fs::rnvpc::index::PageKey::new(
-                fixture.ext4.rnvpc_fs_id(),
-                inode,
-                0,
-            ))
-            .unwrap();
-        assert_eq!(
-            handle.state,
-            crate::fs::rnvpc::descriptor::NvObjectState::NvDirty
-        );
-        assert_eq!(
-            pool.persisted_redirect_state_for_test(handle).unwrap(),
-            crate::fs::rnvpc::descriptor::NvObjectState::NvDirty
-        );
-    }
-    assert_eq!(
-        fixture.ext4.migrate_nv_round(1).unwrap_err().error(),
-        Errno::EAGAIN
-    );
-    fixture.ext4.drain_nv_in_flight().unwrap();
+    let states = [11, 12].map(|inode| {
+        pool.lookup_dirty_nv_entry(crate::fs::rnvpc::index::PageKey::new(
+            fixture.ext4.rnvpc_fs_id(),
+            inode,
+            0,
+        ))
+        .unwrap()
+        .state()
+    });
+    assert!(states.contains(&crate::fs::rnvpc::redirect_index::NvExtentEntryState::Migrating));
+    assert!(states.contains(&crate::fs::rnvpc::redirect_index::NvExtentEntryState::Dirty));
     assert_eq!(fixture.ext4.migrate_nv_round(1).unwrap(), 1);
     fixture.ext4.drain_nv_in_flight().unwrap();
 }
@@ -468,8 +460,8 @@ fn nv_route_rnvpce_redirect_completion_avoids_leaf() {
     assert_eq!(event_count(Event::RedirectPublishedPages), 4);
     assert_eq!(event_count(Event::CandidateRanges), 1);
     assert_eq!(event_count(Event::CandidatePages), 4);
-    assert_eq!(event_count(Event::CompletionComparisons), 4);
-    assert_eq!(event_count(Event::DescriptorClearBatches), 1);
+    assert_eq!(event_count(Event::CompletionComparisons), 0);
+    assert_eq!(event_count(Event::DescriptorClearBatches), 0);
     assert_eq!(event_count(Event::ReclaimedPages), 4);
     assert_eq!(event_count(Event::ReclaimedSlotRanges), 1);
     assert_eq!(event_count(Event::StructuralBaselineMutations), 0);
@@ -884,6 +876,16 @@ fn nv_route_rnvpc_wal_and_native_paths_remain_distinct() {
     assert!(VfsInode::page_cache(inode.as_ref()).is_some());
     assert!(crate::fs::rnvpc::existing_cow_context(native.ext4.rnvpc_fs_id(), 11).is_none());
     inode.resize(0).unwrap();
+}
+
+#[ktest]
+fn rnvpc_capacity_pressure_waits_for_rtio_reclaim() {
+    assert!(super::inode::is_nv_capacity_pressure(&Error::new(
+        Errno::EAGAIN
+    )));
+    assert!(!super::inode::is_nv_capacity_pressure(&Error::new(
+        Errno::EIO
+    )));
 }
 
 fn nv_route_busy_lease_read_and_partial_write_retry() {

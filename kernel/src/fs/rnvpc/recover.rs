@@ -7,7 +7,7 @@ use super::id::NvPageId;
 use super::{
     allocation_metadata::{AllocationGroupDirectoryRecord, AllocationMetadataCache},
     capacity::PoolClass,
-    descriptor::{NvObjectKind, NvObjectState},
+    descriptor::{NvObjectKind, NvObjectState, NvRedirectAuthority, NvRedirectExtentRecord},
     extent_mutation::ExtentMutation,
     frame::{FIXED_INODE_LOGICAL_INDEX, Rnvpc},
     id::NvFrameId,
@@ -103,6 +103,7 @@ pub(super) struct RecoveredScan {
     pub(super) wal_data: Vec<RecoveredEntry>,
     pub(super) data: RecoveredDataSet,
     pub(super) max_allocation_seq: u64,
+    pub(super) redirect_extents: Vec<NvRedirectExtentRecord>,
 }
 
 pub(super) fn select_data_versions(entries: Vec<RecoveredEntry>) -> Result<RecoveredDataSet> {
@@ -133,17 +134,54 @@ pub(super) fn select_data_versions(entries: Vec<RecoveredEntry>) -> Result<Recov
 
 pub(super) fn scan(engine: &PersistEngine, capacity_pages: usize) -> Result<RecoveredScan> {
     engine.read_header()?;
+    let mut redirect_extents = Vec::new();
+    let mut redirect_slots = BTreeSet::new();
+    let mut redirect_keys = BTreeSet::new();
+    let mut pending_free_slots = BTreeSet::new();
+    for index in 0..capacity_pages {
+        let Some(record) = engine.read_redirect_extent(index)? else {
+            continue;
+        };
+        if record.nv_slot_start() != index as u64 {
+            return_errno_with_message!(Errno::EUCLEAN, "redirect extent is not stored at its head");
+        }
+        for slot in record.nv_slot_range()? {
+            if !redirect_slots.insert(slot) {
+                return_errno_with_message!(Errno::EUCLEAN, "redirect extents overlap NV slots");
+            }
+            if record.authority()? == NvRedirectAuthority::SsdAuthoritativePendingFree {
+                pending_free_slots.insert(slot);
+            }
+        }
+        for logical in record.logical_range()? {
+            if !redirect_keys.insert((record.fs_id(), record.inode(), logical)) {
+                return_errno_with_message!(
+                    Errno::EUCLEAN,
+                    "redirect extents overlap logical pages"
+                );
+            }
+        }
+        redirect_extents.push(record);
+    }
     let mut metadata_identities = BTreeSet::new();
     let mut fixed_roots = BTreeSet::new();
     let mut metadata_entries = Vec::new();
     let mut data_entries = Vec::new();
     let mut max_allocation_seq = 0;
     for index in 0..capacity_pages {
+        // A v8 rNVPCe range owns every slot in the range through its head
+        // selector. None of those slots carries a per-page descriptor.
+        if redirect_slots.contains(&(index as u64)) {
+            continue;
+        }
         // 自描述：只靠条目自己的描述符就能知道“这页是谁、数据在哪”，
         // 不需要预建“SSD block → NV object”的全局映射。
         let Some(descriptor) = engine.read_entry(index)? else {
             continue;
         };
+        if pending_free_slots.contains(&(index as u64)) {
+            continue;
+        }
         let class = match descriptor.kind()? {
             NvObjectKind::NvPage => PoolClass::Data,
             NvObjectKind::Nvbh => PoolClass::Metadata,
@@ -190,11 +228,37 @@ pub(super) fn scan(engine: &PersistEngine, capacity_pages: usize) -> Result<Reco
             rnvpce_data.push(entry);
         }
     }
+    for record in redirect_extents
+        .iter()
+        .filter(|record| record.authority().ok() == Some(NvRedirectAuthority::NvAuthoritative))
+    {
+        for offset in 0..u64::from(record.page_count()) {
+            max_allocation_seq = max_allocation_seq
+                .checked_add(1)
+                .ok_or_else(|| Error::new(Errno::EOVERFLOW))?;
+            rnvpce_data.push(RecoveredEntry {
+                index: usize::try_from(record.nv_slot_start() + offset)
+                    .map_err(|_| Error::new(Errno::EOVERFLOW))?,
+                class: PoolClass::Data,
+                key: PageKey::new(
+                    record.fs_id(),
+                    record.inode(),
+                    record.logical_start() + offset,
+                ),
+                version: 1,
+                allocation_seq: max_allocation_seq,
+                ssd_backing_block: record.ssd_block_start() + offset,
+                state: NvObjectState::NvDirty,
+                migration_target: false,
+            });
+        }
+    }
     Ok(RecoveredScan {
         metadata: metadata_entries,
         wal_data,
         data: select_data_versions(rnvpce_data)?,
         max_allocation_seq,
+        redirect_extents,
     })
 }
 

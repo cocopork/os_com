@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MPL-2.0
 
 //! Two-worker, bounded asynchronous NV migration. BIO callbacks enqueue only;
-//! process-context completion owns durability and publishes reclaim tickets;
+//! process-context completion owns durability and publishes reclaim work items;
 //! foreground or background helpers own SSD publication and NVPage reclamation.
 use core::sync::atomic::{AtomicUsize, Ordering};
 
@@ -15,7 +15,7 @@ use crate::fs::rnvpc::{
     batch_metrics::{self, Event, Phase},
     frame::{ClaimedDirtyExtent, EvictingDataPage},
     metadata::PersistentObjectRef,
-    redirect_index::DescriptorHandle,
+    redirect_index::{DescriptorHandle, NvExtentEntryLease},
     write_transaction::SsdBaselineExtent,
 };
 
@@ -32,7 +32,7 @@ pub(super) struct CompletionJob {
     status: BioStatus,
     pages: Vec<PendingPage>,
 }
-pub(super) type ReclaimQueue = Arc<ReclaimReadyQueue<ReclaimTicket>>;
+pub(super) type ReclaimQueue = Arc<ReclaimReadyQueue<ReclaimWorkItem>>;
 
 pub(super) fn reclaim_queue() -> ReclaimQueue {
     Arc::new(ReclaimReadyQueue::new())
@@ -43,26 +43,26 @@ pub(super) fn assert_reclaim_queue_contract() {
     reclaim::assert_queue_contract();
 }
 
-pub(super) struct ReclaimTicket {
-    pages: Vec<PendingPage>,
+pub(super) struct ReclaimWorkItem {
+    entry: NvExtentEntryLease,
     batch: Arc<ReclaimBatch>,
     ready_at_ns: u64,
 }
 
 struct ReclaimBatch {
-    remaining_tickets: AtomicUsize,
+    remaining_work_items: AtomicUsize,
 }
 
 impl ReclaimBatch {
-    fn new(tickets: usize) -> Arc<Self> {
-        debug_assert!(tickets != 0);
+    fn new(work_items: usize) -> Arc<Self> {
+        debug_assert!(work_items != 0);
         Arc::new(Self {
-            remaining_tickets: AtomicUsize::new(tickets),
+            remaining_work_items: AtomicUsize::new(work_items),
         })
     }
 
-    fn complete_ticket(&self, fs: &Ext4) {
-        if self.remaining_tickets.fetch_sub(1, Ordering::AcqRel) == 1 {
+    fn complete_work_item(&self, fs: &Ext4) {
+        if self.remaining_work_items.fetch_sub(1, Ordering::AcqRel) == 1 {
             fs.request_nv_migration();
         }
     }
@@ -249,42 +249,44 @@ impl Ext4 {
             }
         })
         .spawn();
-        let weak = Arc::downgrade(self);
-        let trigger = self.nv_allocation_pager_trigger.clone();
-        crate::thread::kernel_thread::ThreadOptions::new(move || {
-            loop {
-                let Some(fs) = weak.upgrade() else {
-                    break;
-                };
-                if fs.is_shutdown() || fs.nv_migration_failed.load(Ordering::Acquire) {
-                    break;
-                }
-                let observed = fs.nv_allocation_pager_epoch.load(Ordering::Acquire);
-                match fs.writeback_one_allocation_group() {
-                    Ok(true) => continue,
-                    Ok(false) => {}
-                    Err(error) => {
-                        error!("allocation metadata pager failed: {error:?}");
-                        fs.fail_nv_migration();
+        if self.allocation_metadata_pager_enabled() {
+            let weak = Arc::downgrade(self);
+            let trigger = self.nv_allocation_pager_trigger.clone();
+            crate::thread::kernel_thread::ThreadOptions::new(move || {
+                loop {
+                    let Some(fs) = weak.upgrade() else {
+                        break;
+                    };
+                    if fs.is_shutdown() || fs.nv_migration_failed.load(Ordering::Acquire) {
                         break;
                     }
+                    let observed = fs.nv_allocation_pager_epoch.load(Ordering::Acquire);
+                    match fs.writeback_one_allocation_group() {
+                        Ok(true) => continue,
+                        Ok(false) => {}
+                        Err(error) => {
+                            error!("allocation metadata pager failed: {error:?}");
+                            fs.fail_nv_migration();
+                            break;
+                        }
+                    }
+                    drop(fs);
+                    let _ = trigger.wait_until_or_timeout(
+                        || {
+                            weak.upgrade()
+                                .is_none_or(|fs| {
+                                    fs.is_shutdown()
+                                        || fs.nv_allocation_pager_epoch.load(Ordering::Acquire)
+                                            != observed
+                                })
+                                .then_some(())
+                        },
+                        &Duration::from_millis(100),
+                    );
                 }
-                drop(fs);
-                let _ = trigger.wait_until_or_timeout(
-                    || {
-                        weak.upgrade()
-                            .is_none_or(|fs| {
-                                fs.is_shutdown()
-                                    || fs.nv_allocation_pager_epoch.load(Ordering::Acquire)
-                                        != observed
-                            })
-                            .then_some(())
-                    },
-                    &Duration::from_millis(100),
-                );
-            }
-        })
-        .spawn();
+            })
+            .spawn();
+        }
     }
 
     pub(super) fn request_allocation_writeback(&self) {
@@ -418,35 +420,15 @@ impl Ext4 {
         };
         let candidate_started = pp::now();
         let mut pages = Vec::new();
+        let mut nv_entries = Vec::new();
         if self.rnvpc_extend_enabled() {
-            for lease in pool.claim_ready_dirty_extents(self.rnvpc_fs_id(), budget)? {
-                let claimed = match pool.claim_dirty_extent(lease) {
-                    Ok(claimed) => Arc::new(claimed),
-                    Err(error)
-                        if error.error() == Errno::EBUSY || error.error() == Errno::ESTALE =>
-                    {
-                        continue;
-                    }
-                    Err(error) => return Err(error),
-                };
+            nv_entries = pool.claim_ready_nv_entries(self.rnvpc_fs_id(), budget)?;
+            for lease in &nv_entries {
                 batch_metrics::count(Event::CandidateRanges, 1);
-                batch_metrics::count(Event::CandidatePages, claimed.pages().len());
-                for (offset, handle) in claimed.pages().iter().copied().enumerate() {
-                    pages.push(PendingPage {
-                        inode: claimed.inode(),
-                        index: claimed.logical_start() + offset as u64,
-                        page: claimed.page_id(offset)?,
-                        generation: handle.reference.allocation_seq(),
-                        target: handle.ssd_target,
-                        reference: Some(handle.reference),
-                        needs_baseline: handle.ssd_target == 0 || handle.migration_target,
-                        redirect: Some((handle, claimed.baseline_token.clone())),
-                        lease: MigrationLease::Redirect {
-                            extent: claimed.clone(),
-                            offset,
-                        },
-                    });
-                }
+                batch_metrics::count(
+                    Event::CandidatePages,
+                    usize::from(lease.entry().page_count()),
+                );
             }
         } else {
             for (inode, index, page, target, generation, seq) in
@@ -470,78 +452,80 @@ impl Ext4 {
                 }
             }
         }
-        pp::NV_CANDIDATE_SELECT.record_since(candidate_started, pages.len());
-        if pages.is_empty() {
+        let selected_pages = if self.rnvpc_extend_enabled() {
+            nv_entries
+                .iter()
+                .map(|lease| usize::from(lease.entry().page_count()))
+                .sum()
+        } else {
+            pages.len()
+        };
+        pp::NV_CANDIDATE_SELECT.record_since(candidate_started, selected_pages);
+        if selected_pages == 0 {
             return Ok(0);
         }
         let target_started = pp::now();
-        let migration_leases = if self.rnvpc_extend_enabled() {
-            match self.prepare_nv_targets(&mut pages) {
-                Ok(leases) => leases,
-                Err(error) if error.error() == Errno::EBUSY => {
-                    let pool = rnvpc::pool().ok_or_else(|| Error::new(Errno::EINVAL))?;
-                    self.restore_failed_migration_jobs(
-                        pool,
-                        vec![CompletionJob {
-                            status: BioStatus::IoError,
-                            pages,
-                        }],
-                    );
-                    return_errno_with_message!(
-                        Errno::EAGAIN,
-                        "allocation group migration is deferred"
-                    );
-                }
-                Err(error) => {
-                    let pool = rnvpc::pool().ok_or_else(|| Error::new(Errno::EINVAL))?;
-                    self.restore_failed_migration_jobs(
-                        pool,
-                        vec![CompletionJob {
-                            status: BioStatus::IoError,
-                            pages,
-                        }],
-                    );
-                    return Err(error);
-                }
-            }
-        } else {
-            Vec::new()
-        };
-        pp::NV_TARGET_PREPARE.record_since(target_started, pages.len());
-        let submitted = pages.len();
+        let migration_leases = Vec::new();
+        pp::NV_TARGET_PREPARE.record_since(target_started, selected_pages);
+        let submitted = selected_pages;
         if submitted == 0 {
             debug_assert!(migration_leases.is_empty());
             return Ok(0);
         }
         let data_submit_started = pp::now();
-        pages.sort_by_key(|page| page.target);
         let max_segments = self
             .block_device()
             .metadata()
             .max_nr_segments_per_bio
             .max(1);
-        let mut pending = pages.into_iter().peekable();
         let mut submissions = Vec::new();
-        while let Some(first) = pending.next() {
-            let target = first.target;
-            let mut run = vec![first];
-            while run.len() < max_segments
-                && pending
-                    .peek()
-                    .is_some_and(|next| next.target == target + run.len() as u64)
-            {
-                run.push(pending.next().unwrap());
+        if self.rnvpc_extend_enabled() {
+            for lease in &nv_entries {
+                let entry = lease.entry();
+                let page_count = usize::from(entry.page_count());
+                let mut offset = 0usize;
+                while offset < page_count {
+                    let chunk = (page_count - offset).min(max_segments);
+                    let target = entry
+                        .ssd_block_range()
+                        .start
+                        .checked_add(offset as u64)
+                        .ok_or_else(|| Error::new(Errno::EOVERFLOW))?;
+                    let mut segments = Vec::with_capacity(chunk);
+                    for page_offset in offset..offset + chunk {
+                        segments.push(BioSegment::new_from_segment(
+                            pool.data_segment_for_migration(lease, page_offset)?,
+                            BioDirection::ToDevice,
+                        ));
+                    }
+                    submissions.push((target, segments, Vec::new()));
+                    offset += chunk;
+                }
             }
-            let mut segments = Vec::with_capacity(run.len());
-            for page in &run {
-                segments.push(BioSegment::new_from_segment(
-                    page.lease.dma_segment()?,
-                    BioDirection::ToDevice,
-                ));
+        } else {
+            pages.sort_by_key(|page| page.target);
+            let mut pending = pages.into_iter().peekable();
+            while let Some(first) = pending.next() {
+                let target = first.target;
+                let mut run = vec![first];
+                while run.len() < max_segments
+                    && pending
+                        .peek()
+                        .is_some_and(|next| next.target == target + run.len() as u64)
+                {
+                    run.push(pending.next().unwrap());
+                }
+                let mut segments = Vec::with_capacity(run.len());
+                for page in &run {
+                    segments.push(BioSegment::new_from_segment(
+                        page.lease.dma_segment()?,
+                        BioDirection::ToDevice,
+                    ));
+                }
+                submissions.push((target, segments, run));
             }
-            submissions.push((target, segments, run));
         }
-        let batch = MigrationBatch::new(submissions.len(), submitted, migration_leases);
+        let batch = MigrationBatch::new(submissions.len(), submitted, migration_leases, nv_entries);
         self.nv_in_flight.fetch_add(submitted, Ordering::AcqRel);
         let mut submit_error = None;
         for (target, segments, run) in submissions {
@@ -917,6 +901,34 @@ impl Ext4 {
         }
         pp::NV_DEVICE_FLUSH.record_since(device_flush_started, page_count);
         batch_metrics::elapsed(Phase::DataBarrier, started);
+        if self.rnvpc_extend_enabled() {
+            let entries = batch.take_nv_entry_leases();
+            if entries.is_empty() {
+                return_errno_with_message!(Errno::EUCLEAN, "rNVPCe completion lost entry leases");
+            }
+            drop(batch.take_migration_leases());
+            let reclaim_batch = ReclaimBatch::new(entries.len());
+            for entry in entries {
+                let entry_pages = usize::from(entry.entry().page_count());
+                pool.complete_nv_entry(&entry)?;
+                self.nv_reclaim_pending
+                    .fetch_add(entry_pages, Ordering::AcqRel);
+                self.nv_reclaim_queue.publish(
+                    ReclaimWorkItem {
+                        entry,
+                        batch: reclaim_batch.clone(),
+                        ready_at_ns: pp::now(),
+                    },
+                    entry_pages,
+                );
+                if self.nv_capacity_waiters.load(Ordering::Acquire) <= 1 {
+                    self.nv_reclaim_trigger.wake_one();
+                }
+                pool.wake_one_data_capacity_waiter();
+            }
+            pp::NV_COMPLETION_TOTAL.record_since(completion_started, page_count);
+            return Ok(true);
+        }
         let mut groups: BTreeMap<(u64, u64, u64), Vec<PendingPage>> = BTreeMap::new();
         let mut failure = None;
         for job in jobs {
@@ -929,43 +941,6 @@ impl Ext4 {
                     });
                 groups.entry(identity).or_default().push(page);
             }
-        }
-        if self.rnvpc_extend_enabled() {
-            if groups.is_empty() {
-                drop(batch.take_migration_leases());
-                pp::NV_COMPLETION_TOTAL.record_since(completion_started, page_count);
-                return Ok(false);
-            }
-            if groups
-                .values()
-                .any(|pages| pages.iter().any(|page| page.redirect.is_none()))
-            {
-                return_errno_with_message!(
-                    Errno::EUCLEAN,
-                    "rNVPCe migration reached a legacy extent candidate"
-                );
-            }
-            drop(batch.take_migration_leases());
-            let reclaim_batch = ReclaimBatch::new(groups.len());
-            for (_identity, pages) in groups {
-                let pages_count = pages.len();
-                self.nv_reclaim_pending
-                    .fetch_add(pages_count, Ordering::AcqRel);
-                self.nv_reclaim_queue.publish(
-                    ReclaimTicket {
-                        pages,
-                        batch: reclaim_batch.clone(),
-                        ready_at_ns: pp::now(),
-                    },
-                    pages_count,
-                );
-                if self.nv_capacity_waiters.load(Ordering::Acquire) <= 1 {
-                    self.nv_reclaim_trigger.wake_one();
-                }
-                pool.wake_one_data_capacity_waiter();
-            }
-            pp::NV_COMPLETION_TOTAL.record_since(completion_started, page_count);
-            return Ok(true);
         }
         for (_identity, pages) in groups {
             for page in pages {
@@ -1013,44 +988,47 @@ impl Ext4 {
     }
 
     pub(super) fn help_nv_reclaim(&self, budget: usize) -> Result<usize> {
-        let mut tickets = Vec::new();
+        let mut work_items = Vec::new();
         let mut page_total = 0usize;
         while page_total < budget {
-            let Some((ticket, pages_count)) = self.nv_reclaim_queue.claim() else {
+            let Some((work_item, pages_count)) = self.nv_reclaim_queue.claim() else {
                 break;
             };
-            let ReclaimTicket {
-                pages,
+            let ReclaimWorkItem {
+                entry,
                 batch,
                 ready_at_ns,
-            } = ticket;
+            } = work_item;
             pp::NV_RECLAIM_READY_WAIT.record_since(ready_at_ns, pages_count);
             page_total = page_total.saturating_add(pages_count);
-            tickets.push((pages, batch, pages_count));
+            work_items.push((entry, batch, pages_count));
         }
-        if tickets.is_empty() {
+        if work_items.is_empty() {
             return Ok(0);
         }
         let publish_started = pp::now();
-        let groups = tickets
-            .iter_mut()
-            .map(|(pages, _, _)| core::mem::take(pages))
-            .collect();
-        let result = self.finish_redirect_page_batches(
-            rnvpc::pool().ok_or_else(|| Error::new(Errno::EINVAL))?,
-            groups,
-        );
+        let pool = rnvpc::pool().ok_or_else(|| Error::new(Errno::EINVAL))?;
+        let mut result = Ok(());
+        for (entry, _, _) in &work_items {
+            if let Err(error) = pool.reclaim_nv_entry(entry) {
+                result = Err(error);
+                break;
+            }
+        }
         pp::NV_EXTENT_PUBLISH.record_since(publish_started, page_total);
         pp::NV_RECLAIM_HELP.record_since(publish_started, page_total);
-        for (_, batch, pages_count) in tickets {
+        let reclaimed_ranges = work_items.len();
+        for (_, batch, pages_count) in work_items {
             self.nv_reclaim_pending
                 .fetch_sub(pages_count, Ordering::AcqRel);
-            batch.complete_ticket(self);
+            batch.complete_work_item(self);
         }
         if let Err(error) = result {
             self.fail_nv_migration();
             return Err(error);
         }
+        batch_metrics::count(Event::ReclaimedPages, page_total);
+        batch_metrics::count(Event::ReclaimedSlotRanges, reclaimed_ranges);
         self.nv_reclaim_trigger.wake_all();
         Ok(page_total)
     }
@@ -1167,7 +1145,7 @@ impl Ext4 {
             {
                 return_errno_with_message!(
                     Errno::EUCLEAN,
-                    "reclaim ticket mixes migration extents"
+                    "reclaim work item mixes migration extents"
                 );
             }
             pages.sort_unstable_by_key(|page| page.index);

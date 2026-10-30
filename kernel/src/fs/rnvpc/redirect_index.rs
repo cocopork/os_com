@@ -56,6 +56,7 @@ pub(crate) struct DirtyNvExtentEntry {
     record: NvRedirectExtentRecord,
     state: AtomicU8,
     readers: AtomicUsize,
+    writers: AtomicUsize,
     waiters: WaitQueue,
 }
 
@@ -69,6 +70,7 @@ impl DirtyNvExtentEntry {
             record,
             state: AtomicU8::new(NvExtentEntryState::Dirty as u8),
             readers: AtomicUsize::new(0),
+            writers: AtomicUsize::new(0),
             waiters: WaitQueue::new(),
         })
     }
@@ -122,6 +124,116 @@ impl DirtyNvExtentEntry {
         self.waiters.wake_all();
         Ok(())
     }
+
+    pub(crate) fn try_read(self: &Arc<Self>) -> Result<NvExtentReadGuard> {
+        loop {
+            let state = self.state();
+            if !matches!(
+                state,
+                NvExtentEntryState::Dirty
+                    | NvExtentEntryState::Migrating
+                    | NvExtentEntryState::IoComplete
+            ) {
+                return_errno_with_message!(Errno::ESTALE, "NV extent entry is reclaiming");
+            }
+            self.readers.fetch_add(1, Ordering::AcqRel);
+            if matches!(
+                self.state(),
+                NvExtentEntryState::Dirty
+                    | NvExtentEntryState::Migrating
+                    | NvExtentEntryState::IoComplete
+            ) {
+                return Ok(NvExtentReadGuard {
+                    entry: self.clone(),
+                });
+            }
+            if self.readers.fetch_sub(1, Ordering::AcqRel) == 1 {
+                self.waiters.wake_all();
+            }
+        }
+    }
+
+    pub(crate) fn try_write(self: &Arc<Self>) -> Result<NvExtentWriteGuard> {
+        if self.state() != NvExtentEntryState::Dirty {
+            return_errno_with_message!(Errno::EBUSY, "NV extent entry is migrating");
+        }
+        self.writers.fetch_add(1, Ordering::AcqRel);
+        if self.state() == NvExtentEntryState::Dirty {
+            return Ok(NvExtentWriteGuard {
+                entry: self.clone(),
+            });
+        }
+        if self.writers.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.waiters.wake_all();
+        }
+        return_errno_with_message!(Errno::EBUSY, "NV extent entry is migrating")
+    }
+
+    fn wait_for_writers(&self) {
+        let _ = self
+            .waiters
+            .wait_until(|| (self.writers.load(Ordering::Acquire) == 0).then_some(()));
+    }
+
+    fn begin_reclaim_and_wait_for_readers(&self) -> Result<()> {
+        self.transition(
+            NvExtentEntryState::IoComplete,
+            NvExtentEntryState::Reclaiming,
+        )?;
+        let _ = self
+            .waiters
+            .wait_until(|| (self.readers.load(Ordering::Acquire) == 0).then_some(()));
+        Ok(())
+    }
+
+    fn finish_reclaim(&self) -> Result<()> {
+        self.transition(
+            NvExtentEntryState::Reclaiming,
+            NvExtentEntryState::Reclaimed,
+        )
+    }
+}
+
+pub(crate) struct NvExtentReadGuard {
+    entry: Arc<DirtyNvExtentEntry>,
+}
+
+impl NvExtentReadGuard {
+    pub(crate) fn entry(&self) -> &Arc<DirtyNvExtentEntry> {
+        &self.entry
+    }
+
+    pub(crate) fn nv_slot(&self, logical_page: u64) -> Result<u64> {
+        let offset = logical_page
+            .checked_sub(self.entry.logical_start())
+            .filter(|offset| *offset < u64::from(self.entry.page_count()))
+            .ok_or_else(|| Error::new(Errno::EINVAL))?;
+        self.entry
+            .nv_slot_range()
+            .start
+            .checked_add(offset)
+            .ok_or_else(|| Error::new(Errno::EOVERFLOW))
+    }
+}
+
+impl Drop for NvExtentReadGuard {
+    fn drop(&mut self) {
+        if self.entry.readers.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.entry.waiters.wake_all();
+        }
+    }
+}
+
+pub(crate) struct NvExtentWriteGuard {
+    entry: Arc<DirtyNvExtentEntry>,
+}
+
+impl Drop for NvExtentWriteGuard {
+    fn drop(&mut self) {
+        if self.entry.writers.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.entry.waiters.wake_all();
+        }
+    }
 }
 
 pub(crate) struct NvExtentEntryLease {
@@ -131,6 +243,18 @@ pub(crate) struct NvExtentEntryLease {
 impl NvExtentEntryLease {
     pub(crate) fn entry(&self) -> &Arc<DirtyNvExtentEntry> {
         &self.entry
+    }
+
+    pub(crate) fn wait_for_writers(&self) {
+        self.entry.wait_for_writers();
+    }
+
+    pub(crate) fn begin_reclaim_and_wait_for_readers(&self) -> Result<()> {
+        self.entry.begin_reclaim_and_wait_for_readers()
+    }
+
+    pub(crate) fn finish_reclaim(&self) -> Result<()> {
+        self.entry.finish_reclaim()
     }
 }
 
@@ -482,6 +606,62 @@ impl RedirectDirectory {
             NvExtentEntryState::Migrating,
             NvExtentEntryState::IoComplete,
         )
+    }
+
+    pub(crate) fn remove_reclaimed_entry(&self, lease: &NvExtentEntryLease) -> Result<()> {
+        let entry = lease.entry();
+        if entry.state() != NvExtentEntryState::Reclaiming {
+            return_errno_with_message!(Errno::ESTALE, "NV extent entry is not reclaiming");
+        }
+        let keys = entry
+            .logical_range()
+            .map(|page| PageKey::new(entry.fs_id(), entry.inode(), page))
+            .collect::<Vec<_>>();
+        let partition_ids = self.partitions_for(&keys);
+        let owner_partition = self.partition_index(keys[0]);
+        let mut guards = Vec::new();
+        for partition in partition_ids {
+            guards.push((partition, self.partitions[partition].lock()));
+        }
+        for key in &keys {
+            let state = &mut guards
+                .iter_mut()
+                .find(|(partition, _)| *partition == self.partition_index(*key))
+                .expect("entry member partition is locked")
+                .1;
+            if !state
+                .dirty_entry_members
+                .get(key)
+                .is_some_and(|candidate| Arc::ptr_eq(candidate, entry))
+            {
+                return_errno_with_message!(Errno::ESTALE, "NV extent entry membership changed");
+            }
+        }
+        for key in &keys {
+            let state = &mut guards
+                .iter_mut()
+                .find(|(partition, _)| *partition == self.partition_index(*key))
+                .expect("entry member partition is locked")
+                .1;
+            state.dirty_entry_members.remove(key);
+            state.committed.remove(key);
+            state.dirty.remove(key);
+            state.ready_set.remove(key);
+        }
+        let owner = &mut guards
+            .iter_mut()
+            .find(|(partition, _)| *partition == owner_partition)
+            .expect("entry owner partition is locked")
+            .1;
+        if !owner
+            .owned_dirty_entries
+            .get(&keys[0])
+            .is_some_and(|candidate| Arc::ptr_eq(candidate, entry))
+        {
+            return_errno_with_message!(Errno::ESTALE, "NV extent entry owner changed");
+        }
+        owner.owned_dirty_entries.remove(&keys[0]);
+        Ok(())
     }
 
     pub(crate) fn reserve_versions(&self, keys: &[PageKey]) -> Result<PendingRedirectBatch> {

@@ -16,12 +16,179 @@ impl Rnvpc {
         self.persist.read_redirect_extent(head_slot)
     }
 
+    #[cfg(ktest)]
+    pub(crate) fn persistent_slot_is_selected_for_test(&self, slot: usize) -> Result<bool> {
+        self.persist.slot_is_selected_for_test(slot)
+    }
+
+    #[cfg(ktest)]
+    pub(crate) fn mark_redirect_extent_pending_for_test(
+        &self,
+        entry: &DirtyNvExtentEntry,
+    ) -> Result<()> {
+        let pending = entry
+            .record()
+            .with_authority(NvRedirectAuthority::SsdAuthoritativePendingFree)?;
+        self.persist.publish_redirect_extent(&pending, None)
+    }
+
     pub(crate) fn claim_ready_nv_entries(
         &self,
         fs_id: u64,
         page_budget: usize,
     ) -> Result<Vec<NvExtentEntryLease>> {
-        self.redirects.claim_ready_entries(fs_id, page_budget)
+        let leases = self.redirects.claim_ready_entries(fs_id, page_budget)?;
+        for lease in &leases {
+            lease.wait_for_writers();
+        }
+        if !leases.is_empty() {
+            note_data_page_lease_change();
+        }
+        Ok(leases)
+    }
+
+    pub(crate) fn lookup_dirty_nv_entry(&self, key: PageKey) -> Option<Arc<DirtyNvExtentEntry>> {
+        self.redirects.lookup_dirty_entry(key)
+    }
+
+    pub(crate) fn data_segment_from_entry(
+        &self,
+        guard: &NvExtentReadGuard,
+        logical_page: u64,
+    ) -> Result<USegment> {
+        let slot = usize::try_from(guard.nv_slot(logical_page)?)
+            .map_err(|_| Error::new(Errno::EOVERFLOW))?;
+        self.backend.data_page_segment(NvPageId::try_from(slot)?)
+    }
+
+    pub(crate) fn copy_entry_to_writer(
+        &self,
+        guard: &NvExtentReadGuard,
+        logical_page: u64,
+        offset: usize,
+        writer: &mut VmWriter,
+        len: usize,
+    ) -> Result<usize> {
+        let slot = usize::try_from(guard.nv_slot(logical_page)?)
+            .map_err(|_| Error::new(Errno::EOVERFLOW))?;
+        self.backend
+            .copy_to_writer(NvPageId::try_from(slot)?, offset, writer, len)
+    }
+
+    pub(crate) fn complete_nv_entry(&self, lease: &NvExtentEntryLease) -> Result<()> {
+        self.redirects.complete_entry(lease)?;
+        note_data_page_lease_change();
+        Ok(())
+    }
+
+    pub(crate) fn data_segment_for_migration(
+        &self,
+        lease: &NvExtentEntryLease,
+        offset: usize,
+    ) -> Result<USegment> {
+        if offset >= usize::from(lease.entry().page_count()) {
+            return_errno!(Errno::EINVAL);
+        }
+        let slot = lease
+            .entry()
+            .nv_slot_range()
+            .start
+            .checked_add(offset as u64)
+            .and_then(|slot| usize::try_from(slot).ok())
+            .ok_or_else(|| Error::new(Errno::EOVERFLOW))?;
+        self.backend.data_page_segment(NvPageId::try_from(slot)?)
+    }
+
+    pub(crate) fn reclaim_nv_entry(&self, lease: &NvExtentEntryLease) -> Result<usize> {
+        lease.begin_reclaim_and_wait_for_readers()?;
+        let entry = lease.entry();
+        let pending = entry
+            .record()
+            .with_authority(NvRedirectAuthority::SsdAuthoritativePendingFree)?;
+        self.persist.publish_redirect_extent(&pending, None)?;
+
+        let slot_range = entry.nv_slot_range();
+        let slots = slot_range
+            .clone()
+            .map(|slot| usize::try_from(slot).map_err(|_| Error::new(Errno::EOVERFLOW)))
+            .collect::<Result<Vec<_>>>()?;
+        let mut prepared = Vec::with_capacity(slots.len());
+        for (offset, slot) in slots.iter().copied().enumerate() {
+            let expected = PageKey::new(
+                entry.fs_id(),
+                entry.inode(),
+                entry.logical_start() + offset as u64,
+            );
+            let mut objects = self.objects.lock_checked(slot)?;
+            let record = &objects.records[slot];
+            if !record.committed
+                || !matches!(record.kind, ObjectKind::Data(DataPageState::NvDirty))
+                || record.key != Some(expected)
+            {
+                drop(objects);
+                self.release_entry_reclaim_pins(&prepared);
+                return_errno_with_message!(Errno::ESTALE, "NV extent entry slot ownership changed");
+            }
+            if record.persisting || record.pins != 0 {
+                drop(objects);
+                self.release_entry_reclaim_pins(&prepared);
+                return_errno_with_message!(Errno::EBUSY, "NV extent entry slot is busy");
+            }
+            if let Err(error) = self.account_pin() {
+                drop(objects);
+                self.release_entry_reclaim_pins(&prepared);
+                return Err(error);
+            }
+            objects.records[slot].pins = 1;
+            objects.records[slot].persisting = true;
+            prepared.push(slot);
+        }
+        let head_slot = usize::try_from(entry.nv_slot_range().start)
+            .map_err(|_| Error::new(Errno::EOVERFLOW))?;
+        if let Err(error) = self.persist.clear_frame(head_slot, None) {
+            self.release_entry_reclaim_pins(&prepared);
+            return Err(error);
+        }
+        for (offset, slot) in slots.iter().copied().enumerate() {
+            let key = PageKey::new(
+                entry.fs_id(),
+                entry.inode(),
+                entry.logical_start() + offset as u64,
+            );
+            let mut objects = self.objects.lock(slot);
+            let record = &mut objects.records[slot];
+            record.kind = ObjectKind::Data(DataPageState::Synced);
+            record.pins = 0;
+            record.persisting = false;
+            record.committed = false;
+            record.key = None;
+            record.version = 0;
+            self.account_unpin();
+            drop(objects);
+            self.state.lock().index.remove(key);
+        }
+        note_data_page_lease_change();
+        self.redirects.remove_reclaimed_entry(lease)?;
+        let pages = slots
+            .into_iter()
+            .map(|slot| NvPageId::try_from(slot).map_err(|_| Error::new(Errno::EOVERFLOW)))
+            .collect::<Result<Vec<_>>>()?;
+        let reclaimed = pages.len();
+        self.free_data_pages(&pages)?;
+        lease.finish_reclaim()?;
+        Ok(reclaimed)
+    }
+
+    fn release_entry_reclaim_pins(&self, slots: &[usize]) {
+        for slot in slots {
+            let mut objects = self.objects.lock(*slot);
+            objects.records[*slot].pins = 0;
+            objects.records[*slot].persisting = false;
+            self.account_unpin();
+        }
+        if !slots.is_empty() {
+            note_data_page_lease_change();
+        }
     }
 
     #[cfg(ktest)]
@@ -226,57 +393,7 @@ impl Rnvpc {
             return Err(error);
         }
 
-        let mut updates = Vec::new();
-        if updates.try_reserve_exact(prepared.len()).is_err() {
-            self.release_redirect_publication_pins(&prepared);
-            self.redirects.abort_reserved(&reservation)?;
-            return_errno!(Errno::ENOMEM);
-        }
-        for (page, key, ssd_target, handle) in &prepared {
-            let descriptor = match self.descriptor_for(
-                PoolClass::Data,
-                *key,
-                handle.logical_version,
-                page.index(),
-                Some(*ssd_target),
-            ) {
-                Ok(descriptor) => descriptor,
-                Err(error) => {
-                    self.release_redirect_publication_pins(&prepared);
-                    self.redirects.abort_reserved(&reservation)?;
-                    return Err(error);
-                }
-            };
-            updates.push((page.index(), descriptor));
-        }
-        if let Err(error) = self.persist.commit_frames(&updates, fault) {
-            self.release_redirect_publication_pins(&prepared);
-            self.redirects.abort_reserved(&reservation)?;
-            if !self.persist.publication_uncertain() {
-                for (page, _, _, _) in &prepared {
-                    let _ = self.abort_data_page(*page);
-                }
-            }
-            return Err(error);
-        }
-        batch_metrics::count(batch_metrics::Event::RedirectPublishBatches, 1);
-        batch_metrics::count(batch_metrics::Event::RedirectPublishedPages, updates.len());
-
-        let redirect_updates: Vec<_> = prepared
-            .iter()
-            .map(|(_, key, _, handle)| (*key, *handle))
-            .collect();
-        for (page, key, _, handle) in &prepared {
-            let mut objects = self.objects.lock(page.index());
-            let record = &mut objects.records[page.index()];
-            record.pins -= 1;
-            record.persisting = false;
-            record.committed = true;
-            record.key = Some(*key);
-            record.version = handle.logical_version;
-            self.account_unpin();
-        }
-        let mut new_entries = Vec::new();
+        let mut records = Vec::new();
         let mut range_start = 0usize;
         while range_start < prepared.len() {
             if !was_unmapped[range_start] {
@@ -298,7 +415,7 @@ impl Rnvpc {
                 range_end += 1;
             }
             let (head_page, head_key, head_ssd, _) = prepared[range_start];
-            let record = NvRedirectExtentRecord::new(
+            records.push(NvRedirectExtentRecord::new(
                 head_key.fs_id,
                 head_key.inode,
                 head_key.page_index,
@@ -306,11 +423,60 @@ impl Rnvpc {
                 head_page.index() as u64,
                 head_ssd,
                 NvRedirectAuthority::NvAuthoritative,
-            )?;
-            self.persist.publish_redirect_extent(&record, None)?;
-            new_entries.push(Arc::new(DirtyNvExtentEntry::new(record)?));
+            )?);
             range_start = range_end;
         }
+        let new_slots = prepared
+            .iter()
+            .zip(&was_unmapped)
+            .filter_map(|((page, _, _, _), is_new)| is_new.then_some(page.index()))
+            .collect::<Vec<_>>();
+        let existing_slots = prepared
+            .iter()
+            .zip(&was_unmapped)
+            .filter_map(|((page, _, _, _), is_new)| (!is_new).then_some(page.index()))
+            .collect::<Vec<_>>();
+        let persist_result = self
+            .persist
+            .persist_data_slots(&existing_slots)
+            .and_then(|()| {
+                self.persist
+                    .commit_redirect_extents(&records, &new_slots, fault)
+            });
+        if let Err(error) = persist_result {
+            self.release_redirect_publication_pins(&prepared);
+            self.redirects.abort_reserved(&reservation)?;
+            if !self.persist.publication_uncertain() {
+                for ((page, _, _, _), is_new) in prepared.iter().zip(&was_unmapped) {
+                    if *is_new {
+                        let _ = self.abort_data_page(*page);
+                    }
+                }
+            }
+            return Err(error);
+        }
+        batch_metrics::count(batch_metrics::Event::RedirectPublishBatches, 1);
+        batch_metrics::count(batch_metrics::Event::RedirectPublishedPages, prepared.len());
+
+        let redirect_updates: Vec<_> = prepared
+            .iter()
+            .map(|(_, key, _, handle)| (*key, *handle))
+            .collect();
+        for (page, key, _, handle) in &prepared {
+            let mut objects = self.objects.lock(page.index());
+            let record = &mut objects.records[page.index()];
+            record.pins -= 1;
+            record.persisting = false;
+            record.committed = true;
+            record.key = Some(*key);
+            record.version = handle.logical_version;
+            self.account_unpin();
+        }
+        let new_entries = records
+            .into_iter()
+            .map(DirtyNvExtentEntry::new)
+            .map(|entry| entry.map(Arc::new))
+            .collect::<Result<Vec<_>>>()?;
         self.redirects
             .commit_reserved(&reservation, &redirect_updates)?;
         for entry in new_entries {

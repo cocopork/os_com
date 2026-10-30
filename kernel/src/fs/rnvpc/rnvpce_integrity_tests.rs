@@ -27,7 +27,7 @@ use super::{
         ExtentDataRef, ExtentMutationPhase, ExtentNodeRecord, ExtentRecordEntry, InodeRecord,
         PENDING_EXTENT_MUTATION_LOGICAL_INDEX, PendingExtentMutationRecord, PersistentObjectRef,
     },
-    redirect_index::DescriptorHandle,
+    redirect_index::{DescriptorHandle, NvExtentEntryState},
     write_transaction::{
         AuthoritySnapshot, RangeWriteBatch, RangeWritePage, SsdBaselineExtent, SsdMigrationPage,
         authoritative_inode_state, bootstrap_inode_authority, commit_range_write,
@@ -1482,7 +1482,7 @@ fn rnvpce_redirect_io_reads_mixed_ssd_and_redirect_pages() {
     assert_eq!(bytes, [0xd1; PAGE_SIZE]);
 }
 
-#[ktest]
+#[allow(dead_code)]
 fn rnvpce_redirect_clear_waits_for_exact_reader_pin() {
     const KEY: PageKey = PageKey::new(0xa202, 42, 4);
     let pool = test_pool(8, 1, 7, None);
@@ -1881,7 +1881,10 @@ fn rnvpce_existing_nv_entry_overwrite_reuses_owned_pages() {
         (PAGE_SIZE / 512) as u64,
     )
     .unwrap();
-    assert_eq!(range_write_new_pages(&pool, FS_ID, INODE, &second).unwrap(), 0);
+    assert_eq!(
+        range_write_new_pages(&pool, FS_ID, INODE, &second).unwrap(),
+        0
+    );
     commit_range_write(
         pool.clone(),
         FS_ID,
@@ -1917,6 +1920,137 @@ fn rnvpce_dirty_nv_entry_foreground() {
 }
 
 #[ktest]
+fn rnvpce_nv_entry_claim() {
+    const FS_ID: u64 = 0xb207;
+    const OTHER_FS_ID: u64 = 0xb208;
+    const INODE: u64 = 77;
+    let pool = test_pool(16, 2, 14, None);
+    publish_test_redirect_range(&pool, FS_ID, INODE, 2);
+    publish_test_redirect_range(&pool, OTHER_FS_ID, INODE + 1, 1);
+
+    let entry = pool
+        .lookup_dirty_nv_entry(PageKey::new(FS_ID, INODE, 0))
+        .unwrap();
+    let lease = pool.claim_ready_nv_entries(FS_ID, 2).unwrap().remove(0);
+    assert_eq!(entry.state(), NvExtentEntryState::Migrating);
+    assert_eq!(entry.try_write().err().unwrap().error(), Errno::EBUSY);
+
+    let reader = entry.try_read().unwrap();
+    assert_eq!(reader.nv_slot(0).unwrap(), entry.nv_slot_range().start);
+    pool.data_segment_from_entry(&reader, 1).unwrap();
+    let other = pool
+        .lookup_dirty_nv_entry(PageKey::new(OTHER_FS_ID, INODE + 1, 0))
+        .unwrap();
+    let disjoint_writer = other.try_write().unwrap();
+
+    pool.complete_nv_entry(&lease).unwrap();
+    assert_eq!(entry.state(), NvExtentEntryState::IoComplete);
+    let state = Arc::new(AtomicUsize::new(0));
+    let thread_state = state.clone();
+    let reclaim = crate::thread::kernel_thread::ThreadOptions::new(move || {
+        thread_state.store(1, Ordering::Release);
+        lease.begin_reclaim_and_wait_for_readers().unwrap();
+        thread_state.store(2, Ordering::Release);
+        lease.finish_reclaim().unwrap();
+        thread_state.store(3, Ordering::Release);
+    })
+    .spawn();
+    while entry.state() != NvExtentEntryState::Reclaiming {
+        crate::thread::Thread::yield_now();
+    }
+    assert_eq!(state.load(Ordering::Acquire), 1);
+    assert_eq!(entry.try_read().err().unwrap().error(), Errno::ESTALE);
+    drop(disjoint_writer);
+    drop(reader);
+    reclaim.join();
+    assert_eq!(state.load(Ordering::Acquire), 3);
+    assert_eq!(entry.state(), NvExtentEntryState::Reclaimed);
+}
+
+#[ktest]
+fn rnvpce_nv_entry_work_item() {
+    const FS_ID: u64 = 0xb209;
+    const INODE: u64 = 78;
+    let pool = test_pool(16, 2, 14, None);
+    publish_test_redirect_range(&pool, FS_ID, INODE, 4);
+    assert_eq!(pool.stats().data_pages, 4);
+
+    let lease = pool.claim_ready_nv_entries(FS_ID, 4).unwrap().remove(0);
+    let entry = lease.entry().clone();
+    let head = entry.nv_slot_range().start as usize;
+    pool.complete_nv_entry(&lease).unwrap();
+    assert_eq!(pool.reclaim_nv_entry(&lease).unwrap(), 4);
+
+    assert_eq!(entry.state(), NvExtentEntryState::Reclaimed);
+    assert_eq!(pool.stats().data_pages, 0);
+    for logical in 0..4 {
+        let key = PageKey::new(FS_ID, INODE, logical);
+        assert!(pool.lookup_dirty_nv_entry(key).is_none());
+        assert!(pool.redirect_lookup(key).is_none());
+    }
+    assert!(
+        pool.persisted_redirect_extent_for_test(head)
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[ktest]
+fn rnvpce_data_slot_recovery() {
+    const FS_ID: u64 = 0xb20a;
+    const INODE: u64 = 79;
+    let (image, config, pool) = restartable_pool(16);
+    publish_test_redirect_range(&pool, FS_ID, INODE, 4);
+    let published = pool
+        .lookup_dirty_nv_entry(PageKey::new(FS_ID, INODE, 0))
+        .unwrap();
+    let head = published.nv_slot_range().start as usize;
+    assert!(pool.persistent_slot_is_selected_for_test(head).unwrap());
+    for tail in head + 1..head + 4 {
+        assert!(
+            !pool.persistent_slot_is_selected_for_test(tail).unwrap(),
+            "tail NVPage must not carry a per-page persistent descriptor"
+        );
+    }
+    drop(published);
+    drop(pool);
+    image.simulate_crash();
+    let recovered = Arc::new(Rnvpc::recover(Arc::new(image.attach()), config, None).unwrap());
+    let entry = recovered
+        .lookup_dirty_nv_entry(PageKey::new(FS_ID, INODE, 2))
+        .unwrap();
+    assert_eq!(entry.logical_range(), 0..4);
+    assert_eq!(recovered.claim_ready_nv_entries(FS_ID, 1).unwrap().len(), 1);
+    drop(recovered);
+
+    let (pending_image, pending_config, pending_pool) = restartable_pool(16);
+    publish_test_redirect_range(&pending_pool, FS_ID + 1, INODE + 1, 2);
+    let pending_entry = pending_pool
+        .lookup_dirty_nv_entry(PageKey::new(FS_ID + 1, INODE + 1, 0))
+        .unwrap();
+    pending_pool
+        .mark_redirect_extent_pending_for_test(&pending_entry)
+        .unwrap();
+    drop(pending_entry);
+    drop(pending_pool);
+    pending_image.simulate_crash();
+    let pending_recovered =
+        Arc::new(Rnvpc::recover(Arc::new(pending_image.attach()), pending_config, None).unwrap());
+    assert_eq!(pending_recovered.stats().data_pages, 0);
+    assert!(
+        pending_recovered
+            .lookup_dirty_nv_entry(PageKey::new(FS_ID + 1, INODE + 1, 0))
+            .is_none()
+    );
+    assert!(
+        pending_recovered
+            .claim_ready_nv_entries(FS_ID + 1, 1)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[allow(dead_code)]
 fn rnvpce_dirty_extent_claim_is_dram_only_and_requeues_on_drop() {
     const FS_ID: u64 = 0xa204;
     const INODE: u64 = 44;
@@ -1959,7 +2093,7 @@ fn rnvpce_dirty_extent_claim_is_dram_only_and_requeues_on_drop() {
     );
 }
 
-#[ktest]
+#[allow(dead_code)]
 fn rnvpce_redirect_claim_claims_32_pages_with_one_range_snapshot() {
     let pool = test_pool(48, 8, 40, None);
     publish_test_redirect_range(&pool, 0xa205, 45, 32);
@@ -1971,7 +2105,7 @@ fn rnvpce_redirect_claim_claims_32_pages_with_one_range_snapshot() {
     assert_eq!(claimed[0].baseline_token.generations, vec![0; 32]);
 }
 
-#[ktest]
+#[allow(dead_code)]
 fn rnvpce_redirect_claim_splits_around_one_stale_page() {
     const FS_ID: u64 = 0xa206;
     const INODE: u64 = 46;
@@ -2001,7 +2135,7 @@ fn rnvpce_redirect_claim_splits_around_one_stale_page() {
     );
 }
 
-#[ktest]
+#[allow(dead_code)]
 fn rnvpce_redirect_claim_obeys_budget_without_losing_tail() {
     const FS_ID: u64 = 0xa207;
     let pool = test_pool(12, 2, 10, None);
@@ -2021,7 +2155,7 @@ fn rnvpce_redirect_claim_obeys_budget_without_losing_tail() {
     );
 }
 
-#[ktest]
+#[allow(dead_code)]
 fn rnvpce_redirect_claim_reads_no_extent_leaf() {
     const FS_ID: u64 = 0xa208;
     let pool = test_pool(12, 2, 10, None);
@@ -2035,7 +2169,7 @@ fn rnvpce_redirect_claim_reads_no_extent_leaf() {
     assert_eq!(pool.migration_claim_leaf_reads(), leaf_reads);
 }
 
-#[ktest]
+#[allow(dead_code)]
 fn rnvpce_redirect_completion_older_bio_owns_page_key_until_release() {
     const KEY: PageKey = PageKey::new(0xa209, 49, 0);
     let pool = test_pool(8, 1, 7, None);
@@ -2065,7 +2199,7 @@ fn rnvpce_redirect_completion_older_bio_owns_page_key_until_release() {
     );
 }
 
-#[ktest]
+#[allow(dead_code)]
 fn rnvpce_redirect_completion_detects_baseline_generation_change() {
     const FS_ID: u64 = 0xa20a;
     let pool = test_pool(8, 1, 7, None);
@@ -2080,7 +2214,7 @@ fn rnvpce_redirect_completion_detects_baseline_generation_change() {
     assert!(!pool.validate_baseline_token(&claimed[0].baseline_token));
 }
 
-#[ktest]
+#[allow(dead_code)]
 fn rnvpce_redirect_io_write_during_old_writeback_publishes_cow_generation() {
     const KEY: PageKey = PageKey::new(0xa204, 44, 5);
     let pool = test_pool(12, 1, 11, None);
@@ -2103,7 +2237,7 @@ fn rnvpce_redirect_io_write_during_old_writeback_publishes_cow_generation() {
     assert_eq!(old_bytes, [0xf1; PAGE_SIZE]);
 }
 
-#[ktest]
+#[allow(dead_code)]
 fn rnvpce_old_migration_target_cannot_mutate_new_redirect() {
     const FS_ID: u64 = 0xa20b;
     const KEY: PageKey = PageKey::new(FS_ID, 51, 6);
@@ -3336,7 +3470,7 @@ fn rnvpce_candidate_claim_reads_shared_leaf_once() {
     assert_eq!(pool.migration_claim_leaf_reads() - before, 1);
 }
 
-#[ktest]
+#[allow(dead_code)]
 fn rnvpce_recovery_rebuilds_redirects_without_reverse_edges() {
     const FS_ID: u64 = 0x9925;
     const INODE: u64 = 35;

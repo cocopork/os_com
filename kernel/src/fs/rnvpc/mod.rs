@@ -89,12 +89,16 @@ pub(crate) fn read_mapped_page_from(
     if output.len() != PAGE_SIZE {
         return_errno_with_message!(Errno::EINVAL, "rNVPCe reads must cover one page");
     }
-    let Some(reference) = write_transaction::mapped_nv_page_ref(pool, fs_id, inode, page_index)?
-    else {
+    let key = index::PageKey::new(fs_id, inode, page_index);
+    let Some(entry) = pool.lookup_dirty_nv_entry(key) else {
         return Ok(false);
     };
-    let page = pool.pin_persistent_data_page(reference)?;
-    page.read(output)?;
+    let guard = entry.try_read()?;
+    let mut writer = VmWriter::from(output).to_fallible();
+    let copied = pool.copy_entry_to_writer(&guard, page_index, 0, &mut writer, PAGE_SIZE)?;
+    if copied != PAGE_SIZE {
+        return_errno_with_message!(Errno::EIO, "short NV extent entry read");
+    }
     Ok(true)
 }
 

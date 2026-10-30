@@ -60,6 +60,10 @@ use crate::fs::{
     vfs::inode::{Extension, FallocMode},
 };
 
+pub(in crate::fs::fs_impls::ext4) fn is_nv_capacity_pressure(error: &Error) -> bool {
+    error.error() == Errno::EAGAIN
+}
+
 /// Number of 32-bit slots in `i_block` (60 bytes total).
 ///
 /// In ext4 these 60 bytes hold the inline extent-tree root rather than the
@@ -1316,6 +1320,12 @@ impl Inode {
                         pool.wait_for_data_page_lease_change(lease_epoch);
                         continue;
                     }
+                    Err(error) if is_nv_capacity_pressure(&error) => {
+                        drop(inner);
+                        drop(op);
+                        fs.wait_for_nv_capacity(1)?;
+                        continue;
+                    }
                     Err(error) => return if done != 0 { Ok(done) } else { Err(error) },
                 }
                 let size = inner.file_size().max(position + copied);
@@ -1472,7 +1482,27 @@ impl Inode {
             let amount = (end - position).min(PAGE_SIZE - page_offset);
             let redirect_key =
                 crate::fs::rnvpc::index::PageKey::new(fs_id, inode_id, logical_block);
-            if let Some(handle) = pool.redirect_lookup(redirect_key) {
+            if let Some(entry) = pool.lookup_dirty_nv_entry(redirect_key) {
+                let guard = match entry.try_read() {
+                    Ok(guard) => guard,
+                    Err(error) if error.error() == Errno::ESTALE => continue,
+                    Err(error) => return Err(error),
+                };
+                let copied = match pool.copy_entry_to_writer(
+                    &guard,
+                    logical_block,
+                    page_offset,
+                    writer,
+                    amount,
+                ) {
+                    Ok(copied) => copied,
+                    Err(_error) if position != offset => return Ok(position - offset),
+                    Err(error) => return Err(error),
+                };
+                if copied != amount {
+                    return Ok(position - offset + copied);
+                }
+            } else if let Some(handle) = pool.redirect_lookup(redirect_key) {
                 let lease_epoch = pool.data_page_lease_epoch();
                 let page = match pool.pin_redirect(redirect_key, handle) {
                     Ok(page) => page,

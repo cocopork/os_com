@@ -128,6 +128,18 @@ impl NvRedirectExtentRecord {
         self.magic == 0 && self.selector == 0
     }
 
+    pub(crate) fn with_authority(&self, authority: NvRedirectAuthority) -> Result<Self> {
+        Self::new(
+            self.fs_id,
+            self.inode,
+            self.logical_start,
+            self.page_count,
+            self.nv_slot_start,
+            self.ssd_block_start,
+            authority,
+        )
+    }
+
     pub(crate) fn logical_range(&self) -> Result<Range<u64>> {
         Ok(self.logical_start
             ..self

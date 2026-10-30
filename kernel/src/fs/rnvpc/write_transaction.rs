@@ -1352,6 +1352,26 @@ where
         }
     }
 
+    let mut guarded_entries = BTreeSet::new();
+    let mut _entry_guards = Vec::new();
+    for page in request.pages {
+        let key = PageKey::new(fs_id, inode, page.logical_block);
+        if let Some(entry) = pool.lookup_dirty_nv_entry(key)
+            && guarded_entries.insert(entry.logical_start())
+        {
+            _entry_guards.push(entry.try_write().map_err(|error| {
+                if error.error() == Errno::EBUSY {
+                    Error::with_message(
+                        Errno::EAGAIN,
+                        "NV extent entry migration won the foreground write race",
+                    )
+                } else {
+                    error
+                }
+            })?);
+        }
+    }
+
     let mut pending = Vec::new();
     pending
         .try_reserve_exact(request.pages.len())

@@ -129,17 +129,13 @@ impl PersistEngine {
         let index =
             usize::try_from(record.nv_slot_start()).map_err(|_| Error::new(Errno::EOVERFLOW))?;
         self.check_index(index)?;
-        let descriptor = self
-            .read_entry(index)?
-            .ok_or_else(|| Error::new(Errno::ESTALE))?;
-        if descriptor.fs_id != record.fs_id()
-            || descriptor.inode != record.inode()
-            || descriptor.logical_index != record.logical_start()
-            || descriptor.ssd_backing_block != record.ssd_block_start()
-        {
-            return_errno_with_message!(Errno::ESTALE, "redirect extent head descriptor changed");
-        }
         let old = self.backend.load_control_u64(commit_offset(index)?)?;
+        if old == 0 {
+            return_errno_with_message!(Errno::ESTALE, "redirect extent head is not published");
+        }
+        let mut descriptor = NvDescriptor::default();
+        self.backend
+            .read_control(descriptor_offset(index, old)?, descriptor.as_mut_bytes())?;
         let next = old
             .checked_add(1)
             .ok_or_else(|| Error::new(Errno::EOVERFLOW))?;
@@ -158,6 +154,88 @@ impl PersistEngine {
         let commit = commit_offset(index)?;
         self.backend.store_control_u64(commit, next)?;
         self.backend.persist_control(commit, size_of::<u64>())?;
+        self.backend.fence()
+    }
+
+    /// Persists all data pages, then publishes one selector per redirect range.
+    /// Tail slots deliberately retain selector zero: the head range record is
+    /// their only persistent allocation and recovery identity.
+    pub(super) fn commit_redirect_extents(
+        &self,
+        records: &[NvRedirectExtentRecord],
+        data_slots: &[usize],
+        fault: Option<FaultPoint>,
+    ) -> Result<()> {
+        self.ensure_writable()?;
+        if records.len() > 128 || data_slots.len() > 128 {
+            return_errno!(Errno::EINVAL);
+        }
+        let mut heads = BTreeSet::new();
+        for record in records {
+            record.validate()?;
+            let head = usize::try_from(record.nv_slot_start())
+                .map_err(|_| Error::new(Errno::EOVERFLOW))?;
+            self.check_index(head)?;
+            if !heads.insert(head) || self.backend.load_control_u64(commit_offset(head)?)? != 0 {
+                return_errno_with_message!(Errno::ESTALE, "redirect extent head is already used");
+            }
+        }
+        for slot in data_slots {
+            self.check_index(*slot)?;
+        }
+        inject(fault, FaultPoint::BeforeContentPersist)?;
+        for slot in data_slots {
+            self.backend.persist(slot * PAGE_SIZE, PAGE_SIZE)?;
+        }
+        for record in records {
+            let head = usize::try_from(record.nv_slot_start())
+                .map_err(|_| Error::new(Errno::EOVERFLOW))?;
+            let selector = 1;
+            let descriptor_offset = descriptor_offset(head, selector)?;
+            let descriptor = NvDescriptor::default();
+            self.backend
+                .write_control(descriptor_offset, descriptor.as_bytes())?;
+            self.backend
+                .persist_control(descriptor_offset, size_of::<NvDescriptor>())?;
+            let record_offset = redirect_extent_offset(head, selector)?;
+            self.backend
+                .write_control(record_offset, record.as_bytes())?;
+            self.backend
+                .persist_control(record_offset, size_of::<NvRedirectExtentRecord>())?;
+        }
+        self.backend.fence()?;
+        inject(fault, FaultPoint::AfterContentPersist)?;
+        let publication = (|| {
+            for record in records {
+                let head = usize::try_from(record.nv_slot_start())
+                    .map_err(|_| Error::new(Errno::EOVERFLOW))?;
+                let offset = commit_offset(head)?;
+                self.backend.store_control_u64(offset, 1)?;
+                inject(fault, FaultPoint::AfterCommitStore)?;
+                self.backend.persist_control(offset, size_of::<u64>())?;
+                inject(fault, FaultPoint::AfterCommitPersist)?;
+            }
+            self.backend.fence()
+        })();
+        if let Err(error) = publication {
+            self.publication_uncertain.store(true, Ordering::Release);
+            return Err(error);
+        }
+        if let Err(error) = inject(fault, FaultPoint::AfterCommitFence) {
+            self.publication_uncertain.store(true, Ordering::Release);
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    /// Persists mutations to already-published range-owned data pages without
+    /// rewriting any descriptor or range selector.
+    pub(super) fn persist_data_slots(&self, slots: &[usize]) -> Result<()> {
+        self.ensure_writable()?;
+        for slot in slots {
+            self.check_index(*slot)?;
+            self.backend.persist(slot * PAGE_SIZE, PAGE_SIZE)?;
+        }
         self.backend.fence()
     }
 
@@ -337,6 +415,12 @@ impl PersistEngine {
 
     pub(super) fn publication_uncertain(&self) -> bool {
         self.publication_uncertain.load(Ordering::Acquire)
+    }
+
+    #[cfg(ktest)]
+    pub(super) fn slot_is_selected_for_test(&self, index: usize) -> Result<bool> {
+        self.check_index(index)?;
+        Ok(self.backend.load_control_u64(commit_offset(index)?)? != 0)
     }
 
     fn check_descriptor(&self, index: usize, descriptor: &NvDescriptor) -> Result<()> {
