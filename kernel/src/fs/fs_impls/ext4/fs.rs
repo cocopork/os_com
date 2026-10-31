@@ -309,6 +309,9 @@ impl Ext4 {
     pub(super) fn rnvpc_extend_enabled(&self) -> bool {
         self.rnvpc_mode() == RnvpcMode::RnvpcExtend
     }
+    pub(super) fn allocation_metadata_pager_enabled(&self) -> bool {
+        self.rnvpc_mode.allocation_metadata_pager_enabled()
+    }
 
     pub(super) fn rnvpc_fs_id(&self) -> u64 {
         self.rnvpc_fs_id

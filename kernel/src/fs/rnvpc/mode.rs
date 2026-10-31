@@ -77,6 +77,12 @@ impl RnvpcModeConfig {
         self.rtio
     }
 
+    /// Only rNVPCe keeps SSD allocation metadata authoritative in NVM and
+    /// therefore needs the allocation-group writeback worker.
+    pub(crate) fn allocation_metadata_pager_enabled(self) -> bool {
+        self.mode == RnvpcMode::RnvpcExtend && self.rtio
+    }
+
     /// 内核 cmdline 入口：三个开关缺省即关。
     pub(crate) fn from_command_line() -> Result<Self> {
         Self::resolve(
@@ -115,3 +121,21 @@ aster_cmdline::define_kv_param!("rnvpc_extend", CMD_RNVPC_EXTEND);
 
 static CMD_RTIO: Once<OnOffParam> = Once::new();
 aster_cmdline::define_kv_param!("rtio", CMD_RTIO);
+
+#[cfg(ktest)]
+mod tests {
+    use ostd::prelude::ktest;
+
+    use super::RnvpcModeConfig;
+
+    #[ktest]
+    fn only_rnvpce_uses_authoritative_allocation_metadata_pager() {
+        let native = RnvpcModeConfig::resolve(false, false, false).unwrap();
+        let rnvpc = RnvpcModeConfig::resolve(true, false, true).unwrap();
+        let rnvpce = RnvpcModeConfig::resolve(false, true, true).unwrap();
+
+        assert!(!native.allocation_metadata_pager_enabled());
+        assert!(!rnvpc.allocation_metadata_pager_enabled());
+        assert!(rnvpce.allocation_metadata_pager_enabled());
+    }
+}
