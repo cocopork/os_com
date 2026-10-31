@@ -823,7 +823,7 @@ impl Ext4 {
             }
         };
         for targets in targets.chunks(rnvpc::write_transaction::SSD_MIGRATION_BATCH_PAGES) {
-            if let Err(error) = pool.assign_migration_targets(targets, None) {
+            if let Err(error) = pool.assign_redirect_migration_targets(targets, None) {
                 // Some selectors may already be durable: never free possibly named blocks.
                 self.fail_nv_migration();
                 return Err(error);

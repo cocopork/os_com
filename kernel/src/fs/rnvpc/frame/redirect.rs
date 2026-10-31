@@ -149,12 +149,7 @@ impl Rnvpc {
             self.release_entry_reclaim_pins(&prepared);
             return Err(error);
         }
-        for (offset, slot) in slots.iter().copied().enumerate() {
-            let key = PageKey::new(
-                entry.fs_id(),
-                entry.inode(),
-                entry.logical_start() + offset as u64,
-            );
+        for slot in slots.iter().copied() {
             let mut objects = self.objects.lock(slot);
             let record = &mut objects.records[slot];
             record.kind = ObjectKind::Data(DataPageState::Synced);
@@ -164,8 +159,6 @@ impl Rnvpc {
             record.key = None;
             record.version = 0;
             self.account_unpin();
-            drop(objects);
-            self.state.lock().index.remove(key);
         }
         note_data_page_lease_change();
         self.redirects.remove_reclaimed_entry(lease)?;
@@ -483,22 +476,6 @@ impl Rnvpc {
             self.redirects.publish_dirty_entry(entry)?;
         }
 
-        let mut legacy = self.state.lock();
-        for (page, key, ssd_target, handle) in &prepared {
-            if self.redirects.lookup(*key) == Some(*handle) {
-                legacy.index.insert(
-                    *key,
-                    PageEntry {
-                        residency: Residency::Nv,
-                        handle: Some(RuntimeHandle::Nv(*page)),
-                        reference: handle.reference,
-                        logical_version: handle.logical_version,
-                        ssd_backing_block: *ssd_target,
-                        state: handle.state,
-                    },
-                );
-            }
-        }
         let handles = prepared
             .into_iter()
             .map(|(_, _, _, handle)| handle)
@@ -654,14 +631,6 @@ impl Rnvpc {
             self.account_unpin();
             drop(objects);
             self.redirects.compare_update(key, old, new);
-            let mut legacy = self.state.lock();
-            if let Some(entry) = legacy.index.lookup_mut(key)
-                && entry.reference == old.reference
-                && entry.logical_version == old.logical_version
-            {
-                entry.state = next;
-                entry.ssd_backing_block = new.ssd_target;
-            }
             transitioned.push(new);
         }
         if !transitioned.is_empty() {
@@ -951,15 +920,6 @@ impl Rnvpc {
             .map(|(_, key, handle)| (*key, *handle))
             .collect::<Vec<_>>();
         self.redirects.compare_remove_batch(&exact);
-        for (_, key, handle) in prepared {
-            let mut legacy = self.state.lock();
-            if legacy.index.lookup(key).is_some_and(|entry| {
-                entry.reference == handle.reference
-                    && entry.logical_version == handle.logical_version
-            }) {
-                legacy.index.remove(key);
-            }
-        }
         if !reclaimed.is_empty() {
             note_data_page_lease_change();
         }

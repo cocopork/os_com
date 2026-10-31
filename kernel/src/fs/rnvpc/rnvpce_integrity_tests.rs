@@ -2253,7 +2253,7 @@ fn rnvpce_old_migration_target_cannot_mutate_new_redirect() {
     let new = pool
         .publish_redirect_batch(&[(new_page, KEY, 60_006)], None)
         .unwrap()[0];
-    pool.assign_migration_targets(&[(old.reference, 70_006)], None)
+    pool.assign_redirect_migration_targets(&[(old.reference, 70_006)], None)
         .unwrap();
     assert_eq!(pool.redirect_lookup(KEY), Some(new));
     assert!(!new.migration_target);
@@ -3629,7 +3629,7 @@ fn rnvpce_batch_migration_crash_recovers_authoritative_forward_graph() {
             1 => Some(FaultPoint::AfterCommitPersist),
             _ => None,
         };
-        let result = pool.assign_migration_targets(&targets, target_fault);
+        let result = pool.assign_redirect_migration_targets(&targets, target_fault);
         assert_eq!(result.is_ok(), phase >= 2);
         if phase >= 2 {
             // Test backend has no physical SSD: simulate its successful data+flush

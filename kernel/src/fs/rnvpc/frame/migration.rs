@@ -12,6 +12,25 @@ impl Rnvpc {
         targets: &[(PersistentObjectRef, u64)],
         fault: Option<FaultPoint>,
     ) -> Result<()> {
+        self.assign_migration_targets_inner(targets, fault, true)
+    }
+
+    /// Assigns SSD targets for redirect-owned pages without touching the
+    /// legacy page index.
+    pub(crate) fn assign_redirect_migration_targets(
+        &self,
+        targets: &[(PersistentObjectRef, u64)],
+        fault: Option<FaultPoint>,
+    ) -> Result<()> {
+        self.assign_migration_targets_inner(targets, fault, false)
+    }
+
+    fn assign_migration_targets_inner(
+        &self,
+        targets: &[(PersistentObjectRef, u64)],
+        fault: Option<FaultPoint>,
+        update_legacy_index: bool,
+    ) -> Result<()> {
         let mut updates = Vec::with_capacity(targets.len());
         let mut keys = Vec::with_capacity(targets.len());
         let mut expected = Vec::with_capacity(targets.len());
@@ -38,8 +57,7 @@ impl Rnvpc {
             updates.push((slot, descriptor));
         }
         self.persist.update_descriptors(&updates, fault)?;
-        // One short control-index critical section per batch, never across persist.
-        {
+        if update_legacy_index {
             let mut state = self.state.lock();
             for ((key, expected), (_, target)) in keys.iter().zip(&expected).zip(targets) {
                 if let Some(entry) = state.index.lookup_mut(*key) {

@@ -1462,6 +1462,36 @@ impl Rnvpc {
         Ok(())
     }
 
+    /// Changes runtime state for a page owned by the redirect directory.
+    ///
+    /// Unlike [`Self::transition_data_page`], this does not duplicate the
+    /// state into the legacy `PageIndex`; redirect handles are authoritative.
+    pub(crate) fn transition_redirect_data_page(
+        &self,
+        id: NvPageId,
+        expected: DataPageState,
+        next: DataPageState,
+    ) -> Result<()> {
+        if !expected.can_transition_to(next) {
+            return_errno_with_message!(Errno::EINVAL, "invalid RNVPC data page transition");
+        }
+        if let (Some(from), Some(to)) = (expected.nv_object_state(), next.nv_object_state())
+            && !from.can_transition_to(to)
+        {
+            return_errno_with_message!(
+                Errno::EINVAL,
+                "RNVPC data page transition violates the NV object state machine"
+            );
+        }
+        let mut objects = self.objects.lock_checked(id.index())?;
+        let record = &mut objects.records[id.index()];
+        if record.kind != ObjectKind::Data(expected) {
+            return_errno_with_message!(Errno::EBUSY, "RNVPC data page state changed");
+        }
+        record.kind = ObjectKind::Data(next);
+        Ok(())
+    }
+
     /// T4.2：预留 `pages` 个数据页的容量。
     ///
     /// 额度不足 ⇒ `EAGAIN`（调用方在**锁外**重试，而不是持着低层锁等容量）。
@@ -5950,6 +5980,56 @@ impl Drop for EvictingDataPage {
 mod allocation_tests {
     use super::*;
     use crate::fs::rnvpc::{config::NvSimMode, dram::DramNvBackend};
+
+    #[ostd::prelude::ktest]
+    fn rnvpce_pool_control_isolation() {
+        let config = RnvpcConfig::from_bytes(
+            Some(16 * PAGE_SIZE),
+            Some(4 * PAGE_SIZE),
+            Some(12 * PAGE_SIZE),
+            Some(NvSimMode::Fast),
+        )
+        .unwrap()
+        .unwrap();
+        let backend = Arc::new(DramNvBackend::allocate(config).unwrap());
+        let pool = Arc::new(Rnvpc::new(backend, config, None).unwrap());
+        let key = PageKey::new(0x51, 7, 3);
+        let page = pool.stage_data_page(&[0x5a; PAGE_SIZE]).unwrap();
+
+        let control = pool.state.lock();
+        pool.transition_redirect_data_page(page, DataPageState::Staged, DataPageState::NvDirty)
+            .unwrap();
+        pool.publish_redirect_batch(&[(page, key, 101)], None)
+            .unwrap();
+        drop(control);
+
+        let current = pool.redirect_lookup(key).unwrap();
+        let control = pool.state.lock();
+        let reclaimed = pool.clear_redirects_exact(&[(key, current)], None).unwrap();
+        drop(control);
+        assert_eq!(reclaimed, vec![page]);
+        pool.free_data_page(page).unwrap();
+
+        let legacy_key = PageKey::new(0x52, 8, 4);
+        let legacy = pool.stage_data_page(&[0xa5; PAGE_SIZE]).unwrap();
+        pool.transition_data_page(legacy, DataPageState::Staged, DataPageState::NvDirty)
+            .unwrap();
+        pool.replace_data_page_in_owner_at(legacy, legacy_key, 101, None)
+            .unwrap();
+        let legacy_handle = pool.redirect_lookup(legacy_key).unwrap();
+        let eviction = pool.begin_data_page_eviction(legacy).unwrap();
+        let control = pool.state.lock();
+        pool.assign_redirect_migration_targets(&[(legacy_handle.reference, 202)], None)
+            .unwrap();
+        drop(control);
+        drop(eviction);
+        pool.transition_data_page(legacy, DataPageState::NvDirty, DataPageState::InFlight)
+            .unwrap();
+        assert_eq!(
+            pool.index_lookup(legacy_key).unwrap().state,
+            NvObjectState::NvWriteback
+        );
+    }
 
     #[ostd::prelude::ktest]
     fn rnvpce_allocation_reclaim_does_not_take_pool_control() {

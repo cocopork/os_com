@@ -497,7 +497,7 @@ pub(crate) fn commit_initial_write_batch(
     let allocation_ref = persist_or_replace(&pool, allocation_key, &allocation)?;
     for page in request.pages {
         let id = pool.stage_reserved_data_page(&mut reservation, page.contents)?;
-        pool.transition_data_page(id, DataPageState::Staged, DataPageState::NvDirty)?;
+        pool.transition_redirect_data_page(id, DataPageState::Staged, DataPageState::NvDirty)?;
         new_mappings.push((
             id,
             PageKey::new(fs_id, inode, page.logical_block),
@@ -1191,7 +1191,11 @@ where
                     return_errno_with_message!(Errno::EFAULT, "write copied no user bytes");
                 }
                 let id = staging.finish()?;
-                pool.transition_data_page(id, DataPageState::Staged, DataPageState::NvDirty)?;
+                pool.transition_redirect_data_page(
+                    id,
+                    DataPageState::Staged,
+                    DataPageState::NvDirty,
+                )?;
                 pending_new_pages.push((
                     id,
                     PageKey::new(fs_id, inode, page.logical_block),
@@ -1412,7 +1416,7 @@ where
                 return_errno_with_message!(Errno::EFAULT, "write copied no user bytes");
             }
             let id = staging.finish()?;
-            pool.transition_data_page(id, DataPageState::Staged, DataPageState::NvDirty)?;
+            pool.transition_redirect_data_page(id, DataPageState::Staged, DataPageState::NvDirty)?;
             pending.push((id, key, page.ssd_block));
             copied = copied
                 .checked_add(amount)
@@ -1650,7 +1654,7 @@ pub(crate) fn commit_write_batch(
             old_redirects.push((key, handle));
         }
         let id = pool.stage_reserved_data_page(&mut reservation, page.contents)?;
-        pool.transition_data_page(id, DataPageState::Staged, DataPageState::NvDirty)?;
+        pool.transition_redirect_data_page(id, DataPageState::Staged, DataPageState::NvDirty)?;
         pending.push((id, key, page.ssd_block));
     }
     for batch in pending.chunks(128) {
