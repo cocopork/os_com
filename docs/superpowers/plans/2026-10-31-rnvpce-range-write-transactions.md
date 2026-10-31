@@ -10,13 +10,19 @@
 
 **Spec:** `docs/os_com_implementation/os_com_refactor_plan/019-range-write-transactions/README.md`
 
-**Implementation status (2026-10-31):** Tasks 1--4 are implemented on
+**Implementation status (2026-10-31):** Tasks 1--4 are implemented and validated on
 `recovery/rnvpce-range-write-transactions`. The final review additionally
 removed Native per-slot object lifecycles, made post-selector DRAM publication
 infallible, added generation-based stale-selector cleanup, bumped the pool image
 to version 9, and retained short-copy SSD allocation ownership until unused
-blocks are released. Final full-suite and real-device results are recorded in
-the experiment report rather than inferred from the earlier image.
+blocks are released. Final hardening keeps prepared redirects lookup-invisible
+until inode-generation publication, durably rolls selectors back before slot
+reuse on failure, and fail-stops foreground/rTIO paths when selector durability
+is uncertain. Final full-suite and real-device results are recorded in
+the experiment report rather than inferred from the earlier image. The release
+image is built from `a1e424eb8`; all six 2 GiB device runs and post-unmount
+filesystem checks completed successfully.
+The final selector rollback and fail-stop hardening is commit `9d4b0dc21`.
 
 ## Global Constraints
 

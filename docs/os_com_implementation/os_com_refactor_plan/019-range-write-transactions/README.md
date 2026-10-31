@@ -1,10 +1,10 @@
 # 019: rNVPCe Range Write Transactions
 
-Date: 2026-10-31. Status: Implemented; final regression and device validation in progress.
+Date: 2026-10-31. Status: Implemented and validated.
 
 ## 1. Intent
 
-Native rNVPCe currently accepts a range write but expands it into one
+Before this change, Native rNVPCe accepted a range write but expanded it into one
 `RangeWritePage` per 4 KiB page. A contiguous 128 KiB overwrite consequently
 repeats extent routing, redirect lookup, version reservation, slot locking, and
 runtime-index publication for 32 `PageKey` values before publishing one
@@ -144,10 +144,11 @@ F3  Allocate maximal contiguous NV ranges; preallocate every Arc entry, inode
     map, publication vector, and inactive redirect record needed after commit.
 F4  Copy user bytes. Read SSD only for partial boundary pages.
 F5  Persist all changed/new NV data ranges and inactive range records; fence.
-F6  Publish all new range selectors; fence.
-F7  Atomically install the preallocated entries in the volatile range index
-    using a no-allocation, infallible state transition; release entry writers.
-F8  Publish inode size/block-count/root once, and only when they changed.
+F6  Publish all new range selectors; fence. Keep their DRAM entries in the
+    lookup-invisible Publishing state.
+F7  Publish inode size/block-count/root and its visibility generation once.
+F8  Activate every prepared entry with an allocation-free, infallible
+    Publishing -> Dirty transition; release entry writers.
 ```
 
 No sleep, capacity wait, SSD I/O wait, or device flush may occur while holding a
@@ -174,9 +175,10 @@ For new redirect entries:
 | Before F5 fence | Old mapping remains authoritative; uncommitted slots are staging leaks and are reclaimed by recovery. |
 | After F5, before a selector is durable | Initialized data/record is unreachable and reclaimable. |
 | Between selector publications | Every durable selector names one complete entry; the unreturned write may have a valid prefix. |
-| After F6 | All published entries are independently recoverable as NV authoritative. |
-| Before inode size publication | Entries tagged with the uncommitted visibility generation are ignored and reclaimed. |
-| After inode publication | The new file range is fully initialized and reachable. |
+| After F6, before F7 | Entries remain lookup-invisible; recovery ignores selectors newer than the authoritative inode generation. |
+| F7 fails and selector rollback succeeds | Selectors are durably cleared before DRAM owners and NV slots are released; the same generation may be retried. |
+| F7 fails and rollback becomes uncertain | The pool enters fail-stop mode and rejects reads, writes, migration claims, and reclaim until recovery. |
+| After F7 | Recovery accepts the complete NV-authoritative entries; F8 only exposes them to the running kernel. |
 
 The soft-update ordering is therefore data/record before selector, and selector
 before inode reachability. A successful return requires both fences and any
@@ -191,16 +193,20 @@ the authoritative inode generation. This prevents F6--F8 crashes from exposing
 an extension that the inode never published.
 
 All volatile insertion storage is reserved before F5. Code after a durable F6
-must not allocate or return an ordinary error. An invariant violation after F6
-latches `publication_uncertain`, blocks further access, and requires recovery;
-it must not continue with a missing volatile redirect.
+must not allocate. If F7 returns an ordinary persistence error, the online
+rollback first clears and fences every selector, then removes the prepared
+entries and range owners, and only then releases the NV slots. A rollback or
+selector result that cannot be proven durable latches `publication_uncertain`.
+The write entry, range-data mutation, migration claim, and reclaim paths all
+check this latch before changing data or allocation state and require recovery.
 
 The implementation represents this ordering explicitly. New DRAM entries are
 inserted in `Publishing` state before selector persistence and cannot satisfy a
-lookup. After selector durability, publication is an allocation-free,
-infallible `Publishing -> Dirty` transition. If persistence fails before the
-result becomes uncertain, the prepared entries and range owners are removed.
-If durability is uncertain, the pool is latched for recovery instead of
+lookup or migration claim. They remain in that state through inode publication.
+Only after the inode visibility generation is durable does an allocation-free,
+infallible `Publishing -> Dirty` transition expose them. If persistence fails
+before the result becomes uncertain, selector rollback follows the ordering
+above. If durability is uncertain, the pool is latched for recovery instead of
 guessing which selectors reached NVM.
 
 The on-media pool version is 9. Recovery durably clears selectors whose
