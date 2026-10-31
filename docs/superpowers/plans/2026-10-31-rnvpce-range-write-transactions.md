@@ -10,6 +10,14 @@
 
 **Spec:** `docs/os_com_implementation/os_com_refactor_plan/019-range-write-transactions/README.md`
 
+**Implementation status (2026-10-31):** Tasks 1--4 are implemented on
+`recovery/rnvpce-range-write-transactions`. The final review additionally
+removed Native per-slot object lifecycles, made post-selector DRAM publication
+infallible, added generation-based stale-selector cleanup, bumped the pool image
+to version 9, and retained short-copy SSD allocation ownership until unused
+blocks are released. Final full-suite and real-device results are recorded in
+the experiment report rather than inferred from the earlier image.
+
 ## Global Constraints
 
 - `PageKey` is a lookup coordinate; `DirtyNvExtentEntry` is the Native data authority and lifecycle identity.

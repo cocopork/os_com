@@ -703,21 +703,49 @@ impl Rnvpc {
             return_errno_with_message!(Errno::EINVAL, "redirect publication exceeds 128 pages");
         }
         let metrics_started = batch_metrics::now();
+        let legacy = visibility_generation == 0;
+        let mut legacy_prepared = Vec::new();
+        if legacy {
+            legacy_prepared
+                .try_reserve_exact(pages.len())
+                .map_err(|_| Error::new(Errno::ENOMEM))?;
+        }
         let mut slots = BTreeSet::new();
         for (page, key, ssd_target) in pages {
             if *ssd_target == 0
                 || !slots.insert(page.index())
                 || self.lookup_dirty_nv_entry(*key).is_some()
             {
+                self.release_legacy_entry_publication_pins(&legacy_prepared);
                 return_errno_with_message!(Errno::EBUSY, "redirect entry publication overlaps");
+            }
+            if legacy {
+                let mut objects = match self.objects.lock_checked(page.index()) {
+                    Ok(objects) => objects,
+                    Err(error) => {
+                        self.release_legacy_entry_publication_pins(&legacy_prepared);
+                        return Err(error);
+                    }
+                };
+                if let Err(error) = self.pin_persistent_update(
+                    &mut objects,
+                    page.index(),
+                    ObjectKind::Data(DataPageState::NvDirty),
+                ) {
+                    drop(objects);
+                    self.release_legacy_entry_publication_pins(&legacy_prepared);
+                    return Err(error);
+                }
+                legacy_prepared.push((*page, *key, *ssd_target));
             }
         }
         let prepared = pages;
 
         let mut records = Vec::new();
-        records
-            .try_reserve_exact(prepared.len())
-            .map_err(|_| Error::new(Errno::ENOMEM))?;
+        if records.try_reserve_exact(prepared.len()).is_err() {
+            self.release_legacy_entry_publication_pins(&legacy_prepared);
+            return Err(Error::new(Errno::ENOMEM));
+        }
         let mut range_start = 0usize;
         while range_start < prepared.len() {
             let mut range_end = range_start + 1;
@@ -747,17 +775,24 @@ impl Rnvpc {
             )?);
             range_start = range_end;
         }
-        let entries = records
+        let entries = match records
             .iter()
             .copied()
             .map(DirtyNvExtentEntry::new_publishing)
             .map(|entry| entry.map(Arc::new))
-            .collect::<Result<Vec<_>>>()?;
+            .collect::<Result<Vec<_>>>()
+        {
+            Ok(entries) => entries,
+            Err(error) => {
+                self.release_legacy_entry_publication_pins(&legacy_prepared);
+                return Err(error);
+            }
+        };
         let data_slots = prepared
             .iter()
             .map(|(page, _, _)| page.index())
             .collect::<Vec<_>>();
-        let owner_ranges = entries
+        let owner_ranges = match entries
             .iter()
             .map(|entry| {
                 let slots = entry.nv_slot_range();
@@ -766,13 +801,21 @@ impl Rnvpc {
                         ..usize::try_from(slots.end).map_err(|_| Error::new(Errno::EOVERFLOW))?,
                 )
             })
-            .collect::<Result<Vec<_>>>()?;
+            .collect::<Result<Vec<_>>>()
+        {
+            Ok(ranges) => ranges,
+            Err(error) => {
+                self.release_legacy_entry_publication_pins(&legacy_prepared);
+                return Err(error);
+            }
+        };
         let mut owners_installed = 0usize;
         for (entry, slots) in entries.iter().zip(owner_ranges) {
             if let Err(error) = self.install_data_range_owner(entry, slots) {
                 for installed in &entries[..owners_installed] {
                     let _ = self.remove_data_range_owner(installed);
                 }
+                self.release_legacy_entry_publication_pins(&legacy_prepared);
                 return Err(error);
             }
             owners_installed += 1;
@@ -782,6 +825,7 @@ impl Rnvpc {
             for entry in &entries {
                 let _ = self.remove_data_range_owner(entry);
             }
+            self.release_legacy_entry_publication_pins(&legacy_prepared);
             return Err(error);
         }
         let persist_result = match fault {
@@ -796,6 +840,7 @@ impl Rnvpc {
             }
         };
         if let Err(error) = persist_result {
+            self.release_legacy_entry_publication_pins(&legacy_prepared);
             if !self.persist.publication_uncertain() {
                 let _ = self.redirects.discard_prepared_entries(&entries);
                 for entry in &entries {
@@ -805,11 +850,34 @@ impl Rnvpc {
             return Err(error);
         }
 
+        for (page, key, _) in &legacy_prepared {
+            let mut objects = self.objects.lock(page.index());
+            let record = &mut objects.records[page.index()];
+            record.pins -= 1;
+            record.persisting = false;
+            record.committed = true;
+            record.key = Some(*key);
+            record.version = 0;
+            self.account_unpin();
+        }
         self.redirects.activate_prepared_entries(&entries);
         batch_metrics::count(batch_metrics::Event::RedirectPublishBatches, 1);
         batch_metrics::count(batch_metrics::Event::RedirectPublishedPages, prepared.len());
         batch_metrics::elapsed(batch_metrics::Phase::RedirectPublish, metrics_started);
         Ok(entries)
+    }
+
+    fn release_legacy_entry_publication_pins(&self, prepared: &[(NvPageId, PageKey, u64)]) {
+        for (page, _, _) in prepared {
+            let mut objects = self.objects.lock(page.index());
+            let record = &mut objects.records[page.index()];
+            record.pins -= 1;
+            record.persisting = false;
+            self.account_unpin();
+        }
+        if !prepared.is_empty() {
+            note_data_page_lease_change();
+        }
     }
 
     fn release_redirect_publication_pins(

@@ -1,6 +1,6 @@
 # 019: rNVPCe Range Write Transactions
 
-Date: 2026-10-31. Status: Approved design; implementation pending.
+Date: 2026-10-31. Status: Implemented; final regression and device validation in progress.
 
 ## 1. Intent
 
@@ -195,6 +195,21 @@ must not allocate or return an ordinary error. An invariant violation after F6
 latches `publication_uncertain`, blocks further access, and requires recovery;
 it must not continue with a missing volatile redirect.
 
+The implementation represents this ordering explicitly. New DRAM entries are
+inserted in `Publishing` state before selector persistence and cannot satisfy a
+lookup. After selector durability, publication is an allocation-free,
+infallible `Publishing -> Dirty` transition. If persistence fails before the
+result becomes uncertain, the prepared entries and range owners are removed.
+If durability is uncertain, the pool is latched for recovery instead of
+guessing which selectors reached NVM.
+
+The on-media pool version is 9. Recovery durably clears selectors whose
+`visibility_generation` is newer than the authoritative inode generation
+before returning their slot ranges to the allocator. Generation zero is
+reserved for the legacy per-page redirect compatibility API; Native records
+always use a nonzero inode visibility generation and recover only as range
+owners.
+
 Plan 018's reclaim ordering remains unchanged:
 
 ```text
@@ -247,6 +262,20 @@ Persistent metadata frames, rNVPC WAL data, and compatibility test APIs retain
 their existing per-slot object records. The Native hot path must not mirror a
 range back into 32 authoritative per-slot identities.
 
+The implemented Native reservation path charges capacity and allocates slots
+as ranges without initializing per-slot `ObjectRecord` values. One persistent
+redirect head and one DRAM range owner are the complete Native identity.
+Reclaim clears that head selector, removes the range owner, and returns the
+whole allocator interval. The generation-zero compatibility path keeps the old
+per-page lifecycle so rNVPC/WAL tests and old helper APIs remain isolated.
+
+For a short user copy after SSD blocks have been reserved, only the initialized
+prefix may become visible. The unused SSD suffix remains covered by its
+persistent allocation-ownership record until EXT4 releases the unpublished
+blocks. Only after that release succeeds may the allocation record be
+reclaimed; cleanup failure is therefore a recoverable leak, never a duplicate
+allocation.
+
 ## 9. Concurrency
 
 - Foreground writes take one writer reference for each overlapping dirty entry.
@@ -278,6 +307,20 @@ Correctness tests must prove:
 7. Reclaim clears one selector and returns one complete slot range.
 8. Requests larger than 128 pages are completed by an internal range loop and
    never leak a short write to userspace solely because of the entry limit.
+
+## 11. Implementation mapping
+
+- `write_transaction.rs` plans and commits bounded range transactions and
+  retains short-copy allocation ownership until cleanup.
+- `redirect_index.rs` provides the inode interval index, entry-level
+  reader/writer state, and prepared publication transition.
+- `frame.rs` owns Native capacity and slots by range; `frame/redirect.rs`
+  publishes and reclaims one range identity.
+- `recover.rs` rebuilds reachable range owners and removes selectors that are
+  newer than the authoritative inode.
+- `rnvpce_integrity_tests.rs` covers selector crash boundaries, stale
+  generations, range reuse, large-write chunking, and short-copy allocation
+  cleanup.
 9. F6--F8 crashes do not expose a redirect whose visibility generation is newer
    than the authoritative inode generation.
 

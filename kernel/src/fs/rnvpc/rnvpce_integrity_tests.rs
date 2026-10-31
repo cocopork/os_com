@@ -1088,8 +1088,7 @@ fn rnvpce_random_overwrites_leave_baseline_leaf_unchanged() {
         )
         .unwrap_or_else(|error| panic!("random overwrite {iteration} failed: {error:?}"));
         assert!(
-            mapped_nv_page_ref(&pool, FS_ID, INODE, logical)
-                .unwrap()
+            pool.lookup_dirty_nv_entry(PageKey::new(FS_ID, INODE, logical))
                 .is_some(),
             "random overwrite {iteration} lost logical page {logical}"
         );
@@ -1173,8 +1172,7 @@ fn fair_split_normalizes_fast_slot_order() {
         );
     }
     assert!(
-        mapped_nv_page_ref(&pool, FS_ID, INODE, 164)
-            .unwrap()
+        pool.lookup_dirty_nv_entry(PageKey::new(FS_ID, INODE, 164))
             .is_some()
     );
 }
@@ -2169,13 +2167,14 @@ fn partial_overwrite_redirects_whole_pages_without_splitting_ssd_extent() {
     drop(claimed);
 
     for (logical, expected_tail) in [(1, 0xa1), (2, 0x22)] {
-        let reference = mapped_nv_page_ref(&pool, FS_ID, INODE, logical)
-            .unwrap()
+        let entry = pool
+            .lookup_dirty_nv_entry(PageKey::new(FS_ID, INODE, logical))
             .unwrap();
-        let page = NvPageId::try_from(reference.slot().unwrap() as usize).unwrap();
-        let pin = pool.pin_data_page(page).unwrap();
+        let guard = entry.try_read().unwrap();
         let mut bytes = [0; PAGE_SIZE];
-        pin.read(&mut bytes).unwrap();
+        let mut writer = VmWriter::from(bytes.as_mut_slice()).to_fallible();
+        pool.copy_entry_to_writer(&guard, logical, 0, &mut writer, PAGE_SIZE)
+            .unwrap();
         assert!(bytes[..PAGE_SIZE / 2].iter().all(|byte| *byte == 0xa1));
         assert!(
             bytes[PAGE_SIZE / 2..]
@@ -3329,13 +3328,11 @@ fn rnvpce_existing_baseline_overwrite_uses_no_extent_update_session() {
 
     assert_eq!(pool.extent_field_update_sessions() - before, 0);
     assert!(
-        mapped_nv_page_ref(&pool, FS_ID, INODE, 2)
-            .unwrap()
+        pool.lookup_dirty_nv_entry(PageKey::new(FS_ID, INODE, 2))
             .is_some()
     );
     assert!(
-        mapped_nv_page_ref(&pool, FS_ID, INODE, 3)
-            .unwrap()
+        pool.lookup_dirty_nv_entry(PageKey::new(FS_ID, INODE, 3))
             .is_some()
     );
     for logical in [0, 1, 4, 7] {

@@ -13,6 +13,18 @@ use crate::fs::{
     vfs::inode::{FileOps, Inode as VfsInode},
 };
 
+fn has_native_redirect(
+    pool: &Arc<crate::fs::rnvpc::frame::Rnvpc>,
+    fs_id: u64,
+    inode: u64,
+    page_index: u64,
+) -> bool {
+    pool.lookup_dirty_nv_entry(crate::fs::rnvpc::index::PageKey::new(
+        fs_id, inode, page_index,
+    ))
+    .is_some()
+}
+
 #[ktest]
 fn ext4_research_routes() {
     crate::fs::fs_impls::ext4::test_utils::scenarios!(
@@ -81,14 +93,7 @@ fn nv_route_rnvpce_first_write_publishes_ssd_baseline() {
         assert!(mapping.is_written());
         targets.push(mapping.ssd_block());
         assert!(
-            crate::fs::rnvpc::write_transaction::mapped_nv_page_ref(
-                pool,
-                fixture.ext4.rnvpc_fs_id(),
-                11,
-                logical,
-            )
-            .unwrap()
-            .is_some(),
+            has_native_redirect(pool, fixture.ext4.rnvpc_fs_id(), 11, logical),
             "the NV redirect remains authoritative before migration completes"
         );
     }
@@ -212,13 +217,11 @@ fn nv_route_rnvpce_completion_publishes_reclaim_work_item() {
     let pool = crate::fs::rnvpc::pool().unwrap();
     for page_index in 0..4 {
         assert!(
-            crate::fs::rnvpc::write_transaction::mapped_nv_page_ref(
-                pool,
+            pool.lookup_dirty_nv_entry(crate::fs::rnvpc::index::PageKey::new(
                 fixture.ext4.rnvpc_fs_id(),
                 11,
                 page_index,
-            )
-            .unwrap()
+            ))
             .is_some(),
             "completion must leave the durable NV redirect for a helper"
         );
@@ -240,14 +243,7 @@ fn nv_route_rnvpce_completion_publishes_reclaim_work_item() {
     );
     for page_index in 0..4 {
         assert!(
-            crate::fs::rnvpc::write_transaction::mapped_nv_page_ref(
-                pool,
-                fixture.ext4.rnvpc_fs_id(),
-                11,
-                page_index,
-            )
-            .unwrap()
-            .is_none(),
+            !has_native_redirect(pool, fixture.ext4.rnvpc_fs_id(), 11, page_index),
             "the helper must publish the SSD baseline and retire the redirect"
         );
     }
@@ -466,16 +462,12 @@ fn nv_route_rnvpce_redirect_completion_avoids_leaf() {
     assert_eq!(event_count(Event::ReclaimedSlotRanges), 1);
     assert_eq!(event_count(Event::StructuralBaselineMutations), 0);
     for logical in 0..4 {
-        assert!(
-            crate::fs::rnvpc::write_transaction::mapped_nv_page_ref(
-                pool,
-                fixture.ext4.rnvpc_fs_id(),
-                11,
-                logical,
-            )
-            .unwrap()
-            .is_none()
-        );
+        assert!(!has_native_redirect(
+            pool,
+            fixture.ext4.rnvpc_fs_id(),
+            11,
+            logical
+        ));
     }
     let mut output = vec![0; second.len()];
     inode
@@ -800,16 +792,12 @@ fn nv_route_rnvpce_direct_partial_write_and_deferred_export() {
         .unwrap();
     assert_eq!(after, output);
     let pool = crate::fs::rnvpc::pool().unwrap();
-    assert!(
-        crate::fs::rnvpc::write_transaction::mapped_nv_page_ref(
-            pool,
-            fixture.ext4.rnvpc_fs_id(),
-            11,
-            0
-        )
-        .unwrap()
-        .is_none()
-    );
+    assert!(!has_native_redirect(
+        pool,
+        fixture.ext4.rnvpc_fs_id(),
+        11,
+        0
+    ));
     assert!(
         crate::fs::rnvpc::write_transaction::current_page_mapping(
             pool,
@@ -1186,26 +1174,26 @@ fn nv_route_rnvpce_batch_allocation_durability() {
     let pool = crate::fs::rnvpc::pool().unwrap();
     let mut protected_targets = Vec::new();
     for index in 0..32 {
-        let reference = crate::fs::rnvpc::write_transaction::mapped_nv_page_ref(
+        assert!(has_native_redirect(
+            pool,
+            failed.ext4.rnvpc_fs_id(),
+            11,
+            index,
+        ));
+        let target = crate::fs::rnvpc::write_transaction::current_page_mapping(
             pool,
             failed.ext4.rnvpc_fs_id(),
             11,
             index,
         )
         .unwrap()
-        .unwrap();
-        let target = pool.persistent_data_ssd_backing(reference).unwrap();
+        .unwrap()
+        .ssd_block();
         assert_ne!(target, 0, "failed flush must retain the foreground target");
         protected_targets.push(target);
         assert_eq!(
-            crate::fs::rnvpc::write_transaction::mapped_nv_page_ref(
-                pool,
-                failed.ext4.rnvpc_fs_id(),
-                11,
-                index,
-            )
-            .unwrap(),
-            Some(reference),
+            has_native_redirect(pool, failed.ext4.rnvpc_fs_id(), 11, index),
+            true,
             "failed completion flush must retain NV authority"
         );
         assert_eq!(
@@ -1234,16 +1222,12 @@ fn nv_route_rnvpce_batch_allocation_durability() {
         )
         .unwrap()
         .unwrap();
-        assert!(
-            crate::fs::rnvpc::write_transaction::mapped_nv_page_ref(
-                pool,
-                failed.ext4.rnvpc_fs_id(),
-                11,
-                index as u64,
-            )
-            .unwrap()
-            .is_none()
-        );
+        assert!(!has_native_redirect(
+            pool,
+            failed.ext4.rnvpc_fs_id(),
+            11,
+            index as u64
+        ));
         assert_eq!(mapping.ssd_block(), target);
     }
 }
@@ -1436,15 +1420,12 @@ fn nv_route_rnvpce_fragmented_batch_and_partial_rollback() {
     assert_eq!(fixture.ext4.free_blocks_count(), 56);
     let pool = crate::fs::rnvpc::pool().unwrap();
     for logical in 0..8 {
-        let reference = crate::fs::rnvpc::write_transaction::mapped_nv_page_ref(
+        assert!(has_native_redirect(
             pool,
             fixture.ext4.rnvpc_fs_id(),
             11,
             logical,
-        )
-        .unwrap()
-        .unwrap();
-        assert_ne!(pool.persistent_data_ssd_backing(reference).unwrap(), 0);
+        ));
         assert!(
             crate::fs::rnvpc::write_transaction::current_page_mapping(
                 pool,
@@ -1460,14 +1441,7 @@ fn nv_route_rnvpce_fragmented_batch_and_partial_rollback() {
     fixture.ext4.drain_nv_in_flight().unwrap();
     for logical in 0..8 {
         assert!(
-            crate::fs::rnvpc::write_transaction::mapped_nv_page_ref(
-                pool,
-                fixture.ext4.rnvpc_fs_id(),
-                11,
-                logical as u64,
-            )
-            .unwrap()
-            .is_none(),
+            !has_native_redirect(pool, fixture.ext4.rnvpc_fs_id(), 11, logical as u64),
             "fragmented per-page completion must reclaim NV authority"
         );
         let mapping = crate::fs::rnvpc::write_transaction::current_page_mapping(
