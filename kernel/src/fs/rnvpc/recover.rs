@@ -228,6 +228,25 @@ pub(super) fn scan(engine: &PersistEngine, capacity_pages: usize) -> Result<Reco
             rnvpce_data.push(entry);
         }
     }
+    let mut inode_generations = BTreeMap::new();
+    for entry in &metadata_entries {
+        if entry.key.page_index != FIXED_INODE_LOGICAL_INDEX {
+            continue;
+        }
+        let mut bytes = [0u8; size_of::<InodeRecord>()];
+        engine.read_data_bytes(entry.index, &mut bytes)?;
+        let inode = InodeRecord::decode(&bytes)?;
+        inode_generations.insert(
+            (entry.key.fs_id, entry.key.inode),
+            inode.header().generation(),
+        );
+    }
+    redirect_extents.retain(|record| {
+        record.visibility_generation() == 0
+            || inode_generations
+                .get(&(record.fs_id(), record.inode()))
+                .is_some_and(|generation| record.visibility_generation() <= *generation)
+    });
     for record in redirect_extents
         .iter()
         .filter(|record| record.authority().ok() == Some(NvRedirectAuthority::NvAuthoritative))

@@ -10,7 +10,7 @@ pub(crate) const NV_DESCRIPTOR_MAGIC: u64 = 0x4e56_4445_5343_3032;
 /// 描述符版本。
 pub(crate) const NV_DESCRIPTOR_VERSION: u32 = 1;
 pub(crate) const NV_REDIRECT_EXTENT_MAGIC: u64 = 0x4e56_5245_5854_3031;
-pub(crate) const NV_REDIRECT_EXTENT_VERSION: u32 = 1;
+pub(crate) const NV_REDIRECT_EXTENT_VERSION: u32 = 2;
 const NV_DESCRIPTOR_MIGRATION_TARGET: u16 = 1 << 0;
 const NV_DESCRIPTOR_MIGRATION_CREDIT_RELEASED: u16 = 1 << 1;
 
@@ -45,7 +45,7 @@ pub(crate) struct NvRedirectExtentRecord {
     logical_start: u64,
     nv_slot_start: u64,
     ssd_block_start: u64,
-    reserved: u64,
+    visibility_generation: u64,
 }
 
 const _: () = {
@@ -63,6 +63,29 @@ impl NvRedirectExtentRecord {
         nv_slot_start: u64,
         ssd_block_start: u64,
         authority: NvRedirectAuthority,
+    ) -> Result<Self> {
+        Self::new_with_visibility(
+            fs_id,
+            inode,
+            logical_start,
+            page_count,
+            nv_slot_start,
+            ssd_block_start,
+            authority,
+            0,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_with_visibility(
+        fs_id: u64,
+        inode: u64,
+        logical_start: u64,
+        page_count: u16,
+        nv_slot_start: u64,
+        ssd_block_start: u64,
+        authority: NvRedirectAuthority,
+        visibility_generation: u64,
     ) -> Result<Self> {
         if page_count == 0 {
             return_errno_with_message!(Errno::EINVAL, "empty NV redirect extent");
@@ -88,7 +111,7 @@ impl NvRedirectExtentRecord {
             logical_start,
             nv_slot_start,
             ssd_block_start,
-            reserved: 0,
+            visibility_generation,
         })
     }
 
@@ -116,6 +139,10 @@ impl NvRedirectExtentRecord {
         self.ssd_block_start
     }
 
+    pub(crate) const fn visibility_generation(&self) -> u64 {
+        self.visibility_generation
+    }
+
     pub(crate) fn authority(&self) -> Result<NvRedirectAuthority> {
         NvRedirectAuthority::from_u8(self.authority)
     }
@@ -129,7 +156,7 @@ impl NvRedirectExtentRecord {
     }
 
     pub(crate) fn with_authority(&self, authority: NvRedirectAuthority) -> Result<Self> {
-        Self::new(
+        Self::new_with_visibility(
             self.fs_id,
             self.inode,
             self.logical_start,
@@ -137,6 +164,7 @@ impl NvRedirectExtentRecord {
             self.nv_slot_start,
             self.ssd_block_start,
             authority,
+            self.visibility_generation,
         )
     }
 
@@ -165,7 +193,7 @@ impl NvRedirectExtentRecord {
     }
 
     pub(crate) fn validate(&self) -> Result<()> {
-        let rebuilt = Self::new(
+        let rebuilt = Self::new_with_visibility(
             self.fs_id,
             self.inode,
             self.logical_start,
@@ -173,11 +201,11 @@ impl NvRedirectExtentRecord {
             self.nv_slot_start,
             self.ssd_block_start,
             self.authority()?,
+            self.visibility_generation,
         )?;
         if self.magic != NV_REDIRECT_EXTENT_MAGIC
             || self.version != NV_REDIRECT_EXTENT_VERSION
             || !self.selector_is_valid()
-            || self.reserved != 0
             || rebuilt.page_count != self.page_count
         {
             return_errno_with_message!(Errno::EINVAL, "invalid NV redirect extent record");

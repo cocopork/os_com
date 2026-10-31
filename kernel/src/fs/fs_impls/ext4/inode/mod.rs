@@ -1846,73 +1846,79 @@ impl Inode {
                 &pool, fs_id, inode_id,
             )?
             .ok_or_else(|| Error::new(Errno::EUCLEAN))?;
-            let mut targets = Vec::new();
             let first_page = offset / PAGE_SIZE;
             let last_page = end.div_ceil(PAGE_SIZE);
             let page_count = last_page - first_page;
-            targets
-                .try_reserve_exact(page_count)
-                .map_err(|_| Error::new(Errno::ENOMEM))?;
+            let plan = crate::fs::rnvpc::write_transaction::plan_range_write(
+                &pool,
+                fs_id,
+                inode_id,
+                offset as u64,
+                write_len,
+                authority.file_size(),
+            )?;
+            if plan.inode_generation != authority.generation() {
+                drop(mutation);
+                drop(inner);
+                continue;
+            }
             let mut spans = Vec::new();
             let mut newly_reserved = 0u64;
             let mut has_in_flight = false;
             let lease_epoch = pool.data_page_lease_epoch();
+            let mut planned_extent = 0usize;
             spans
                 .try_reserve_exact(page_count)
                 .map_err(|_| Error::new(Errno::ENOMEM))?;
             for page_index in first_page..last_page {
                 let logical_block = page_index as u64;
-                let redirect_key =
-                    crate::fs::rnvpc::index::PageKey::new(fs_id, inode_id, logical_block);
-                let redirect = pool.redirect_lookup(redirect_key);
-                has_in_flight |= redirect.is_some_and(|handle| {
-                    handle.state == crate::fs::rnvpc::descriptor::NvObjectState::NvWriteback
-                        || handle.migration_target
-                });
+                while plan.extents[planned_extent].logical_range().end <= logical_block {
+                    planned_extent += 1;
+                }
+                let extent = &plan.extents[planned_extent];
                 let page_start = page_index * PAGE_SIZE;
                 let copy_start = offset.max(page_start);
                 let copy_end = end.min(page_start + PAGE_SIZE);
                 let page_offset = copy_start - page_start;
                 let len = copy_end - copy_start;
-                let mut newly_allocated = false;
-                if let Some(mapping) = crate::fs::rnvpc::write_transaction::current_page_mapping(
-                    &pool,
-                    fs_id,
-                    inode_id,
-                    logical_block,
-                )? {
-                    targets.push(mapping.ssd_block());
-                    has_in_flight |= mapping.is_in_flight();
-                } else {
-                    targets.push(0);
-                    if redirect.is_none() {
+                let (ssd_block, newly_allocated) = match extent {
+                    crate::fs::rnvpc::write_transaction::WriteExtent::ExistingNv {
+                        entry, ..
+                    } => {
+                        has_in_flight |= entry.state()
+                            != crate::fs::rnvpc::redirect_index::NvExtentEntryState::Dirty;
+                        let block = entry
+                            .ssd_block_range()
+                            .start
+                            .checked_add(logical_block - entry.logical_start())
+                            .ok_or_else(|| Error::new(Errno::EOVERFLOW))?;
+                        (block, false)
+                    }
+                    crate::fs::rnvpc::write_transaction::WriteExtent::ExistingSsd {
+                        logical_range,
+                        ssd_start,
+                        ..
+                    } => (
+                        ssd_start
+                            .checked_add(logical_block - logical_range.start)
+                            .ok_or_else(|| Error::new(Errno::EOVERFLOW))?,
+                        false,
+                    ),
+                    crate::fs::rnvpc::write_transaction::WriteExtent::NewAllocation { .. } => {
                         newly_reserved = newly_reserved
                             .checked_add(1)
                             .ok_or_else(|| Error::new(Errno::EOVERFLOW))?;
-                        newly_allocated = true;
+                        (0, true)
                     }
-                }
+                };
                 spans.push(crate::fs::rnvpc::write_transaction::RangeWritePage::new(
                     logical_block,
-                    *targets.last().unwrap(),
+                    ssd_block,
                     page_offset,
                     len,
                     newly_allocated,
                 )?);
             }
-            let provisional_request = crate::fs::rnvpc::write_transaction::RangeWriteBatch::new(
-                authority
-                    .generation()
-                    .checked_add(1)
-                    .ok_or_else(|| Error::new(Errno::EOVERFLOW))?,
-                offset as u64,
-                write_len,
-                &[],
-                &spans,
-                authority.file_size(),
-                authority.block_count(),
-                (BLOCK_SIZE / 512) as u64,
-            )?;
             if has_in_flight {
                 // No capacity or user bytes have been consumed. Completion
                 // needs this publication guard, so wait after dropping both
@@ -1922,12 +1928,7 @@ impl Inode {
                 fs.wait_for_nv_migration_progress(&pool, lease_epoch)?;
                 continue;
             }
-            let needed = crate::fs::rnvpc::write_transaction::range_write_new_pages(
-                &pool,
-                fs_id,
-                inode_id,
-                &provisional_request,
-            )?;
+            let needed = plan.new_data_pages()?;
             let reservation = match pool.reserve_data_pages(needed) {
                 Ok(reservation) => reservation,
                 Err(error) if error.error() == Errno::EAGAIN => {
@@ -2028,7 +2029,8 @@ impl Inode {
                 authority.file_size(),
                 authority.block_count(),
                 (BLOCK_SIZE / 512) as u64,
-            )?;
+            )?
+            .with_plan(plan)?;
             let persist_started = pp::now();
             let result = crate::fs::rnvpc::write_transaction::commit_range_write_with_mutation(
                 pool.clone(),

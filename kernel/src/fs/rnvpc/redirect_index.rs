@@ -551,6 +551,31 @@ impl RedirectDirectory {
     }
 
     pub(crate) fn publish_dirty_entry(&self, entry: Arc<DirtyNvExtentEntry>) -> Result<()> {
+        self.publish_entries(core::slice::from_ref(&entry))
+    }
+
+    pub(crate) fn publish_entries(&self, new_entries: &[Arc<DirtyNvExtentEntry>]) -> Result<()> {
+        for entry in new_entries {
+            if entry.state() != NvExtentEntryState::Dirty {
+                return_errno_with_message!(Errno::EINVAL, "published NV extent entry is not dirty");
+            }
+        }
+        let mut ordered = new_entries.iter().collect::<Vec<_>>();
+        ordered.sort_unstable_by_key(|entry| (entry.fs_id(), entry.inode(), entry.logical_start()));
+        for pair in ordered.windows(2) {
+            if (pair[0].fs_id(), pair[0].inode()) == (pair[1].fs_id(), pair[1].inode())
+                && pair[0].logical_range().end > pair[1].logical_start()
+            {
+                return_errno_with_message!(Errno::EBUSY, "NV extent publication overlaps itself");
+            }
+        }
+        for entry in ordered {
+            self.publish_one_entry(entry.clone())?;
+        }
+        Ok(())
+    }
+
+    fn publish_one_entry(&self, entry: Arc<DirtyNvExtentEntry>) -> Result<()> {
         if entry.state() != NvExtentEntryState::Dirty {
             return_errno_with_message!(Errno::EINVAL, "published NV extent entry is not dirty");
         }
@@ -618,6 +643,29 @@ impl RedirectDirectory {
     #[cfg(ktest)]
     pub(crate) fn overlap_lookup_count(&self) -> usize {
         self.overlap_lookups.load(Ordering::Acquire)
+    }
+
+    #[cfg(ktest)]
+    pub(crate) fn dirty_entry_count(&self, fs_id: u64, inode: u64) -> usize {
+        self.inode_map(fs_id, inode, false)
+            .ok()
+            .flatten()
+            .map_or(0, |map| map.entries.lock().len())
+    }
+
+    #[cfg(ktest)]
+    pub(crate) fn page_handle_count(&self, fs_id: u64, inode: u64) -> usize {
+        self.partitions
+            .iter()
+            .map(|partition| {
+                partition
+                    .lock()
+                    .committed
+                    .keys()
+                    .filter(|key| (key.fs_id, key.inode) == (fs_id, inode))
+                    .count()
+            })
+            .sum()
     }
 
     pub(crate) fn claim_ready_entries(

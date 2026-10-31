@@ -9,14 +9,14 @@
 //! its extent state is durable. Legacy full-page-image helpers remain only for
 //! pre-migration unit coverage and are not used by the VFS path.
 
-use core::ops::Range;
+use core::{fmt, ops::Range};
 
 use super::{
     data_page::DataPageState,
-    descriptor::NvObjectState,
     extent_mutation::ExtentMutation,
     fault::FaultPoint,
     frame::Rnvpc,
+    id::NvPageId,
     index::PageKey,
     metadata::{
         AllocationRecord, AuthoritativeMetadataRecord, EXTENT_NODE_ENTRY_CAPACITY, ExtentDataRef,
@@ -804,6 +804,31 @@ pub(crate) struct RangeWritePlan {
     pub(crate) extents: Vec<WriteExtent>,
 }
 
+impl RangeWritePlan {
+    pub(crate) fn new_data_pages(&self) -> Result<usize> {
+        self.extents.iter().try_fold(0usize, |pages, extent| {
+            let additional = match extent {
+                WriteExtent::ExistingNv { .. } => 0,
+                WriteExtent::ExistingSsd { logical_range, .. }
+                | WriteExtent::NewAllocation { logical_range } => {
+                    usize::try_from(logical_range.end - logical_range.start)
+                        .map_err(|_| Error::new(Errno::EOVERFLOW))?
+                }
+            };
+            pages
+                .checked_add(additional)
+                .ok_or_else(|| Error::new(Errno::EOVERFLOW))
+        })
+    }
+
+    pub(crate) fn extent_for(&self, logical_block: u64) -> Result<&WriteExtent> {
+        self.extents
+            .iter()
+            .find(|extent| extent.logical_range().contains(&logical_block))
+            .ok_or_else(|| Error::new(Errno::EUCLEAN))
+    }
+}
+
 pub(crate) enum WriteExtent {
     ExistingNv {
         entry: Arc<super::redirect_index::DirtyNvExtentEntry>,
@@ -817,6 +842,16 @@ pub(crate) enum WriteExtent {
     NewAllocation {
         logical_range: Range<u64>,
     },
+}
+
+impl WriteExtent {
+    pub(crate) fn logical_range(&self) -> &Range<u64> {
+        match self {
+            Self::ExistingNv { logical_range, .. }
+            | Self::ExistingSsd { logical_range, .. }
+            | Self::NewAllocation { logical_range } => logical_range,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -990,7 +1025,6 @@ impl RangeWritePage {
     }
 }
 
-#[derive(Debug)]
 pub(crate) struct RangeWriteBatch<'a> {
     generation: u64,
     file_offset: u64,
@@ -999,6 +1033,23 @@ pub(crate) struct RangeWriteBatch<'a> {
     old_file_size: u64,
     old_block_count: u64,
     sectors_per_block: u64,
+    plan: Option<RangeWritePlan>,
+}
+
+impl fmt::Debug for RangeWriteBatch<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RangeWriteBatch")
+            .field("generation", &self.generation)
+            .field("file_offset", &self.file_offset)
+            .field("allocations", &self.allocations)
+            .field("pages", &self.pages)
+            .field("old_file_size", &self.old_file_size)
+            .field("old_block_count", &self.old_block_count)
+            .field("sectors_per_block", &self.sectors_per_block)
+            .field("has_plan", &self.plan.is_some())
+            .finish()
+    }
 }
 
 impl<'a> RangeWriteBatch<'a> {
@@ -1049,7 +1100,27 @@ impl<'a> RangeWriteBatch<'a> {
             old_file_size,
             old_block_count,
             sectors_per_block,
+            plan: None,
         })
+    }
+
+    pub(crate) fn with_plan(mut self, plan: RangeWritePlan) -> Result<Self> {
+        if plan.file_offset != self.file_offset
+            || plan.write_len
+                != self
+                    .pages
+                    .iter()
+                    .try_fold(0usize, |total, page| total.checked_add(page.len))
+                    .ok_or_else(|| Error::new(Errno::EOVERFLOW))?
+            || plan
+                .inode_generation
+                .checked_add(1)
+                .is_none_or(|generation| generation != self.generation)
+        {
+            return_errno_with_message!(Errno::ESTALE, "range write plan no longer matches request");
+        }
+        self.plan = Some(plan);
+        Ok(self)
     }
 }
 
@@ -1115,33 +1186,23 @@ pub(crate) fn range_write_new_pages(
     inode: u64,
     request: &RangeWriteBatch<'_>,
 ) -> Result<usize> {
-    if request.pages.iter().all(|page| page.newly_allocated) {
-        return Ok(request.pages.len());
+    if let Some(plan) = &request.plan {
+        return plan.new_data_pages();
     }
-
-    let mut existing_baseline = true;
-    for page in request.pages {
-        let mapping = current_page_mapping(pool, fs_id, inode, page.logical_block)?;
-        existing_baseline &= !page.newly_allocated
-            && mapping.is_some_and(|mapping| {
-                mapping.is_written() && mapping.ssd_block() == page.ssd_block
-            });
-    }
-    if existing_baseline {
-        return request.pages.iter().try_fold(0usize, |pages, page| {
-            Ok(pages
-                + usize::from(
-                    mapped_nv_page_ref(pool, fs_id, inode, page.logical_block)?.is_none(),
-                ))
-        });
-    }
-    let mut pages = 0;
-    for page in request.pages {
-        if mapped_nv_page_ref(pool, fs_id, inode, page.logical_block)?.is_none() {
-            pages += 1;
-        }
-    }
-    Ok(pages)
+    let write_len = request.pages.iter().try_fold(0usize, |total, page| {
+        total
+            .checked_add(page.len)
+            .ok_or_else(|| Error::new(Errno::EOVERFLOW))
+    })?;
+    plan_range_write(
+        pool,
+        fs_id,
+        inode,
+        request.file_offset,
+        write_len,
+        request.old_file_size,
+    )?
+    .new_data_pages()
 }
 
 pub(crate) fn commit_range_write_with_mutation<F>(
@@ -1163,11 +1224,32 @@ where
     let current_inode_ref =
         authoritative_inode_ref(&pool, fs_id, inode)?.ok_or_else(|| Error::new(Errno::ENOENT))?;
     let current_inode = pool.read_authoritative_metadata::<InodeRecord>(current_inode_ref)?;
-    if request.generation <= current_inode.header().generation() {
+    if request.generation != current_inode.header().generation().saturating_add(1) {
         return_errno_with_message!(Errno::ESTALE, "write generation is not newer than inode");
     }
     let current_root = current_inode.extent_root();
     LATENCY_STATS.fg_inode_read.record_since(started);
+    let computed_plan;
+    let plan = if let Some(plan) = &request.plan {
+        plan
+    } else {
+        computed_plan = plan_range_write(
+            &pool,
+            fs_id,
+            inode,
+            request.file_offset,
+            request.pages.iter().try_fold(0usize, |total, page| {
+                total
+                    .checked_add(page.len)
+                    .ok_or_else(|| Error::new(Errno::EOVERFLOW))
+            })?,
+            request.old_file_size,
+        )?;
+        &computed_plan
+    };
+    if plan.inode_generation != current_inode.header().generation() {
+        return_errno_with_message!(Errno::ESTALE, "range write plan generation changed");
+    }
 
     if let Some(committed) = try_commit_existing_baseline_redirect_write(
         &pool,
@@ -1181,6 +1263,7 @@ where
         &mut reservation,
         current_inode_ref,
         &current_inode,
+        plan,
     )? {
         LATENCY_STATS.fg_body.record_since(body_started);
         return Ok(committed);
@@ -1231,32 +1314,43 @@ where
         // Planning established that a newly allocated logical page has no
         // baseline while this mutation's publication guard was already held.
         // Re-routing the immutable tree for every page only repeats that fact.
-        let entry = if page.newly_allocated {
-            None
-        } else {
-            lookup_tree_extent(&pool, fs_id, inode, current_root, page.logical_block)?
-        };
-        let existing = match entry {
-            Some(entry) => match entry.data_ref()? {
-                ExtentDataRef::Nv(_) => return_errno_with_message!(
-                    Errno::EUCLEAN,
-                    "v5 extent leaf contains a legacy NV target"
-                ),
-                ExtentDataRef::Ssd(first) => {
-                    let block = first
-                        .checked_add(page.logical_block - entry.logical_block())
-                        .ok_or_else(|| Error::new(Errno::EOVERFLOW))?;
-                    if block != page.ssd_block || page.newly_allocated {
-                        return_errno_with_message!(Errno::ESTALE, "SSD extent target changed");
-                    }
-                    None
+        let (entry, existing) = match plan.extent_for(page.logical_block)? {
+            WriteExtent::ExistingNv { entry, .. } => {
+                let slot = entry
+                    .nv_slot_range()
+                    .start
+                    .checked_add(page.logical_block - entry.logical_start())
+                    .and_then(|slot| usize::try_from(slot).ok())
+                    .ok_or_else(|| Error::new(Errno::EOVERFLOW))?;
+                let reference = pool.persistent_data_ref(NvPageId::try_from(slot)?)?;
+                (None, Some(reference))
+            }
+            WriteExtent::ExistingSsd {
+                logical_range,
+                ssd_start,
+                written,
+            } => {
+                let block = ssd_start
+                    .checked_add(page.logical_block - logical_range.start)
+                    .ok_or_else(|| Error::new(Errno::EOVERFLOW))?;
+                if block != page.ssd_block || page.newly_allocated {
+                    return_errno_with_message!(Errno::ESTALE, "SSD extent target changed");
                 }
-            },
-            None => {
+                (
+                    Some(ExtentRecordEntry::leaf(
+                        page.logical_block,
+                        1,
+                        block,
+                        !*written,
+                    )?),
+                    None,
+                )
+            }
+            WriteExtent::NewAllocation { .. } => {
                 if !page.newly_allocated {
                     return_errno_with_message!(Errno::ESTALE, "write target lost its allocation");
                 }
-                None
+                (None, None)
             }
         };
         existing_refs.push((entry, existing));
@@ -1380,7 +1474,14 @@ where
     }
     let t_register = read_ns();
     for batch in pending_new_pages.chunks(128) {
-        pool.publish_redirect_batch(batch, None)?;
+        if let Err(error) = pool.publish_redirect_entries(batch, request.generation, None) {
+            if !pool.redirect_publication_uncertain() {
+                for (page, _, _) in &pending_new_pages {
+                    let _ = pool.abort_data_page(*page);
+                }
+            }
+            return Err(error);
+        }
     }
     let mut new_mappings = Vec::new();
     new_mappings
@@ -1483,6 +1584,7 @@ fn try_commit_existing_baseline_redirect_write<F>(
     reservation: &mut super::frame::CapacityReservation,
     current_inode_ref: PersistentObjectRef,
     current_inode: &InodeRecord,
+    plan: &RangeWritePlan,
 ) -> Result<Option<CommittedRangeWrite>>
 where
     F: FnMut(u64, &mut super::frame::StagingDataPage) -> Result<()>,
@@ -1490,33 +1592,39 @@ where
     if request.pages.iter().any(|page| page.newly_allocated) {
         return Ok(None);
     }
+    if plan.extents.iter().any(|extent| {
+        matches!(
+            extent,
+            WriteExtent::NewAllocation { .. } | WriteExtent::ExistingSsd { written: false, .. }
+        )
+    }) {
+        return Ok(None);
+    }
     for page in request.pages {
-        let Some(entry) = lookup_tree_extent(
-            pool,
-            fs_id,
-            inode,
-            current_inode.extent_root(),
-            page.logical_block,
-        )?
-        else {
-            return Ok(None);
+        let target = match plan.extent_for(page.logical_block)? {
+            WriteExtent::ExistingNv { entry, .. } => entry
+                .ssd_block_range()
+                .start
+                .checked_add(page.logical_block - entry.logical_start())
+                .ok_or_else(|| Error::new(Errno::EOVERFLOW))?,
+            WriteExtent::ExistingSsd {
+                logical_range,
+                ssd_start,
+                ..
+            } => ssd_start
+                .checked_add(page.logical_block - logical_range.start)
+                .ok_or_else(|| Error::new(Errno::EOVERFLOW))?,
+            WriteExtent::NewAllocation { .. } => unreachable!(),
         };
-        let ExtentDataRef::Ssd(first) = entry.data_ref()? else {
-            return Ok(None);
-        };
-        let target = first
-            .checked_add(page.logical_block - entry.logical_block())
-            .ok_or_else(|| Error::new(Errno::EOVERFLOW))?;
-        if entry.is_unwritten() || target != page.ssd_block {
+        if target != page.ssd_block {
             return Ok(None);
         }
     }
 
     let mut guarded_entries = BTreeSet::new();
     let mut _entry_guards = Vec::new();
-    for page in request.pages {
-        let key = PageKey::new(fs_id, inode, page.logical_block);
-        if let Some(entry) = pool.lookup_dirty_nv_entry(key)
+    for extent in &plan.extents {
+        if let WriteExtent::ExistingNv { entry, .. } = extent
             && guarded_entries.insert(entry.logical_start())
         {
             _entry_guards.push(entry.try_write().map_err(|error| {
@@ -1540,12 +1648,15 @@ where
     let staging_result = (|| -> Result<()> {
         for page in request.pages {
             let key = PageKey::new(fs_id, inode, page.logical_block);
-            let previous = pool.redirect_lookup(key);
-            if let Some(handle) = previous {
-                if handle.state != NvObjectState::NvDirty || handle.migration_target {
-                    return_errno_with_message!(Errno::EBUSY, "NV redirect is being migrated");
-                }
-                let data = pool.begin_persistent_data_mutation(handle.reference)?;
+            if let WriteExtent::ExistingNv { entry, .. } = plan.extent_for(page.logical_block)? {
+                let slot = entry
+                    .nv_slot_range()
+                    .start
+                    .checked_add(page.logical_block - entry.logical_start())
+                    .and_then(|slot| usize::try_from(slot).ok())
+                    .ok_or_else(|| Error::new(Errno::EOVERFLOW))?;
+                let reference = pool.persistent_data_ref(NvPageId::try_from(slot)?)?;
+                let data = pool.begin_persistent_data_mutation(reference)?;
                 let amount = data.copy_from_reader(page.page_offset, reader, page.len, None)?;
                 data.finish();
                 if amount == 0 {
@@ -1590,9 +1701,11 @@ where
         return Err(error);
     }
     for batch in pending.chunks(128) {
-        if let Err(error) = pool.publish_redirect_batch(batch, None) {
-            for (page, _, _) in &pending {
-                let _ = pool.abort_data_page(*page);
+        if let Err(error) = pool.publish_redirect_entries(batch, request.generation, None) {
+            if !pool.redirect_publication_uncertain() {
+                for (page, _, _) in &pending {
+                    let _ = pool.abort_data_page(*page);
+                }
             }
             return Err(error);
         }
@@ -2267,9 +2380,18 @@ pub(crate) fn mapped_nv_page_ref(
     inode: u64,
     logical_block: u64,
 ) -> Result<Option<PersistentObjectRef>> {
-    Ok(pool
-        .redirect_lookup(PageKey::new(fs_id, inode, logical_block))
-        .map(|handle| handle.reference))
+    let key = PageKey::new(fs_id, inode, logical_block);
+    let Some(entry) = pool.lookup_dirty_nv_entry(key) else {
+        return Ok(None);
+    };
+    let slot = entry
+        .nv_slot_range()
+        .start
+        .checked_add(logical_block - entry.logical_start())
+        .and_then(|slot| usize::try_from(slot).ok())
+        .ok_or_else(|| Error::new(Errno::EOVERFLOW))?;
+    pool.persistent_data_ref(NvPageId::try_from(slot)?)
+        .map(Some)
 }
 
 /// Returns true only while the inode's extent tree has no recoverable local

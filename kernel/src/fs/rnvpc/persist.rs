@@ -8,6 +8,7 @@ use super::{
     backend::NvMemoryBackend,
     descriptor::{NvDescriptor, NvRedirectExtentRecord},
     fault::{FaultPoint, inject},
+    id::NvPageId,
     layout::{
         NV_IMAGE_MAGIC, NV_IMAGE_VERSION, NvEntry, NvImageHeader, commit_offset, control_len,
         descriptor_offset, redirect_extent_offset,
@@ -22,6 +23,14 @@ pub(crate) struct PersistEngine {
 }
 
 impl PersistEngine {
+    pub(super) fn read_data_bytes(&self, index: usize, output: &mut [u8]) -> Result<()> {
+        self.check_index(index)?;
+        if output.len() > PAGE_SIZE {
+            return_errno_with_message!(Errno::EINVAL, "persistent record exceeds one NV page");
+        }
+        self.backend
+            .read_page_range(NvPageId::try_from(index)?, 0, output)
+    }
     pub(super) fn new(backend: Arc<dyn NvMemoryBackend>, capacity_pages: usize) -> Result<Self> {
         if backend.capacity_pages() != capacity_pages
             || backend.control_len() < control_len(capacity_pages)?
@@ -166,6 +175,28 @@ impl PersistEngine {
         data_slots: &[usize],
         fault: Option<FaultPoint>,
     ) -> Result<()> {
+        self.commit_redirect_extents_inner(records, data_slots, |point| inject(fault, point))
+    }
+
+    #[cfg(ktest)]
+    pub(super) fn commit_redirect_extents_counted(
+        &self,
+        records: &[NvRedirectExtentRecord],
+        data_slots: &[usize],
+        fault: Option<super::fault::FaultSpec>,
+    ) -> Result<()> {
+        let mut seen = 0;
+        self.commit_redirect_extents_inner(records, data_slots, |point| {
+            super::fault::inject_counted(fault, point, &mut seen)
+        })
+    }
+
+    fn commit_redirect_extents_inner(
+        &self,
+        records: &[NvRedirectExtentRecord],
+        data_slots: &[usize],
+        mut inject_fault: impl FnMut(FaultPoint) -> Result<()>,
+    ) -> Result<()> {
         self.ensure_writable()?;
         if records.len() > 128 || data_slots.len() > 128 {
             return_errno!(Errno::EINVAL);
@@ -183,7 +214,7 @@ impl PersistEngine {
         for slot in data_slots {
             self.check_index(*slot)?;
         }
-        inject(fault, FaultPoint::BeforeContentPersist)?;
+        inject_fault(FaultPoint::BeforeContentPersist)?;
         for slot in data_slots {
             self.backend.persist(slot * PAGE_SIZE, PAGE_SIZE)?;
         }
@@ -204,16 +235,16 @@ impl PersistEngine {
                 .persist_control(record_offset, size_of::<NvRedirectExtentRecord>())?;
         }
         self.backend.fence()?;
-        inject(fault, FaultPoint::AfterContentPersist)?;
+        inject_fault(FaultPoint::AfterContentPersist)?;
         let publication = (|| {
             for record in records {
                 let head = usize::try_from(record.nv_slot_start())
                     .map_err(|_| Error::new(Errno::EOVERFLOW))?;
                 let offset = commit_offset(head)?;
                 self.backend.store_control_u64(offset, 1)?;
-                inject(fault, FaultPoint::AfterCommitStore)?;
+                inject_fault(FaultPoint::AfterCommitStore)?;
                 self.backend.persist_control(offset, size_of::<u64>())?;
-                inject(fault, FaultPoint::AfterCommitPersist)?;
+                inject_fault(FaultPoint::AfterCommitPersist)?;
             }
             self.backend.fence()
         })();
@@ -221,7 +252,7 @@ impl PersistEngine {
             self.publication_uncertain.store(true, Ordering::Release);
             return Err(error);
         }
-        if let Err(error) = inject(fault, FaultPoint::AfterCommitFence) {
+        if let Err(error) = inject_fault(FaultPoint::AfterCommitFence) {
             self.publication_uncertain.store(true, Ordering::Release);
             return Err(error);
         }
@@ -415,6 +446,10 @@ impl PersistEngine {
 
     pub(super) fn publication_uncertain(&self) -> bool {
         self.publication_uncertain.load(Ordering::Acquire)
+    }
+
+    pub(super) fn latch_publication_uncertain(&self) {
+        self.publication_uncertain.store(true, Ordering::Release);
     }
 
     #[cfg(ktest)]

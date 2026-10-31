@@ -7,6 +7,13 @@ use crate::fs::rnvpc::batch_metrics;
 #[cfg(ktest)]
 use crate::fs::rnvpc::redirect_index::RedirectRange;
 
+#[derive(Clone, Copy)]
+enum RedirectEntryFault {
+    Point(Option<FaultPoint>),
+    #[cfg(ktest)]
+    Counted(Option<crate::fs::rnvpc::fault::FaultSpec>),
+}
+
 impl Rnvpc {
     pub(crate) fn begin_reserved_data_ranges(
         self: &Arc<Self>,
@@ -151,6 +158,24 @@ impl Rnvpc {
     #[cfg(ktest)]
     pub(crate) fn redirect_overlap_lookups(&self) -> usize {
         self.redirects.overlap_lookup_count()
+    }
+
+    #[cfg(ktest)]
+    pub(crate) fn dirty_nv_entry_count_for_test(&self, fs_id: u64, inode: u64) -> usize {
+        self.redirects.dirty_entry_count(fs_id, inode)
+    }
+
+    #[cfg(ktest)]
+    pub(crate) fn native_redirect_page_handle_count_for_test(
+        &self,
+        fs_id: u64,
+        inode: u64,
+    ) -> usize {
+        self.redirects.page_handle_count(fs_id, inode)
+    }
+
+    pub(crate) fn redirect_publication_uncertain(&self) -> bool {
+        self.persist.publication_uncertain()
     }
 
     pub(crate) fn data_segment_from_entry(
@@ -584,6 +609,184 @@ impl Rnvpc {
             .collect();
         batch_metrics::elapsed(batch_metrics::Phase::RedirectPublish, metrics_started);
         Ok(handles)
+    }
+
+    pub(crate) fn publish_redirect_entries(
+        &self,
+        pages: &[(NvPageId, PageKey, u64)],
+        visibility_generation: u64,
+        fault: Option<FaultPoint>,
+    ) -> Result<Vec<Arc<DirtyNvExtentEntry>>> {
+        self.publish_redirect_entries_inner(
+            pages,
+            visibility_generation,
+            RedirectEntryFault::Point(fault),
+        )
+    }
+
+    #[cfg(ktest)]
+    pub(crate) fn publish_redirect_entries_counted(
+        &self,
+        pages: &[(NvPageId, PageKey, u64)],
+        visibility_generation: u64,
+        fault: Option<crate::fs::rnvpc::fault::FaultSpec>,
+    ) -> Result<Vec<Arc<DirtyNvExtentEntry>>> {
+        self.publish_redirect_entries_inner(
+            pages,
+            visibility_generation,
+            RedirectEntryFault::Counted(fault),
+        )
+    }
+
+    fn publish_redirect_entries_inner(
+        &self,
+        pages: &[(NvPageId, PageKey, u64)],
+        visibility_generation: u64,
+        fault: RedirectEntryFault,
+    ) -> Result<Vec<Arc<DirtyNvExtentEntry>>> {
+        if pages.is_empty() {
+            return Ok(Vec::new());
+        }
+        if pages.len() > crate::fs::rnvpc::redirect_index::MAX_DIRTY_MIGRATION_EXTENT_PAGES {
+            return_errno_with_message!(Errno::EINVAL, "redirect publication exceeds 128 pages");
+        }
+        let metrics_started = batch_metrics::now();
+        let mut prepared = Vec::new();
+        prepared
+            .try_reserve_exact(pages.len())
+            .map_err(|_| Error::new(Errno::ENOMEM))?;
+        let mut slots = BTreeSet::new();
+        for (page, key, ssd_target) in pages {
+            if *ssd_target == 0
+                || !slots.insert(page.index())
+                || self.lookup_dirty_nv_entry(*key).is_some()
+            {
+                self.release_entry_publication_pins(&prepared);
+                return_errno_with_message!(Errno::EBUSY, "redirect entry publication overlaps");
+            }
+            let mut objects = self.objects.lock_checked(page.index())?;
+            if let Err(error) = self.pin_persistent_update(
+                &mut objects,
+                page.index(),
+                ObjectKind::Data(DataPageState::NvDirty),
+            ) {
+                drop(objects);
+                self.release_entry_publication_pins(&prepared);
+                return Err(error);
+            }
+            prepared.push((*page, *key, *ssd_target));
+        }
+
+        let mut records = Vec::new();
+        records
+            .try_reserve_exact(prepared.len())
+            .map_err(|_| Error::new(Errno::ENOMEM))?;
+        let mut range_start = 0usize;
+        while range_start < prepared.len() {
+            let mut range_end = range_start + 1;
+            while range_end < prepared.len()
+                && range_end - range_start
+                    < crate::fs::rnvpc::redirect_index::MAX_DIRTY_MIGRATION_EXTENT_PAGES
+                && prepared[range_end].1.fs_id == prepared[range_end - 1].1.fs_id
+                && prepared[range_end].1.inode == prepared[range_end - 1].1.inode
+                && prepared[range_end - 1].1.page_index.checked_add(1)
+                    == Some(prepared[range_end].1.page_index)
+                && prepared[range_end - 1].0.index().checked_add(1)
+                    == Some(prepared[range_end].0.index())
+                && prepared[range_end - 1].2.checked_add(1) == Some(prepared[range_end].2)
+            {
+                range_end += 1;
+            }
+            let (head_page, head_key, head_ssd) = prepared[range_start];
+            records.push(NvRedirectExtentRecord::new_with_visibility(
+                head_key.fs_id,
+                head_key.inode,
+                head_key.page_index,
+                u16::try_from(range_end - range_start).map_err(|_| Error::new(Errno::EOVERFLOW))?,
+                head_page.index() as u64,
+                head_ssd,
+                NvRedirectAuthority::NvAuthoritative,
+                visibility_generation,
+            )?);
+            range_start = range_end;
+        }
+        let entries = records
+            .iter()
+            .copied()
+            .map(DirtyNvExtentEntry::new)
+            .map(|entry| entry.map(Arc::new))
+            .collect::<Result<Vec<_>>>()?;
+        let mut owners_installed = 0usize;
+        for entry in &entries {
+            let slots = entry.nv_slot_range();
+            let slots = usize::try_from(slots.start).map_err(|_| Error::new(Errno::EOVERFLOW))?
+                ..usize::try_from(slots.end).map_err(|_| Error::new(Errno::EOVERFLOW))?;
+            if let Err(error) = self.install_data_range_owner(entry, slots) {
+                for installed in &entries[..owners_installed] {
+                    let _ = self.remove_data_range_owner(installed);
+                }
+                self.release_entry_publication_pins(&prepared);
+                return Err(error);
+            }
+            owners_installed += 1;
+        }
+
+        let data_slots = prepared
+            .iter()
+            .map(|(page, _, _)| page.index())
+            .collect::<Vec<_>>();
+        let persist_result = match fault {
+            RedirectEntryFault::Point(fault) => {
+                self.persist
+                    .commit_redirect_extents(&records, &data_slots, fault)
+            }
+            #[cfg(ktest)]
+            RedirectEntryFault::Counted(fault) => {
+                self.persist
+                    .commit_redirect_extents_counted(&records, &data_slots, fault)
+            }
+        };
+        if let Err(error) = persist_result {
+            self.release_entry_publication_pins(&prepared);
+            if !self.persist.publication_uncertain() {
+                for entry in &entries {
+                    let _ = self.remove_data_range_owner(entry);
+                }
+            }
+            return Err(error);
+        }
+
+        for (page, key, _) in &prepared {
+            let mut objects = self.objects.lock(page.index());
+            let record = &mut objects.records[page.index()];
+            record.pins -= 1;
+            record.persisting = false;
+            record.committed = true;
+            record.key = Some(*key);
+            record.version = 0;
+            self.account_unpin();
+        }
+        if let Err(error) = self.redirects.publish_entries(&entries) {
+            self.persist.latch_publication_uncertain();
+            return Err(error);
+        }
+        batch_metrics::count(batch_metrics::Event::RedirectPublishBatches, 1);
+        batch_metrics::count(batch_metrics::Event::RedirectPublishedPages, prepared.len());
+        batch_metrics::elapsed(batch_metrics::Phase::RedirectPublish, metrics_started);
+        Ok(entries)
+    }
+
+    fn release_entry_publication_pins(&self, prepared: &[(NvPageId, PageKey, u64)]) {
+        for (page, _, _) in prepared {
+            let mut objects = self.objects.lock(page.index());
+            let record = &mut objects.records[page.index()];
+            record.pins -= 1;
+            record.persisting = false;
+            self.account_unpin();
+        }
+        if !prepared.is_empty() {
+            note_data_page_lease_change();
+        }
     }
 
     fn release_redirect_publication_pins(

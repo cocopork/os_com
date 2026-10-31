@@ -18,7 +18,7 @@ use super::{
     descriptor::{NvDescriptor, NvObjectState, NvRedirectAuthority},
     dram::{DramNvBackend, DramNvImage},
     extent_mutation::ExtentMutation,
-    fault::FaultPoint,
+    fault::{FaultPoint, FaultSpec},
     frame::{EvictingDataPage, MigrationExtentIdentity, Rnvpc},
     id::{NvFrameId, NvPageId},
     index::PageKey,
@@ -1554,6 +1554,128 @@ fn rnvpce_redirect_io_128k_overwrite_publishes_one_redirect_range() {
     let ranges = pool.redirect_dirty_ranges_for_test(64);
     assert_eq!(ranges.len(), 1);
     assert_eq!(ranges[0].pages.len(), 32);
+    assert_eq!(pool.dirty_nv_entry_count_for_test(FS_ID, INODE), 1);
+    assert_eq!(
+        pool.native_redirect_page_handle_count_for_test(FS_ID, INODE),
+        0
+    );
+
+    let before = pool
+        .lookup_dirty_nv_entry(PageKey::new(FS_ID, INODE, 7))
+        .unwrap();
+    let selector = *before.record();
+    let overwrite_span = [RangeWritePage::new(7, 40_007, 0, PAGE_SIZE, false).unwrap()];
+    let overwrite = RangeWriteBatch::new(
+        3,
+        7 * PAGE_SIZE as u64,
+        PAGE_SIZE,
+        &[],
+        &overwrite_span,
+        32 * PAGE_SIZE as u64,
+        (32 * PAGE_SIZE / 512) as u64,
+        (PAGE_SIZE / 512) as u64,
+    )
+    .unwrap();
+    let replacement = [0xe2; PAGE_SIZE];
+    commit_range_write(
+        pool.clone(),
+        FS_ID,
+        INODE,
+        &overwrite,
+        &mut VmReader::from(replacement.as_slice()).to_fallible(),
+        |_, _| panic!("existing NV overwrite must not load SSD"),
+        None,
+    )
+    .unwrap();
+    let after = pool
+        .lookup_dirty_nv_entry(PageKey::new(FS_ID, INODE, 7))
+        .unwrap();
+    assert!(Arc::ptr_eq(&before, &after));
+    assert_eq!(*after.record(), selector);
+    assert_eq!(pool.dirty_nv_entry_count_for_test(FS_ID, INODE), 1);
+    assert_eq!(
+        pool.native_redirect_page_handle_count_for_test(FS_ID, INODE),
+        0
+    );
+}
+
+#[ktest]
+fn rnvpce_redirect_newer_than_inode_generation_is_ignored() {
+    const FS_ID: u64 = 0xa204;
+    const INODE: u64 = 44;
+    let (image, config, pool) = restartable_pool(16);
+    let baseline = [ExtentRecordEntry::leaf(0, 1, 41_000, false).unwrap()];
+    bootstrap_inode_authority(
+        pool.clone(),
+        FS_ID,
+        INODE,
+        &AuthoritySnapshot::new(
+            1,
+            &baseline,
+            PAGE_SIZE as u64,
+            (PAGE_SIZE / 512) as u64,
+            0o100644,
+            0,
+        )
+        .unwrap(),
+        None,
+    )
+    .unwrap();
+    let page = staged_redirect_page(&pool, 0xe4);
+    pool.publish_redirect_entries(&[(page, PageKey::new(FS_ID, INODE, 1), 41_001)], 2, None)
+        .unwrap();
+    drop(pool);
+    image.simulate_crash();
+
+    let recovered = Arc::new(Rnvpc::recover(Arc::new(image.attach()), config, None).unwrap());
+    assert!(
+        recovered
+            .lookup_dirty_nv_entry(PageKey::new(FS_ID, INODE, 1))
+            .is_none()
+    );
+}
+
+#[ktest]
+fn rnvpce_redirect_counted_selector_boundaries_recover_complete_entries() {
+    const FS_ID: u64 = 0xa205;
+    const INODE: u64 = 45;
+    for (occurrence, visible) in [(1, 1), (2, 2)] {
+        let (image, config, pool) = restartable_pool(16);
+        let first = staged_redirect_page(&pool, 0x51);
+        let second = staged_redirect_page(&pool, 0x52);
+        assert!(
+            pool.publish_redirect_entries_counted(
+                &[
+                    (first, PageKey::new(FS_ID, INODE, 0), 51_000),
+                    (second, PageKey::new(FS_ID, INODE, 2), 52_000),
+                ],
+                0,
+                Some(FaultSpec {
+                    point: FaultPoint::AfterCommitPersist,
+                    occurrence,
+                }),
+            )
+            .is_err()
+        );
+        drop(pool);
+        image.simulate_crash();
+        let recovered = Arc::new(Rnvpc::recover(Arc::new(image.attach()), config, None).unwrap());
+        assert_eq!(
+            recovered.dirty_nv_entry_count_for_test(FS_ID, INODE),
+            visible
+        );
+        assert!(
+            recovered
+                .lookup_dirty_nv_entry(PageKey::new(FS_ID, INODE, 0))
+                .is_some()
+        );
+        assert_eq!(
+            recovered
+                .lookup_dirty_nv_entry(PageKey::new(FS_ID, INODE, 2))
+                .is_some(),
+            visible == 2
+        );
+    }
 }
 
 #[ktest]
