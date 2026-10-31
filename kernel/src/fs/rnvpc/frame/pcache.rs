@@ -168,9 +168,9 @@ impl Rnvpc {
             objects.records[id.index()].persisting = true;
         }
         let result = self.persist.clear_frame(id.index(), None);
+        let mut freed = false;
         {
             let mut state = self.state.lock();
-            let mut allocation = self.allocation.lock();
             let mut objects = self.objects.lock(id.index());
             let record = &mut objects.records[id.index()];
             debug_assert_eq!(record.alloc_seq, page.generation);
@@ -188,9 +188,14 @@ impl Rnvpc {
                 record.key = None;
                 record.version = 0;
                 record.kind = ObjectKind::Free;
-                allocation.free_ids.push(id.index());
-                allocation.capacity.account_free(PoolClass::Metadata);
+                freed = true;
             }
+        }
+        if freed {
+            self.allocation
+                .slots
+                .free_range(id.index()..id.index() + 1)?;
+            self.allocation.capacity.release(PoolClass::Metadata, 1);
         }
         note_metadata_pin_change();
         result
@@ -279,9 +284,9 @@ impl Rnvpc {
             objects.records[id.index()].persisting = true;
         }
         let result = self.persist.clear_frame(id.index(), fault);
+        let mut freed = false;
         {
             let mut state = self.state.lock();
-            let mut allocation = self.allocation.lock();
             let mut objects = self.objects.lock(id.index());
             let record = &mut objects.records[id.index()];
             debug_assert_eq!(record.alloc_seq, generation);
@@ -302,9 +307,14 @@ impl Rnvpc {
                 record.key = None;
                 record.version = 0;
                 record.kind = ObjectKind::Free;
-                allocation.free_ids.push(id.index());
-                allocation.capacity.account_free(PoolClass::Data);
+                freed = true;
             }
+        }
+        if freed {
+            self.allocation
+                .slots
+                .free_range(id.index()..id.index() + 1)?;
+            self.allocation.capacity.release(PoolClass::Data, 1);
         }
         result.map(|_| true)
     }

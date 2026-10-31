@@ -356,6 +356,28 @@ impl NvSlotAllocator {
         Ok(())
     }
 
+    pub(super) fn free_slots(&self, slots: &[usize]) -> Result<()> {
+        if slots.is_empty() {
+            return Ok(());
+        }
+        let mut sorted = slots.to_vec();
+        sorted.sort_unstable();
+        if sorted.windows(2).any(|pair| pair[0] == pair[1]) {
+            return_errno!(Errno::EINVAL);
+        }
+        let mut start = sorted[0];
+        let mut previous = start;
+        for slot in sorted.into_iter().skip(1) {
+            let domain_end = self.domain_for_slot(previous)?.end;
+            if slot != previous + 1 || slot >= domain_end {
+                self.free_range(start..previous + 1)?;
+                start = slot;
+            }
+            previous = slot;
+        }
+        self.free_range(start..previous + 1)
+    }
+
     pub(super) fn mark_allocated(&self, range: Range<usize>) -> Result<()> {
         let (domain, local) = self.resolve_range(range)?;
         let mut state = domain.state.lock();
@@ -407,15 +429,18 @@ impl NvSlotAllocator {
         if range.is_empty() || range.end > self.total_pages {
             return_errno!(Errno::EINVAL);
         }
-        let domain = self
-            .domains
-            .iter()
-            .find(|domain| range.start >= domain.start && range.start < domain.end)
-            .ok_or_else(|| Error::new(Errno::EINVAL))?;
+        let domain = self.domain_for_slot(range.start)?;
         if range.end > domain.end {
             return_errno_with_message!(Errno::EINVAL, "NV slot range crosses allocation domains");
         }
         Ok((domain, range.start - domain.start..range.end - domain.start))
+    }
+
+    fn domain_for_slot(&self, slot: usize) -> Result<&NvAllocationDomain> {
+        self.domains
+            .iter()
+            .find(|domain| slot >= domain.start && slot < domain.end)
+            .ok_or_else(|| Error::new(Errno::EINVAL))
     }
 
     fn publish_domain_state(domain: &NvAllocationDomain, state: &NvDomainState) {

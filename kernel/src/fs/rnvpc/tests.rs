@@ -249,6 +249,92 @@ fn consecutive_range_reservations_continue_one_physical_nv_extent() {
 }
 
 #[ktest]
+fn rnvpce_domain_allocator() {
+    allocation_does_not_cross_domain_boundary();
+    parallel_multi_page_ranges_are_unique();
+    wal_charge_does_not_consume_physical_slot();
+    capacity_classes_remain_independent();
+}
+
+fn allocation_does_not_cross_domain_boundary() {
+    let pool = test_pool(2_048, 1, 2_047, None);
+    let mut first = pool.reserve_data_pages(1_000).unwrap();
+    let first_slots = (0..1_000)
+        .map(|_| pool.take_reserved_page(&mut first).unwrap().index())
+        .collect::<Vec<_>>();
+    assert_eq!(first_slots.first().copied(), Some(0));
+    assert_eq!(first_slots.last().copied(), Some(999));
+
+    let mut second = pool.reserve_data_pages(64).unwrap();
+    let second_slots = (0..64)
+        .map(|_| pool.take_reserved_page(&mut second).unwrap().index())
+        .collect::<Vec<_>>();
+    assert_eq!(second_slots.first().copied(), Some(1_024));
+    assert_eq!(second_slots.last().copied(), Some(1_087));
+}
+
+fn parallel_multi_page_ranges_are_unique() {
+    const THREADS: usize = 4;
+    const PAGES_PER_THREAD: usize = 128;
+    let pool = test_pool(2_048, 1, 2_047, None);
+    let ready = Arc::new(AtomicUsize::new(0));
+    let observed = Arc::new(Mutex::new(BTreeSet::new()));
+    let mut threads = Vec::new();
+    for _ in 0..THREADS {
+        let pool = pool.clone();
+        let ready = ready.clone();
+        let observed = observed.clone();
+        threads.push(
+            crate::thread::kernel_thread::ThreadOptions::new(move || {
+                let mut reservation = pool.reserve_data_pages(PAGES_PER_THREAD).unwrap();
+                for _ in 0..PAGES_PER_THREAD {
+                    let slot = pool.take_reserved_page(&mut reservation).unwrap().index();
+                    assert!(observed.lock().insert(slot));
+                }
+                ready.fetch_add(1, Ordering::AcqRel);
+                while ready.load(Ordering::Acquire) != THREADS {
+                    crate::thread::Thread::yield_now();
+                }
+            })
+            .spawn(),
+        );
+    }
+    for thread in threads {
+        thread.join();
+    }
+    assert_eq!(observed.lock().len(), THREADS * PAGES_PER_THREAD);
+}
+
+fn wal_charge_does_not_consume_physical_slot() {
+    let pool = test_pool(16, 4, 12, None);
+    let before = pool.physical_free_pages();
+    pool.charge_wal_pages(3).unwrap();
+    assert_eq!(pool.physical_free_pages(), before);
+    assert_eq!(pool.stats().free_pages, before - 3);
+    pool.release_wal_pages(3);
+    assert_eq!(pool.physical_free_pages(), before);
+}
+
+fn capacity_classes_remain_independent() {
+    let pool = test_pool(16, 4, 12, None);
+    let data = (0..12)
+        .map(|_| pool.alloc_data_page().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(pool.alloc_data_page().unwrap_err().error(), Errno::EAGAIN);
+    let metadata = (0..4)
+        .map(|_| pool.alloc_frame(PoolClass::Metadata).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(pool.physical_free_pages(), 0);
+    for frame in metadata {
+        pool.free_frame(frame).unwrap();
+    }
+    for page in data {
+        pool.free_data_page(page).unwrap();
+    }
+    assert_eq!(pool.physical_free_pages(), 16);
+}
+
+#[ktest]
 fn metadata_can_borrow_unused_data_capacity() {
     let pool = test_pool(8, 2, 6, None);
     let mut frames = Vec::new();

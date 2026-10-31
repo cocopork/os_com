@@ -153,22 +153,22 @@ impl Rnvpc {
         LATENCY_STATS
             .nvpc_finish_clear_descriptor
             .record_since(started);
-        // Bound the shared allocation lock hold time; never nest slot locks.
         for chunk in pages.chunks_mut(32) {
-            let started = read_ns();
-            let mut allocation = self.allocation.lock();
-            LATENCY_STATS.reclaim_allocation_wait.record_since(started);
             for (lease, reference) in chunk {
                 let slot = lease.id.index();
                 let mut state = self.objects.lock(slot);
                 debug_assert_eq!(state.records[slot].alloc_seq, reference.allocation_seq());
                 state.records[slot] = ObjectRecord::free();
-                allocation.free_ids.push(slot);
-                allocation.capacity.account_free(PoolClass::Data);
                 self.account_unpin();
                 lease.active = false;
             }
         }
+        let started = read_ns();
+        self.allocation.slots.free_slots(&slots)?;
+        LATENCY_STATS.reclaim_allocation_wait.record_since(started);
+        self.allocation
+            .capacity
+            .release(PoolClass::Data, slots.len());
         // Notify once after the complete successful batch is reusable.
         if !pages.is_empty() {
             note_data_page_lease_change();

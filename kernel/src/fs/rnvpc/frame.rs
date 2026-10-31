@@ -11,7 +11,7 @@ use core::{
 };
 
 use aster_block::BLOCK_SIZE;
-use ostd::{mm::USegment, sync::WaitQueue};
+use ostd::{cpu::CpuId, mm::USegment, sync::WaitQueue, util::id_set::Id};
 
 #[cfg(ktest)]
 use super::index::ReverseExtentRef;
@@ -46,6 +46,7 @@ use super::{
         DescriptorHandle, DirtyNvExtentEntry, MigrationConflict, MigrationExtentLease,
         NvExtentEntryLease, NvExtentReadGuard, RedirectDirectory,
     },
+    slot_allocator::NvSlotAllocator,
 };
 use crate::{
     fs::fs_impls::ext4::{LATENCY_ENABLED, LATENCY_STATS, read_ns},
@@ -319,10 +320,28 @@ impl PendingExtentIndex {
 }
 
 struct AllocationState {
-    free_ids: Vec<usize>,
-    /// 下一个分配序号（只增不减）。见 [`ObjectRecord::alloc_seq`]。
-    next_alloc_seq: u64,
+    slots: NvSlotAllocator,
+    next_alloc_seq: AtomicU64,
     capacity: CapacityState,
+}
+
+impl AllocationState {
+    fn new(config: RnvpcConfig) -> Result<Self> {
+        Ok(Self {
+            slots: NvSlotAllocator::new(config.total_pages())?,
+            next_alloc_seq: AtomicU64::new(1),
+            capacity: CapacityState::new(config),
+        })
+    }
+
+    fn reserve_sequences(&self, count: usize) -> Result<u64> {
+        let count = u64::try_from(count).map_err(|_| Error::new(Errno::EOVERFLOW))?;
+        self.next_alloc_seq
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |next| {
+                next.checked_add(count)
+            })
+            .map_err(|_| Error::new(Errno::EOVERFLOW))
+    }
 }
 
 struct PoolState {
@@ -377,9 +396,7 @@ pub(crate) struct Rnvpc {
     persist: PersistEngine,
     config: RnvpcConfig,
     state: SpinLock<PoolState>,
-    // Nested acquisition order: pool state -> allocation -> one slot.
-    // Persist/I/O and wakeups must happen outside these locks.
-    allocation: SpinLock<AllocationState>,
+    allocation: AllocationState,
     // Identity lookup for inode initialization, recovery and standalone pool users.
     // Live EXT4 inodes cache the Arc; publication never holds this directory lock.
     publication_contexts: Mutex<BTreeMap<(u64, u64), Weak<InodePublication>>>,
@@ -719,11 +736,6 @@ impl Rnvpc {
 
         let total_pages = config.total_pages();
         let objects = ObjectTable::new(total_pages)?;
-        let mut free_ids = Vec::new();
-        free_ids
-            .try_reserve_exact(total_pages)
-            .map_err(|_| Error::with_message(Errno::ENOMEM, "RNVPC free-list allocation failed"))?;
-        free_ids.extend((0..total_pages).rev());
         let persist = PersistEngine::new(backend.clone(), total_pages)?;
         Ok(Self {
             backend,
@@ -737,11 +749,7 @@ impl Rnvpc {
             redirects: RedirectDirectory::new()?,
             baseline_generations: BaselineGenerationMap::new()?,
             recovered_pcache: Mutex::new(None),
-            allocation: SpinLock::new(AllocationState {
-                free_ids,
-                next_alloc_seq: 1,
-                capacity: CapacityState::new(config),
-            }),
+            allocation: AllocationState::new(config)?,
             state: SpinLock::new(PoolState {
                 index: PageIndex::new(),
                 metadata_index: BTreeMap::new(),
@@ -923,7 +931,6 @@ impl Rnvpc {
         metadata.extend(data.selected.into_values());
         {
             let state = pool.state.get_mut();
-            let allocation = pool.allocation.get_mut();
             for entry in metadata {
                 pool.objects.get_mut(entry.index).kind = match entry.class {
                     PoolClass::Metadata => ObjectKind::Metadata,
@@ -944,7 +951,10 @@ impl Rnvpc {
                 pool.objects.get_mut(entry.index).key = Some(entry.key);
                 pool.objects.get_mut(entry.index).version = entry.version;
                 pool.objects.get_mut(entry.index).alloc_seq = entry.allocation_seq;
-                allocation.capacity.account_recovered(entry.class)?;
+                pool.allocation
+                    .slots
+                    .mark_allocated(entry.index..entry.index + 1)?;
+                let _ = pool.allocation.capacity.reserve(entry.class, 1)?;
                 // T3.3：只从自描述描述符重建 `Nv` 条目；`Dram` 条目掉电即失效，
                 // 没有任何东西可以让它们复活（也不该复活）。
                 if entry.class == PoolClass::Data {
@@ -975,13 +985,13 @@ impl Rnvpc {
                     }
                 }
             }
-            allocation
-                .free_ids
-                .retain(|index| pool.objects.get_mut(*index).kind == ObjectKind::Free);
             if max_allocation_seq != 0 {
-                allocation.next_alloc_seq = max_allocation_seq
-                    .checked_add(1)
-                    .ok_or_else(|| Error::new(Errno::EOVERFLOW))?;
+                pool.allocation.next_alloc_seq.store(
+                    max_allocation_seq
+                        .checked_add(1)
+                        .ok_or_else(|| Error::new(Errno::EOVERFLOW))?,
+                    Ordering::Release,
+                );
             }
         }
         pool.rebuild_pending_extent_index();
@@ -1094,19 +1104,7 @@ impl Rnvpc {
     /// 为 per-inode WAL 记入 `pages` 页 PM 容量（`porting.md §3.1`：WAL 与 CoW page
     /// 都计入 PM 容量）。半途失败时把已记入的部分退回，不留账。
     pub(crate) fn charge_wal_pages(&self, pages: usize) -> Result<()> {
-        let mut wake = false;
-        {
-            let mut state = self.allocation.lock();
-            for charged in 0..pages {
-                if let Err(error) = state.capacity.before_allocate(PoolClass::Wal) {
-                    for _ in 0..charged {
-                        state.capacity.account_free(PoolClass::Wal);
-                    }
-                    return Err(error);
-                }
-                wake |= state.capacity.account_allocate(PoolClass::Wal);
-            }
-        }
+        let wake = self.allocation.capacity.reserve(PoolClass::Wal, pages)?;
         if wake {
             self.wake_high_water();
         }
@@ -1115,10 +1113,7 @@ impl Rnvpc {
 
     /// 退回 WAL 占用的 PM 容量（completion 退休记录后调用）。
     pub(crate) fn release_wal_pages(&self, pages: usize) {
-        let mut state = self.allocation.lock();
-        for _ in 0..pages {
-            state.capacity.account_free(PoolClass::Wal);
-        }
+        self.allocation.capacity.release(PoolClass::Wal, pages);
     }
 
     /// Allocates a staged data page initialized with one full page of content.
@@ -1258,8 +1253,6 @@ impl Rnvpc {
             .filter(|entry| entry.published)
             .map(|entry| entry.page)
             .collect::<BTreeSet<_>>();
-        let mut allocation = self.allocation.lock();
-        let mut freed = 0usize;
         for page in pages {
             let mut objects = self.objects.lock_checked(page.index())?;
             let record = objects
@@ -1279,21 +1272,19 @@ impl Rnvpc {
                 return_errno_with_message!(Errno::EBUSY, "RNVPC data page cannot be freed");
             }
             record.kind = ObjectKind::Free;
-            allocation.free_ids.push(page.index());
-            allocation.capacity.account_free(PoolClass::Data);
-            freed += 1;
         }
-        drop(allocation);
         drop(state);
-        if freed != 0 {
-            self.wake_one_data_capacity_waiter();
-        }
+        let slots = pages.iter().map(|page| page.index()).collect::<Vec<_>>();
+        self.allocation.slots.free_slots(&slots)?;
+        self.allocation
+            .capacity
+            .release(PoolClass::Data, pages.len());
+        self.wake_one_data_capacity_waiter();
         Ok(())
     }
 
     fn free_data_page_inner(&self, id: NvPageId) -> Result<()> {
         let state = self.state.lock();
-        let mut allocation = self.allocation.lock();
         let mut objects = self.objects.lock(id.index());
         if objects.records[id.index()].committed {
             return_errno_with_message!(Errno::EBUSY, "RNVPC data page is still committed");
@@ -1317,11 +1308,12 @@ impl Rnvpc {
             return_errno_with_message!(Errno::EBUSY, "RNVPC data page cannot be freed");
         }
         record.kind = ObjectKind::Free;
-        allocation.free_ids.push(id.index());
-        allocation.capacity.account_free(PoolClass::Data);
         drop(objects);
-        drop(allocation);
         drop(state);
+        self.allocation
+            .slots
+            .free_range(id.index()..id.index() + 1)?;
+        self.allocation.capacity.release(PoolClass::Data, 1);
         Ok(())
     }
 
@@ -1335,7 +1327,6 @@ impl Rnvpc {
     /// 被已发布引用持有 / 被 pin 住），调用方保留待重试。
     pub(crate) fn free_data_page_if_seq(&self, id: NvPageId, seq: u64) -> Result<bool> {
         let state = self.state.lock();
-        let mut allocation = self.allocation.lock();
         let mut objects = self.objects.lock_checked(id.index())?;
         let record = objects
             .records
@@ -1359,17 +1350,17 @@ impl Rnvpc {
         }
         let record = &mut objects.records[id.index()];
         record.kind = ObjectKind::Free;
-        allocation.free_ids.push(id.index());
-        allocation.capacity.account_free(PoolClass::Data);
         drop(objects);
-        drop(allocation);
         drop(state);
+        self.allocation
+            .slots
+            .free_range(id.index()..id.index() + 1)?;
+        self.allocation.capacity.release(PoolClass::Data, 1);
         self.wake_data_capacity_waiters();
         Ok(true)
     }
 
     pub(crate) fn abort_data_page(&self, id: NvPageId) -> Result<()> {
-        let mut state = self.allocation.lock();
         let mut objects = self.objects.lock_checked(id.index())?;
         let record = objects
             .records
@@ -1385,10 +1376,11 @@ impl Rnvpc {
             return_errno_with_message!(Errno::EINVAL, "RNVPC data page is not abortable");
         }
         objects.records[id.index()] = ObjectRecord::free();
-        state.free_ids.push(id.index());
-        state.capacity.account_free(PoolClass::Data);
         drop(objects);
-        drop(state);
+        self.allocation
+            .slots
+            .free_range(id.index()..id.index() + 1)?;
+        self.allocation.capacity.release(PoolClass::Data, 1);
         self.wake_data_capacity_waiters();
         Ok(())
     }
@@ -1490,21 +1482,17 @@ impl Rnvpc {
             .try_reserve_exact(pages)
             .map_err(|_| Error::with_message(Errno::ENOMEM, "RNVPC reservation allocation"))?;
         loop {
-            let needs_repair_drain = {
-                let mut allocation = self.allocation.lock();
-                let stats = allocation.capacity.stats();
-                if pages
-                    > self
-                        .config
-                        .data_limit_pages()
-                        .saturating_sub(stats.data_pages)
-                {
-                    allocation
-                        .capacity
-                        .before_allocate_many(PoolClass::Data, pages)?;
-                }
-                pages > stats.free_pages || pages > allocation.free_ids.len()
-            };
+            let stats = self.allocation.capacity.stats();
+            if pages
+                > self
+                    .config
+                    .data_limit_pages()
+                    .saturating_sub(stats.data_pages)
+            {
+                break;
+            }
+            let needs_repair_drain =
+                pages > stats.free_pages || pages > self.allocation.slots.stats().free_pages;
             if !needs_repair_drain {
                 break;
             }
@@ -1513,67 +1501,46 @@ impl Rnvpc {
             };
             self.free_frame(frame)?;
         }
-        let mut wake = false;
-        {
-            let mut allocation = self.allocation.lock();
-            allocation
-                .capacity
-                .before_allocate_many(PoolClass::Data, pages)?;
-            if pages > allocation.free_ids.len() {
-                return_errno_with_message!(Errno::ENOSPC, "RNVPC capacity is exhausted");
+        let wake = self.allocation.capacity.reserve(PoolClass::Data, pages)?;
+        let hint = CpuId::current_racy().as_usize();
+        let ranges = match self.allocation.slots.allocate_ranges(pages, hint) {
+            Ok(ranges) => ranges,
+            Err(error) => {
+                self.allocation.capacity.release(PoolClass::Data, pages);
+                return Err(error);
             }
-            let pages_u64 = u64::try_from(pages).map_err(|_| Error::new(Errno::EOVERFLOW))?;
-            allocation
-                .next_alloc_seq
-                .checked_add(pages_u64)
-                .ok_or_else(|| Error::new(Errno::EOVERFLOW))?;
-            // Keep a large write physically contiguous whenever the free space
-            // contains a suitable run. The reservation remains authoritative:
-            // callers still coalesce the slots they actually receive.
-            let selected = if pages == 0 {
-                Vec::new()
-            } else if pages == 1 {
-                vec![allocation.free_ids.pop().unwrap()]
-            } else {
-                allocation.free_ids.sort_unstable();
-                let contiguous_start = allocation.free_ids.windows(pages).position(|window| {
-                    window
-                        .windows(2)
-                        .all(|pair| pair[0].checked_add(1) == Some(pair[1]))
-                });
-                let mut selected: Vec<usize> = if let Some(start) = contiguous_start {
-                    allocation.free_ids.drain(start..start + pages).collect()
-                } else {
-                    allocation.free_ids.drain(..pages).collect()
-                };
-                // CapacityReservation consumes from the tail. Store the
-                // selected interval in reverse so callers receive increasing
-                // physical page IDs across this and later range reservations.
-                selected.reverse();
-                selected
-            };
-            for index in &selected {
-                NvPageId::try_from(*index).map_err(|_| Error::new(Errno::EOVERFLOW))?;
-            }
-            for index in selected {
-                allocation.capacity.before_allocate(PoolClass::Data)?;
-                let mut objects = self.objects.lock(index);
-                let record = &mut objects.records[index];
-                debug_assert_eq!(record.kind, ObjectKind::Free);
-                record.kind = ObjectKind::Data(DataPageState::Staged);
-                record.persisting = false;
-                record.committed = false;
-                record.key = None;
-                record.version = 0;
-                record.alloc_seq = allocation.next_alloc_seq;
-                allocation.next_alloc_seq += 1;
-                #[cfg(ktest)]
-                {
-                    objects.reverse = None;
+        };
+        let sequence_start = match self.allocation.reserve_sequences(pages) {
+            Ok(sequence) => sequence,
+            Err(error) => {
+                for range in ranges {
+                    self.allocation.slots.free_range(range)?;
                 }
-                wake |= allocation.capacity.account_allocate(PoolClass::Data);
-                reservation.pages.push(NvPageId::try_from(index).unwrap());
+                self.allocation.capacity.release(PoolClass::Data, pages);
+                return Err(error);
             }
+        };
+        let selected = ranges
+            .iter()
+            .flat_map(|range| range.clone())
+            .collect::<Vec<_>>();
+        for (offset, index) in selected.iter().copied().enumerate() {
+            let mut objects = self.objects.lock(index);
+            let record = &mut objects.records[index];
+            debug_assert_eq!(record.kind, ObjectKind::Free);
+            record.kind = ObjectKind::Data(DataPageState::Staged);
+            record.persisting = false;
+            record.committed = false;
+            record.key = None;
+            record.version = 0;
+            record.alloc_seq = sequence_start + offset as u64;
+            #[cfg(ktest)]
+            {
+                objects.reverse = None;
+            }
+        }
+        for index in selected.into_iter().rev() {
+            reservation.pages.push(NvPageId::try_from(index)?);
         }
         if wake {
             self.wake_high_water();
@@ -1582,14 +1549,13 @@ impl Rnvpc {
     }
 
     pub(crate) fn can_reserve_data_pages(&self, pages: usize) -> bool {
-        let allocation = self.allocation.lock();
-        let stats = allocation.capacity.stats();
-        pages
-            <= self
-                .config
-                .data_limit_pages()
-                .saturating_sub(stats.data_pages)
-            && pages <= stats.free_pages
+        self.allocation.capacity.can_reserve_data(pages)
+            && pages <= self.allocation.slots.stats().free_pages
+    }
+
+    #[cfg(ktest)]
+    pub(crate) fn physical_free_pages(&self) -> usize {
+        self.allocation.slots.stats().free_pages
     }
 
     /// 从预留里取一个页；预留耗尽 ⇒ `EAGAIN`（调用方应重新预留）。
@@ -1656,7 +1622,6 @@ impl Rnvpc {
     /// `Ok(true)` = 已撤销并归还；`Ok(false)` = 槽位已不是这一版（调用方只能记一笔）。
     pub(crate) fn revoke_and_free_frame_if_seq(&self, id: NvFrameId, seq: u64) -> Result<bool> {
         let mut state = self.state.lock();
-        let mut allocation = self.allocation.lock();
         let mut objects = self.objects.lock_checked(id.index())?;
         {
             let record = objects
@@ -1674,8 +1639,12 @@ impl Rnvpc {
         state.references.remove(&id.index());
         let record = &mut objects.records[id.index()];
         record.kind = ObjectKind::Free;
-        allocation.free_ids.push(id.index());
-        allocation.capacity.account_free(PoolClass::Metadata);
+        drop(objects);
+        drop(state);
+        self.allocation
+            .slots
+            .free_range(id.index()..id.index() + 1)?;
+        self.allocation.capacity.release(PoolClass::Metadata, 1);
         Ok(true)
     }
 
@@ -2220,7 +2189,7 @@ impl Rnvpc {
     }
 
     pub(crate) fn stats(&self) -> RnvpcStats {
-        let mut stats = self.allocation.lock().capacity.stats();
+        let mut stats = self.allocation.capacity.stats();
         stats.pinned_frames = self.pinned_frames.load(Ordering::Relaxed);
         stats
     }
@@ -5076,42 +5045,51 @@ impl Rnvpc {
     }
 
     fn allocate_index(&self, class: PoolClass) -> Result<(usize, u64, bool)> {
-        let mut state = self.allocation.lock();
-        let next_seq = state
-            .next_alloc_seq
-            .checked_add(1)
-            .ok_or_else(|| Error::new(Errno::EOVERFLOW))?;
-        state.capacity.before_allocate(class)?;
-        let index = state
-            .free_ids
-            .pop()
-            .ok_or_else(|| Error::new(Errno::ENOSPC))?;
+        if class == PoolClass::Wal {
+            return_errno_with_message!(
+                Errno::EINVAL,
+                "WAL pages are accounted by charge_wal_pages, not allocate_index"
+            );
+        }
+        let wake = self.allocation.capacity.reserve(class, 1)?;
+        let ranges = match self
+            .allocation
+            .slots
+            .allocate_ranges(1, CpuId::current_racy().as_usize())
+        {
+            Ok(ranges) => ranges,
+            Err(error) => {
+                self.allocation.capacity.release(class, 1);
+                return Err(error);
+            }
+        };
+        let index = ranges[0].start;
+        let seq = match self.allocation.reserve_sequences(1) {
+            Ok(sequence) => sequence,
+            Err(error) => {
+                self.allocation.slots.free_range(ranges[0].clone())?;
+                self.allocation.capacity.release(class, 1);
+                return Err(error);
+            }
+        };
         let mut objects = self.objects.lock(index);
         let record = &mut objects.records[index];
         debug_assert_eq!(record.kind, ObjectKind::Free);
         record.kind = match class {
             PoolClass::Metadata => ObjectKind::Metadata,
             PoolClass::Data => ObjectKind::Data(DataPageState::Staged),
-            // WAL 页不走 free-list：它们由 `charge_wal_pages` 直接记账。
-            PoolClass::Wal => {
-                return_errno_with_message!(
-                    Errno::EINVAL,
-                    "WAL pages are accounted by charge_wal_pages, not allocate_index"
-                )
-            }
+            PoolClass::Wal => unreachable!(),
         };
         record.persisting = false;
         record.committed = false;
         record.key = None;
         record.version = 0;
-        let seq = state.next_alloc_seq;
-        state.next_alloc_seq = next_seq;
         objects.records[index].alloc_seq = seq;
         #[cfg(ktest)]
         {
             objects.reverse = None;
         }
-        Ok((index, seq, state.capacity.account_allocate(class)))
+        Ok((index, seq, wake))
     }
 
     fn allocate_index_with_repair_drain(&self, class: PoolClass) -> Result<(usize, u64, bool)> {
@@ -5138,11 +5116,7 @@ impl Rnvpc {
     }
 
     fn refresh_repair_frame_generation(&self, frame: NvFrameId) -> Result<()> {
-        let mut allocation = self.allocation.lock();
-        let next_seq = allocation
-            .next_alloc_seq
-            .checked_add(1)
-            .ok_or_else(|| Error::new(Errno::EOVERFLOW))?;
+        let sequence = self.allocation.reserve_sequences(1)?;
         let mut objects = self.objects.lock_checked(frame.index())?;
         let metadata_mutating = objects.metadata_mutation.is_some();
         let record = objects
@@ -5160,8 +5134,7 @@ impl Rnvpc {
         let record = &mut objects.records[frame.index()];
         record.key = None;
         record.version = 0;
-        record.alloc_seq = allocation.next_alloc_seq;
-        allocation.next_alloc_seq = next_seq;
+        record.alloc_seq = sequence;
         #[cfg(ktest)]
         {
             objects.reverse = None;
@@ -5193,7 +5166,6 @@ impl Rnvpc {
     }
 
     fn free_index(&self, index: usize, class: PoolClass) -> Result<()> {
-        let mut state = self.allocation.lock();
         let mut objects = self.objects.lock(index);
         if objects.records[index].committed {
             return_errno_with_message!(Errno::EBUSY, "RNVPC frame is still committed");
@@ -5220,8 +5192,9 @@ impl Rnvpc {
             return_errno_with_message!(Errno::EBUSY, "RNVPC frame is pinned");
         }
         record.kind = ObjectKind::Free;
-        state.free_ids.push(index);
-        state.capacity.account_free(class);
+        drop(objects);
+        self.allocation.slots.free_range(index..index + 1)?;
+        self.allocation.capacity.release(class, 1);
         Ok(())
     }
 
@@ -6007,7 +5980,7 @@ mod allocation_tests {
         assert_eq!(pool.stats().pinned_frames, 0);
         assert!(pool.persist.read_entry(page.index()).unwrap().is_none());
         let (reused, next_seq) = pool.alloc_data_page_seq().unwrap();
-        assert_eq!(reused, page);
+        assert!(reused.index() < config.total_pages());
         assert!(next_seq > seq);
         pool.abort_data_page(reused).unwrap();
         pool.charge_wal_pages(1).unwrap();
