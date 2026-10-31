@@ -2288,6 +2288,90 @@ fn rnvpce_existing_nv_entry_overwrite_reuses_owned_pages() {
 }
 
 #[ktest]
+fn rnvpce_publication_uncertainty_blocks_existing_nv_overwrite() {
+    const FS_ID: u64 = 0xb20f;
+    const INODE: u64 = 86;
+    const SSD_BLOCK: u64 = 111_000;
+    let pool = test_pool(16, 2, 14, None);
+    bootstrap_inode_authority(
+        pool.clone(),
+        FS_ID,
+        INODE,
+        &AuthoritySnapshot::new(
+            1,
+            &[ExtentRecordEntry::leaf(0, 1, SSD_BLOCK, false).unwrap()],
+            PAGE_SIZE as u64,
+            (PAGE_SIZE / 512) as u64,
+            0o100644,
+            0,
+        )
+        .unwrap(),
+        None,
+    )
+    .unwrap();
+    let pages = [RangeWritePage::new(0, SSD_BLOCK, 0, PAGE_SIZE, false).unwrap()];
+    let first = RangeWriteBatch::new(
+        2,
+        0,
+        PAGE_SIZE,
+        &[],
+        &pages,
+        PAGE_SIZE as u64,
+        (PAGE_SIZE / 512) as u64,
+        (PAGE_SIZE / 512) as u64,
+    )
+    .unwrap();
+    commit_range_write(
+        pool.clone(),
+        FS_ID,
+        INODE,
+        &first,
+        &mut VmReader::from(&[0x31; PAGE_SIZE][..]).to_fallible(),
+        |_, _| panic!("full overwrite must not load SSD"),
+        None,
+    )
+    .unwrap();
+
+    pool.latch_publication_uncertain_for_test();
+    let second = RangeWriteBatch::new(
+        3,
+        0,
+        PAGE_SIZE,
+        &[],
+        &pages,
+        PAGE_SIZE as u64,
+        (PAGE_SIZE / 512) as u64,
+        (PAGE_SIZE / 512) as u64,
+    )
+    .unwrap();
+    assert_eq!(
+        commit_range_write(
+            pool.clone(),
+            FS_ID,
+            INODE,
+            &second,
+            &mut VmReader::from(&[0x72; PAGE_SIZE][..]).to_fallible(),
+            |_, _| panic!("uncertain pool must reject before SSD access"),
+            None,
+        )
+        .err()
+        .unwrap()
+        .error(),
+        Errno::EUCLEAN
+    );
+
+    let entry = pool
+        .lookup_dirty_nv_entry(PageKey::new(FS_ID, INODE, 0))
+        .unwrap();
+    let guard = entry.try_read().unwrap();
+    let mut bytes = [0; PAGE_SIZE];
+    let mut writer = VmWriter::from(bytes.as_mut_slice()).to_fallible();
+    pool.copy_entry_to_writer(&guard, 0, 0, &mut writer, PAGE_SIZE)
+        .unwrap();
+    assert!(bytes.iter().all(|byte| *byte == 0x31));
+}
+
+#[ktest]
 fn rnvpce_dirty_nv_entry_foreground() {
     dirty_nv_entry_foreground_publishes_one_triple_contiguous_entry();
     dirty_nv_entry_foreground_splits_at_nv_and_ssd_discontinuities();
@@ -2342,6 +2426,31 @@ fn rnvpce_nv_entry_claim() {
     reclaim.join();
     assert_eq!(state.load(Ordering::Acquire), 3);
     assert_eq!(entry.state(), NvExtentEntryState::Reclaimed);
+}
+
+#[ktest]
+fn rnvpce_nv_entry_claim_failure_rolls_back_batch() {
+    const FS_ID: u64 = 0xb208;
+    const FIRST_INODE: u64 = 79;
+    const SECOND_INODE: u64 = 80;
+    let pool = test_pool(16, 2, 14, None);
+    publish_test_redirect_range(&pool, FS_ID, FIRST_INODE, 2);
+    publish_test_redirect_range(&pool, FS_ID, SECOND_INODE, 2);
+
+    let first = pool
+        .lookup_dirty_nv_entry(PageKey::new(FS_ID, FIRST_INODE, 0))
+        .unwrap();
+    let second = pool
+        .lookup_dirty_nv_entry(PageKey::new(FS_ID, SECOND_INODE, 0))
+        .unwrap();
+    pool.remove_data_range_owner(&second).unwrap();
+
+    assert_eq!(
+        pool.claim_ready_nv_entries(FS_ID, 4).err().unwrap().error(),
+        Errno::ESTALE
+    );
+    assert_eq!(first.state(), NvExtentEntryState::Dirty);
+    assert_eq!(second.state(), NvExtentEntryState::Dirty);
 }
 
 #[ktest]
@@ -4029,6 +4138,87 @@ fn rnvpce_short_copy_retains_unused_physical_allocation_ownership() {
         pool.reclaim_committed_metadata(*reference).unwrap();
     }
     assert_eq!(allocation_record_count(&pool), 0);
+}
+
+#[ktest]
+fn rnvpce_failed_inode_publication_keeps_redirect_invisible() {
+    const FS_ID: u64 = 0x9927;
+    const INODE: u64 = 37;
+    const SSD_BLOCK: u64 = 131_000;
+    let (image, config, pool) = restartable_pool(16);
+    bootstrap_inode_authority(
+        pool.clone(),
+        FS_ID,
+        INODE,
+        &AuthoritySnapshot::new(
+            1,
+            &[ExtentRecordEntry::leaf(0, 1, SSD_BLOCK, false).unwrap()],
+            PAGE_SIZE as u64,
+            (PAGE_SIZE / 512) as u64,
+            0o100644,
+            0,
+        )
+        .unwrap(),
+        None,
+    )
+    .unwrap();
+    let pages = [RangeWritePage::new(0, SSD_BLOCK, 0, PAGE_SIZE, false).unwrap()];
+    let request = RangeWriteBatch::new(
+        2,
+        0,
+        PAGE_SIZE,
+        &[],
+        &pages,
+        PAGE_SIZE as u64,
+        (PAGE_SIZE / 512) as u64,
+        (PAGE_SIZE / 512) as u64,
+    )
+    .unwrap();
+
+    assert!(
+        commit_range_write(
+            pool.clone(),
+            FS_ID,
+            INODE,
+            &request,
+            &mut VmReader::from(&[0xa7; PAGE_SIZE][..]).to_fallible(),
+            |_, _| panic!("new pages must not read SSD"),
+            Some(FaultPoint::BeforeContentPersist),
+        )
+        .is_err()
+    );
+    assert!(
+        pool.lookup_dirty_nv_entry(PageKey::new(FS_ID, INODE, 0))
+            .is_none()
+    );
+    assert_eq!(pool.dirty_nv_entry_count_for_test(FS_ID, INODE), 0);
+
+    commit_range_write(
+        pool.clone(),
+        FS_ID,
+        INODE,
+        &request,
+        &mut VmReader::from(&[0xb8; PAGE_SIZE][..]).to_fallible(),
+        |_, _| panic!("new pages must not read SSD"),
+        None,
+    )
+    .unwrap();
+    drop(pool);
+    image.simulate_crash();
+    let recovered = Arc::new(Rnvpc::recover(Arc::new(image.attach()), config, None).unwrap());
+    let entry = recovered
+        .lookup_dirty_nv_entry(PageKey::new(FS_ID, INODE, 0))
+        .unwrap();
+    let guard = entry.try_read().unwrap();
+    let mut bytes = [0; PAGE_SIZE];
+    let mut writer = VmWriter::from(bytes.as_mut_slice()).to_fallible();
+    assert_eq!(
+        recovered
+            .copy_entry_to_writer(&guard, 0, 0, &mut writer, PAGE_SIZE)
+            .unwrap(),
+        PAGE_SIZE
+    );
+    assert!(bytes.iter().all(|byte| *byte == 0xb8));
 }
 
 #[cfg(any())]

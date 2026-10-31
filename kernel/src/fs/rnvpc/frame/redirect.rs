@@ -52,6 +52,7 @@ impl Rnvpc {
         entry: &Arc<DirtyNvExtentEntry>,
         logical_range: Range<u64>,
     ) -> Result<RangeDataMutation> {
+        self.ensure_publication_certain()?;
         if logical_range.start >= logical_range.end
             || logical_range.start < entry.logical_start()
             || logical_range.end > entry.logical_range().end
@@ -132,6 +133,7 @@ impl Rnvpc {
         fs_id: u64,
         page_budget: usize,
     ) -> Result<Vec<NvExtentEntryLease>> {
+        self.ensure_publication_certain()?;
         let leases = self.redirects.claim_ready_entries(fs_id, page_budget)?;
         for lease in &leases {
             self.objects.claim_data_range_owner(lease.entry())?;
@@ -177,6 +179,15 @@ impl Rnvpc {
 
     pub(crate) fn redirect_publication_uncertain(&self) -> bool {
         self.persist.publication_uncertain()
+    }
+
+    pub(crate) fn ensure_publication_certain(&self) -> Result<()> {
+        self.persist.ensure_writable()
+    }
+
+    #[cfg(ktest)]
+    pub(crate) fn latch_publication_uncertain_for_test(&self) {
+        self.persist.latch_publication_uncertain();
     }
 
     #[cfg(ktest)]
@@ -238,6 +249,7 @@ impl Rnvpc {
     }
 
     pub(crate) fn reclaim_nv_entry(&self, lease: &NvExtentEntryLease) -> Result<usize> {
+        self.ensure_publication_certain()?;
         lease.begin_reclaim_and_wait_for_readers()?;
         let entry = lease.entry();
         let pending = entry
@@ -676,6 +688,37 @@ impl Rnvpc {
         )
     }
 
+    pub(crate) fn activate_redirect_entries(&self, entries: &[Arc<DirtyNvExtentEntry>]) {
+        self.redirects.activate_prepared_entries(entries);
+    }
+
+    pub(crate) fn abort_redirect_entries(&self, entries: &[Arc<DirtyNvExtentEntry>]) -> Result<()> {
+        for entry in entries {
+            let head = usize::try_from(entry.nv_slot_range().start)
+                .map_err(|_| Error::new(Errno::EOVERFLOW))?;
+            self.persist.clear_frame(head, None)?;
+        }
+        if let Err(error) = self.redirects.discard_prepared_entries(entries) {
+            self.persist.latch_publication_uncertain();
+            return Err(error);
+        }
+        for entry in entries {
+            let owned = match self.remove_data_range_owner(entry) {
+                Ok(owned) => owned,
+                Err(error) => {
+                    self.persist.latch_publication_uncertain();
+                    return Err(error);
+                }
+            };
+            if let Err(error) = self.free_native_data_range(owned.start.index()..owned.end.index())
+            {
+                self.persist.latch_publication_uncertain();
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+
     #[cfg(ktest)]
     pub(crate) fn publish_redirect_entries_counted(
         &self,
@@ -763,16 +806,29 @@ impl Rnvpc {
                 range_end += 1;
             }
             let (head_page, head_key, head_ssd) = prepared[range_start];
-            records.push(NvRedirectExtentRecord::new_with_visibility(
+            let record = NvRedirectExtentRecord::new_with_visibility(
                 head_key.fs_id,
                 head_key.inode,
                 head_key.page_index,
-                u16::try_from(range_end - range_start).map_err(|_| Error::new(Errno::EOVERFLOW))?,
+                match u16::try_from(range_end - range_start) {
+                    Ok(page_count) => page_count,
+                    Err(_) => {
+                        self.release_legacy_entry_publication_pins(&legacy_prepared);
+                        return Err(Error::new(Errno::EOVERFLOW));
+                    }
+                },
                 head_page.index() as u64,
                 head_ssd,
                 NvRedirectAuthority::NvAuthoritative,
                 visibility_generation,
-            )?);
+            );
+            match record {
+                Ok(record) => records.push(record),
+                Err(error) => {
+                    self.release_legacy_entry_publication_pins(&legacy_prepared);
+                    return Err(error);
+                }
+            }
             range_start = range_end;
         }
         let entries = match records
@@ -860,7 +916,9 @@ impl Rnvpc {
             record.version = 0;
             self.account_unpin();
         }
-        self.redirects.activate_prepared_entries(&entries);
+        if legacy {
+            self.redirects.activate_prepared_entries(&entries);
+        }
         batch_metrics::count(batch_metrics::Event::RedirectPublishBatches, 1);
         batch_metrics::count(batch_metrics::Event::RedirectPublishedPages, prepared.len());
         batch_metrics::elapsed(batch_metrics::Phase::RedirectPublish, metrics_started);

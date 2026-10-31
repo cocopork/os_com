@@ -437,7 +437,7 @@ impl PersistEngine {
         inject(fault, FaultPoint::AfterClearFence)
     }
 
-    fn ensure_writable(&self) -> Result<()> {
+    pub(super) fn ensure_writable(&self) -> Result<()> {
         if self.publication_uncertain.load(Ordering::Acquire) {
             return_errno_with_message!(Errno::EUCLEAN, "NV selector publication requires recovery");
         }

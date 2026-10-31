@@ -418,6 +418,7 @@ impl Ext4 {
         let Some(pool) = rnvpc::pool() else {
             return Ok(0);
         };
+        pool.ensure_publication_certain()?;
         let candidate_started = pp::now();
         let mut pages = Vec::new();
         let mut nv_entries = Vec::new();

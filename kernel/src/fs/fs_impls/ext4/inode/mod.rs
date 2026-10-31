@@ -1442,6 +1442,7 @@ impl Inode {
         let pool = crate::fs::rnvpc::pool()
             .ok_or_else(|| Error::with_message(Errno::EINVAL, "rNVPC pool is not configured"))?
             .clone();
+        pool.ensure_publication_certain()?;
         fs.nv_inodes.lock().insert(self.ino);
         let fs_id = fs.rnvpc_fs_id();
         let inode_id = self.ino as u64;
@@ -1789,6 +1790,7 @@ impl Inode {
         let pool = crate::fs::rnvpc::pool()
             .ok_or_else(|| Error::with_message(Errno::EINVAL, "rNVPC pool is not configured"))?
             .clone();
+        pool.ensure_publication_certain()?;
         fs.nv_inodes.lock().insert(self.ino);
         let fs_id = fs.rnvpc_fs_id();
         let inode_id = self.ino as u64;

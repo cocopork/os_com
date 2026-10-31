@@ -1229,6 +1229,7 @@ pub(crate) fn commit_range_write_with_mutation<F>(
 where
     F: FnMut(u64, &mut super::frame::StagingDataPage) -> Result<()>,
 {
+    pool.ensure_publication_certain()?;
     let body_started = read_ns();
     let started = read_ns();
     let current_inode_ref =
@@ -1473,16 +1474,6 @@ where
     }
     finish_plan_nv_mutations(nv_mutations)?;
     let t_register = read_ns();
-    for batch in pending_new_pages.chunks(128) {
-        if let Err(error) = pool.publish_redirect_entries(batch, request.generation, None) {
-            if !pool.redirect_publication_uncertain() {
-                for (page, _, _) in &pending_new_pages {
-                    let _ = pool.free_native_data_range(page.index()..page.index() + 1);
-                }
-            }
-            return Err(error);
-        }
-    }
     let mut new_mappings = Vec::new();
     new_mappings
         .try_reserve_exact(pending_new_pages.len())
@@ -1491,7 +1482,10 @@ where
         new_mappings.push((key.page_index, *ssd_block));
     }
     let replacements = coalesce_ssd_extent_entries(&new_mappings)?;
-    LATENCY_STATS.fg_data_register.record_since(t_register);
+    let mut published_entries = Vec::new();
+    published_entries
+        .try_reserve_exact(pending_new_pages.len())
+        .map_err(|_| Error::new(Errno::ENOMEM))?;
     if copied == 0 {
         return_errno_with_message!(Errno::EFAULT, "write copied no user bytes");
     }
@@ -1533,7 +1527,27 @@ where
                 .ok_or_else(|| Error::new(Errno::EOVERFLOW))?,
         )
         .ok_or_else(|| Error::new(Errno::EOVERFLOW))?;
-    let inode_ref = mutation.publish_inode_state_with_generation(
+    for batch in pending_new_pages.chunks(128) {
+        match pool.publish_redirect_entries(batch, request.generation, None) {
+            Ok(entries) => published_entries.extend(entries),
+            Err(error) => {
+                if !pool.redirect_publication_uncertain() {
+                    pool.abort_redirect_entries(&published_entries)?;
+                    for (page, _, _) in &pending_new_pages {
+                        if !published_entries
+                            .iter()
+                            .any(|entry| entry.nv_slot_range().contains(&(page.index() as u64)))
+                        {
+                            let _ = pool.free_native_data_range(page.index()..page.index() + 1);
+                        }
+                    }
+                }
+                return Err(error);
+            }
+        }
+    }
+    LATENCY_STATS.fg_data_register.record_since(t_register);
+    let inode_ref = match mutation.publish_inode_state_with_generation(
         current_inode_ref,
         new_root.reference(),
         &new_root,
@@ -1541,7 +1555,14 @@ where
         file_size,
         block_count,
         inode_fault,
-    )?;
+    ) {
+        Ok(inode_ref) => inode_ref,
+        Err(error) => {
+            pool.abort_redirect_entries(&published_entries)?;
+            return Err(error);
+        }
+    };
+    pool.activate_redirect_entries(&published_entries);
     if !request.allocations.is_empty() {
         let mut used = newly_mapped;
         for allocation in request.allocations {
@@ -1712,23 +1733,36 @@ where
         return Err(error);
     }
     finish_plan_nv_mutations(nv_mutations)?;
-    for batch in pending.chunks(128) {
-        if let Err(error) = pool.publish_redirect_entries(batch, request.generation, None) {
-            if !pool.redirect_publication_uncertain() {
-                for (page, _, _) in &pending {
-                    let _ = pool.free_native_data_range(page.index()..page.index() + 1);
-                }
-            }
-            return Err(error);
-        }
-    }
-
     let root = mutation.committed_node(current_inode.extent_root())?;
     let visible_end = request
         .file_offset
         .checked_add(copied as u64)
         .ok_or_else(|| Error::new(Errno::EOVERFLOW))?;
-    let inode_ref = mutation.publish_inode_state_with_generation(
+    let mut published_entries = Vec::new();
+    published_entries
+        .try_reserve_exact(pending.len())
+        .map_err(|_| Error::new(Errno::ENOMEM))?;
+    for batch in pending.chunks(128) {
+        match pool.publish_redirect_entries(batch, request.generation, None) {
+            Ok(entries) => published_entries.extend(entries),
+            Err(error) => {
+                if !pool.redirect_publication_uncertain() {
+                    pool.abort_redirect_entries(&published_entries)?;
+                    for (page, _, _) in &pending {
+                        if !published_entries
+                            .iter()
+                            .any(|entry| entry.nv_slot_range().contains(&(page.index() as u64)))
+                        {
+                            let _ = pool.free_native_data_range(page.index()..page.index() + 1);
+                        }
+                    }
+                }
+                return Err(error);
+            }
+        }
+    }
+
+    let inode_ref = match mutation.publish_inode_state_with_generation(
         current_inode_ref,
         current_inode.extent_root(),
         &root,
@@ -1736,7 +1770,14 @@ where
         request.old_file_size.max(visible_end),
         request.old_block_count,
         inode_fault,
-    )?;
+    ) {
+        Ok(inode_ref) => inode_ref,
+        Err(error) => {
+            pool.abort_redirect_entries(&published_entries)?;
+            return Err(error);
+        }
+    };
+    pool.activate_redirect_entries(&published_entries);
     Ok(Some(CommittedRangeWrite {
         copied,
         inode: inode_ref,
