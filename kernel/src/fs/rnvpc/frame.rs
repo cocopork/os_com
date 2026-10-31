@@ -5711,6 +5711,10 @@ pub(crate) struct RangeDataMutation {
 }
 
 impl RangeDataMutation {
+    pub(crate) fn contains(&self, logical_page: u64) -> bool {
+        self.logical_range.contains(&logical_page)
+    }
+
     pub(crate) fn data_segments(&self) -> Result<Vec<USegment>> {
         self.pool.data_range_segments(
             self.guard.entry(),
@@ -5719,6 +5723,52 @@ impl RangeDataMutation {
             usize::try_from(self.logical_range.end - self.logical_range.start)
                 .map_err(|_| Error::new(Errno::EOVERFLOW))?,
         )
+    }
+
+    pub(crate) fn copy_page_from_reader(
+        &self,
+        logical_page: u64,
+        offset: usize,
+        reader: &mut VmReader,
+        len: usize,
+    ) -> Result<usize> {
+        if !self.logical_range.contains(&logical_page)
+            || offset.checked_add(len).is_none_or(|end| end > PAGE_SIZE)
+        {
+            return_errno!(Errno::EINVAL);
+        }
+        let slot = self
+            .guard
+            .entry()
+            .nv_slot_range()
+            .start
+            .checked_add(logical_page - self.guard.entry().logical_start())
+            .and_then(|slot| usize::try_from(slot).ok())
+            .ok_or_else(|| Error::new(Errno::EOVERFLOW))?;
+        self.pool
+            .backend
+            .copy_from_reader(NvPageId::try_from(slot)?, offset, reader, len)
+    }
+
+    pub(crate) fn finish(self) -> Result<()> {
+        let first = self
+            .guard
+            .entry()
+            .nv_slot_range()
+            .start
+            .checked_add(self.logical_range.start - self.guard.entry().logical_start())
+            .and_then(|slot| usize::try_from(slot).ok())
+            .ok_or_else(|| Error::new(Errno::EOVERFLOW))?;
+        let pages = usize::try_from(self.logical_range.end - self.logical_range.start)
+            .map_err(|_| Error::new(Errno::EOVERFLOW))?;
+        let offset = first
+            .checked_mul(PAGE_SIZE)
+            .ok_or_else(|| Error::new(Errno::EOVERFLOW))?;
+        let len = pages
+            .checked_mul(PAGE_SIZE)
+            .ok_or_else(|| Error::new(Errno::EOVERFLOW))?;
+        self.pool.backend.persist(offset, len)?;
+        self.pool.backend.fence()
     }
 }
 

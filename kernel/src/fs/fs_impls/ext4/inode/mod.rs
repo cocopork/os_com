@@ -899,6 +899,15 @@ impl RaState {
     }
 }
 
+fn rnvpce_write_chunk_len(offset: usize, remaining: usize) -> Result<usize> {
+    128usize
+        .checked_mul(PAGE_SIZE)
+        .and_then(|bytes| bytes.checked_sub(offset % PAGE_SIZE))
+        .map(|limit| remaining.min(limit))
+        .filter(|chunk| *chunk != 0)
+        .ok_or_else(|| Error::new(Errno::EOVERFLOW))
+}
+
 /// A single ext4 inode: shared metadata plus type-specific payload.
 pub struct Inode {
     ino: Ext4Ino,
@@ -1769,11 +1778,7 @@ impl Inode {
         if fs.is_rdonly() {
             return_errno_with_message!(Errno::EROFS, "read-only filesystem");
         }
-        let max_write_len = 128usize
-            .checked_mul(PAGE_SIZE)
-            .and_then(|bytes| bytes.checked_sub(offset % PAGE_SIZE))
-            .ok_or_else(|| Error::new(Errno::EOVERFLOW))?;
-        let mut write_len = reader.remain().min(max_write_len);
+        let mut write_len = rnvpce_write_chunk_len(offset, reader.remain())?;
         reader.limit(write_len);
         let mut end = offset
             .checked_add(write_len)
@@ -2086,6 +2091,33 @@ impl Inode {
         }
     }
 
+    fn write_rnvpce_all_at(
+        &self,
+        fs: &Arc<Ext4>,
+        offset: usize,
+        reader: &mut VmReader,
+    ) -> Result<usize> {
+        let mut done = 0usize;
+        while reader.remain() != 0 {
+            let chunk_len = rnvpce_write_chunk_len(offset + done, reader.remain())?;
+            let mut chunk = reader.clone();
+            chunk.limit(chunk_len);
+            match self.write_rnvpce_at(fs, offset + done, &mut chunk) {
+                Ok(written) => {
+                    reader.skip(written);
+                    done = done
+                        .checked_add(written)
+                        .ok_or_else(|| Error::new(Errno::EOVERFLOW))?;
+                    if written < chunk_len {
+                        break;
+                    }
+                }
+                Err(error) => return if done == 0 { Err(error) } else { Ok(done) },
+            }
+        }
+        Ok(done)
+    }
+
     pub(super) fn write_at(&self, offset: usize, reader: &mut VmReader) -> Result<usize> {
         if self.type_ == InodeType::Dir {
             return_errno!(Errno::EISDIR);
@@ -2096,7 +2128,7 @@ impl Inode {
         let fs = self.fs()?;
         if self.type_ == InodeType::File && fs.rnvpc_extend_enabled() {
             let started = pp::now();
-            let result = self.write_rnvpce_at(&fs, offset, reader);
+            let result = self.write_rnvpce_all_at(&fs, offset, reader);
             if let Ok(written) = &result {
                 pp::NV_FOREGROUND_TOTAL.record_since(started, *written);
             }
@@ -5735,6 +5767,21 @@ mod write_tests {
 
     const FILE_INO: u32 = 11;
     const SECTORS_PER_BLOCK: u64 = (BLOCK_SIZE / SECTOR_SIZE) as u64;
+
+    #[ktest]
+    fn rnvpce_1024k_write_chunks() {
+        let mut offset = 0usize;
+        let mut remaining = 1024 * 1024;
+        let mut chunks = Vec::new();
+        while remaining != 0 {
+            let chunk = rnvpce_write_chunk_len(offset, remaining).unwrap();
+            chunks.push(chunk);
+            offset += chunk;
+            remaining -= chunk;
+        }
+        assert_eq!(chunks, vec![128 * PAGE_SIZE, 128 * PAGE_SIZE]);
+        assert_eq!(offset, 1024 * 1024);
+    }
 
     /// A fixture with a realistic bitmap and an empty regular file at `FILE_INO`.
     fn fixture_with_empty_file() -> Ext4Fixture {

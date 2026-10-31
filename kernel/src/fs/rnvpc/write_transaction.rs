@@ -1284,6 +1284,7 @@ where
         }
         Err(error) => return Err(error),
     };
+    let nv_mutations = begin_plan_nv_mutations(&pool, plan)?;
 
     let started = read_ns();
     let mut existing_refs = Vec::new();
@@ -1315,16 +1316,7 @@ where
         // baseline while this mutation's publication guard was already held.
         // Re-routing the immutable tree for every page only repeats that fact.
         let (entry, existing) = match plan.extent_for(page.logical_block)? {
-            WriteExtent::ExistingNv { entry, .. } => {
-                let slot = entry
-                    .nv_slot_range()
-                    .start
-                    .checked_add(page.logical_block - entry.logical_start())
-                    .and_then(|slot| usize::try_from(slot).ok())
-                    .ok_or_else(|| Error::new(Errno::EOVERFLOW))?;
-                let reference = pool.persistent_data_ref(NvPageId::try_from(slot)?)?;
-                (None, Some(reference))
-            }
+            WriteExtent::ExistingNv { entry, .. } => (None, Some(entry.clone())),
             WriteExtent::ExistingSsd {
                 logical_range,
                 ssd_start,
@@ -1403,22 +1395,21 @@ where
         .try_reserve_exact(new_page_count)
         .map_err(|_| Error::new(Errno::ENOMEM))?;
     for (page, (old_entry, existing)) in request.pages.iter().zip(existing_refs) {
-        let page_result = (|| -> Result<(usize, Option<PersistentObjectRef>)> {
-            if let Some(reference) = existing {
-                if pool.validate_persistent_data_ref(reference)?
-                    != PageKey::new(fs_id, inode, page.logical_block)
-                {
-                    return_errno_with_message!(
-                        Errno::EUCLEAN,
-                        "extent data object identity mismatch"
-                    );
-                }
-                let data = pool.begin_persistent_data_mutation(reference)?;
+        let page_result = (|| -> Result<usize> {
+            if existing.is_some() {
+                let data = nv_mutations
+                    .iter()
+                    .find(|mutation| mutation.contains(page.logical_block))
+                    .ok_or_else(|| Error::new(Errno::ESTALE))?;
                 let t_copy = read_ns();
-                let amount = data.copy_from_reader(page.page_offset, reader, page.len, None)?;
+                let amount = data.copy_page_from_reader(
+                    page.logical_block,
+                    page.page_offset,
+                    reader,
+                    page.len,
+                )?;
                 LATENCY_STATS.fg_copy.record_since(t_copy);
-                data.finish();
-                Ok((amount, Some(reference)))
+                Ok(amount)
             } else {
                 let t_init = read_ns();
                 let mut staging = pool.begin_reserved_data_page(&mut reservation)?;
@@ -1456,15 +1447,14 @@ where
                         .checked_add(1)
                         .ok_or_else(|| Error::new(Errno::EOVERFLOW))?;
                 }
-                Ok((amount, None))
+                Ok(amount)
             }
         })();
-        let (page_copied, reference) = match page_result {
+        let page_copied = match page_result {
             Ok(result) => result,
             Err(_) if copied != 0 => break,
             Err(error) => return Err(error),
         };
-        debug_assert!(reference.is_none());
         copied = copied
             .checked_add(page_copied)
             .ok_or_else(|| Error::new(Errno::EOVERFLOW))?;
@@ -1472,6 +1462,7 @@ where
             break;
         }
     }
+    finish_plan_nv_mutations(nv_mutations)?;
     let t_register = read_ns();
     for batch in pending_new_pages.chunks(128) {
         if let Err(error) = pool.publish_redirect_entries(batch, request.generation, None) {
@@ -1621,24 +1612,7 @@ where
         }
     }
 
-    let mut guarded_entries = BTreeSet::new();
-    let mut _entry_guards = Vec::new();
-    for extent in &plan.extents {
-        if let WriteExtent::ExistingNv { entry, .. } = extent
-            && guarded_entries.insert(entry.logical_start())
-        {
-            _entry_guards.push(entry.try_write().map_err(|error| {
-                if error.error() == Errno::EBUSY {
-                    Error::with_message(
-                        Errno::EAGAIN,
-                        "NV extent entry migration won the foreground write race",
-                    )
-                } else {
-                    error
-                }
-            })?);
-        }
-    }
+    let nv_mutations = begin_plan_nv_mutations(pool, plan)?;
 
     let mut pending = Vec::new();
     pending
@@ -1648,17 +1622,20 @@ where
     let staging_result = (|| -> Result<()> {
         for page in request.pages {
             let key = PageKey::new(fs_id, inode, page.logical_block);
-            if let WriteExtent::ExistingNv { entry, .. } = plan.extent_for(page.logical_block)? {
-                let slot = entry
-                    .nv_slot_range()
-                    .start
-                    .checked_add(page.logical_block - entry.logical_start())
-                    .and_then(|slot| usize::try_from(slot).ok())
-                    .ok_or_else(|| Error::new(Errno::EOVERFLOW))?;
-                let reference = pool.persistent_data_ref(NvPageId::try_from(slot)?)?;
-                let data = pool.begin_persistent_data_mutation(reference)?;
-                let amount = data.copy_from_reader(page.page_offset, reader, page.len, None)?;
-                data.finish();
+            if matches!(
+                plan.extent_for(page.logical_block)?,
+                WriteExtent::ExistingNv { .. }
+            ) {
+                let data = nv_mutations
+                    .iter()
+                    .find(|mutation| mutation.contains(page.logical_block))
+                    .ok_or_else(|| Error::new(Errno::ESTALE))?;
+                let amount = data.copy_page_from_reader(
+                    page.logical_block,
+                    page.page_offset,
+                    reader,
+                    page.len,
+                )?;
                 if amount == 0 {
                     return_errno_with_message!(Errno::EFAULT, "write copied no user bytes");
                 }
@@ -1698,8 +1675,10 @@ where
         for (page, _, _) in pending {
             let _ = pool.abort_data_page(page);
         }
+        finish_plan_nv_mutations(nv_mutations)?;
         return Err(error);
     }
+    finish_plan_nv_mutations(nv_mutations)?;
     for batch in pending.chunks(128) {
         if let Err(error) = pool.publish_redirect_entries(batch, request.generation, None) {
             if !pool.redirect_publication_uncertain() {
@@ -1730,6 +1709,44 @@ where
         inode: inode_ref,
         reserved_blocks: 0,
     }))
+}
+
+fn begin_plan_nv_mutations(
+    pool: &Arc<Rnvpc>,
+    plan: &RangeWritePlan,
+) -> Result<Vec<super::frame::RangeDataMutation>> {
+    let mut seen = BTreeSet::new();
+    let mut mutations = Vec::new();
+    for extent in &plan.extents {
+        if let WriteExtent::ExistingNv {
+            entry,
+            logical_range,
+        } = extent
+            && seen.insert(entry.logical_start())
+        {
+            mutations.push(
+                pool.begin_range_data_mutation(entry, logical_range.clone())
+                    .map_err(|error| {
+                        if error.error() == Errno::EBUSY {
+                            Error::with_message(
+                                Errno::EAGAIN,
+                                "NV extent entry migration won the foreground write race",
+                            )
+                        } else {
+                            error
+                        }
+                    })?,
+            );
+        }
+    }
+    Ok(mutations)
+}
+
+fn finish_plan_nv_mutations(mutations: Vec<super::frame::RangeDataMutation>) -> Result<()> {
+    for mutation in mutations {
+        mutation.finish()?;
+    }
+    Ok(())
 }
 
 impl WriteAllocation {
