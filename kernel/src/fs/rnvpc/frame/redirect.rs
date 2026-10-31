@@ -8,6 +8,94 @@ use crate::fs::rnvpc::batch_metrics;
 use crate::fs::rnvpc::redirect_index::RedirectRange;
 
 impl Rnvpc {
+    pub(crate) fn begin_reserved_data_ranges(
+        self: &Arc<Self>,
+        reservation: &mut CapacityReservation,
+        pages: usize,
+    ) -> Result<Vec<StagingDataRange>> {
+        if pages == 0 || reservation.pages.len() < pages {
+            return_errno_with_message!(Errno::EAGAIN, "insufficient reserved NV data pages");
+        }
+        let mut ranges = Vec::new();
+        let mut current = Vec::new();
+        for _ in 0..pages {
+            let page = self.begin_reserved_data_page(reservation)?;
+            let contiguous = current.last().is_some_and(|previous: &StagingDataPage| {
+                previous.id().index().checked_add(1) == Some(page.id().index())
+            });
+            if !current.is_empty()
+                && (!contiguous
+                    || current.len()
+                        == crate::fs::rnvpc::redirect_index::MAX_DIRTY_MIGRATION_EXTENT_PAGES)
+            {
+                ranges.push(StagingDataRange {
+                    pages: core::mem::take(&mut current),
+                });
+            }
+            current.push(page);
+        }
+        if !current.is_empty() {
+            ranges.push(StagingDataRange { pages: current });
+        }
+        Ok(ranges)
+    }
+
+    pub(crate) fn begin_range_data_mutation(
+        self: &Arc<Self>,
+        entry: &Arc<DirtyNvExtentEntry>,
+        logical_range: Range<u64>,
+    ) -> Result<RangeDataMutation> {
+        if logical_range.start >= logical_range.end
+            || logical_range.start < entry.logical_start()
+            || logical_range.end > entry.logical_range().end
+        {
+            return_errno_with_message!(Errno::EINVAL, "mutation is outside NV data range");
+        }
+        let guard = entry.try_write()?;
+        Ok(RangeDataMutation {
+            pool: self.clone(),
+            guard,
+            logical_range,
+        })
+    }
+
+    pub(crate) fn install_data_range_owner(
+        &self,
+        entry: &Arc<DirtyNvExtentEntry>,
+        slots: Range<usize>,
+    ) -> Result<()> {
+        self.objects.install_data_range_owner(entry, slots)
+    }
+
+    pub(crate) fn remove_data_range_owner(
+        &self,
+        entry: &Arc<DirtyNvExtentEntry>,
+    ) -> Result<Range<NvPageId>> {
+        let slots = self.objects.remove_data_range_owner(entry)?;
+        Ok(NvPageId::try_from(slots.start)?..NvPageId::try_from(slots.end)?)
+    }
+
+    pub(crate) fn data_range_segments(
+        &self,
+        entry: &Arc<DirtyNvExtentEntry>,
+        offset: usize,
+        count: usize,
+    ) -> Result<Vec<USegment>> {
+        let slots = self.objects.data_range_owner(entry)?;
+        let start = slots
+            .start
+            .checked_add(offset)
+            .filter(|start| *start <= slots.end)
+            .ok_or_else(|| Error::new(Errno::EINVAL))?;
+        let end = start
+            .checked_add(count)
+            .filter(|end| *end <= slots.end)
+            .ok_or_else(|| Error::new(Errno::EINVAL))?;
+        (start..end)
+            .map(|slot| self.backend.data_page_segment(NvPageId::try_from(slot)?))
+            .collect()
+    }
+
     #[cfg(ktest)]
     pub(crate) fn persisted_redirect_extent_for_test(
         &self,
@@ -49,6 +137,20 @@ impl Rnvpc {
 
     pub(crate) fn lookup_dirty_nv_entry(&self, key: PageKey) -> Option<Arc<DirtyNvExtentEntry>> {
         self.redirects.lookup_dirty_entry(key)
+    }
+
+    pub(crate) fn lookup_dirty_nv_overlaps(
+        &self,
+        fs_id: u64,
+        inode: u64,
+        range: Range<u64>,
+    ) -> Result<Vec<Arc<DirtyNvExtentEntry>>> {
+        self.redirects.lookup_overlaps(fs_id, inode, range)
+    }
+
+    #[cfg(ktest)]
+    pub(crate) fn redirect_overlap_lookups(&self) -> usize {
+        self.redirects.overlap_lookup_count()
     }
 
     pub(crate) fn data_segment_from_entry(

@@ -44,7 +44,7 @@ use super::{
     recover,
     redirect_index::{
         DescriptorHandle, DirtyNvExtentEntry, MigrationConflict, MigrationExtentLease,
-        NvExtentEntryLease, NvExtentReadGuard, RedirectDirectory,
+        NvExtentEntryLease, NvExtentReadGuard, NvExtentWriteGuard, RedirectDirectory,
     },
     slot_allocator::NvSlotAllocator,
 };
@@ -815,6 +815,11 @@ impl Rnvpc {
     #[cfg(ktest)]
     pub(crate) fn extent_tree_lookups(&self) -> u64 {
         self.extent_tree_lookups.load(Ordering::Acquire)
+    }
+
+    #[cfg(ktest)]
+    pub(crate) fn extent_tree_range_lookups(&self) -> u64 {
+        self.extent_tree_lookups()
     }
 
     #[cfg(ktest)]
@@ -5649,6 +5654,68 @@ impl Drop for PinnedDataPage {
 pub(crate) struct StagingDataPage {
     pin: Option<PinnedDataPage>,
     initialized: bool,
+}
+
+pub(crate) struct StagingDataRange {
+    pages: Vec<StagingDataPage>,
+}
+
+impl StagingDataRange {
+    pub(crate) fn len(&self) -> usize {
+        self.pages.len()
+    }
+
+    pub(crate) fn page_mut(&mut self, offset: usize) -> Result<&mut StagingDataPage> {
+        self.pages
+            .get_mut(offset)
+            .ok_or_else(|| Error::new(Errno::EINVAL))
+    }
+
+    pub(crate) fn slot_range(&self) -> Result<Range<usize>> {
+        let first = self
+            .pages
+            .first()
+            .ok_or_else(|| Error::new(Errno::EINVAL))?
+            .id()
+            .index();
+        let end = first
+            .checked_add(self.pages.len())
+            .ok_or_else(|| Error::new(Errno::EOVERFLOW))?;
+        if self
+            .pages
+            .iter()
+            .enumerate()
+            .any(|(offset, page)| page.id().index() != first + offset)
+        {
+            return_errno_with_message!(Errno::EUCLEAN, "staged NV data range is not contiguous");
+        }
+        Ok(first..end)
+    }
+
+    pub(crate) fn finish(self) -> Result<Vec<NvPageId>> {
+        self.pages
+            .into_iter()
+            .map(StagingDataPage::finish)
+            .collect()
+    }
+}
+
+pub(crate) struct RangeDataMutation {
+    pool: Arc<Rnvpc>,
+    guard: NvExtentWriteGuard,
+    logical_range: Range<u64>,
+}
+
+impl RangeDataMutation {
+    pub(crate) fn data_segments(&self) -> Result<Vec<USegment>> {
+        self.pool.data_range_segments(
+            self.guard.entry(),
+            usize::try_from(self.logical_range.start - self.guard.entry().logical_start())
+                .map_err(|_| Error::new(Errno::EOVERFLOW))?,
+            usize::try_from(self.logical_range.end - self.logical_range.start)
+                .map_err(|_| Error::new(Errno::EOVERFLOW))?,
+        )
+    }
 }
 
 impl StagingDataPage {

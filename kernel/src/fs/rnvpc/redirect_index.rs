@@ -228,6 +228,12 @@ pub(crate) struct NvExtentWriteGuard {
     entry: Arc<DirtyNvExtentEntry>,
 }
 
+impl NvExtentWriteGuard {
+    pub(crate) fn entry(&self) -> &Arc<DirtyNvExtentEntry> {
+        &self.entry
+    }
+}
+
 impl Drop for NvExtentWriteGuard {
     fn drop(&mut self) {
         if self.entry.writers.fetch_sub(1, Ordering::AcqRel) == 1 {
@@ -454,6 +460,12 @@ fn redirect_partition_index(key: PageKey) -> usize {
         % REDIRECT_PARTITION_COUNT as u64) as usize
 }
 
+fn inode_redirect_partition_index(fs_id: u64, inode: u64) -> usize {
+    let owner = fs_id.wrapping_mul(0x9e37_79b9_7f4a_7c15).rotate_left(17)
+        ^ inode.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    (owner % REDIRECT_PARTITION_COUNT as u64) as usize
+}
+
 #[derive(Debug)]
 pub(crate) struct PendingRedirectBatch {
     reservations: Vec<(PageKey, u64)>,
@@ -476,15 +488,28 @@ struct RedirectPartition {
     ready_set: BTreeSet<PageKey>,
     claimed_extents: BTreeMap<PageKey, IndexedDirtyExtent>,
     next_extent_generation: u64,
-    dirty_entry_members: BTreeMap<PageKey, Arc<DirtyNvExtentEntry>>,
-    owned_dirty_entries: BTreeMap<PageKey, Arc<DirtyNvExtentEntry>>,
     epoch: u64,
+}
+
+struct InodeRedirectMap {
+    entries: SpinLock<BTreeMap<u64, Arc<DirtyNvExtentEntry>>>,
+}
+
+impl InodeRedirectMap {
+    fn new() -> Self {
+        Self {
+            entries: SpinLock::new(BTreeMap::new()),
+        }
+    }
 }
 
 pub(crate) struct RedirectDirectory {
     partitions: Box<[SpinLock<RedirectPartition>]>,
+    inode_maps: Box<[SpinLock<BTreeMap<(u64, u64), Arc<InodeRedirectMap>>>]>,
     next_candidate_partition: AtomicUsize,
     candidate_extent_visits: AtomicUsize,
+    #[cfg(ktest)]
+    overlap_lookups: AtomicUsize,
     #[cfg(ktest)]
     dirty_extent_rebuilds: AtomicUsize,
 }
@@ -498,10 +523,20 @@ impl RedirectDirectory {
         for _ in 0..REDIRECT_PARTITION_COUNT {
             partitions.push(SpinLock::new(RedirectPartition::default()));
         }
+        let mut inode_maps = Vec::new();
+        inode_maps
+            .try_reserve_exact(REDIRECT_PARTITION_COUNT)
+            .map_err(|_| Error::new(Errno::ENOMEM))?;
+        for _ in 0..REDIRECT_PARTITION_COUNT {
+            inode_maps.push(SpinLock::new(BTreeMap::new()));
+        }
         Ok(Self {
             partitions: partitions.into_boxed_slice(),
+            inode_maps: inode_maps.into_boxed_slice(),
             next_candidate_partition: AtomicUsize::new(0),
             candidate_extent_visits: AtomicUsize::new(0),
+            #[cfg(ktest)]
+            overlap_lookups: AtomicUsize::new(0),
             #[cfg(ktest)]
             dirty_extent_rebuilds: AtomicUsize::new(0),
         })
@@ -519,49 +554,70 @@ impl RedirectDirectory {
         if entry.state() != NvExtentEntryState::Dirty {
             return_errno_with_message!(Errno::EINVAL, "published NV extent entry is not dirty");
         }
-        let keys = entry
-            .logical_range()
-            .map(|page| PageKey::new(entry.fs_id(), entry.inode(), page))
-            .collect::<Vec<_>>();
-        let partition_ids = self.partitions_for(&keys);
-        let owner_partition = self.partition_index(keys[0]);
-        let mut guards = Vec::new();
-        for partition in partition_ids {
-            guards.push((partition, self.partitions[partition].lock()));
-        }
-        if keys.iter().any(|key| {
-            guards
-                .iter()
-                .find(|(partition, _)| *partition == self.partition_index(*key))
-                .is_some_and(|(_, state)| state.dirty_entry_members.contains_key(key))
-        }) {
+        let inode_map = self
+            .inode_map(entry.fs_id(), entry.inode(), true)?
+            .expect("requested creation returns an inode redirect map");
+        let mut entries = inode_map.entries.lock();
+        let range = entry.logical_range();
+        if Self::entries_overlap(&entries, range.clone()) {
             return_errno_with_message!(Errno::EBUSY, "NV extent entry overlaps an existing entry");
         }
-        for key in &keys {
-            guards
-                .iter_mut()
-                .find(|(partition, _)| *partition == self.partition_index(*key))
-                .expect("entry member partition is locked")
-                .1
-                .dirty_entry_members
-                .insert(*key, entry.clone());
-        }
-        guards
-            .iter_mut()
-            .find(|(partition, _)| *partition == owner_partition)
-            .expect("entry owner partition is locked")
-            .1
-            .owned_dirty_entries
-            .insert(keys[0], entry);
+        entries.insert(range.start, entry);
         Ok(())
     }
 
     pub(crate) fn lookup_dirty_entry(&self, key: PageKey) -> Option<Arc<DirtyNvExtentEntry>> {
-        self.partitions[self.partition_index(key)]
-            .lock()
-            .dirty_entry_members
-            .get(&key)
-            .cloned()
+        self.lookup_page(key)
+    }
+
+    pub(crate) fn lookup_page(&self, key: PageKey) -> Option<Arc<DirtyNvExtentEntry>> {
+        let inode_map = self.inode_map(key.fs_id, key.inode, false).ok().flatten()?;
+        let entries = inode_map.entries.lock();
+        let (_, entry) = entries.range(..=key.page_index).next_back()?;
+        entry
+            .logical_range()
+            .contains(&key.page_index)
+            .then(|| entry.clone())
+    }
+
+    pub(crate) fn lookup_overlaps(
+        &self,
+        fs_id: u64,
+        inode: u64,
+        range: Range<u64>,
+    ) -> Result<Vec<Arc<DirtyNvExtentEntry>>> {
+        if range.start >= range.end {
+            return_errno_with_message!(Errno::EINVAL, "empty redirect lookup range");
+        }
+        #[cfg(ktest)]
+        self.overlap_lookups.fetch_add(1, Ordering::Relaxed);
+        let Some(inode_map) = self.inode_map(fs_id, inode, false)? else {
+            return Ok(Vec::new());
+        };
+        let entries = inode_map.entries.lock();
+        let mut overlaps = Vec::new();
+        if let Some((_, entry)) = entries.range(..=range.start).next_back()
+            && entry.logical_range().end > range.start
+        {
+            overlaps.push(entry.clone());
+        }
+        for (_, entry) in entries.range(range.start..) {
+            if entry.logical_start() >= range.end {
+                break;
+            }
+            if overlaps
+                .last()
+                .is_none_or(|previous| !Arc::ptr_eq(previous, entry))
+            {
+                overlaps.push(entry.clone());
+            }
+        }
+        Ok(overlaps)
+    }
+
+    #[cfg(ktest)]
+    pub(crate) fn overlap_lookup_count(&self) -> usize {
+        self.overlap_lookups.load(Ordering::Acquire)
     }
 
     pub(crate) fn claim_ready_entries(
@@ -580,21 +636,26 @@ impl RedirectDirectory {
         let mut leases = Vec::new();
         for offset in 0..self.partitions.len() {
             let partition = (start + offset) % self.partitions.len();
-            let state = self.partitions[partition].lock();
-            for entry in state.owned_dirty_entries.values() {
-                if entry.fs_id() != fs_id
-                    || entry
-                        .transition(NvExtentEntryState::Dirty, NvExtentEntryState::Migrating)
-                        .is_err()
-                {
+            let inode_maps = self.inode_maps[partition].lock();
+            for ((owner_fs_id, _), inode_map) in inode_maps.iter() {
+                if *owner_fs_id != fs_id {
                     continue;
                 }
-                claimed_pages = claimed_pages.saturating_add(usize::from(entry.page_count()));
-                leases.push(NvExtentEntryLease {
-                    entry: entry.clone(),
-                });
-                if claimed_pages >= page_budget {
-                    return Ok(leases);
+                let entries = inode_map.entries.lock();
+                for entry in entries.values() {
+                    if entry
+                        .transition(NvExtentEntryState::Dirty, NvExtentEntryState::Migrating)
+                        .is_err()
+                    {
+                        continue;
+                    }
+                    claimed_pages = claimed_pages.saturating_add(usize::from(entry.page_count()));
+                    leases.push(NvExtentEntryLease {
+                        entry: entry.clone(),
+                    });
+                    if claimed_pages >= page_budget {
+                        return Ok(leases);
+                    }
                 }
             }
         }
@@ -618,50 +679,66 @@ impl RedirectDirectory {
             .map(|page| PageKey::new(entry.fs_id(), entry.inode(), page))
             .collect::<Vec<_>>();
         let partition_ids = self.partitions_for(&keys);
-        let owner_partition = self.partition_index(keys[0]);
         let mut guards = Vec::new();
         for partition in partition_ids {
             guards.push((partition, self.partitions[partition].lock()));
         }
+        self.remove_entry(entry)?;
         for key in &keys {
             let state = &mut guards
                 .iter_mut()
                 .find(|(partition, _)| *partition == self.partition_index(*key))
                 .expect("entry member partition is locked")
                 .1;
-            if !state
-                .dirty_entry_members
-                .get(key)
-                .is_some_and(|candidate| Arc::ptr_eq(candidate, entry))
-            {
-                return_errno_with_message!(Errno::ESTALE, "NV extent entry membership changed");
-            }
-        }
-        for key in &keys {
-            let state = &mut guards
-                .iter_mut()
-                .find(|(partition, _)| *partition == self.partition_index(*key))
-                .expect("entry member partition is locked")
-                .1;
-            state.dirty_entry_members.remove(key);
             state.committed.remove(key);
             state.dirty.remove(key);
             state.ready_set.remove(key);
         }
-        let owner = &mut guards
-            .iter_mut()
-            .find(|(partition, _)| *partition == owner_partition)
-            .expect("entry owner partition is locked")
-            .1;
-        if !owner
-            .owned_dirty_entries
-            .get(&keys[0])
+        Ok(())
+    }
+
+    pub(crate) fn remove_entry(&self, entry: &Arc<DirtyNvExtentEntry>) -> Result<()> {
+        let inode_map = self
+            .inode_map(entry.fs_id(), entry.inode(), false)?
+            .ok_or_else(|| Error::new(Errno::ESTALE))?;
+        let mut entries = inode_map.entries.lock();
+        if !entries
+            .get(&entry.logical_start())
             .is_some_and(|candidate| Arc::ptr_eq(candidate, entry))
         {
             return_errno_with_message!(Errno::ESTALE, "NV extent entry owner changed");
         }
-        owner.owned_dirty_entries.remove(&keys[0]);
+        entries.remove(&entry.logical_start());
         Ok(())
+    }
+
+    fn entries_overlap(
+        entries: &BTreeMap<u64, Arc<DirtyNvExtentEntry>>,
+        range: Range<u64>,
+    ) -> bool {
+        entries
+            .range(..range.end)
+            .next_back()
+            .is_some_and(|(_, entry)| entry.logical_range().end > range.start)
+    }
+
+    fn inode_map(
+        &self,
+        fs_id: u64,
+        inode: u64,
+        create: bool,
+    ) -> Result<Option<Arc<InodeRedirectMap>>> {
+        let partition = inode_redirect_partition_index(fs_id, inode);
+        let mut maps = self.inode_maps[partition].lock();
+        if let Some(map) = maps.get(&(fs_id, inode)) {
+            return Ok(Some(map.clone()));
+        }
+        if !create {
+            return Ok(None);
+        }
+        let map = Arc::new(InodeRedirectMap::new());
+        maps.insert((fs_id, inode), map.clone());
+        Ok(Some(map))
     }
 
     pub(crate) fn reserve_versions(&self, keys: &[PageKey]) -> Result<PendingRedirectBatch> {

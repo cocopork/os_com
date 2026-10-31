@@ -2,18 +2,24 @@
 
 //! Each slot owns one lock protecting its runtime record.
 
-use core::ops::{Index, IndexMut};
+use core::ops::{Index, IndexMut, Range};
 
 use ostd::sync::{PreemptDisabled, WaitQueue};
 
 use super::ObjectRecord;
 #[cfg(ktest)]
 use super::ReverseExtentRef;
-use crate::prelude::*;
+use crate::{fs::rnvpc::redirect_index::DirtyNvExtentEntry, prelude::*};
 
 pub(super) struct ObjectTable {
     slots: Vec<SlotEntry>,
     migration_ranges: SpinLock<MigrationRangeState>,
+    data_ranges: SpinLock<BTreeMap<usize, DataRangeOwner>>,
+}
+
+struct DataRangeOwner {
+    end: usize,
+    owner: Weak<DirtyNvExtentEntry>,
 }
 
 #[derive(Default)]
@@ -79,7 +85,78 @@ impl ObjectTable {
         Ok(Self {
             slots,
             migration_ranges: SpinLock::new(MigrationRangeState::default()),
+            data_ranges: SpinLock::new(BTreeMap::new()),
         })
+    }
+
+    pub(super) fn install_data_range_owner(
+        &self,
+        entry: &Arc<DirtyNvExtentEntry>,
+        slots: Range<usize>,
+    ) -> Result<()> {
+        if slots.start >= slots.end
+            || slots.end > self.slots.len()
+            || slots.end - slots.start != usize::from(entry.page_count())
+            || u64::try_from(slots.start).ok() != Some(entry.nv_slot_range().start)
+            || u64::try_from(slots.end).ok() != Some(entry.nv_slot_range().end)
+        {
+            return_errno_with_message!(Errno::EINVAL, "invalid NV data range owner");
+        }
+        let mut ranges = self.data_ranges.lock();
+        if ranges
+            .range(..slots.end)
+            .next_back()
+            .is_some_and(|(_, owner)| owner.end > slots.start)
+        {
+            return_errno_with_message!(Errno::EBUSY, "NV data range owner overlaps");
+        }
+        ranges.insert(
+            slots.start,
+            DataRangeOwner {
+                end: slots.end,
+                owner: Arc::downgrade(entry),
+            },
+        );
+        Ok(())
+    }
+
+    pub(super) fn remove_data_range_owner(
+        &self,
+        entry: &Arc<DirtyNvExtentEntry>,
+    ) -> Result<Range<usize>> {
+        let start = usize::try_from(entry.nv_slot_range().start)
+            .map_err(|_| Error::new(Errno::EOVERFLOW))?;
+        let mut ranges = self.data_ranges.lock();
+        let owner = ranges
+            .get(&start)
+            .ok_or_else(|| Error::new(Errno::ESTALE))?;
+        if !owner
+            .owner
+            .upgrade()
+            .is_some_and(|candidate| Arc::ptr_eq(&candidate, entry))
+        {
+            return_errno_with_message!(Errno::ESTALE, "NV data range owner changed");
+        }
+        let end = owner.end;
+        ranges.remove(&start);
+        Ok(start..end)
+    }
+
+    pub(super) fn data_range_owner(&self, entry: &Arc<DirtyNvExtentEntry>) -> Result<Range<usize>> {
+        let start = usize::try_from(entry.nv_slot_range().start)
+            .map_err(|_| Error::new(Errno::EOVERFLOW))?;
+        let ranges = self.data_ranges.lock();
+        let owner = ranges
+            .get(&start)
+            .ok_or_else(|| Error::new(Errno::ESTALE))?;
+        if !owner
+            .owner
+            .upgrade()
+            .is_some_and(|candidate| Arc::ptr_eq(&candidate, entry))
+        {
+            return_errno_with_message!(Errno::ESTALE, "NV data range owner changed");
+        }
+        Ok(start..owner.end)
     }
 
     pub(super) fn claim_migration_range(

@@ -30,8 +30,8 @@ use super::{
     redirect_index::{DescriptorHandle, NvExtentEntryState},
     write_transaction::{
         AuthoritySnapshot, RangeWriteBatch, RangeWritePage, SsdBaselineExtent, SsdMigrationPage,
-        authoritative_inode_state, bootstrap_inode_authority, commit_range_write,
-        consume_ssd_capacity_locked, current_page_mapping, mapped_nv_page_ref,
+        WriteExtent, authoritative_inode_state, bootstrap_inode_authority, commit_range_write,
+        consume_ssd_capacity_locked, current_page_mapping, mapped_nv_page_ref, plan_range_write,
         publish_ssd_baseline_batch, publish_ssd_baseline_extent, publish_ssd_baseline_extents,
         range_write_new_pages, reserve_ssd_capacity, space_reservation,
         test_release_migration_credit_with, visit_ssd_extents,
@@ -1625,6 +1625,227 @@ fn rnvpce_initial_range_commit_does_not_revalidate_each_page() {
         pool.extent_tree_lookups() - lookups,
         0,
         "initial range commit reread the extent tree once per page"
+    );
+}
+
+#[ktest]
+fn rnvpce_range_write_plan() {
+    const FS_ID: u64 = 0xa20c;
+    const INODE: u64 = 51;
+
+    fn shape(plan: &super::write_transaction::RangeWritePlan) -> Vec<(u8, u64, u64, u64, bool)> {
+        plan.extents
+            .iter()
+            .map(|extent| match extent {
+                WriteExtent::ExistingNv {
+                    entry,
+                    logical_range,
+                } => (
+                    0,
+                    logical_range.start,
+                    logical_range.end,
+                    entry.nv_slot_range().start,
+                    true,
+                ),
+                WriteExtent::ExistingSsd {
+                    logical_range,
+                    ssd_start,
+                    written,
+                } => (
+                    1,
+                    logical_range.start,
+                    logical_range.end,
+                    *ssd_start,
+                    *written,
+                ),
+                WriteExtent::NewAllocation { logical_range } => {
+                    (2, logical_range.start, logical_range.end, 0, false)
+                }
+            })
+            .collect()
+    }
+
+    let contiguous = test_pool(128, 32, 96, None);
+    let contiguous_extents = [ExtentRecordEntry::leaf(0, 32, 40_000, false).unwrap()];
+    bootstrap_inode_authority(
+        contiguous.clone(),
+        FS_ID,
+        INODE,
+        &AuthoritySnapshot::new(
+            7,
+            &contiguous_extents,
+            32 * PAGE_SIZE as u64,
+            32 * (PAGE_SIZE / 512) as u64,
+            0o100644,
+            0,
+        )
+        .unwrap(),
+        None,
+    )
+    .unwrap();
+    let tree_lookups = contiguous.extent_tree_range_lookups();
+    let redirect_lookups = contiguous.redirect_overlap_lookups();
+    let plan = plan_range_write(
+        &contiguous,
+        FS_ID,
+        INODE,
+        0,
+        32 * PAGE_SIZE,
+        32 * PAGE_SIZE as u64,
+    )
+    .unwrap();
+    assert_eq!(plan.inode_generation, 7);
+    assert_eq!(plan.first_page_offset, 0);
+    assert_eq!(plan.last_page_end, PAGE_SIZE);
+    assert_eq!(shape(&plan), vec![(1, 0, 32, 40_000, true)]);
+    assert_eq!(contiguous.extent_tree_range_lookups() - tree_lookups, 1);
+    assert_eq!(contiguous.redirect_overlap_lookups() - redirect_lookups, 1);
+
+    let discontinuous = test_pool(128, 32, 96, None);
+    let discontinuous_extents = [
+        ExtentRecordEntry::leaf(0, 8, 50_000, false).unwrap(),
+        ExtentRecordEntry::leaf(8, 8, 60_000, false).unwrap(),
+        ExtentRecordEntry::leaf(20, 4, 70_000, true).unwrap(),
+    ];
+    bootstrap_inode_authority(
+        discontinuous.clone(),
+        FS_ID,
+        INODE + 1,
+        &AuthoritySnapshot::new(
+            3,
+            &discontinuous_extents,
+            24 * PAGE_SIZE as u64,
+            20 * (PAGE_SIZE / 512) as u64,
+            0o100644,
+            0,
+        )
+        .unwrap(),
+        None,
+    )
+    .unwrap();
+    let plan = plan_range_write(
+        &discontinuous,
+        FS_ID,
+        INODE + 1,
+        0,
+        24 * PAGE_SIZE,
+        24 * PAGE_SIZE as u64,
+    )
+    .unwrap();
+    assert_eq!(
+        shape(&plan),
+        vec![
+            (1, 0, 8, 50_000, true),
+            (1, 8, 16, 60_000, true),
+            (2, 16, 20, 0, false),
+            (1, 20, 24, 70_000, false),
+        ]
+    );
+
+    let eof_plan = plan_range_write(
+        &contiguous,
+        FS_ID,
+        INODE,
+        12 * PAGE_SIZE as u64,
+        8 * PAGE_SIZE,
+        16 * PAGE_SIZE as u64,
+    )
+    .unwrap();
+    assert_eq!(
+        shape(&eof_plan),
+        vec![(1, 12, 16, 40_012, true), (1, 16, 20, 40_016, true)]
+    );
+
+    let dirty = test_pool(128, 32, 96, None);
+    let dirty_extents = [ExtentRecordEntry::leaf(0, 16, 80_000, false).unwrap()];
+    bootstrap_inode_authority(
+        dirty.clone(),
+        FS_ID,
+        INODE + 2,
+        &AuthoritySnapshot::new(
+            4,
+            &dirty_extents,
+            16 * PAGE_SIZE as u64,
+            16 * (PAGE_SIZE / 512) as u64,
+            0o100644,
+            0,
+        )
+        .unwrap(),
+        None,
+    )
+    .unwrap();
+    let staged = (8..12)
+        .map(|page| {
+            (
+                staged_redirect_page(&dirty, page as u8),
+                PageKey::new(FS_ID, INODE + 2, page),
+                80_000 + page,
+            )
+        })
+        .collect::<Vec<_>>();
+    let dirty_nv_start = staged[0].0.index() as u64;
+    dirty.publish_redirect_batch(&staged, None).unwrap();
+    let dirty_plan = plan_range_write(
+        &dirty,
+        FS_ID,
+        INODE + 2,
+        0,
+        16 * PAGE_SIZE,
+        16 * PAGE_SIZE as u64,
+    )
+    .unwrap();
+    assert_eq!(
+        shape(&dirty_plan),
+        vec![
+            (1, 0, 8, 80_000, true),
+            (0, 8, 12, dirty_nv_start, true),
+            (1, 12, 16, 80_012, true),
+        ]
+    );
+
+    let unaligned = plan_range_write(
+        &contiguous,
+        FS_ID,
+        INODE,
+        (PAGE_SIZE / 2) as u64,
+        2 * PAGE_SIZE,
+        32 * PAGE_SIZE as u64,
+    )
+    .unwrap();
+    assert_eq!(unaligned.first_page_offset, PAGE_SIZE / 2);
+    assert_eq!(unaligned.last_page_end, PAGE_SIZE / 2);
+    assert_eq!(shape(&unaligned), vec![(1, 0, 3, 40_000, true)]);
+
+    let large = test_pool(256, 64, 192, None);
+    let large_extents = [ExtentRecordEntry::leaf(0, 129, 90_000, false).unwrap()];
+    bootstrap_inode_authority(
+        large.clone(),
+        FS_ID,
+        INODE + 3,
+        &AuthoritySnapshot::new(
+            5,
+            &large_extents,
+            129 * PAGE_SIZE as u64,
+            129 * (PAGE_SIZE / 512) as u64,
+            0o100644,
+            0,
+        )
+        .unwrap(),
+        None,
+    )
+    .unwrap();
+    let large_plan = plan_range_write(
+        &large,
+        FS_ID,
+        INODE + 3,
+        0,
+        129 * PAGE_SIZE,
+        129 * PAGE_SIZE as u64,
+    )
+    .unwrap();
+    assert_eq!(
+        shape(&large_plan),
+        vec![(1, 0, 128, 90_000, true), (1, 128, 129, 90_128, true)]
     );
 }
 

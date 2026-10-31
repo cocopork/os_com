@@ -9,6 +9,8 @@
 //! its extent state is durable. Legacy full-page-image helpers remain only for
 //! pre-migration unit coverage and are not used by the VFS path.
 
+use core::ops::Range;
+
 use super::{
     data_page::DataPageState,
     descriptor::NvObjectState,
@@ -791,6 +793,160 @@ pub(crate) struct RangeWritePage {
     page_offset: usize,
     len: usize,
     newly_allocated: bool,
+}
+
+pub(crate) struct RangeWritePlan {
+    pub(crate) inode_generation: u64,
+    pub(crate) file_offset: u64,
+    pub(crate) write_len: usize,
+    pub(crate) first_page_offset: usize,
+    pub(crate) last_page_end: usize,
+    pub(crate) extents: Vec<WriteExtent>,
+}
+
+pub(crate) enum WriteExtent {
+    ExistingNv {
+        entry: Arc<super::redirect_index::DirtyNvExtentEntry>,
+        logical_range: Range<u64>,
+    },
+    ExistingSsd {
+        logical_range: Range<u64>,
+        ssd_start: u64,
+        written: bool,
+    },
+    NewAllocation {
+        logical_range: Range<u64>,
+    },
+}
+
+#[derive(Clone, Debug)]
+struct SsdWriteExtent {
+    logical_range: Range<u64>,
+    ssd_start: u64,
+    written: bool,
+}
+
+pub(crate) fn plan_range_write(
+    pool: &Arc<Rnvpc>,
+    fs_id: u64,
+    inode: u64,
+    file_offset: u64,
+    write_len: usize,
+    old_file_size: u64,
+) -> Result<RangeWritePlan> {
+    if write_len == 0 {
+        return_errno_with_message!(Errno::EINVAL, "empty range write");
+    }
+    let write_end = file_offset
+        .checked_add(u64::try_from(write_len).map_err(|_| Error::new(Errno::EOVERFLOW))?)
+        .ok_or_else(|| Error::new(Errno::EOVERFLOW))?;
+    let first_page = file_offset / PAGE_SIZE as u64;
+    let page_end = write_end
+        .checked_add(PAGE_SIZE as u64 - 1)
+        .ok_or_else(|| Error::new(Errno::EOVERFLOW))?
+        / PAGE_SIZE as u64;
+    let logical_range = first_page..page_end;
+    let inode_ref =
+        authoritative_inode_ref(pool, fs_id, inode)?.ok_or_else(|| Error::new(Errno::ENOENT))?;
+    let inode_record = pool.read_authoritative_metadata::<InodeRecord>(inode_ref)?;
+    let redirects = pool.lookup_dirty_nv_overlaps(fs_id, inode, logical_range.clone())?;
+    let ssd_extents = lookup_tree_extent_ranges(
+        pool,
+        fs_id,
+        inode,
+        inode_record.extent_root(),
+        logical_range.clone(),
+    )?;
+    let old_eof_page = (old_file_size % PAGE_SIZE as u64 == 0)
+        .then_some(old_file_size / PAGE_SIZE as u64)
+        .filter(|page| *page > logical_range.start && *page < logical_range.end);
+
+    let mut extents = Vec::new();
+    let mut cursor = logical_range.start;
+    let mut redirect_index = 0usize;
+    let mut ssd_index = 0usize;
+    while cursor < logical_range.end {
+        while redirect_index < redirects.len()
+            && redirects[redirect_index].logical_range().end <= cursor
+        {
+            redirect_index += 1;
+        }
+        while ssd_index < ssd_extents.len() && ssd_extents[ssd_index].logical_range.end <= cursor {
+            ssd_index += 1;
+        }
+
+        let limit =
+            logical_range
+                .end
+                .min(cursor.saturating_add(
+                    super::redirect_index::MAX_DIRTY_MIGRATION_EXTENT_PAGES as u64,
+                ));
+        let semantic_limit = old_eof_page
+            .filter(|page| *page > cursor)
+            .unwrap_or(limit)
+            .min(limit);
+        if let Some(entry) = redirects.get(redirect_index)
+            && entry.logical_range().contains(&cursor)
+        {
+            let end = entry.logical_range().end.min(semantic_limit);
+            extents.push(WriteExtent::ExistingNv {
+                entry: entry.clone(),
+                logical_range: cursor..end,
+            });
+            cursor = end;
+            continue;
+        }
+        if let Some(ssd) = ssd_extents.get(ssd_index)
+            && ssd.logical_range.contains(&cursor)
+        {
+            let end = ssd.logical_range.end.min(semantic_limit).min(
+                redirects
+                    .get(redirect_index)
+                    .map_or(u64::MAX, |entry| entry.logical_start()),
+            );
+            let ssd_start = ssd
+                .ssd_start
+                .checked_add(cursor - ssd.logical_range.start)
+                .ok_or_else(|| Error::new(Errno::EOVERFLOW))?;
+            extents.push(WriteExtent::ExistingSsd {
+                logical_range: cursor..end,
+                ssd_start,
+                written: ssd.written,
+            });
+            cursor = end;
+            continue;
+        }
+
+        let next_redirect = redirects
+            .get(redirect_index)
+            .map_or(u64::MAX, |entry| entry.logical_start());
+        let next_ssd = ssd_extents
+            .get(ssd_index)
+            .map_or(u64::MAX, |extent| extent.logical_range.start);
+        let end = semantic_limit.min(next_redirect).min(next_ssd);
+        if end <= cursor {
+            return_errno_with_message!(Errno::EUCLEAN, "range planner made no progress");
+        }
+        extents.push(WriteExtent::NewAllocation {
+            logical_range: cursor..end,
+        });
+        cursor = end;
+    }
+
+    let last_page_end =
+        usize::try_from(write_end % PAGE_SIZE as u64).map_err(|_| Error::new(Errno::EOVERFLOW))?;
+    Ok(RangeWritePlan {
+        inode_generation: inode_record.header().generation(),
+        file_offset,
+        write_len,
+        first_page_offset: file_offset as usize % PAGE_SIZE,
+        last_page_end: if last_page_end == 0 {
+            PAGE_SIZE
+        } else {
+            last_page_end
+        },
+        extents,
+    })
 }
 
 impl RangeWritePage {
@@ -2791,6 +2947,126 @@ fn lookup_tree_extent(
         else {
             return Ok(None);
         };
+        expected_level = Some(node.level() - 1);
+        current = pool.persistent_metadata_ref_from_slot(child_slot)?;
+    }
+}
+
+fn lookup_tree_extent_ranges(
+    pool: &Arc<Rnvpc>,
+    fs_id: u64,
+    inode: u64,
+    root: PersistentObjectRef,
+    logical_range: Range<u64>,
+) -> Result<Vec<SsdWriteExtent>> {
+    #[cfg(ktest)]
+    pool.note_extent_tree_lookup();
+    if logical_range.start >= logical_range.end || root.is_none() {
+        return Ok(Vec::new());
+    }
+    let mut current = root;
+    let mut expected_level = None;
+    loop {
+        let mut node = pool.read_authoritative_metadata_boxed::<ExtentNodeRecord>(current)?;
+        if node.header().fs_id() != fs_id || node.header().inode() != inode {
+            return_errno_with_message!(Errno::EUCLEAN, "extent node belongs to another inode");
+        }
+        if let Some(level) = expected_level
+            && node.level() != level
+        {
+            return_errno_with_message!(Errno::EUCLEAN, "extent child depth mismatch");
+        }
+        while node.level() != 0
+            && let Some(sibling_slot) = node.right_sibling_slot()
+        {
+            let sibling_ref = pool.persistent_metadata_ref_from_slot(sibling_slot)?;
+            let sibling =
+                pool.read_authoritative_metadata_boxed::<ExtentNodeRecord>(sibling_ref)?;
+            let boundary = sibling
+                .entries()?
+                .first()
+                .map(ExtentRecordEntry::logical_block)
+                .ok_or_else(|| Error::new(Errno::EUCLEAN))?;
+            if logical_range.start < boundary {
+                break;
+            }
+            node = sibling;
+        }
+        if node.level() == 0 {
+            let mut ranges = Vec::new();
+            loop {
+                for entry in node.entries()?.iter().copied() {
+                    let entry_end = entry
+                        .logical_block()
+                        .checked_add(u64::from(entry.length()))
+                        .ok_or_else(|| Error::new(Errno::EOVERFLOW))?;
+                    let start = entry.logical_block().max(logical_range.start);
+                    let end = entry_end.min(logical_range.end);
+                    if start >= end {
+                        continue;
+                    }
+                    let ExtentDataRef::Ssd(ssd_base) = entry.data_ref()? else {
+                        return_errno_with_message!(
+                            Errno::EUCLEAN,
+                            "v5 extent leaf contains a legacy NV target"
+                        );
+                    };
+                    if ssd_base == 0 {
+                        continue;
+                    }
+                    let ssd_start = ssd_base
+                        .checked_add(start - entry.logical_block())
+                        .ok_or_else(|| Error::new(Errno::EOVERFLOW))?;
+                    let written = !entry.is_unwritten();
+                    let can_merge = ranges.last().is_some_and(|previous: &SsdWriteExtent| {
+                        previous.logical_range.end == start
+                            && previous.written == written
+                            && previous.ssd_start.checked_add(
+                                previous.logical_range.end - previous.logical_range.start,
+                            ) == Some(ssd_start)
+                    });
+                    if can_merge {
+                        ranges.last_mut().expect("range exists").logical_range.end = end;
+                    } else {
+                        ranges.push(SsdWriteExtent {
+                            logical_range: start..end,
+                            ssd_start,
+                            written,
+                        });
+                    }
+                }
+                let Some(sibling_slot) = node.right_sibling_slot() else {
+                    break;
+                };
+                let sibling_ref = pool.persistent_metadata_ref_from_slot(sibling_slot)?;
+                let sibling =
+                    pool.read_authoritative_metadata_boxed::<ExtentNodeRecord>(sibling_ref)?;
+                if sibling.header().fs_id() != fs_id
+                    || sibling.header().inode() != inode
+                    || sibling.level() != 0
+                {
+                    return_errno_with_message!(Errno::EUCLEAN, "invalid extent leaf sibling");
+                }
+                let boundary = sibling
+                    .entries()?
+                    .first()
+                    .map(ExtentRecordEntry::logical_block)
+                    .ok_or_else(|| Error::new(Errno::EUCLEAN))?;
+                if boundary >= logical_range.end {
+                    break;
+                }
+                node = sibling;
+            }
+            return Ok(ranges);
+        }
+        let entries = node.entries()?;
+        let child_slot = entries
+            .iter()
+            .filter(|entry| entry.logical_block() <= logical_range.start)
+            .max_by_key(|entry| entry.logical_block())
+            .or_else(|| entries.first())
+            .and_then(ExtentRecordEntry::child_slot)
+            .ok_or_else(|| Error::new(Errno::EUCLEAN))?;
         expected_level = Some(node.level() - 1);
         current = pool.persistent_metadata_ref_from_slot(child_slot)?;
     }
