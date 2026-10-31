@@ -3,6 +3,7 @@
 This directory contains host-side Asterinas EXT4 harnesses. Run each specialized harness from its own directory; this guide defines the shared environment and acceptance policy.
 
 - [FIO baseline and recovery](aster-ext4-baseline-test/README.md)
+- [Preliminary EXT4/rNVPC/rNVPCe performance sweep](preliminary-performance-sweep/README.md)
 - [EXT4 journal comparison](ext4-journal-compare/README.md)
 - [Filebench macro workloads](filebench-test/README.md)
 - [SQLite macro workload](sqlite-test/README.md)
