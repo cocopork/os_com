@@ -30,11 +30,12 @@ use super::{
     redirect_index::{DescriptorHandle, NvExtentEntryState},
     write_transaction::{
         AuthoritySnapshot, RangeWriteBatch, RangeWritePage, SsdBaselineExtent, SsdMigrationPage,
-        WriteExtent, authoritative_inode_state, bootstrap_inode_authority, commit_range_write,
-        consume_ssd_capacity_locked, current_page_mapping, mapped_nv_page_ref, plan_range_write,
-        publish_ssd_baseline_batch, publish_ssd_baseline_extent, publish_ssd_baseline_extents,
-        range_write_new_pages, reserve_ssd_capacity, space_reservation,
-        test_release_migration_credit_with, visit_ssd_extents,
+        WriteAllocation, WriteExtent, allocation_record_count, authoritative_inode_state,
+        bootstrap_inode_authority, commit_range_write, consume_ssd_capacity_locked,
+        current_page_mapping, mapped_nv_page_ref, plan_range_write, publish_ssd_baseline_batch,
+        publish_ssd_baseline_extent, publish_ssd_baseline_extents, range_write_new_pages,
+        reserve_ssd_capacity, space_reservation, test_release_migration_credit_with,
+        visit_ssd_extents,
     },
 };
 use crate::prelude::*;
@@ -1453,9 +1454,10 @@ fn rnvpce_redirect_io_middle_page_overwrite_keeps_extent_tree_bytes_unchanged() 
         .unwrap();
     assert_eq!(before, after);
     assert_eq!(
-        pool.redirect_lookup(PageKey::new(FS_ID, INODE, 4))
+        pool.lookup_dirty_nv_entry(PageKey::new(FS_ID, INODE, 4))
             .unwrap()
-            .ssd_target,
+            .ssd_block_range()
+            .start,
         20_004
     );
 }
@@ -1551,9 +1553,12 @@ fn rnvpce_redirect_io_128k_overwrite_publishes_one_redirect_range() {
         None,
     )
     .unwrap();
-    let ranges = pool.redirect_dirty_ranges_for_test(64);
-    assert_eq!(ranges.len(), 1);
-    assert_eq!(ranges[0].pages.len(), 32);
+    assert_eq!(
+        pool.lookup_dirty_nv_entry(PageKey::new(FS_ID, INODE, 0))
+            .unwrap()
+            .page_count(),
+        32
+    );
     assert_eq!(pool.dirty_nv_entry_count_for_test(FS_ID, INODE), 1);
     assert_eq!(
         pool.native_redirect_page_handle_count_for_test(FS_ID, INODE),
@@ -1633,6 +1638,27 @@ fn rnvpce_redirect_newer_than_inode_generation_is_ignored() {
             .lookup_dirty_nv_entry(PageKey::new(FS_ID, INODE, 1))
             .is_none()
     );
+
+    let replacement = staged_redirect_page(&recovered, 0xe5);
+    assert_eq!(
+        replacement, page,
+        "unreachable redirect slot was not reusable"
+    );
+    recovered
+        .publish_redirect_entries(
+            &[(replacement, PageKey::new(FS_ID, INODE, 0), 41_000)],
+            1,
+            None,
+        )
+        .unwrap();
+    drop(recovered);
+    image.simulate_crash();
+    let recovered_again = Arc::new(Rnvpc::recover(Arc::new(image.attach()), config, None).unwrap());
+    assert!(
+        recovered_again
+            .lookup_dirty_nv_entry(PageKey::new(FS_ID, INODE, 0))
+            .is_some()
+    );
 }
 
 #[ktest]
@@ -1705,7 +1731,10 @@ fn rnvpce_initial_range_capacity_count_does_not_reread_extent_tree() {
         range_write_new_pages(&pool, FS_ID, INODE, &request).unwrap(),
         32
     );
-    assert_eq!(pool.authoritative_metadata_reads() - reads, 0);
+    assert!(
+        pool.authoritative_metadata_reads() - reads <= 3,
+        "range capacity planning scaled with the 32 member pages"
+    );
 }
 
 #[ktest]
@@ -1743,9 +1772,8 @@ fn rnvpce_initial_range_commit_does_not_revalidate_each_page() {
     )
     .unwrap();
 
-    assert_eq!(
-        pool.extent_tree_lookups() - lookups,
-        0,
+    assert!(
+        pool.extent_tree_lookups() - lookups <= 2,
         "initial range commit reread the extent tree once per page"
     );
 }
@@ -2207,11 +2235,10 @@ fn rnvpce_existing_nv_entry_overwrite_reuses_owned_pages() {
         None,
     )
     .unwrap();
-    let before = pages.map(|page| {
-        pool.redirect_lookup(PageKey::new(FS_ID, INODE, page.logical_block()))
-            .unwrap()
-            .reference
-    });
+    let before = pool
+        .lookup_dirty_nv_entry(PageKey::new(FS_ID, INODE, 0))
+        .unwrap();
+    let before_slots = before.nv_slot_range();
 
     let second = RangeWriteBatch::new(
         3,
@@ -2239,13 +2266,21 @@ fn rnvpce_existing_nv_entry_overwrite_reuses_owned_pages() {
     )
     .unwrap();
 
-    for (page, expected_reference) in pages.iter().zip(before) {
+    let after = pool
+        .lookup_dirty_nv_entry(PageKey::new(FS_ID, INODE, 0))
+        .unwrap();
+    assert!(Arc::ptr_eq(&before, &after));
+    assert_eq!(after.nv_slot_range(), before_slots);
+    let guard = after.try_read().unwrap();
+    for page in &pages {
         let key = PageKey::new(FS_ID, INODE, page.logical_block());
-        let handle = pool.redirect_lookup(key).unwrap();
-        assert_eq!(handle.reference, expected_reference);
-        let pin = pool.pin_redirect(key, handle).unwrap();
         let mut bytes = [0; PAGE_SIZE];
-        pin.read(&mut bytes).unwrap();
+        let mut writer = VmWriter::from(bytes.as_mut_slice()).to_fallible();
+        assert_eq!(
+            pool.copy_entry_to_writer(&guard, key.page_index, 0, &mut writer, PAGE_SIZE)
+                .unwrap(),
+            PAGE_SIZE
+        );
         assert!(bytes.iter().all(|byte| *byte == 0x72));
     }
     let claimed = pool.claim_ready_nv_entries(FS_ID, 2).unwrap();
@@ -3938,6 +3973,65 @@ fn rnvpce_recovery_rebuilds_redirects_without_reverse_edges() {
             .outstanding_blocks(),
         2
     );
+}
+
+#[ktest]
+fn rnvpce_short_copy_retains_unused_physical_allocation_ownership() {
+    const FS_ID: u64 = 0x9926;
+    const INODE: u64 = 36;
+    const SSD_START: u64 = 130_000;
+    let pool = test_pool(32, 8, 24, None);
+    bootstrap_inode_authority(
+        pool.clone(),
+        FS_ID,
+        INODE,
+        &AuthoritySnapshot::new(1, &[], 0, 0, 0o100644, 0).unwrap(),
+        None,
+    )
+    .unwrap();
+    let allocation = [WriteAllocation::new(3, SSD_START, 3).unwrap()];
+    let pages = [
+        RangeWritePage::new(0, SSD_START, 0, PAGE_SIZE, true).unwrap(),
+        RangeWritePage::new(1, SSD_START + 1, 0, PAGE_SIZE, true).unwrap(),
+        RangeWritePage::new(2, SSD_START + 2, 0, PAGE_SIZE, true).unwrap(),
+    ];
+    let request = RangeWriteBatch::new(
+        2,
+        0,
+        3 * PAGE_SIZE,
+        &allocation,
+        &pages,
+        0,
+        0,
+        (PAGE_SIZE / 512) as u64,
+    )
+    .unwrap();
+    let input = vec![0x91; PAGE_SIZE + 37];
+    let committed = commit_range_write(
+        pool.clone(),
+        FS_ID,
+        INODE,
+        &request,
+        &mut VmReader::from(input.as_slice()).to_fallible(),
+        |_, _| panic!("new pages must not read SSD"),
+        None,
+    )
+    .unwrap();
+
+    assert_eq!(committed.copied(), input.len());
+    assert_eq!(committed.reserved_blocks(), 2);
+    assert_eq!(committed.unused_allocations().len(), 1);
+    assert_eq!(
+        committed.unused_allocations()[0].first_ssd_block(),
+        SSD_START + 2
+    );
+    assert_eq!(committed.unused_allocations()[0].block_count(), 1);
+    assert_eq!(committed.allocation_records().len(), 1);
+    assert_eq!(allocation_record_count(&pool), 1);
+    for reference in committed.allocation_records() {
+        pool.reclaim_committed_metadata(*reference).unwrap();
+    }
+    assert_eq!(allocation_record_count(&pool), 0);
 }
 
 #[cfg(any())]

@@ -32,21 +32,23 @@ pub(crate) struct DescriptorHandle {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
 pub(crate) enum NvExtentEntryState {
-    Dirty = 1,
-    Migrating = 2,
-    IoComplete = 3,
-    Reclaiming = 4,
-    Reclaimed = 5,
+    Publishing = 1,
+    Dirty = 2,
+    Migrating = 3,
+    IoComplete = 4,
+    Reclaiming = 5,
+    Reclaimed = 6,
 }
 
 impl NvExtentEntryState {
     fn from_u8(value: u8) -> Self {
         match value {
-            1 => Self::Dirty,
-            2 => Self::Migrating,
-            3 => Self::IoComplete,
-            4 => Self::Reclaiming,
-            5 => Self::Reclaimed,
+            1 => Self::Publishing,
+            2 => Self::Dirty,
+            3 => Self::Migrating,
+            4 => Self::IoComplete,
+            5 => Self::Reclaiming,
+            6 => Self::Reclaimed,
             _ => panic!("invalid NV extent entry state"),
         }
     }
@@ -62,13 +64,21 @@ pub(crate) struct DirtyNvExtentEntry {
 
 impl DirtyNvExtentEntry {
     pub(crate) fn new(record: NvRedirectExtentRecord) -> Result<Self> {
+        Self::new_with_state(record, NvExtentEntryState::Dirty)
+    }
+
+    pub(crate) fn new_publishing(record: NvRedirectExtentRecord) -> Result<Self> {
+        Self::new_with_state(record, NvExtentEntryState::Publishing)
+    }
+
+    fn new_with_state(record: NvRedirectExtentRecord, state: NvExtentEntryState) -> Result<Self> {
         record.validate()?;
         if record.authority()? != NvRedirectAuthority::NvAuthoritative {
             return_errno_with_message!(Errno::EINVAL, "dirty entry is not NV authoritative");
         }
         Ok(Self {
             record,
-            state: AtomicU8::new(NvExtentEntryState::Dirty as u8),
+            state: AtomicU8::new(state as u8),
             readers: AtomicUsize::new(0),
             writers: AtomicUsize::new(0),
             waiters: WaitQueue::new(),
@@ -123,6 +133,18 @@ impl DirtyNvExtentEntry {
             .map_err(|_| Error::new(Errno::ESTALE))?;
         self.waiters.wake_all();
         Ok(())
+    }
+
+    fn activate_publication(&self) {
+        self.state
+            .compare_exchange(
+                NvExtentEntryState::Publishing as u8,
+                NvExtentEntryState::Dirty as u8,
+                Ordering::Release,
+                Ordering::Relaxed,
+            )
+            .expect("a prepared NV extent entry is activated exactly once");
+        self.waiters.wake_all();
     }
 
     pub(crate) fn try_read(self: &Arc<Self>) -> Result<NvExtentReadGuard> {
@@ -551,13 +573,19 @@ impl RedirectDirectory {
     }
 
     pub(crate) fn publish_dirty_entry(&self, entry: Arc<DirtyNvExtentEntry>) -> Result<()> {
-        self.publish_entries(core::slice::from_ref(&entry))
+        self.publish_one_entry(entry, NvExtentEntryState::Dirty)
     }
 
     pub(crate) fn publish_entries(&self, new_entries: &[Arc<DirtyNvExtentEntry>]) -> Result<()> {
+        self.prepare_entries(new_entries)?;
+        self.activate_prepared_entries(new_entries);
+        Ok(())
+    }
+
+    pub(crate) fn prepare_entries(&self, new_entries: &[Arc<DirtyNvExtentEntry>]) -> Result<()> {
         for entry in new_entries {
-            if entry.state() != NvExtentEntryState::Dirty {
-                return_errno_with_message!(Errno::EINVAL, "published NV extent entry is not dirty");
+            if entry.state() != NvExtentEntryState::Publishing {
+                return_errno_with_message!(Errno::EINVAL, "NV extent entry is not publishing");
             }
         }
         let mut ordered = new_entries.iter().collect::<Vec<_>>();
@@ -569,15 +597,47 @@ impl RedirectDirectory {
                 return_errno_with_message!(Errno::EBUSY, "NV extent publication overlaps itself");
             }
         }
+        let mut inserted = Vec::new();
+        inserted
+            .try_reserve_exact(ordered.len())
+            .map_err(|_| Error::new(Errno::ENOMEM))?;
         for entry in ordered {
-            self.publish_one_entry(entry.clone())?;
+            if let Err(error) =
+                self.publish_one_entry(entry.clone(), NvExtentEntryState::Publishing)
+            {
+                for published in inserted.iter().rev() {
+                    let _ = self.remove_entry(published);
+                }
+                return Err(error);
+            }
+            inserted.push(entry.clone());
         }
         Ok(())
     }
 
-    fn publish_one_entry(&self, entry: Arc<DirtyNvExtentEntry>) -> Result<()> {
-        if entry.state() != NvExtentEntryState::Dirty {
-            return_errno_with_message!(Errno::EINVAL, "published NV extent entry is not dirty");
+    pub(crate) fn activate_prepared_entries(&self, entries: &[Arc<DirtyNvExtentEntry>]) {
+        for entry in entries {
+            entry.activate_publication();
+        }
+    }
+
+    pub(crate) fn discard_prepared_entries(
+        &self,
+        entries: &[Arc<DirtyNvExtentEntry>],
+    ) -> Result<()> {
+        for entry in entries.iter().rev() {
+            self.remove_entry(entry)?;
+        }
+        Ok(())
+    }
+
+    fn publish_one_entry(
+        &self,
+        entry: Arc<DirtyNvExtentEntry>,
+        expected_state: NvExtentEntryState,
+    ) -> Result<()> {
+        if entry.state() != expected_state {
+            return_errno_with_message!(Errno::EINVAL, "NV extent entry state changed");
         }
         let inode_map = self
             .inode_map(entry.fs_id(), entry.inode(), true)?
@@ -603,6 +663,12 @@ impl RedirectDirectory {
             .logical_range()
             .contains(&key.page_index)
             .then(|| entry.clone())
+            .filter(|entry| {
+                !matches!(
+                    entry.state(),
+                    NvExtentEntryState::Publishing | NvExtentEntryState::Reclaimed
+                )
+            })
     }
 
     pub(crate) fn lookup_overlaps(
@@ -722,26 +788,7 @@ impl RedirectDirectory {
         if entry.state() != NvExtentEntryState::Reclaiming {
             return_errno_with_message!(Errno::ESTALE, "NV extent entry is not reclaiming");
         }
-        let keys = entry
-            .logical_range()
-            .map(|page| PageKey::new(entry.fs_id(), entry.inode(), page))
-            .collect::<Vec<_>>();
-        let partition_ids = self.partitions_for(&keys);
-        let mut guards = Vec::new();
-        for partition in partition_ids {
-            guards.push((partition, self.partitions[partition].lock()));
-        }
         self.remove_entry(entry)?;
-        for key in &keys {
-            let state = &mut guards
-                .iter_mut()
-                .find(|(partition, _)| *partition == self.partition_index(*key))
-                .expect("entry member partition is locked")
-                .1;
-            state.committed.remove(key);
-            state.dirty.remove(key);
-            state.ready_set.remove(key);
-        }
         Ok(())
     }
 

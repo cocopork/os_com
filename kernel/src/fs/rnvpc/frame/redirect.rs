@@ -245,9 +245,30 @@ impl Rnvpc {
             .with_authority(NvRedirectAuthority::SsdAuthoritativePendingFree)?;
         self.persist.publish_redirect_extent(&pending, None)?;
 
-        let slot_range = entry.nv_slot_range();
-        let slots = slot_range
-            .clone()
+        if entry.record().visibility_generation() == 0 {
+            return self.reclaim_legacy_nv_entry(lease);
+        }
+
+        let head_slot = usize::try_from(entry.nv_slot_range().start)
+            .map_err(|_| Error::new(Errno::EOVERFLOW))?;
+        self.persist.clear_frame(head_slot, None)?;
+        self.redirects.remove_reclaimed_entry(lease)?;
+        let owned_pages = self.remove_data_range_owner(entry)?;
+        let reclaimed = usize::from(entry.page_count());
+        if owned_pages.start.index() != head_slot
+            || owned_pages.end.index() != head_slot + reclaimed
+        {
+            return_errno_with_message!(Errno::ESTALE, "NV extent entry range owner changed");
+        }
+        self.free_native_data_range(head_slot..head_slot + reclaimed)?;
+        lease.finish_reclaim()?;
+        Ok(reclaimed)
+    }
+
+    fn reclaim_legacy_nv_entry(&self, lease: &NvExtentEntryLease) -> Result<usize> {
+        let entry = lease.entry();
+        let slots = entry
+            .nv_slot_range()
             .map(|slot| usize::try_from(slot).map_err(|_| Error::new(Errno::EOVERFLOW)))
             .collect::<Result<Vec<_>>>()?;
         let mut prepared = Vec::with_capacity(slots.len());
@@ -262,29 +283,26 @@ impl Rnvpc {
             if !record.committed
                 || !matches!(record.kind, ObjectKind::Data(DataPageState::NvDirty))
                 || record.key != Some(expected)
+                || record.persisting
+                || record.pins != 0
             {
                 drop(objects);
-                self.release_entry_reclaim_pins(&prepared);
-                return_errno_with_message!(Errno::ESTALE, "NV extent entry slot ownership changed");
-            }
-            if record.persisting || record.pins != 0 {
-                drop(objects);
-                self.release_entry_reclaim_pins(&prepared);
-                return_errno_with_message!(Errno::EBUSY, "NV extent entry slot is busy");
+                self.release_legacy_entry_reclaim_pins(&prepared);
+                return_errno_with_message!(Errno::ESTALE, "legacy NV extent slot changed");
             }
             if let Err(error) = self.account_pin() {
                 drop(objects);
-                self.release_entry_reclaim_pins(&prepared);
+                self.release_legacy_entry_reclaim_pins(&prepared);
                 return Err(error);
             }
             objects.records[slot].pins = 1;
             objects.records[slot].persisting = true;
             prepared.push(slot);
         }
-        let head_slot = usize::try_from(entry.nv_slot_range().start)
+        let head = usize::try_from(entry.nv_slot_range().start)
             .map_err(|_| Error::new(Errno::EOVERFLOW))?;
-        if let Err(error) = self.persist.clear_frame(head_slot, None) {
-            self.release_entry_reclaim_pins(&prepared);
+        if let Err(error) = self.persist.clear_frame(head, None) {
+            self.release_legacy_entry_reclaim_pins(&prepared);
             return Err(error);
         }
         for slot in slots.iter().copied() {
@@ -300,23 +318,21 @@ impl Rnvpc {
         }
         note_data_page_lease_change();
         self.redirects.remove_reclaimed_entry(lease)?;
-        let owned_pages = self.remove_data_range_owner(entry)?;
+        let owned = self.remove_data_range_owner(entry)?;
+        if owned.start.index() != head || owned.end.index() != head + slots.len() {
+            return_errno_with_message!(Errno::ESTALE, "legacy NV extent owner changed");
+        }
         let pages = slots
             .into_iter()
             .map(|slot| NvPageId::try_from(slot).map_err(|_| Error::new(Errno::EOVERFLOW)))
             .collect::<Result<Vec<_>>>()?;
-        if owned_pages.start != pages[0]
-            || owned_pages.end.index() != pages.last().unwrap().index() + 1
-        {
-            return_errno_with_message!(Errno::ESTALE, "NV extent entry range owner changed");
-        }
         let reclaimed = pages.len();
         self.free_data_pages(&pages)?;
         lease.finish_reclaim()?;
         Ok(reclaimed)
     }
 
-    fn release_entry_reclaim_pins(&self, slots: &[usize]) {
+    fn release_legacy_entry_reclaim_pins(&self, slots: &[usize]) {
         for slot in slots {
             let mut objects = self.objects.lock(*slot);
             objects.records[*slot].pins = 0;
@@ -687,31 +703,16 @@ impl Rnvpc {
             return_errno_with_message!(Errno::EINVAL, "redirect publication exceeds 128 pages");
         }
         let metrics_started = batch_metrics::now();
-        let mut prepared = Vec::new();
-        prepared
-            .try_reserve_exact(pages.len())
-            .map_err(|_| Error::new(Errno::ENOMEM))?;
         let mut slots = BTreeSet::new();
         for (page, key, ssd_target) in pages {
             if *ssd_target == 0
                 || !slots.insert(page.index())
                 || self.lookup_dirty_nv_entry(*key).is_some()
             {
-                self.release_entry_publication_pins(&prepared);
                 return_errno_with_message!(Errno::EBUSY, "redirect entry publication overlaps");
             }
-            let mut objects = self.objects.lock_checked(page.index())?;
-            if let Err(error) = self.pin_persistent_update(
-                &mut objects,
-                page.index(),
-                ObjectKind::Data(DataPageState::NvDirty),
-            ) {
-                drop(objects);
-                self.release_entry_publication_pins(&prepared);
-                return Err(error);
-            }
-            prepared.push((*page, *key, *ssd_target));
         }
+        let prepared = pages;
 
         let mut records = Vec::new();
         records
@@ -749,28 +750,40 @@ impl Rnvpc {
         let entries = records
             .iter()
             .copied()
-            .map(DirtyNvExtentEntry::new)
+            .map(DirtyNvExtentEntry::new_publishing)
             .map(|entry| entry.map(Arc::new))
             .collect::<Result<Vec<_>>>()?;
+        let data_slots = prepared
+            .iter()
+            .map(|(page, _, _)| page.index())
+            .collect::<Vec<_>>();
+        let owner_ranges = entries
+            .iter()
+            .map(|entry| {
+                let slots = entry.nv_slot_range();
+                Ok(
+                    usize::try_from(slots.start).map_err(|_| Error::new(Errno::EOVERFLOW))?
+                        ..usize::try_from(slots.end).map_err(|_| Error::new(Errno::EOVERFLOW))?,
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
         let mut owners_installed = 0usize;
-        for entry in &entries {
-            let slots = entry.nv_slot_range();
-            let slots = usize::try_from(slots.start).map_err(|_| Error::new(Errno::EOVERFLOW))?
-                ..usize::try_from(slots.end).map_err(|_| Error::new(Errno::EOVERFLOW))?;
+        for (entry, slots) in entries.iter().zip(owner_ranges) {
             if let Err(error) = self.install_data_range_owner(entry, slots) {
                 for installed in &entries[..owners_installed] {
                     let _ = self.remove_data_range_owner(installed);
                 }
-                self.release_entry_publication_pins(&prepared);
                 return Err(error);
             }
             owners_installed += 1;
         }
 
-        let data_slots = prepared
-            .iter()
-            .map(|(page, _, _)| page.index())
-            .collect::<Vec<_>>();
+        if let Err(error) = self.redirects.prepare_entries(&entries) {
+            for entry in &entries {
+                let _ = self.remove_data_range_owner(entry);
+            }
+            return Err(error);
+        }
         let persist_result = match fault {
             RedirectEntryFault::Point(fault) => {
                 self.persist
@@ -783,8 +796,8 @@ impl Rnvpc {
             }
         };
         if let Err(error) = persist_result {
-            self.release_entry_publication_pins(&prepared);
             if !self.persist.publication_uncertain() {
+                let _ = self.redirects.discard_prepared_entries(&entries);
                 for entry in &entries {
                     let _ = self.remove_data_range_owner(entry);
                 }
@@ -792,37 +805,11 @@ impl Rnvpc {
             return Err(error);
         }
 
-        for (page, key, _) in &prepared {
-            let mut objects = self.objects.lock(page.index());
-            let record = &mut objects.records[page.index()];
-            record.pins -= 1;
-            record.persisting = false;
-            record.committed = true;
-            record.key = Some(*key);
-            record.version = 0;
-            self.account_unpin();
-        }
-        if let Err(error) = self.redirects.publish_entries(&entries) {
-            self.persist.latch_publication_uncertain();
-            return Err(error);
-        }
+        self.redirects.activate_prepared_entries(&entries);
         batch_metrics::count(batch_metrics::Event::RedirectPublishBatches, 1);
         batch_metrics::count(batch_metrics::Event::RedirectPublishedPages, prepared.len());
         batch_metrics::elapsed(batch_metrics::Phase::RedirectPublish, metrics_started);
         Ok(entries)
-    }
-
-    fn release_entry_publication_pins(&self, prepared: &[(NvPageId, PageKey, u64)]) {
-        for (page, _, _) in prepared {
-            let mut objects = self.objects.lock(page.index());
-            let record = &mut objects.records[page.index()];
-            record.pins -= 1;
-            record.persisting = false;
-            self.account_unpin();
-        }
-        if !prepared.is_empty() {
-            note_data_page_lease_change();
-        }
     }
 
     fn release_redirect_publication_pins(

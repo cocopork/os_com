@@ -241,16 +241,31 @@ pub(super) fn scan(engine: &PersistEngine, capacity_pages: usize) -> Result<Reco
             inode.header().generation(),
         );
     }
+    let mut unreachable_redirect_heads = Vec::new();
     redirect_extents.retain(|record| {
-        record.visibility_generation() == 0
+        let reachable = record.visibility_generation() == 0
             || inode_generations
                 .get(&(record.fs_id(), record.inode()))
-                .is_some_and(|generation| record.visibility_generation() <= *generation)
+                .is_some_and(|generation| record.visibility_generation() <= *generation);
+        if !reachable {
+            unreachable_redirect_heads.push(record.nv_slot_start());
+        }
+        reachable
     });
-    for record in redirect_extents
-        .iter()
-        .filter(|record| record.authority().ok() == Some(NvRedirectAuthority::NvAuthoritative))
-    {
+    for head in unreachable_redirect_heads {
+        engine.clear_frame(
+            usize::try_from(head).map_err(|_| Error::new(Errno::EOVERFLOW))?,
+            None,
+        )?;
+    }
+    // Generation zero is reserved for the legacy redirect compatibility API.
+    // It still exposes one volatile handle per page after recovery. Native
+    // rNVPCe publications always carry an inode visibility generation and are
+    // represented only by their range record.
+    for record in redirect_extents.iter().filter(|record| {
+        record.visibility_generation() == 0
+            && record.authority().ok() == Some(NvRedirectAuthority::NvAuthoritative)
+    }) {
         for offset in 0..u64::from(record.page_count()) {
             max_allocation_seq = max_allocation_seq
                 .checked_add(1)

@@ -1129,6 +1129,8 @@ pub(crate) struct CommittedRangeWrite {
     copied: usize,
     inode: PersistentObjectRef,
     reserved_blocks: u64,
+    unused_allocations: Vec<WriteAllocation>,
+    allocation_records: Vec<PersistentObjectRef>,
 }
 
 impl CommittedRangeWrite {
@@ -1142,6 +1144,14 @@ impl CommittedRangeWrite {
 
     pub(crate) const fn reserved_blocks(&self) -> u64 {
         self.reserved_blocks
+    }
+
+    pub(crate) fn unused_allocations(&self) -> &[WriteAllocation] {
+        &self.unused_allocations
+    }
+
+    pub(crate) fn allocation_records(&self) -> &[PersistentObjectRef] {
+        &self.allocation_records
     }
 }
 
@@ -1164,7 +1174,7 @@ where
 {
     let mutation = ExtentMutation::new(pool.clone(), fs_id, inode)?;
     let pages = range_write_new_pages(&pool, fs_id, inode, request)?;
-    let reservation = pool.reserve_data_pages(pages)?;
+    let reservation = pool.reserve_native_data_pages(pages)?;
     commit_range_write_with_mutation(
         pool,
         fs_id,
@@ -1358,6 +1368,10 @@ where
     allocation_refs
         .try_reserve_exact(request.allocations.len())
         .map_err(|_| Error::new(Errno::ENOMEM))?;
+    let mut unused_allocations = Vec::new();
+    unused_allocations
+        .try_reserve_exact(request.allocations.len())
+        .map_err(|_| Error::new(Errno::ENOMEM))?;
     if !request.allocations.is_empty() {
         let allocation_record_started = pp::now();
         for (index, allocation) in request.allocations.iter().enumerate() {
@@ -1412,7 +1426,7 @@ where
                 Ok(amount)
             } else {
                 let t_init = read_ns();
-                let mut staging = pool.begin_reserved_data_page(&mut reservation)?;
+                let mut staging = pool.begin_reserved_native_data_page(&mut reservation)?;
                 staging.zero_all()?;
                 LATENCY_STATS.fg_data_init.record_since(t_init);
                 let full_overwrite = page.page_offset == 0 && page.len == PAGE_SIZE;
@@ -1432,11 +1446,6 @@ where
                     return_errno_with_message!(Errno::EFAULT, "write copied no user bytes");
                 }
                 let id = staging.finish()?;
-                pool.transition_redirect_data_page(
-                    id,
-                    DataPageState::Staged,
-                    DataPageState::NvDirty,
-                )?;
                 pending_new_pages.push((
                     id,
                     PageKey::new(fs_id, inode, page.logical_block),
@@ -1468,7 +1477,7 @@ where
         if let Err(error) = pool.publish_redirect_entries(batch, request.generation, None) {
             if !pool.redirect_publication_uncertain() {
                 for (page, _, _) in &pending_new_pages {
-                    let _ = pool.abort_data_page(*page);
+                    let _ = pool.free_native_data_range(page.index()..page.index() + 1);
                 }
             }
             return Err(error);
@@ -1534,13 +1543,37 @@ where
         inode_fault,
     )?;
     if !request.allocations.is_empty() {
+        let mut used = newly_mapped;
+        for allocation in request.allocations {
+            let count = u64::from(allocation.block_count);
+            if used >= count {
+                used -= count;
+                continue;
+            }
+            let first = allocation
+                .first_ssd_block
+                .checked_add(used)
+                .ok_or_else(|| Error::new(Errno::EOVERFLOW))?;
+            unused_allocations.push(WriteAllocation::new(
+                allocation.block_group,
+                first,
+                u32::try_from(count - used).map_err(|_| Error::new(Errno::EOVERFLOW))?,
+            )?);
+            used = 0;
+        }
+        if used != 0 {
+            return_errno_with_message!(Errno::EUCLEAN, "copied allocation prefix exceeds batch");
+        }
         // These ownership records protect the interval between allocating the
         // NVM-authoritative bitmap and publishing the SSD baseline. The
         // baseline now names every allocated block, so retaining one metadata
         // page per write would leak the metadata reserve.
         let allocation_record_reclaim_started = pp::now();
-        for reference in &allocation_refs {
-            pool.reclaim_committed_metadata(*reference)?;
+        if unused_allocations.is_empty() {
+            for reference in &allocation_refs {
+                pool.reclaim_committed_metadata(*reference)?;
+            }
+            allocation_refs.clear();
         }
         pp::NV_FOREGROUND_ALLOCATION_RECORD_RECLAIM.record_since(
             allocation_record_reclaim_started,
@@ -1550,7 +1583,6 @@ where
                 .map(|allocation| allocation.block_count as usize)
                 .sum(),
         );
-        allocation_refs.clear();
     }
     LATENCY_STATS.fg_inode_publish.record_since(started);
     LATENCY_STATS.fg_enqueue.record_events(0);
@@ -1559,6 +1591,8 @@ where
         copied,
         inode: inode_ref,
         reserved_blocks: newly_mapped,
+        unused_allocations,
+        allocation_records: allocation_refs,
     })
 }
 
@@ -1647,7 +1681,7 @@ where
                 }
                 continue;
             }
-            let mut staging = pool.begin_reserved_data_page(reservation)?;
+            let mut staging = pool.begin_reserved_native_data_page(reservation)?;
             let full_overwrite = page.page_offset == 0 && page.len == PAGE_SIZE;
             if full_overwrite {
                 staging.zero_all()?;
@@ -1660,7 +1694,6 @@ where
                 return_errno_with_message!(Errno::EFAULT, "write copied no user bytes");
             }
             let id = staging.finish()?;
-            pool.transition_redirect_data_page(id, DataPageState::Staged, DataPageState::NvDirty)?;
             pending.push((id, key, page.ssd_block));
             copied = copied
                 .checked_add(amount)
@@ -1673,7 +1706,7 @@ where
     })();
     if let Err(error) = staging_result {
         for (page, _, _) in pending {
-            let _ = pool.abort_data_page(page);
+            let _ = pool.free_native_data_range(page.index()..page.index() + 1);
         }
         finish_plan_nv_mutations(nv_mutations)?;
         return Err(error);
@@ -1683,7 +1716,7 @@ where
         if let Err(error) = pool.publish_redirect_entries(batch, request.generation, None) {
             if !pool.redirect_publication_uncertain() {
                 for (page, _, _) in &pending {
-                    let _ = pool.abort_data_page(*page);
+                    let _ = pool.free_native_data_range(page.index()..page.index() + 1);
                 }
             }
             return Err(error);
@@ -1708,6 +1741,8 @@ where
         copied,
         inode: inode_ref,
         reserved_blocks: 0,
+        unused_allocations: Vec::new(),
+        allocation_records: Vec::new(),
     }))
 }
 
@@ -1759,6 +1794,14 @@ impl WriteAllocation {
             first_ssd_block,
             block_count,
         })
+    }
+
+    pub(crate) const fn first_ssd_block(&self) -> u64 {
+        self.first_ssd_block
+    }
+
+    pub(crate) const fn block_count(&self) -> u32 {
+        self.block_count
     }
 }
 

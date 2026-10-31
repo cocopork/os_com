@@ -1934,7 +1934,7 @@ impl Inode {
                 continue;
             }
             let needed = plan.new_data_pages()?;
-            let reservation = match pool.reserve_data_pages(needed) {
+            let reservation = match pool.reserve_native_data_pages(needed) {
                 Ok(reservation) => reservation,
                 Err(error) if error.error() == Errno::EAGAIN => {
                     // Nothing has consumed reader bytes or SSD admission credits yet.
@@ -2063,6 +2063,29 @@ impl Inode {
             );
             return match result {
                 Ok(committed) => {
+                    let mut cleanup_complete = true;
+                    for allocation in committed.unused_allocations() {
+                        let end = allocation
+                            .first_ssd_block()
+                            .checked_add(u64::from(allocation.block_count()))
+                            .ok_or_else(|| Error::new(Errno::EOVERFLOW))?;
+                        if let Err(error) = fs.release_unpublished_rnvpce_range(
+                            allocation.first_ssd_block()..end,
+                            true,
+                        ) {
+                            cleanup_complete = false;
+                            error!("rNVPCe short-write allocation cleanup deferred: {error:?}");
+                            break;
+                        }
+                    }
+                    if cleanup_complete {
+                        for reference in committed.allocation_records() {
+                            if let Err(error) = pool.reclaim_committed_metadata(*reference) {
+                                error!("rNVPCe allocation-record cleanup deferred: {error:?}");
+                                break;
+                            }
+                        }
+                    }
                     inner.set_file_size(old_size.max(offset + committed.copied()));
                     let state = crate::fs::rnvpc::write_transaction::authoritative_inode_state(
                         &pool, fs_id, inode_id,

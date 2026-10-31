@@ -113,7 +113,7 @@ impl MigrationLease {
 }
 
 impl Ext4 {
-    fn release_unpublished_rnvpce_range(
+    pub(super) fn release_unpublished_rnvpce_range(
         &self,
         range: Range<Ext4Bid>,
         nvm_allocated: bool,

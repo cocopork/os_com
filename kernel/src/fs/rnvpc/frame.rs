@@ -143,6 +143,7 @@ pub(crate) struct ReferenceEntry {
 pub(crate) struct CapacityReservation {
     pool: Arc<Rnvpc>,
     pages: Vec<NvPageId>,
+    native_ranges: bool,
 }
 
 impl Debug for CapacityReservation {
@@ -155,6 +156,16 @@ impl Debug for CapacityReservation {
 
 impl Drop for CapacityReservation {
     fn drop(&mut self) {
+        if self.native_ranges {
+            if let Err(error) = self.pool.free_native_data_pages(&self.pages) {
+                error!(
+                    "RNVPC native reservation could not return pages: {:?}",
+                    error
+                );
+            }
+            self.pages.clear();
+            return;
+        }
         for page in self.pages.drain(..) {
             // 归还失败只可能是调用方已把该页消费/释放——留一条错误日志即可，
             // 绝不能在析构里 panic。
@@ -933,6 +944,13 @@ impl Rnvpc {
             let slots = entry.nv_slot_range();
             let slots = usize::try_from(slots.start).map_err(|_| Error::new(Errno::EOVERFLOW))?
                 ..usize::try_from(slots.end).map_err(|_| Error::new(Errno::EOVERFLOW))?;
+            if record.visibility_generation() != 0 {
+                pool.allocation.slots.mark_allocated(slots.clone())?;
+                let _ = pool
+                    .allocation
+                    .capacity
+                    .reserve(PoolClass::Data, slots.end - slots.start)?;
+            }
             pool.objects.install_data_range_owner(&entry, slots)?;
             pool.redirects.publish_dirty_entry(entry)?;
         }
@@ -1515,6 +1533,7 @@ impl Rnvpc {
         let mut reservation = CapacityReservation {
             pool: self.clone(),
             pages: Vec::new(),
+            native_ranges: false,
         };
         reservation
             .pages
@@ -1587,6 +1606,69 @@ impl Rnvpc {
         Ok(reservation)
     }
 
+    /// Reserves Native rNVPCe data slots without creating per-slot runtime
+    /// identities. The redirect range entry becomes their only owner when it is
+    /// published.
+    pub(crate) fn reserve_native_data_pages(
+        self: &Arc<Self>,
+        pages: usize,
+    ) -> Result<CapacityReservation> {
+        if pages > self.config.data_limit_pages() {
+            return_errno_with_message!(Errno::ENOMEM, "NV reservation exceeds data capacity");
+        }
+        let mut reservation = CapacityReservation {
+            pool: self.clone(),
+            pages: Vec::new(),
+            native_ranges: true,
+        };
+        reservation
+            .pages
+            .try_reserve_exact(pages)
+            .map_err(|_| Error::with_message(Errno::ENOMEM, "RNVPC reservation allocation"))?;
+        let wake = self.allocation.capacity.reserve(PoolClass::Data, pages)?;
+        let hint = CpuId::current_racy().as_usize();
+        let ranges = match self.allocation.slots.allocate_ranges(pages, hint) {
+            Ok(ranges) => ranges,
+            Err(error) => {
+                self.allocation.capacity.release(PoolClass::Data, pages);
+                return Err(error);
+            }
+        };
+        for index in ranges.iter().flat_map(|range| range.clone()).rev() {
+            reservation.pages.push(NvPageId::try_from(index)?);
+        }
+        if wake {
+            self.wake_high_water();
+        }
+        Ok(reservation)
+    }
+
+    pub(crate) fn free_native_data_range(&self, range: Range<usize>) -> Result<()> {
+        if range.start >= range.end {
+            return_errno!(Errno::EINVAL);
+        }
+        self.allocation.slots.free_range(range.clone())?;
+        self.allocation
+            .capacity
+            .release(PoolClass::Data, range.end - range.start);
+        self.wake_data_capacity_waiters();
+        Ok(())
+    }
+
+    fn free_native_data_pages(&self, pages: &[NvPageId]) -> Result<()> {
+        if pages.is_empty() {
+            return Ok(());
+        }
+        let mut slots = pages.iter().map(|page| page.index()).collect::<Vec<_>>();
+        slots.sort_unstable();
+        self.allocation.slots.free_slots(&slots)?;
+        self.allocation
+            .capacity
+            .release(PoolClass::Data, slots.len());
+        self.wake_data_capacity_waiters();
+        Ok(())
+    }
+
     pub(crate) fn can_reserve_data_pages(&self, pages: usize) -> bool {
         self.allocation.capacity.can_reserve_data(pages)
             && pages <= self.allocation.slots.stats().free_pages
@@ -1631,14 +1713,34 @@ impl Rnvpc {
         let id = self.take_reserved_page(reservation)?;
         match self.pin_data_page(id) {
             Ok(pin) => Ok(StagingDataPage {
+                pool: self.clone(),
+                id,
                 pin: Some(pin),
                 initialized: false,
+                active: true,
             }),
             Err(error) => {
                 let _ = self.free_data_page(id);
                 Err(error)
             }
         }
+    }
+
+    pub(crate) fn begin_reserved_native_data_page(
+        self: &Arc<Self>,
+        reservation: &mut CapacityReservation,
+    ) -> Result<StagingDataPage> {
+        if !reservation.native_ranges {
+            return_errno_with_message!(Errno::EINVAL, "reservation is not Native range-owned");
+        }
+        let id = self.take_reserved_page(reservation)?;
+        Ok(StagingDataPage {
+            pool: self.clone(),
+            id,
+            pin: None,
+            initialized: false,
+            active: true,
+        })
     }
 
     /// 预留中尚未消费的页数（ktest）。
@@ -5656,8 +5758,11 @@ impl Drop for PinnedDataPage {
 }
 
 pub(crate) struct StagingDataPage {
+    pool: Arc<Rnvpc>,
+    id: NvPageId,
     pin: Option<PinnedDataPage>,
     initialized: bool,
+    active: bool,
 }
 
 pub(crate) struct StagingDataRange {
@@ -5774,12 +5879,11 @@ impl RangeDataMutation {
 
 impl StagingDataPage {
     pub(crate) fn id(&self) -> NvPageId {
-        self.pin.as_ref().expect("staging page is active").id
+        self.id
     }
 
     pub(crate) fn zero_all(&mut self) -> Result<()> {
-        let pin = self.pin.as_ref().expect("staging page is active");
-        pin.pool.backend.zero_page_range(pin.id, 0, PAGE_SIZE)?;
+        self.pool.backend.zero_page_range(self.id, 0, PAGE_SIZE)?;
         self.initialized = true;
         Ok(())
     }
@@ -5788,10 +5892,7 @@ impl StagingDataPage {
         if input.len() != PAGE_SIZE {
             return_errno!(Errno::EINVAL);
         }
-        self.pin
-            .as_ref()
-            .expect("staging page is active")
-            .write(input)?;
+        self.pool.backend.write_page(self.id, input)?;
         self.initialized = true;
         Ok(())
     }
@@ -5802,39 +5903,43 @@ impl StagingDataPage {
         reader: &mut VmReader,
         len: usize,
     ) -> Result<usize> {
-        let pin = self.pin.as_ref().expect("staging page is active");
         if LATENCY_ENABLED {
-            pin.pool.objects.lock(pin.id.index()).records[pin.id.index()].profile_write_ns =
-                read_ns();
+            if self.pin.is_some() {
+                self.pool.objects.lock(self.id.index()).records[self.id.index()].profile_write_ns =
+                    read_ns();
+            }
         }
-        pin.pool
+        self.pool
             .backend
-            .copy_from_reader(pin.id, offset, reader, len)
+            .copy_from_reader(self.id, offset, reader, len)
     }
 
     pub(crate) fn dma_segment(&self) -> Result<USegment> {
-        let pin = self.pin.as_ref().expect("staging page is active");
-        pin.pool.backend.data_page_segment(pin.id)
+        self.pool.backend.data_page_segment(self.id)
     }
 
     pub(crate) fn finish(mut self) -> Result<NvPageId> {
         if !self.initialized {
             return_errno_with_message!(Errno::EINVAL, "staged NVPage is not fully initialized");
         }
-        let pin = self.pin.take().expect("staging page is active");
-        let id = pin.id;
-        drop(pin);
-        Ok(id)
+        self.active = false;
+        drop(self.pin.take());
+        Ok(self.id)
     }
 }
 
 impl Drop for StagingDataPage {
     fn drop(&mut self) {
-        if let Some(pin) = self.pin.take() {
-            let pool = pin.pool.clone();
-            let id = pin.id;
-            drop(pin);
-            let _ = pool.free_data_page(id);
+        if self.active {
+            let legacy = self.pin.is_some();
+            drop(self.pin.take());
+            if legacy {
+                let _ = self.pool.free_data_page(self.id);
+            } else {
+                let _ = self
+                    .pool
+                    .free_native_data_range(self.id.index()..self.id.index() + 1);
+            }
         }
     }
 }
