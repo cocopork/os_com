@@ -929,8 +929,12 @@ impl Rnvpc {
             .iter()
             .filter(|record| record.authority().ok() == Some(NvRedirectAuthority::NvAuthoritative))
         {
-            pool.redirects
-                .publish_dirty_entry(Arc::new(DirtyNvExtentEntry::new(*record)?))?;
+            let entry = Arc::new(DirtyNvExtentEntry::new(*record)?);
+            let slots = entry.nv_slot_range();
+            let slots = usize::try_from(slots.start).map_err(|_| Error::new(Errno::EOVERFLOW))?
+                ..usize::try_from(slots.end).map_err(|_| Error::new(Errno::EOVERFLOW))?;
+            pool.objects.install_data_range_owner(&entry, slots)?;
+            pool.redirects.publish_dirty_entry(entry)?;
         }
         metadata.extend(wal_data);
         metadata.extend(data.selected.into_values());

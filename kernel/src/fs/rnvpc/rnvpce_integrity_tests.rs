@@ -1981,7 +1981,7 @@ fn publish_test_redirect_range(pool: &Arc<Rnvpc>, fs_id: u64, inode: u64, pages:
             )
         })
         .collect::<Vec<_>>();
-    pool.publish_redirect_batch(&staged, None).unwrap();
+    pool.publish_redirect_entries(&staged, 0, None).unwrap();
 }
 
 fn dirty_nv_entry_foreground_publishes_one_triple_contiguous_entry() {
@@ -2336,6 +2336,37 @@ fn rnvpce_nv_entry_work_item() {
             .unwrap()
             .is_none()
     );
+}
+
+#[ktest]
+fn rnvpce_range_owned_slots() {
+    const FS_ID: u64 = 0xb20c;
+    const INODE: u64 = 81;
+    let pool = test_pool(64, 8, 56, None);
+    pool.reset_data_range_lock_acquisitions_for_test();
+    publish_test_redirect_range(&pool, FS_ID, INODE, 32);
+    assert_eq!(pool.data_range_lock_acquisitions_for_test(), 1);
+
+    let original = pool
+        .lookup_dirty_nv_entry(PageKey::new(FS_ID, INODE, 0))
+        .unwrap();
+    let reader = original.try_read().unwrap();
+    let lease = pool.claim_ready_nv_entries(FS_ID, 32).unwrap().remove(0);
+    assert!(Arc::ptr_eq(&original, lease.entry()));
+    assert_eq!(pool.data_range_lock_acquisitions_for_test(), 2);
+    assert_eq!(original.try_write().err().unwrap().error(), Errno::EBUSY);
+    pool.complete_nv_entry(&lease).unwrap();
+    drop(reader);
+    assert_eq!(pool.reclaim_nv_entry(&lease).unwrap(), 32);
+    assert_eq!(pool.data_range_lock_acquisitions_for_test(), 3);
+    assert_eq!(original.state(), NvExtentEntryState::Reclaimed);
+
+    publish_test_redirect_range(&pool, FS_ID, INODE, 32);
+    let replacement = pool
+        .lookup_dirty_nv_entry(PageKey::new(FS_ID, INODE, 0))
+        .unwrap();
+    assert!(!Arc::ptr_eq(&original, &replacement));
+    assert_eq!(original.try_read().err().unwrap().error(), Errno::ESTALE);
 }
 
 #[ktest]

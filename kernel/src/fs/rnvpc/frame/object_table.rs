@@ -3,6 +3,8 @@
 //! Each slot owns one lock protecting its runtime record.
 
 use core::ops::{Index, IndexMut, Range};
+#[cfg(ktest)]
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 use ostd::sync::{PreemptDisabled, WaitQueue};
 
@@ -15,6 +17,8 @@ pub(super) struct ObjectTable {
     slots: Vec<SlotEntry>,
     migration_ranges: SpinLock<MigrationRangeState>,
     data_ranges: SpinLock<BTreeMap<usize, DataRangeOwner>>,
+    #[cfg(ktest)]
+    data_range_lock_acquisitions: AtomicUsize,
 }
 
 struct DataRangeOwner {
@@ -86,6 +90,8 @@ impl ObjectTable {
             slots,
             migration_ranges: SpinLock::new(MigrationRangeState::default()),
             data_ranges: SpinLock::new(BTreeMap::new()),
+            #[cfg(ktest)]
+            data_range_lock_acquisitions: AtomicUsize::new(0),
         })
     }
 
@@ -102,7 +108,7 @@ impl ObjectTable {
         {
             return_errno_with_message!(Errno::EINVAL, "invalid NV data range owner");
         }
-        let mut ranges = self.data_ranges.lock();
+        let mut ranges = self.lock_data_ranges();
         if ranges
             .range(..slots.end)
             .next_back()
@@ -126,7 +132,7 @@ impl ObjectTable {
     ) -> Result<Range<usize>> {
         let start = usize::try_from(entry.nv_slot_range().start)
             .map_err(|_| Error::new(Errno::EOVERFLOW))?;
-        let mut ranges = self.data_ranges.lock();
+        let mut ranges = self.lock_data_ranges();
         let owner = ranges
             .get(&start)
             .ok_or_else(|| Error::new(Errno::ESTALE))?;
@@ -145,7 +151,7 @@ impl ObjectTable {
     pub(super) fn data_range_owner(&self, entry: &Arc<DirtyNvExtentEntry>) -> Result<Range<usize>> {
         let start = usize::try_from(entry.nv_slot_range().start)
             .map_err(|_| Error::new(Errno::EOVERFLOW))?;
-        let ranges = self.data_ranges.lock();
+        let ranges = self.lock_data_ranges();
         let owner = ranges
             .get(&start)
             .ok_or_else(|| Error::new(Errno::ESTALE))?;
@@ -157,6 +163,33 @@ impl ObjectTable {
             return_errno_with_message!(Errno::ESTALE, "NV data range owner changed");
         }
         Ok(start..owner.end)
+    }
+
+    pub(super) fn claim_data_range_owner(
+        &self,
+        entry: &Arc<DirtyNvExtentEntry>,
+    ) -> Result<Range<usize>> {
+        self.data_range_owner(entry)
+    }
+
+    fn lock_data_ranges(
+        &self,
+    ) -> SpinLockGuard<'_, BTreeMap<usize, DataRangeOwner>, PreemptDisabled> {
+        #[cfg(ktest)]
+        self.data_range_lock_acquisitions
+            .fetch_add(1, Ordering::Relaxed);
+        self.data_ranges.lock()
+    }
+
+    #[cfg(ktest)]
+    pub(super) fn reset_data_range_lock_acquisitions(&self) {
+        self.data_range_lock_acquisitions
+            .store(0, Ordering::Release);
+    }
+
+    #[cfg(ktest)]
+    pub(super) fn data_range_lock_acquisitions(&self) -> usize {
+        self.data_range_lock_acquisitions.load(Ordering::Acquire)
     }
 
     pub(super) fn claim_migration_range(

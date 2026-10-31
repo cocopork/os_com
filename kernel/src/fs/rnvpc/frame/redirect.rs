@@ -134,6 +134,7 @@ impl Rnvpc {
     ) -> Result<Vec<NvExtentEntryLease>> {
         let leases = self.redirects.claim_ready_entries(fs_id, page_budget)?;
         for lease in &leases {
+            self.objects.claim_data_range_owner(lease.entry())?;
             lease.wait_for_writers();
         }
         if !leases.is_empty() {
@@ -176,6 +177,16 @@ impl Rnvpc {
 
     pub(crate) fn redirect_publication_uncertain(&self) -> bool {
         self.persist.publication_uncertain()
+    }
+
+    #[cfg(ktest)]
+    pub(crate) fn reset_data_range_lock_acquisitions_for_test(&self) {
+        self.objects.reset_data_range_lock_acquisitions();
+    }
+
+    #[cfg(ktest)]
+    pub(crate) fn data_range_lock_acquisitions_for_test(&self) -> usize {
+        self.objects.data_range_lock_acquisitions()
     }
 
     pub(crate) fn data_segment_from_entry(
@@ -289,10 +300,16 @@ impl Rnvpc {
         }
         note_data_page_lease_change();
         self.redirects.remove_reclaimed_entry(lease)?;
+        let owned_pages = self.remove_data_range_owner(entry)?;
         let pages = slots
             .into_iter()
             .map(|slot| NvPageId::try_from(slot).map_err(|_| Error::new(Errno::EOVERFLOW)))
             .collect::<Result<Vec<_>>>()?;
+        if owned_pages.start != pages[0]
+            || owned_pages.end.index() != pages.last().unwrap().index() + 1
+        {
+            return_errno_with_message!(Errno::ESTALE, "NV extent entry range owner changed");
+        }
         let reclaimed = pages.len();
         self.free_data_pages(&pages)?;
         lease.finish_reclaim()?;
