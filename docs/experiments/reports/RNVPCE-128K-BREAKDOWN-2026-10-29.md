@@ -75,7 +75,7 @@ capacity wait 是结果而不是最初原因：前台线程在容量不足时会
 | target prepare | 0.29 us/page | 0.95 us/page | 不是主项 |
 | data BIO submit | 0.78 us/page | 0.93 us/page | 不存在毫秒级提交开销 |
 | async I/O ready wait | 1.46 us/page | 1.10 us/page | 设备侧不是上限 |
-| completion worker | 0.27 us/page | 0.33 us/page | 只生成 reclaim ticket，足够快 |
+| completion worker | 0.27 us/page | 0.33 us/page | 只生成回收工作项，足够快 |
 | device flush | 0.17 us/page | 0.14 us/page | 513 个批量 flush |
 | completion compare | 18.88 us/page | 291.35 us/page | 当前主瓶颈 |
 | descriptor clear | 0.83 us/page | 5.13 us/page | 次要共享状态竞争 |

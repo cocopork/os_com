@@ -6,13 +6,13 @@ use ostd::sync::LocalIrqDisabled;
 
 use crate::prelude::*;
 
-struct ReadyTicket<T> {
+struct ReadyEntry<T> {
     value: T,
     units: usize,
 }
 
 pub(in crate::fs::fs_impls::ext4) struct ReclaimReadyQueue<T> {
-    queue: SpinLock<VecDeque<ReadyTicket<T>>, LocalIrqDisabled>,
+    queue: SpinLock<VecDeque<ReadyEntry<T>>, LocalIrqDisabled>,
     ready_units: AtomicUsize,
 }
 
@@ -26,14 +26,14 @@ impl<T> ReclaimReadyQueue<T> {
 
     pub(super) fn publish(&self, value: T, units: usize) {
         debug_assert!(units != 0);
-        self.queue.lock().push_back(ReadyTicket { value, units });
+        self.queue.lock().push_back(ReadyEntry { value, units });
         self.ready_units.fetch_add(units, Ordering::Release);
     }
 
     pub(super) fn claim(&self) -> Option<(T, usize)> {
-        let ticket = self.queue.lock().pop_front()?;
-        self.ready_units.fetch_sub(ticket.units, Ordering::AcqRel);
-        Some((ticket.value, ticket.units))
+        let entry = self.queue.lock().pop_front()?;
+        self.ready_units.fetch_sub(entry.units, Ordering::AcqRel);
+        Some((entry.value, entry.units))
     }
 
     pub(super) fn ready_units(&self) -> usize {
@@ -60,7 +60,7 @@ mod tests {
     use super::ReclaimReadyQueue;
 
     #[ktest]
-    fn reclaim_ready_ticket_has_one_owner() {
+    fn reclaim_ready_work_item_has_one_owner() {
         let queue = ReclaimReadyQueue::new();
         queue.publish(11, 32);
 
@@ -70,7 +70,7 @@ mod tests {
     }
 
     #[ktest]
-    fn reclaim_ready_queue_accounts_each_ticket_exactly_once() {
+    fn reclaim_ready_queue_accounts_each_work_item_exactly_once() {
         let queue = ReclaimReadyQueue::new();
         queue.publish(1, 4);
         queue.publish(2, 32);

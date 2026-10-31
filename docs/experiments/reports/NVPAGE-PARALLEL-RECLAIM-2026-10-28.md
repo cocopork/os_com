@@ -5,10 +5,10 @@
 This experiment implements the runtime scheduling phase of plan 017 on the
 current per-page descriptor redirection architecture:
 
-- completion performs the batch device flush and publishes reclaim-ready tickets;
-- with multiple capacity waiters, foreground threads claim tickets before sleeping and run the
+- completion performs the batch device flush and publishes reclaim-ready work items;
+- with multiple capacity waiters, foreground threads claim work items before sleeping and run the
   same bounded helper;
-- with zero or one capacity waiter, the background worker consumes tickets so a single writer
+- with zero or one capacity waiter, the background worker consumes work items so a single writer
   does not execute publication and cleanup inline;
 - helper completion clears exact redirects, batch-frees NVPages, and releases block-group ownership;
 - `io_in_flight` and `reclaim_pending` are accounted and drained independently;

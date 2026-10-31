@@ -12,7 +12,7 @@ replacement, and clearing update a partition-local ready-page index; candidate
 claim materializes only the selected extent and no longer rebuilds or globally
 sorts every dirty page.
 
-Completion/reclaim now collects several ready extent tickets, groups their new
+Completion/reclaim now collects several ready extent work items, groups their new
 SSD baselines by inode, publishes each inode's baseline once, then clears exact
 descriptors and frees NVPages in batches.  The 128-page limit remains the
 structural migration-lock boundary; it is not enlarged by reclaim aggregation.

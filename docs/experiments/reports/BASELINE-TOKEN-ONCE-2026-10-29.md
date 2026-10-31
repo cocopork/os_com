@@ -119,7 +119,7 @@ admission，避免整段 claim/requeue。
 - 聚焦 `ext4_research_routes`：通过，`1 passed; 0 failed`，内部 23 个 NV
   场景全部通过；
 - 完整 dev ktest 在 QEMU/TCG 中启动 385 个 `aster-kernel` 测试。已执行部分均
-  通过，包括新增的 `nv_route_rnvpce_completion_publishes_reclaim_ticket`；20 分钟
+  通过，包括新增的 `nv_route_rnvpce_completion_publishes_reclaim_work_item`；20 分钟
   外层超时发生在既有
   `persistent_wal_root_split_faults_recover_from_committed_records` 场景，因此没有取得
   完整测试集的最终汇总，不能据此宣称 385 项全部通过；
