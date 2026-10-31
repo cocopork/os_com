@@ -573,6 +573,27 @@ impl Rnvpc {
             .zip(&was_unmapped)
             .filter_map(|((page, _, _, _), is_new)| (!is_new).then_some(page.index()))
             .collect::<Vec<_>>();
+        let new_entries = records
+            .iter()
+            .copied()
+            .map(DirtyNvExtentEntry::new)
+            .map(|entry| entry.map(Arc::new))
+            .collect::<Result<Vec<_>>>()?;
+        let mut owners_installed = 0usize;
+        for entry in &new_entries {
+            let slots = entry.nv_slot_range();
+            let slots = usize::try_from(slots.start).map_err(|_| Error::new(Errno::EOVERFLOW))?
+                ..usize::try_from(slots.end).map_err(|_| Error::new(Errno::EOVERFLOW))?;
+            if let Err(error) = self.install_data_range_owner(entry, slots) {
+                for installed in &new_entries[..owners_installed] {
+                    let _ = self.remove_data_range_owner(installed);
+                }
+                self.release_redirect_publication_pins(&prepared);
+                self.redirects.abort_reserved(&reservation)?;
+                return Err(error);
+            }
+            owners_installed += 1;
+        }
         let persist_result = self
             .persist
             .persist_data_slots(&existing_slots)
@@ -584,6 +605,9 @@ impl Rnvpc {
             self.release_redirect_publication_pins(&prepared);
             self.redirects.abort_reserved(&reservation)?;
             if !self.persist.publication_uncertain() {
+                for entry in &new_entries {
+                    let _ = self.remove_data_range_owner(entry);
+                }
                 for ((page, _, _, _), is_new) in prepared.iter().zip(&was_unmapped) {
                     if *is_new {
                         let _ = self.abort_data_page(*page);
@@ -609,11 +633,6 @@ impl Rnvpc {
             record.version = handle.logical_version;
             self.account_unpin();
         }
-        let new_entries = records
-            .into_iter()
-            .map(DirtyNvExtentEntry::new)
-            .map(|entry| entry.map(Arc::new))
-            .collect::<Result<Vec<_>>>()?;
         self.redirects
             .commit_reserved(&reservation, &redirect_updates)?;
         for entry in new_entries {
