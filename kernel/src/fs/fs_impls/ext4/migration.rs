@@ -248,6 +248,9 @@ impl Ext4 {
 
     pub(super) fn start_nv_migration(self: &Arc<Self>) -> Result<()> {
         let worker_count = configured_rtio_worker_count(self.rnvpc_mode())?;
+        if uses_shared_migration_rounds(self.rnvpc_mode()) {
+            pp::configure_rtio_workers(worker_count);
+        }
         if !self.nv_migration_enabled() {
             return Ok(());
         }
@@ -517,6 +520,7 @@ impl Ext4 {
     pub(super) fn migrate_nv_round(&self, budget: usize) -> Result<usize> {
         if uses_shared_migration_rounds(self.rnvpc_mode()) {
             let _permit = self.nv_migration_gate.enter_shared();
+            let _active_worker = pp::enter_rtio_worker_round();
             self.migrate_nv_round_inner(budget)
         } else {
             let _serial = self.nv_migration_lock.lock();
@@ -656,7 +660,11 @@ impl Ext4 {
             }
         }
         let batch = MigrationBatch::new(submissions.len(), submitted, migration_leases, nv_entries);
-        self.nv_in_flight.fetch_add(submitted, Ordering::AcqRel);
+        let submitted_bios = submissions.len();
+        let in_flight = self.nv_in_flight.fetch_add(submitted, Ordering::AcqRel) + submitted;
+        if self.rnvpc_extend_enabled() {
+            pp::record_rtio_submission(submitted, submitted_bios, in_flight);
+        }
         let mut submit_error = None;
         for (target, segments, run) in submissions {
             let completed = self.nv_completion_queue.clone();
@@ -1009,6 +1017,7 @@ impl Ext4 {
         &self,
         batches: Vec<Arc<MigrationBatch>>,
     ) -> Result<usize> {
+        let epoch_batches = batches.len();
         let pool = rnvpc::pool().ok_or_else(|| Error::new(Errno::EINVAL))?;
         let mut successful = Vec::new();
         let mut io_failed = false;
@@ -1024,6 +1033,8 @@ impl Ext4 {
             successful_pages = successful_pages.saturating_add(batch.page_count());
             successful.push((batch, jobs, completion_started));
         }
+
+        pp::record_rtio_epoch(epoch_batches, successful_pages, !successful.is_empty());
 
         if !successful.is_empty() {
             let started = batch_metrics::now();

@@ -113,6 +113,160 @@ pub(crate) static NV_RECLAIM: Metric = Metric::new();
 pub(crate) static NV_RECLAIM_READY_WAIT: Metric = Metric::new();
 pub(crate) static NV_RECLAIM_HELP: Metric = Metric::new();
 
+struct RtioMultiWorkerMetrics {
+    configured_workers: AtomicU64,
+    active_workers: AtomicU64,
+    peak_workers: AtomicU64,
+    epochs: AtomicU64,
+    epoch_batches: AtomicU64,
+    epoch_pages: AtomicU64,
+    device_flushes: AtomicU64,
+    submitted_pages: AtomicU64,
+    submitted_bios: AtomicU64,
+    max_in_flight_pages: AtomicU64,
+}
+
+impl RtioMultiWorkerMetrics {
+    const fn new() -> Self {
+        Self {
+            configured_workers: AtomicU64::new(0),
+            active_workers: AtomicU64::new(0),
+            peak_workers: AtomicU64::new(0),
+            epochs: AtomicU64::new(0),
+            epoch_batches: AtomicU64::new(0),
+            epoch_pages: AtomicU64::new(0),
+            device_flushes: AtomicU64::new(0),
+            submitted_pages: AtomicU64::new(0),
+            submitted_bios: AtomicU64::new(0),
+            max_in_flight_pages: AtomicU64::new(0),
+        }
+    }
+}
+
+static RTIO_MULTI_WORKER: RtioMultiWorkerMetrics = RtioMultiWorkerMetrics::new();
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct RtioMultiWorkerSnapshot {
+    pub(crate) configured_workers: u64,
+    pub(crate) active_workers: u64,
+    pub(crate) peak_workers: u64,
+    pub(crate) epochs: u64,
+    pub(crate) epoch_batches: u64,
+    pub(crate) epoch_pages: u64,
+    pub(crate) device_flushes: u64,
+    pub(crate) submitted_pages: u64,
+    pub(crate) submitted_bios: u64,
+    pub(crate) max_in_flight_pages: u64,
+}
+
+const fn rtio_metrics_enabled() -> bool {
+    ENABLED || cfg!(ktest)
+}
+
+pub(crate) fn configure_rtio_workers(workers: usize) {
+    if rtio_metrics_enabled() {
+        RTIO_MULTI_WORKER
+            .configured_workers
+            .store(workers as u64, Ordering::Relaxed);
+    }
+}
+
+pub(crate) struct RtioWorkerRound {
+    recorded: bool,
+}
+
+pub(crate) fn enter_rtio_worker_round() -> RtioWorkerRound {
+    let recorded = rtio_metrics_enabled();
+    if recorded {
+        let active = RTIO_MULTI_WORKER
+            .active_workers
+            .fetch_add(1, Ordering::Relaxed)
+            + 1;
+        RTIO_MULTI_WORKER
+            .peak_workers
+            .fetch_max(active, Ordering::Relaxed);
+    }
+    RtioWorkerRound { recorded }
+}
+
+impl Drop for RtioWorkerRound {
+    fn drop(&mut self) {
+        if self.recorded {
+            RTIO_MULTI_WORKER
+                .active_workers
+                .fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+}
+
+pub(crate) fn record_rtio_submission(pages: usize, bios: usize, in_flight_pages: usize) {
+    if !rtio_metrics_enabled() {
+        return;
+    }
+    RTIO_MULTI_WORKER
+        .submitted_pages
+        .fetch_add(pages as u64, Ordering::Relaxed);
+    RTIO_MULTI_WORKER
+        .submitted_bios
+        .fetch_add(bios as u64, Ordering::Relaxed);
+    RTIO_MULTI_WORKER
+        .max_in_flight_pages
+        .fetch_max(in_flight_pages as u64, Ordering::Relaxed);
+}
+
+pub(crate) fn record_rtio_epoch(batches: usize, pages: usize, device_flush: bool) {
+    if !rtio_metrics_enabled() {
+        return;
+    }
+    RTIO_MULTI_WORKER.epochs.fetch_add(1, Ordering::Relaxed);
+    RTIO_MULTI_WORKER
+        .epoch_batches
+        .fetch_add(batches as u64, Ordering::Relaxed);
+    RTIO_MULTI_WORKER
+        .epoch_pages
+        .fetch_add(pages as u64, Ordering::Relaxed);
+    if device_flush {
+        RTIO_MULTI_WORKER
+            .device_flushes
+            .fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+pub(crate) fn rtio_multi_worker_snapshot() -> RtioMultiWorkerSnapshot {
+    RtioMultiWorkerSnapshot {
+        configured_workers: RTIO_MULTI_WORKER.configured_workers.load(Ordering::Relaxed),
+        active_workers: RTIO_MULTI_WORKER.active_workers.load(Ordering::Relaxed),
+        peak_workers: RTIO_MULTI_WORKER.peak_workers.load(Ordering::Relaxed),
+        epochs: RTIO_MULTI_WORKER.epochs.load(Ordering::Relaxed),
+        epoch_batches: RTIO_MULTI_WORKER.epoch_batches.load(Ordering::Relaxed),
+        epoch_pages: RTIO_MULTI_WORKER.epoch_pages.load(Ordering::Relaxed),
+        device_flushes: RTIO_MULTI_WORKER.device_flushes.load(Ordering::Relaxed),
+        submitted_pages: RTIO_MULTI_WORKER.submitted_pages.load(Ordering::Relaxed),
+        submitted_bios: RTIO_MULTI_WORKER.submitted_bios.load(Ordering::Relaxed),
+        max_in_flight_pages: RTIO_MULTI_WORKER
+            .max_in_flight_pages
+            .load(Ordering::Relaxed),
+    }
+}
+
+#[cfg(ktest)]
+fn reset_rtio_multi_worker_for_test() {
+    for counter in [
+        &RTIO_MULTI_WORKER.configured_workers,
+        &RTIO_MULTI_WORKER.active_workers,
+        &RTIO_MULTI_WORKER.peak_workers,
+        &RTIO_MULTI_WORKER.epochs,
+        &RTIO_MULTI_WORKER.epoch_batches,
+        &RTIO_MULTI_WORKER.epoch_pages,
+        &RTIO_MULTI_WORKER.device_flushes,
+        &RTIO_MULTI_WORKER.submitted_pages,
+        &RTIO_MULTI_WORKER.submitted_bios,
+        &RTIO_MULTI_WORKER.max_in_flight_pages,
+    ] {
+        counter.store(0, Ordering::Relaxed);
+    }
+}
+
 pub(crate) fn dump_snapshot() {
     if !ENABLED
         || (NATIVE_FOREGROUND_TOTAL.count.load(Ordering::Relaxed) == 0
@@ -198,6 +352,20 @@ pub(crate) fn dump_snapshot() {
             histogram
         );
     }
+    let rtio = rtio_multi_worker_snapshot();
+    ostd::error!(
+        "[PIPELINE] name=rtio_multi_worker configured={} active={} peak={} epochs={} epoch_batches={} epoch_pages={} device_flushes={} submitted_pages={} submitted_bios={} max_in_flight_pages={}",
+        rtio.configured_workers,
+        rtio.active_workers,
+        rtio.peak_workers,
+        rtio.epochs,
+        rtio.epoch_batches,
+        rtio.epoch_pages,
+        rtio.device_flushes,
+        rtio.submitted_pages,
+        rtio.submitted_bios,
+        rtio.max_in_flight_pages,
+    );
 }
 
 #[cfg(ktest)]
@@ -214,5 +382,30 @@ mod tests {
         assert_eq!(histogram_bucket(3), 2);
         assert_eq!(histogram_bucket(4), 2);
         assert_eq!(histogram_bucket(u64::MAX), HISTOGRAM_BINS - 1);
+    }
+
+    #[ktest]
+    fn rtio_multi_worker_counter_accounting() {
+        reset_rtio_multi_worker_for_test();
+        configure_rtio_workers(4);
+        let first = enter_rtio_worker_round();
+        let second = enter_rtio_worker_round();
+        record_rtio_submission(32, 1, 32);
+        record_rtio_submission(64, 2, 96);
+        record_rtio_epoch(2, 96, true);
+        drop(second);
+        drop(first);
+
+        let snapshot = rtio_multi_worker_snapshot();
+        assert_eq!(snapshot.configured_workers, 4);
+        assert_eq!(snapshot.active_workers, 0);
+        assert_eq!(snapshot.peak_workers, 2);
+        assert_eq!(snapshot.epochs, 1);
+        assert_eq!(snapshot.epoch_batches, 2);
+        assert_eq!(snapshot.epoch_pages, 96);
+        assert_eq!(snapshot.device_flushes, 1);
+        assert_eq!(snapshot.submitted_pages, 96);
+        assert_eq!(snapshot.submitted_bios, 3);
+        assert_eq!(snapshot.max_in_flight_pages, 96);
     }
 }
