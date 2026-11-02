@@ -1511,7 +1511,9 @@ impl RedirectDirectory {
 
 #[cfg(ktest)]
 mod tests {
-    use ostd::prelude::ktest;
+    use core::sync::atomic::AtomicBool;
+
+    use ostd::{prelude::ktest, sync::LocalIrqDisabled};
 
     use super::*;
     fn dirty_entry(
@@ -1609,6 +1611,61 @@ mod tests {
         assert_eq!(claimed[1].entry().ssd_block_range(), 9000..9002);
     }
 
+    fn concurrent_claims_never_duplicate_an_extent_entry() {
+        let directory = Arc::new(RedirectDirectory::new().unwrap());
+        directory
+            .publish_dirty_entry(dirty_entry(0x96, 12, 0, 2, 600, 6000))
+            .unwrap();
+        directory
+            .publish_dirty_entry(dirty_entry(0x96, 12, 2, 2, 602, 6002))
+            .unwrap();
+        let ready = Arc::new(AtomicUsize::new(0));
+        let start = Arc::new(AtomicBool::new(false));
+        let claim_count = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new(AtomicBool::new(false));
+        let claimed = Arc::new(SpinLock::<Vec<u64>, LocalIrqDisabled>::new(Vec::new()));
+        let mut workers = Vec::new();
+        for _ in 0..2 {
+            let directory = directory.clone();
+            let ready = ready.clone();
+            let start = start.clone();
+            let claim_count = claim_count.clone();
+            let release = release.clone();
+            let claimed = claimed.clone();
+            workers.push(
+                crate::thread::kernel_thread::ThreadOptions::new(move || {
+                    ready.fetch_add(1, Ordering::AcqRel);
+                    while !start.load(Ordering::Acquire) {
+                        crate::thread::Thread::yield_now();
+                    }
+                    let lease = directory.claim_ready_entries(0x96, 1).unwrap();
+                    assert_eq!(lease.len(), 1);
+                    claimed.lock().push(lease[0].entry().logical_start());
+                    claim_count.fetch_add(1, Ordering::Release);
+                    while !release.load(Ordering::Acquire) {
+                        crate::thread::Thread::yield_now();
+                    }
+                    drop(lease);
+                })
+                .spawn(),
+            );
+        }
+        while ready.load(Ordering::Acquire) != 2 {
+            crate::thread::Thread::yield_now();
+        }
+        start.store(true, Ordering::Release);
+        while claim_count.load(Ordering::Acquire) != 2 {
+            crate::thread::Thread::yield_now();
+        }
+        release.store(true, Ordering::Release);
+        for worker in workers {
+            worker.join();
+        }
+        let mut claimed = claimed.lock().clone();
+        claimed.sort_unstable();
+        assert_eq!(claimed, vec![0, 2]);
+    }
+
     fn dirty_nv_entry_rejects_more_than_128_pages() {
         assert_eq!(
             NvRedirectExtentRecord::new(
@@ -1643,6 +1700,7 @@ mod tests {
         dirty_nv_entry_budget_never_splits_entry();
         adjacent_nv_entries_remain_distinct();
         dirty_nv_entry_splits_at_ssd_discontinuity();
+        concurrent_claims_never_duplicate_an_extent_entry();
         dirty_nv_entry_rejects_more_than_128_pages();
         nv_redirect_extent_record_has_fixed_layout();
     }

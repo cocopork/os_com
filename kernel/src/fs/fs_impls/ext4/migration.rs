@@ -62,6 +62,10 @@ fn configured_rtio_worker_count(mode: rnvpc::mode::RnvpcMode) -> Result<usize> {
     rtio_worker_count(mode, ostd::cpu::num_cpus(), override_value)
 }
 
+const fn uses_shared_migration_rounds(mode: rnvpc::mode::RnvpcMode) -> bool {
+    matches!(mode, rnvpc::mode::RnvpcMode::RnvpcExtend)
+}
+
 pub(super) struct MigrationGate {
     access: RwMutex<()>,
     exclusive_serial: Mutex<()>,
@@ -243,56 +247,58 @@ impl Ext4 {
     }
 
     pub(super) fn start_nv_migration(self: &Arc<Self>) -> Result<()> {
-        let _worker_count = configured_rtio_worker_count(self.rnvpc_mode())?;
+        let worker_count = configured_rtio_worker_count(self.rnvpc_mode())?;
         if !self.nv_migration_enabled() {
             return Ok(());
         }
-        let weak = Arc::downgrade(self);
-        let trigger = self.nv_migration_trigger.clone();
-        crate::thread::kernel_thread::ThreadOptions::new(move || {
-            loop {
-                let observed;
-                {
-                    let Some(fs) = weak.upgrade() else {
-                        break;
-                    };
-                    if fs.is_shutdown() || fs.nv_migration_failed.load(Ordering::Acquire) {
-                        break;
-                    }
-                    observed = fs.nv_migration_epoch.load(Ordering::Acquire);
-                    if rnvpc::needs_flush_watermark()
-                        || fs.nv_capacity_waiters.load(Ordering::Acquire) != 0
-                        || fs.nv_migration_progress_waiters.load(Ordering::Acquire) != 0
+        for _worker_id in 0..worker_count {
+            let weak = Arc::downgrade(self);
+            let trigger = self.nv_migration_trigger.clone();
+            crate::thread::kernel_thread::ThreadOptions::new(move || {
+                loop {
+                    let observed;
                     {
-                        match fs.migrate_nv_round(MIGRATION_BATCH_PAGES) {
-                            // Keep the pipeline full while work and credits exist.
-                            Ok(submitted) if submitted != 0 => continue,
-                            Ok(_) => {}
-                            Err(error) if error.error() == Errno::EAGAIN => {}
-                            Err(error) => {
-                                error!("NV migration failed: {error:?}");
-                                fs.fail_nv_migration();
-                                break;
+                        let Some(fs) = weak.upgrade() else {
+                            break;
+                        };
+                        if fs.is_shutdown() || fs.nv_migration_failed.load(Ordering::Acquire) {
+                            break;
+                        }
+                        observed = fs.nv_migration_epoch.load(Ordering::Acquire);
+                        if rnvpc::needs_flush_watermark()
+                            || fs.nv_capacity_waiters.load(Ordering::Acquire) != 0
+                            || fs.nv_migration_progress_waiters.load(Ordering::Acquire) != 0
+                        {
+                            match fs.migrate_nv_round(MIGRATION_BATCH_PAGES) {
+                                // Keep the pipeline full while work and credits exist.
+                                Ok(submitted) if submitted != 0 => continue,
+                                Ok(_) => {}
+                                Err(error) if error.error() == Errno::EAGAIN => {}
+                                Err(error) => {
+                                    error!("NV migration failed: {error:?}");
+                                    fs.fail_nv_migration();
+                                    break;
+                                }
                             }
                         }
                     }
+                    // The timeout only retries idle/stalled candidates. Successful
+                    // rounds have no timer delay; completion wakes all workers.
+                    let _ = trigger.wait_until_or_timeout(
+                        || {
+                            weak.upgrade()
+                                .is_none_or(|fs| {
+                                    fs.is_shutdown()
+                                        || fs.nv_migration_epoch.load(Ordering::Acquire) != observed
+                                })
+                                .then_some(())
+                        },
+                        &Duration::from_millis(10),
+                    );
                 }
-                // The timeout only retries idle/stalled candidates. Successful
-                // rounds have no timer delay; completion wakes the credit wait.
-                let _ = trigger.wait_until_or_timeout(
-                    || {
-                        weak.upgrade()
-                            .is_none_or(|fs| {
-                                fs.is_shutdown()
-                                    || fs.nv_migration_epoch.load(Ordering::Acquire) != observed
-                            })
-                            .then_some(())
-                    },
-                    &Duration::from_millis(10),
-                );
-            }
-        })
-        .spawn();
+            })
+            .spawn();
+        }
         let weak = Arc::downgrade(self);
         let trigger = self.nv_reclaim_trigger.clone();
         crate::thread::kernel_thread::ThreadOptions::new(move || {
@@ -510,8 +516,17 @@ impl Ext4 {
     }
 
     pub(super) fn migrate_nv_round(&self, budget: usize) -> Result<usize> {
+        if uses_shared_migration_rounds(self.rnvpc_mode()) {
+            let _permit = self.nv_migration_gate.enter_shared();
+            self.migrate_nv_round_inner(budget)
+        } else {
+            let _serial = self.nv_migration_lock.lock();
+            self.migrate_nv_round_inner(budget)
+        }
+    }
+
+    fn migrate_nv_round_inner(&self, budget: usize) -> Result<usize> {
         let profile_started = pp::now();
-        let _serial = self.nv_migration_lock.lock();
         if self.nv_migration_failed.load(Ordering::Acquire) {
             return_errno_with_message!(Errno::EIO, "ambiguous migration target requires recovery");
         }
@@ -1489,6 +1504,13 @@ mod tests {
                 .error(),
             Errno::EINVAL
         );
+    }
+
+    #[ktest]
+    fn only_rnvpce_uses_parallel_migration_rounds() {
+        assert!(uses_shared_migration_rounds(RnvpcMode::RnvpcExtend));
+        assert!(!uses_shared_migration_rounds(RnvpcMode::Rnvpc));
+        assert!(!uses_shared_migration_rounds(RnvpcMode::Native));
     }
 
     #[ktest]
