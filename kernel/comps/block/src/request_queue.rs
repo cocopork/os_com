@@ -189,7 +189,9 @@ impl BioRequest {
 
     /// Returns `true` if can merge the `SubmittedBio`, `false` otherwise.
     pub fn can_merge(&self, rq_bio: &SubmittedBio) -> bool {
-        if rq_bio.type_() != self.type_ {
+        if rq_bio.type_() != self.type_
+            || self.bios.front().unwrap().queue_affinity() != rq_bio.queue_affinity()
+        {
             return false;
         }
 
@@ -277,6 +279,31 @@ mod tests {
         }
         fn id(&self) -> DeviceId {
             DeviceId::new(MajorId::new(1), MinorId::new(0))
+        }
+    }
+
+    #[derive(Debug)]
+    struct MultiQueueDevice(BioRequestSingleQueue);
+
+    impl BlockDevice for MultiQueueDevice {
+        fn enqueue(&self, bio: SubmittedBio) -> Result<(), BioEnqueueError> {
+            self.0.enqueue(bio)
+        }
+
+        fn metadata(&self) -> BlockDeviceMeta {
+            BlockDeviceMeta {
+                max_nr_segments_per_bio: self.0.max_nr_segments_per_bio(),
+                nr_sectors: 4096,
+                nr_submission_queues: 2,
+            }
+        }
+
+        fn name(&self) -> &str {
+            "multi-queue-test"
+        }
+
+        fn id(&self) -> DeviceId {
+            DeviceId::new(MajorId::new(1), MinorId::new(1))
         }
     }
 
@@ -373,5 +400,39 @@ mod tests {
         assert_eq!(device.0.num_requests(), 0);
         assert_eq!(completed.load(Ordering::Relaxed), 0);
         assert_eq!(batch.len(), 0);
+    }
+
+    #[ktest]
+    fn bio_request_merges_only_matching_queue_affinities() {
+        for (first, second, expected_requests) in [
+            (BioQueueAffinity::Any, BioQueueAffinity::Any, 1),
+            (BioQueueAffinity::Queue(0), BioQueueAffinity::Queue(0), 1),
+            (BioQueueAffinity::Queue(0), BioQueueAffinity::Queue(1), 2),
+            (BioQueueAffinity::Any, BioQueueAffinity::Queue(0), 2),
+            (BioQueueAffinity::Queue(0), BioQueueAffinity::Any, 2),
+        ] {
+            let device = MultiQueueDevice(BioRequestSingleQueue::new());
+            let mut batch = IoBatch::new();
+            for (start, affinity) in [(0, first), (8, second)] {
+                let segment = BioSegment::alloc(1, BioDirection::ToDevice);
+                Bio::new_on_queue(
+                    BioType::Write,
+                    Sid::new(start),
+                    vec![segment],
+                    None,
+                    affinity,
+                )
+                .submit(&device, &mut batch)
+                .unwrap();
+            }
+
+            assert_eq!(device.0.num_requests(), expected_requests);
+            for _ in 0..expected_requests {
+                let request = device.0.dequeue();
+                for bio in request.into_bios() {
+                    bio.complete(BioStatus::Complete);
+                }
+            }
+        }
     }
 }

@@ -225,8 +225,35 @@ pub enum BioEnqueueError {
 }
 
 impl From<BioEnqueueError> for Error {
-    fn from(_error: BioEnqueueError) -> Self {
-        Error::NotEnoughResources
+    fn from(error: BioEnqueueError) -> Self {
+        match error {
+            BioEnqueueError::InvalidQueue => Error::InvalidArgs,
+            BioEnqueueError::IsFull | BioEnqueueError::Refused | BioEnqueueError::TooBig => {
+                Error::NotEnoughResources
+            }
+        }
+    }
+}
+
+#[cfg(ktest)]
+mod queue_error_tests {
+    use ostd::prelude::*;
+
+    use super::*;
+
+    #[ktest]
+    fn invalid_queue_maps_to_invalid_args() {
+        assert!(matches!(
+            Error::from(BioEnqueueError::InvalidQueue),
+            Error::InvalidArgs
+        ));
+        for error in [
+            BioEnqueueError::IsFull,
+            BioEnqueueError::Refused,
+            BioEnqueueError::TooBig,
+        ] {
+            assert!(matches!(Error::from(error), Error::NotEnoughResources));
+        }
     }
 }
 
