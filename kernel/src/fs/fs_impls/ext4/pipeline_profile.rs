@@ -267,10 +267,122 @@ fn reset_rtio_multi_worker_for_test() {
     }
 }
 
-pub(crate) fn dump_snapshot() {
-    if !ENABLED
-        || (NATIVE_FOREGROUND_TOTAL.count.load(Ordering::Relaxed) == 0
-            && NV_FOREGROUND_TOTAL.count.load(Ordering::Relaxed) == 0)
+/// Mount-local worker bindings and accepted migration data submissions.
+pub(super) struct RtioQueueProfile {
+    workers: usize,
+    submissions: Vec<RtioQueueSubmissions>,
+}
+
+struct RtioQueueSubmissions {
+    pages: AtomicU64,
+    bios: AtomicU64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct RtioQueueSubmissionSnapshot {
+    pub(super) pages: u64,
+    pub(super) bios: u64,
+}
+
+impl RtioQueueProfile {
+    pub(super) fn new(workers: usize, submission_queues: u16) -> Self {
+        Self {
+            workers,
+            submissions: (0..submission_queues)
+                .map(|_| RtioQueueSubmissions {
+                    pages: AtomicU64::new(0),
+                    bios: AtomicU64::new(0),
+                })
+                .collect(),
+        }
+    }
+
+    pub(super) fn worker_count(&self) -> usize {
+        self.workers
+    }
+
+    pub(super) fn record_worker_mapping(
+        &self,
+        device: &dyn aster_block::BlockDevice,
+        worker_id: usize,
+    ) {
+        if ENABLED {
+            ostd::error!(
+                "[PIPELINE] name=rtio_worker_mapping device={} worker={} queue={}",
+                device.name(),
+                worker_id,
+                worker_id
+            );
+        }
+    }
+
+    pub(super) fn record_submission(&self, queue_id: u16, pages: usize, bios: usize) {
+        if !rtio_metrics_enabled() {
+            return;
+        }
+        let submission = &self.submissions[usize::from(queue_id)];
+        submission.pages.fetch_add(pages as u64, Ordering::Relaxed);
+        submission.bios.fetch_add(bios as u64, Ordering::Relaxed);
+    }
+
+    pub(super) fn submission_snapshot(&self, queue_id: u16) -> Option<RtioQueueSubmissionSnapshot> {
+        let submission = self.submissions.get(usize::from(queue_id))?;
+        Some(RtioQueueSubmissionSnapshot {
+            pages: submission.pages.load(Ordering::Relaxed),
+            bios: submission.bios.load(Ordering::Relaxed),
+        })
+    }
+
+    fn dump_snapshot(&self, device: &dyn aster_block::BlockDevice) {
+        for worker_id in 0..self.workers {
+            let submission = self.submission_snapshot(worker_id as u16).unwrap();
+            ostd::error!(
+                "[PIPELINE] name=rtio_worker device={} worker={} queue={} submitted_pages={} submitted_bios={}",
+                device.name(),
+                worker_id,
+                worker_id,
+                submission.pages,
+                submission.bios
+            );
+        }
+        // Queue snapshots are taken only at the existing report boundary.
+        for queue_id in 0..device.metadata().nr_submission_queues {
+            let Some(queue) = device.queue_diagnostics(queue_id) else {
+                ostd::error!(
+                    "[PIPELINE] name=block_submission_queue device={} queue={} supported=false",
+                    device.name(),
+                    queue_id
+                );
+                continue;
+            };
+            ostd::error!(
+                "[PIPELINE] name=block_submission_queue device={} queue={} supported=true queued_bios={} queued_pages={} submitted_bios={} submitted_pages={} staging_depth={} max_sampled_staging_depth={} descriptor_wait_count={} descriptor_wait_ticks={} active_forwarders={} peak_forwarders={} irq_completions={} in_flight_requests={}",
+                device.name(),
+                queue_id,
+                queue.queued_bios,
+                queue.queued_pages,
+                queue.submitted_bios,
+                queue.submitted_pages,
+                queue.staging_depth,
+                queue.max_sampled_staging_depth,
+                queue.descriptor_wait_count,
+                queue.descriptor_wait_ticks,
+                queue.active_forwarders,
+                queue.peak_forwarders,
+                queue.irq_completions,
+                queue.in_flight_requests,
+            );
+        }
+    }
+}
+
+pub(super) fn dump_snapshot(device: &dyn aster_block::BlockDevice, queues: &RtioQueueProfile) {
+    if !ENABLED {
+        return;
+    }
+    queues.dump_snapshot(device);
+    if NATIVE_FOREGROUND_TOTAL.count.load(Ordering::Relaxed) == 0
+        && NV_FOREGROUND_TOTAL.count.load(Ordering::Relaxed) == 0
     {
         return;
     }
@@ -382,6 +494,34 @@ mod tests {
         assert_eq!(histogram_bucket(3), 2);
         assert_eq!(histogram_bucket(4), 2);
         assert_eq!(histogram_bucket(u64::MAX), HISTOGRAM_BINS - 1);
+    }
+
+    #[ktest]
+    fn rtio_queue_profiles_are_mount_scoped() {
+        let first = RtioQueueProfile::new(2, 4);
+        let second = RtioQueueProfile::new(1, 1);
+        first.record_submission(0, 4, 2);
+        first.record_submission(1, 8, 3);
+        first.record_submission(0, 2, 1);
+        assert_eq!(first.worker_count(), 2);
+        assert_eq!(
+            first.submission_snapshot(0).unwrap(),
+            RtioQueueSubmissionSnapshot { pages: 6, bios: 3 }
+        );
+        assert_eq!(
+            first.submission_snapshot(1).unwrap(),
+            RtioQueueSubmissionSnapshot { pages: 8, bios: 3 }
+        );
+        assert_eq!(
+            first.submission_snapshot(2).unwrap(),
+            RtioQueueSubmissionSnapshot { pages: 0, bios: 0 }
+        );
+        assert_eq!(first.submission_snapshot(4), None);
+        assert_eq!(second.worker_count(), 1);
+        assert_eq!(
+            second.submission_snapshot(0).unwrap(),
+            RtioQueueSubmissionSnapshot { pages: 0, bios: 0 }
+        );
     }
 
     #[ktest]

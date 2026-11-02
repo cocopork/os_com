@@ -1,11 +1,12 @@
 // SPDX-License-Identifier: MPL-2.0
 
-//! Two-worker, bounded asynchronous NV migration. BIO callbacks enqueue only;
+//! Bounded asynchronous NV migration with queue-bound rTIO workers.
+//! BIO callbacks enqueue only;
 //! process-context completion owns durability and publishes reclaim work items;
 //! foreground or background helpers own SSD publication and NVPage reclamation.
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use aster_block::bio::BioDirection;
+use aster_block::bio::{BioDirection, BioQueueAffinity};
 use ostd::{
     cpu::CpuId,
     sync::{LocalIrqDisabled, RwMutexWriteGuard},
@@ -39,6 +40,7 @@ aster_cmdline::define_kv_param!("rtio_workers", RTIO_WORKERS_PARAM);
 pub(super) fn rtio_worker_count(
     mode: rnvpc::mode::RnvpcMode,
     cpu_count: usize,
+    submission_queues: u16,
     override_value: Option<usize>,
 ) -> Result<usize> {
     if override_value.is_some_and(|workers| !(1..=MAX_RTIO_WORKERS).contains(&workers)) {
@@ -47,11 +49,20 @@ pub(super) fn rtio_worker_count(
     if mode != rnvpc::mode::RnvpcMode::RnvpcExtend {
         return Ok(1);
     }
-    let _ = cpu_count;
-    Ok(override_value.unwrap_or(1))
+    let submission_queues = usize::from(submission_queues);
+    if submission_queues == 0 || override_value.is_some_and(|workers| workers > submission_queues) {
+        return_errno_with_message!(
+            Errno::EINVAL,
+            "rtio_workers exceeds available submission queues"
+        );
+    }
+    Ok(override_value.unwrap_or_else(|| (cpu_count / 8).clamp(1, 4).min(submission_queues)))
 }
 
-fn configured_rtio_worker_count(mode: rnvpc::mode::RnvpcMode) -> Result<usize> {
+pub(super) fn configured_rtio_worker_count(
+    mode: rnvpc::mode::RnvpcMode,
+    submission_queues: u16,
+) -> Result<usize> {
     let override_value = RTIO_WORKERS_PARAM
         .get()
         .map(|value| {
@@ -60,11 +71,32 @@ fn configured_rtio_worker_count(mode: rnvpc::mode::RnvpcMode) -> Result<usize> {
                 .map_err(|_| Error::with_message(Errno::EINVAL, "rtio_workers must be an integer"))
         })
         .transpose()?;
-    rtio_worker_count(mode, ostd::cpu::num_cpus(), override_value)
+    rtio_worker_count(
+        mode,
+        ostd::cpu::num_cpus(),
+        submission_queues,
+        override_value,
+    )
 }
 
 const fn uses_shared_migration_rounds(mode: rnvpc::mode::RnvpcMode) -> bool {
     matches!(mode, rnvpc::mode::RnvpcMode::RnvpcExtend)
+}
+
+enum MigrationSubmitter {
+    Worker(u16),
+    Quiesced,
+    Legacy,
+}
+
+impl MigrationSubmitter {
+    fn affinity(&self) -> BioQueueAffinity {
+        match self {
+            Self::Worker(queue_id) => BioQueueAffinity::Queue(*queue_id),
+            Self::Quiesced => BioQueueAffinity::Queue(0),
+            Self::Legacy => BioQueueAffinity::Any,
+        }
+    }
 }
 
 pub(super) struct MigrationGate {
@@ -248,14 +280,24 @@ impl Ext4 {
     }
 
     pub(super) fn start_nv_migration(self: &Arc<Self>) -> Result<()> {
-        let worker_count = configured_rtio_worker_count(self.rnvpc_mode())?;
+        let worker_count = if uses_shared_migration_rounds(self.rnvpc_mode()) {
+            self.rtio_profile.worker_count()
+        } else {
+            1
+        };
         if uses_shared_migration_rounds(self.rnvpc_mode()) {
             pp::configure_rtio_workers(worker_count);
         }
         if !self.nv_migration_enabled() {
             return Ok(());
         }
-        for _worker_id in 0..worker_count {
+        for worker_id in 0..worker_count {
+            // Bind once before spawning; scheduler migration never changes the queue.
+            let affinity = BioQueueAffinity::Queue(worker_id as u16);
+            if uses_shared_migration_rounds(self.rnvpc_mode()) {
+                self.rtio_profile
+                    .record_worker_mapping(self.block_device().as_ref(), worker_id);
+            }
             let weak = Arc::downgrade(self);
             let trigger = self.nv_migration_trigger.clone();
             crate::thread::kernel_thread::ThreadOptions::new(move || {
@@ -273,7 +315,12 @@ impl Ext4 {
                             || fs.nv_capacity_waiters.load(Ordering::Acquire) != 0
                             || fs.nv_migration_progress_waiters.load(Ordering::Acquire) != 0
                         {
-                            match fs.migrate_nv_round(MIGRATION_BATCH_PAGES) {
+                            let result = if uses_shared_migration_rounds(fs.rnvpc_mode()) {
+                                fs.migrate_nv_round_on_queue(MIGRATION_BATCH_PAGES, affinity)
+                            } else {
+                                fs.migrate_nv_round(MIGRATION_BATCH_PAGES)
+                            };
+                            match result {
                                 // Keep the pipeline full while work and credits exist.
                                 Ok(submitted) if submitted != 0 => continue,
                                 Ok(_) => {}
@@ -523,13 +570,32 @@ impl Ext4 {
 
     pub(super) fn migrate_nv_round(&self, budget: usize) -> Result<usize> {
         if uses_shared_migration_rounds(self.rnvpc_mode()) {
-            let _permit = self.nv_migration_gate.enter_shared();
-            let _active_worker = pp::enter_rtio_worker_round();
-            self.migrate_nv_round_inner(budget)
-        } else {
-            let _serial = self.nv_migration_lock.lock();
-            self.migrate_nv_round_inner(budget)
+            // Direct process-context callers use a valid, explicit queue zero.
+            return self.migrate_nv_round_on_queue(budget, BioQueueAffinity::Queue(0));
         }
+        let _serial = self.nv_migration_lock.lock();
+        self.migrate_nv_round_inner(budget, MigrationSubmitter::Legacy)
+    }
+
+    pub(super) fn migrate_nv_round_on_queue(
+        &self,
+        budget: usize,
+        affinity: BioQueueAffinity,
+    ) -> Result<usize> {
+        let BioQueueAffinity::Queue(queue_id) = affinity else {
+            return_errno_with_message!(Errno::EINVAL, "rNVPCe migration requires a strict queue");
+        };
+        if !uses_shared_migration_rounds(self.rnvpc_mode())
+            || queue_id >= self.block_device().metadata().nr_submission_queues
+        {
+            return_errno_with_message!(
+                Errno::EINVAL,
+                "rNVPCe migration requires a valid strict queue"
+            );
+        }
+        let _permit = self.nv_migration_gate.enter_shared();
+        let _active_worker = pp::enter_rtio_worker_round();
+        self.migrate_nv_round_inner(budget, MigrationSubmitter::Worker(queue_id))
     }
 
     fn migrate_rnvpce_round_quiesced(
@@ -540,10 +606,16 @@ impl Ext4 {
         if !core::ptr::eq(guard.gate, &self.nv_migration_gate) {
             return_errno_with_message!(Errno::EINVAL, "migration guard belongs to another fs");
         }
-        self.migrate_nv_round_inner(budget)
+        // Exclusive quiescence owns this round; no worker/shared permit is taken.
+        self.migrate_nv_round_inner(budget, MigrationSubmitter::Quiesced)
     }
 
-    fn migrate_nv_round_inner(&self, budget: usize) -> Result<usize> {
+    fn migrate_nv_round_inner(
+        &self,
+        budget: usize,
+        submitter: MigrationSubmitter,
+    ) -> Result<usize> {
+        let affinity = submitter.affinity();
         let profile_started = pp::now();
         if self.nv_migration_failed.load(Ordering::Acquire) {
             return_errno_with_message!(Errno::EIO, "ambiguous migration target requires recovery");
@@ -686,9 +758,24 @@ impl Ext4 {
                 callback_batch.complete_data(CompletionJob { status, pages }, &completed, &trigger);
             });
             let mut io_batch = IoBatch::new();
-            if let Err(error) =
+            let pages = segments.iter().map(BioSegment::nblocks).sum();
+            let result = if self.rnvpc_extend_enabled() {
+                self.write_segments_on_queue_async(
+                    target,
+                    segments,
+                    affinity,
+                    Some(callback),
+                    &mut io_batch,
+                )
+            } else {
                 self.write_segments_async(target, segments, Some(callback), &mut io_batch)
+            };
+            if result.is_ok()
+                && let MigrationSubmitter::Worker(queue_id) = submitter
             {
+                self.rtio_profile.record_submission(queue_id, pages, 1);
+            }
+            if let Err(error) = result {
                 // Enqueue failure drops the callback without running it. Recover
                 // its pages from the shared slot and complete the batch once.
                 let pages = callback_pages
@@ -1528,48 +1615,195 @@ mod tests {
 
     #[ktest]
     fn rtio_worker_policy_defaults_and_bounds() {
+        for (cpus, queues, expected) in [
+            (64, 16, 4),
+            (16, 16, 2),
+            (4, 16, 1),
+            (0, 16, 1),
+            (64, 2, 2),
+            (64, 1, 1),
+            (256, 16, 4),
+        ] {
+            assert_eq!(
+                rtio_worker_count(RnvpcMode::RnvpcExtend, cpus, queues, None).unwrap(),
+                expected
+            );
+        }
+        for workers in [1, 4, 16] {
+            assert_eq!(
+                rtio_worker_count(RnvpcMode::RnvpcExtend, 64, 16, Some(workers)).unwrap(),
+                workers
+            );
+        }
+        for (queues, workers) in [(16, 0), (16, 17), (2, 3), (1, 4)] {
+            assert_eq!(
+                rtio_worker_count(RnvpcMode::RnvpcExtend, 64, queues, Some(workers))
+                    .unwrap_err()
+                    .error(),
+                Errno::EINVAL
+            );
+        }
         assert_eq!(
-            rtio_worker_count(RnvpcMode::RnvpcExtend, 64, None).unwrap(),
-            1,
-            "single-queue validation requires an opt-in for multiple submitters"
-        );
-        assert_eq!(
-            rtio_worker_count(RnvpcMode::RnvpcExtend, 16, None).unwrap(),
-            1
-        );
-        assert_eq!(
-            rtio_worker_count(RnvpcMode::RnvpcExtend, 4, None).unwrap(),
-            1
-        );
-        assert_eq!(
-            rtio_worker_count(RnvpcMode::RnvpcExtend, 64, Some(1)).unwrap(),
-            1
-        );
-        assert_eq!(
-            rtio_worker_count(RnvpcMode::RnvpcExtend, 64, Some(16)).unwrap(),
-            16
-        );
-        assert_eq!(
-            rtio_worker_count(RnvpcMode::Rnvpc, 64, Some(4)).unwrap(),
-            1,
-            "the legacy WAL path remains single-worker"
-        );
-        assert_eq!(
-            rtio_worker_count(RnvpcMode::Native, 64, Some(4)).unwrap(),
-            1
-        );
-        assert_eq!(
-            rtio_worker_count(RnvpcMode::RnvpcExtend, 64, Some(0))
+            rtio_worker_count(RnvpcMode::RnvpcExtend, 64, 0, None)
                 .unwrap_err()
                 .error(),
             Errno::EINVAL
         );
+        for mode in [RnvpcMode::Rnvpc, RnvpcMode::Native] {
+            assert_eq!(rtio_worker_count(mode, 64, 1, None).unwrap(), 1);
+            assert_eq!(rtio_worker_count(mode, 64, 1, Some(4)).unwrap(), 1);
+        }
+    }
+
+    #[derive(Debug)]
+    struct QueueRecordingDisk {
+        disk: Arc<super::super::test_utils::Ext4MemoryDisk>,
+        writes: Mutex<Vec<aster_block::bio::BioQueueAffinity>>,
+    }
+
+    impl BlockDevice for QueueRecordingDisk {
+        fn enqueue(
+            &self,
+            bio: aster_block::bio::SubmittedBio,
+        ) -> core::result::Result<(), aster_block::bio::BioEnqueueError> {
+            if bio.type_() == aster_block::bio::BioType::Write {
+                self.writes.lock().push(bio.queue_affinity());
+            }
+            self.disk.enqueue(bio)
+        }
+        fn metadata(&self) -> aster_block::BlockDeviceMeta {
+            aster_block::BlockDeviceMeta {
+                nr_submission_queues: 4,
+                max_nr_segments_per_bio: 1,
+                ..self.disk.metadata()
+            }
+        }
+        fn name(&self) -> &str {
+            "rtio-queue-test"
+        }
+        fn id(&self) -> device_id::DeviceId {
+            self.disk.id()
+        }
+    }
+
+    #[ktest]
+    fn rnvpce_workers_keep_stable_distinct_queue_ids() {
+        use aster_block::bio::BioQueueAffinity;
+        use ostd::mm::VmReader;
+
+        use super::super::test_utils::{Ext4FixtureBuilder, make_empty_file_inode};
+        use crate::fs::vfs::inode::FileOps;
+
+        rnvpc::init_for_ext4_tests();
+        crate::time::clocks::init_for_ktest();
+        let fixture = Ext4FixtureBuilder::new(2048, 256, 2048)
+            .with_free_blocks(128)
+            .with_uuid([0xe4; 16])
+            .build()
+            .unwrap();
+        for ino in 11..20 {
+            fixture.write_raw_inode(ino, &make_empty_file_inode());
+        }
         assert_eq!(
-            rtio_worker_count(RnvpcMode::RnvpcExtend, 64, Some(17))
+            fixture
+                .ext4
+                .migrate_nv_round_on_queue(1, BioQueueAffinity::Queue(0))
                 .unwrap_err()
                 .error(),
             Errno::EINVAL
         );
+        let disk = Arc::new(QueueRecordingDisk {
+            disk: fixture.disk.clone(),
+            writes: Mutex::new(Vec::new()),
+        });
+        drop(fixture);
+        let options = CString::new("rnvpce=on,rtio=off").unwrap();
+        let fs = Ext4::open(disk.clone(), Some(options.as_c_str())).unwrap();
+        for ino in 11..19 {
+            fs.read_inode(ino)
+                .unwrap()
+                .write_at(
+                    0,
+                    &mut VmReader::from([ino as u8; PAGE_SIZE].as_slice()).to_fallible(),
+                )
+                .unwrap();
+        }
+        disk.writes.lock().clear();
+        for affinity in [BioQueueAffinity::Any, BioQueueAffinity::Queue(4)] {
+            assert_eq!(
+                fs.migrate_nv_round_on_queue(1, affinity)
+                    .unwrap_err()
+                    .error(),
+                Errno::EINVAL
+            );
+        }
+        let mut workers = Vec::new();
+        for worker_id in 0..4 {
+            let fs = fs.clone();
+            workers.push(
+                crate::thread::kernel_thread::ThreadOptions::new(move || {
+                    let affinity = BioQueueAffinity::Queue(worker_id);
+                    for _ in 0..2 {
+                        assert_eq!(fs.migrate_nv_round_on_queue(1, affinity).unwrap(), 1);
+                        crate::thread::Thread::yield_now();
+                    }
+                })
+                .spawn(),
+            );
+        }
+        for worker in workers {
+            worker.join();
+        }
+        let writes = disk.writes.lock();
+        assert_eq!(writes.len(), 8);
+        for queue_id in 0..4 {
+            assert_eq!(
+                writes
+                    .iter()
+                    .filter(|&&affinity| affinity == BioQueueAffinity::Queue(queue_id))
+                    .count(),
+                2
+            );
+        }
+        drop(writes);
+        for queue_id in 0..4 {
+            let stats = fs.rtio_profile.submission_snapshot(queue_id).unwrap();
+            assert_eq!(stats.pages, 2);
+            assert_eq!(stats.bios, 2);
+        }
+        let before = disk.disk.flush_count();
+        assert_eq!(fs.process_nv_completions().unwrap(), 8);
+        assert_eq!(disk.disk.flush_count() - before, 1);
+        assert_eq!(fs.help_nv_reclaim(8).unwrap(), 8);
+
+        fs.read_inode(19)
+            .unwrap()
+            .write_at(
+                0,
+                &mut VmReader::from([19; PAGE_SIZE].as_slice()).to_fallible(),
+            )
+            .unwrap();
+        disk.writes.lock().clear();
+        let guard = fs.nv_migration_gate.enter_exclusive();
+        assert_eq!(fs.migrate_rnvpce_round_quiesced(&guard, 1).unwrap(), 1);
+        drop(guard);
+        assert_eq!(*disk.writes.lock(), vec![BioQueueAffinity::Queue(0)]);
+        assert_eq!(
+            fs.rtio_profile.submission_snapshot(0).unwrap().pages,
+            2,
+            "quiesced sync submissions are not worker activity"
+        );
+        assert_eq!(fs.process_nv_completions().unwrap(), 1);
+        assert_eq!(fs.help_nv_reclaim(1).unwrap(), 1);
+        disk.writes.lock().clear();
+        fs.write_segments_async(
+            200,
+            vec![BioSegment::alloc(1, BioDirection::ToDevice)],
+            None,
+            &mut IoBatch::new(),
+        )
+        .unwrap();
+        assert_eq!(*disk.writes.lock(), vec![BioQueueAffinity::Any]);
     }
 
     #[ktest]

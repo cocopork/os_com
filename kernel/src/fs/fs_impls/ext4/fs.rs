@@ -13,6 +13,7 @@
 use core::sync::atomic::AtomicI64;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
+use aster_block::bio::BioQueueAffinity;
 use device_id::DeviceId;
 
 use super::{
@@ -244,6 +245,7 @@ pub struct Ext4 {
     pub(super) cache_pressure: Arc<super::writeback::CachePressure>,
     pub(super) nv_migration_lock: Mutex<()>,
     pub(super) nv_migration_gate: super::migration::MigrationGate,
+    pub(super) rtio_profile: super::pipeline_profile::RtioQueueProfile,
     pub(super) nv_migration_trigger: Arc<ostd::sync::WaitQueue>,
     pub(super) nv_migration_epoch: AtomicUsize,
     pub(super) nv_capacity_waiters: AtomicUsize,
@@ -388,6 +390,18 @@ impl Ext4 {
         let super_block = SuperBlock::try_from(raw_super_block)?;
         let mount_options = Ext4MountOptions::parse(data);
         let rnvpc_mode = mount_options.rnvpc_mode()?;
+        let submission_queues = device.metadata().nr_submission_queues;
+        // Reject impossible policies before recovery, metadata writes, or spawning.
+        let rtio_workers =
+            super::migration::configured_rtio_worker_count(rnvpc_mode.mode(), submission_queues)?;
+        let rtio_profile = super::pipeline_profile::RtioQueueProfile::new(
+            if rnvpc_mode.mode() == RnvpcMode::RnvpcExtend {
+                rtio_workers
+            } else {
+                0
+            },
+            submission_queues,
+        );
         if rnvpc_mode.mode() != RnvpcMode::Native && crate::fs::rnvpc::pool().is_none() {
             return_errno_with_message!(Errno::EINVAL, "rNVPC mount requires a configured pool");
         }
@@ -442,6 +456,7 @@ impl Ext4 {
             cache_pressure: super::writeback::CachePressure::new(),
             nv_migration_lock: Mutex::new(()),
             nv_migration_gate: super::migration::MigrationGate::new(),
+            rtio_profile,
             nv_migration_trigger: Arc::new(ostd::sync::WaitQueue::new()),
             nv_migration_epoch: AtomicUsize::new(0),
             nv_capacity_waiters: AtomicUsize::new(0),
@@ -1310,6 +1325,25 @@ impl Ext4 {
     ) -> Result<()> {
         self.block_device
             .write_segments_async(Bid::new(bid), segments, complete_fn, io_batch)?;
+        Ok(())
+    }
+
+    /// Submits rNVPCe migration data through its bound submission queue.
+    pub(super) fn write_segments_on_queue_async(
+        &self,
+        bid: Ext4Bid,
+        segments: Vec<BioSegment>,
+        affinity: BioQueueAffinity,
+        complete_fn: Option<BioCompleteFn>,
+        io_batch: &mut IoBatch,
+    ) -> Result<()> {
+        self.block_device.write_segments_on_queue_async(
+            Bid::new(bid),
+            segments,
+            affinity,
+            complete_fn,
+            io_batch,
+        )?;
         Ok(())
     }
 
