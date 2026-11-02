@@ -39,7 +39,7 @@ aster_cmdline::define_kv_param!("rtio_workers", RTIO_WORKERS_PARAM);
 
 pub(super) fn rtio_worker_count(
     mode: rnvpc::mode::RnvpcMode,
-    cpu_count: usize,
+    _cpu_count: usize,
     submission_queues: u16,
     override_value: Option<usize>,
 ) -> Result<usize> {
@@ -56,7 +56,9 @@ pub(super) fn rtio_worker_count(
             "rtio_workers exceeds available submission queues"
         );
     }
-    Ok(override_value.unwrap_or_else(|| (cpu_count / 8).clamp(1, 4).min(submission_queues)))
+    // The four-queue experiment regressed sequential writes; parallel workers
+    // remain opt-in until the performance acceptance gates pass.
+    Ok(override_value.unwrap_or(1))
 }
 
 pub(super) fn configured_rtio_worker_count(
@@ -1621,22 +1623,28 @@ pub(super) mod tests {
     #[ktest]
     fn rtio_worker_policy_defaults_and_bounds() {
         for (cpus, queues, expected) in [
-            (64, 16, 4),
-            (16, 16, 2),
+            (64, 16, 1),
+            (16, 16, 1),
             (4, 16, 1),
             (0, 16, 1),
-            (64, 2, 2),
+            (64, 2, 1),
             (64, 1, 1),
-            (256, 16, 4),
+            (256, 16, 1),
         ] {
             assert_eq!(
                 rtio_worker_count(RnvpcMode::RnvpcExtend, cpus, queues, None).unwrap(),
                 expected
             );
         }
-        for workers in [1, 4, 16] {
+        for workers in [1, 2, 4, 16] {
             assert_eq!(
                 rtio_worker_count(RnvpcMode::RnvpcExtend, 64, 16, Some(workers)).unwrap(),
+                workers
+            );
+        }
+        for (queues, workers) in [(1, 1), (2, 2), (4, 4), (16, 16)] {
+            assert_eq!(
+                rtio_worker_count(RnvpcMode::RnvpcExtend, 64, queues, Some(workers)).unwrap(),
                 workers
             );
         }

@@ -23,11 +23,21 @@ saves Docker stdout as `open-users-root.json`, stderr as
 It accepts only an unused result with matching identities, empty diagnostics,
 and consistent statuses. An unavailable helper or ambiguous result aborts.
 The selected partition is passed raw to QEMU and may be overwritten by the
-guest. `QUEUES=1` selects the one-worker/one-queue/one-IOThread control;
-`QUEUES=4` (the default) selects the four-queue arm. Other values are rejected.
+guest. `QUEUES=1` selects one virtqueue/IOThread; `QUEUES=4` (the default)
+selects four. Other values are rejected. Guest worker count is independent:
+the current kernel defaults to one, and the four-worker arm requires an ISO
+with `rtio_workers=4` in its kernel command line.
 `FORMAT_TARGET=1` reformats the authorized target as 4 KiB no-journal EXT4.
 Both formatting and QEMU exposure repeat the target and host-root open-user
-checks. The host `fuser` CLI is invoked without `--`, which this host's
+checks. After validating the target identity, the standalone runner acquires
+`/run/lock/rtio-mq-<major>-<minor>.lock` and holds it until exit, including
+container cleanup and optional read-only e2fsck. This stable lock inode is
+shared across artifact roots and is never unlinked on release. A competing
+run for the same major:minor fails before artifact creation or device exposure;
+different verified partition identities use different locks. Failure to create
+or acquire the shared lock aborts. `CHECK_FILESYSTEM=1` enables post-guest
+`e2fsck -fn` inside that same lock lifetime; the matrix always enables it and
+does not acquire a nested device lock. The host `fuser` CLI is invoked without `--`, which this host's
 psmisc version rejects; both target paths are already canonical absolute paths.
 
 ```sh
@@ -87,26 +97,38 @@ replace Task 7 correctness and performance acceptance.
 
 ## Serialized matrix
 
-Use one release ISO with no `rtio_workers` override: its queue-aware policy
-selects one worker on the control and four on the arm. Build with pipeline
-profiling enabled to capture the required diagnostics, record that build diff
-and restore it after copying/fingerprinting the ISO. Do not rebuild during
-measurements. `run-matrix.sh` injects `guest.sh` and a per-point configuration
-into private copies of the ext2 image, using the ISO's
-`--init-args=/ext2/rebuild-fio.sh` workflow.
+The current kernel defaults to one worker after the failed performance gate.
+Prepare two images from the same source before starting measurements: the
+control uses `rtio_workers=1`, and the arm uses `rtio_workers=4`. Pass each to
+its matching queue count; a four-worker image on a one-queue target is rejected
+at mount. Build with pipeline profiling enabled to capture diagnostics, record
+the profiling diff, and restore it after copying/fingerprinting both images.
+Do not rebuild during measurements. Each source directory must contain its
+`selected.iso`, `ext2.img`, and `exfat.img`. `run-matrix.sh` injects `guest.sh`
+and per-point configuration into private ext2 copies; each ISO must boot
+`--init-args=/ext2/rebuild-fio.sh`.
 
 ```sh
 ROOT_ART=/path/to/existing-external-matrix-directory \
-SOURCE_ART=/path/to/fingerprinted-inputs \
+SOURCE_ART=/path/to/worker-1-inputs MATRIX_QUEUES=1 \
+TOOLS_IMAGE=os-com-recovery-tools:workspace-20261018 \
+bash run-matrix.sh --authorized-destructive-target=/dev/nvme1n1p1
+
+ROOT_ART=/path/to/existing-external-matrix-directory \
+SOURCE_ART=/path/to/worker-4-inputs MATRIX_QUEUES=4 \
 TOOLS_IMAGE=os-com-recovery-tools:workspace-20261018 \
 bash run-matrix.sh --authorized-destructive-target=/dev/nvme1n1p1
 ```
 
+The retained 2026-11-02 experiment used one older queue-aware ISO without an
+override; this historical behavior is not the current default.
+
 The default matrix is queues 1 then 4; each arm runs `randwrite 4k 1`,
 `randwrite 4k 16`, `write 128k 1`, and `write 128k 16`, 2 GiB each.
 `MATRIX_QUEUES` and newline-separated `MATRIX_SPECS` can select missing points
-without overwriting evidence. A matrix lock prevents concurrent invocations
-in the same artifact directory. Each point is formatted after the full target
+without overwriting evidence. An artifact lock protects image/configuration
+edits in the same root. Independently, the runner device lock excludes all
+other roots through the post-guest e2fsck. Each point is formatted after the full target
 checks. Random writes first prepare SSD-backed files with a direct sequential
 write; sequential points use new files. Both use buffered psync fio, depth 1,
 a 128 MiB NVM pool, and 64 MiB data capacity.

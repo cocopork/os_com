@@ -11,8 +11,8 @@
 
 随机写含 sync 吞吐量在 1/16 job 分别提高 30.2%/36.6%，但 128 KiB 顺序写
 分别回退 46.9%/42.3%，16 job 提交及容量等待也未下降。因此四 worker 不能
-作为默认配置接受。测量版本 `936722960` 的 queue-aware 默认尚未在本实验中修改；
-需在独立后续变更中恢复一个 worker 默认，多队列仅保留为实验路径。
+作为默认配置接受。测量版本 `936722960` 使用 queue-aware 默认；
+验收后已恢复一个 worker 默认，`rtio_workers=N` 保留为受设备队列数限制的实验选项。
 详见[实验报告](../../../experiments/reports/RTIO-VIRTIO-MULTIQUEUE-2026-11-02.md)。
 
 ## 目标
@@ -72,7 +72,7 @@ pub enum BioQueueAffinity {
 ### 3. rTIO 队列绑定
 
 - rNVPCe worker `i` 在整个挂载生命周期内固定使用 `Queue(i)`。
-- 测量候选版本的默认 worker 数为 `min(4, max(1, online_cpu / 8), nr_submission_queues)`；性能验收失败，发布前须恢复一个 worker 默认。
+- 当前默认 worker 数为 1，与 CPU/队列数无关；测量候选版本的 queue-aware 默认因性能验收失败已撤回。
 - `rtio_workers=N` 大于设备提交队列数量时挂载返回 `EINVAL`。
 - rNVPC WAL 仍限制为一个 worker。
 - 所有队列的数据 BIO completion 仍汇聚到一个 durability coordinator。

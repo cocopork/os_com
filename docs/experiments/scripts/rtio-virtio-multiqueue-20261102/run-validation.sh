@@ -3,6 +3,33 @@
 set -euo pipefail
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+acquire_device_lock() {
+    local identity=$1 lock_path
+    [[ $identity =~ ^[0-9]+:[0-9]+$ ]] || {
+        echo "invalid verified device identity: $identity" >&2
+        return 2
+    }
+    lock_path="/run/lock/rtio-mq-${identity/:/-}.lock"
+    [[ ! -L $lock_path ]] || { echo "refusing symlink lock: $lock_path" >&2; return 2; }
+    # Keep a stable shared inode: never unlink it on release. The fd remains
+    # open through cleanup and optional post-guest e2fsck, across artifact roots.
+    exec {device_lock_fd}>> "$lock_path" || return 2
+    flock -n "$device_lock_fd" || {
+        echo "device $identity is already held by another validation run" >&2
+        exec {device_lock_fd}>&-
+        return 2
+    }
+}
+
+check_filesystem() {
+    local check_status=0
+    confirm_target_idle || return 2
+    docker run --rm --network none --device "$TARGET:/dev/benchmark-target:r" "$TOOLS_IMAGE" \
+        e2fsck -fn /dev/benchmark-target > "$ART/e2fsck.log" 2>&1 || check_status=$?
+    printf '%s\n' "$check_status" > "$ART/e2fsck.status" || return 2
+    [[ $check_status == 0 ]] || { echo "read-only e2fsck failed: $check_status" >&2; return 2; }
+}
+
 configure_queues() {
     case $1 in 1|4) QUEUES=$1 ;; *) echo "QUEUES must be 1 or 4" >&2; return 2 ;; esac
     iothread_args=()
@@ -231,6 +258,7 @@ TOOLS_IMAGE=${TOOLS_IMAGE:-os-com-recovery-tools:workspace-20261018}
 QEMU_BIN=${QEMU_BIN:-qemu-system-x86_64}
 configure_queues "${QUEUES:-4}"
 case ${FORMAT_TARGET:-0} in 0|1) ;; *) echo "FORMAT_TARGET must be 0 or 1" >&2; return 2 ;; esac
+case ${CHECK_FILESYSTEM:-0} in 0|1) ;; *) echo "CHECK_FILESYSTEM must be 0 or 1" >&2; return 2 ;; esac
 for file in selected.iso ext2.img exfat.img; do
     [[ -f "$SOURCE_ART/$file" ]] || { echo "missing input: $SOURCE_ART/$file" >&2; exit 2; }
 done
@@ -239,6 +267,7 @@ target_json=$(python3 "$SCRIPT_DIR/summarize.py" target-preflight "$TARGET")
 parent=$(python3 -c 'import json,sys; print(json.load(sys.stdin)["parent"])' <<< "$target_json")
 target_id=$(python3 -c 'import json,sys; print(json.load(sys.stdin)["target_major_minor"])' <<< "$target_json")
 parent_id=$(python3 -c 'import json,sys; print(json.load(sys.stdin)["parent_major_minor"])' <<< "$target_json")
+acquire_device_lock "$target_id" || return 2
 [[ -d "/sys/block/$parent/mq" ]] || { echo "missing NVMe mq sysfs map" >&2; exit 2; }
 allowed_cpus=$(taskset -pc $$ | sed 's/.*: //')
 
@@ -354,6 +383,9 @@ qemu_status=$(< "$ART/qemu-exit.txt")
     return 2
 }
 require_complete_trace "$ART/trace.wait-status.txt" "$ART/trace.raw" "$ART/hctx-counts.json"
+if [[ ${CHECK_FILESYSTEM:-0} == 1 ]]; then
+    check_filesystem || return 2
+fi
 python3 - "$ART/hctx-counts.json" "$QUEUES" <<'PY'
 import json
 import sys

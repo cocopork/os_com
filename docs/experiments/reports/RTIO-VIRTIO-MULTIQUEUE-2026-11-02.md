@@ -13,9 +13,10 @@ including-sync throughput regressed 46.9% with one job and 42.3% with 16 jobs.
 The 16-job sequential arm also increased cumulative submission and capacity-wait
 time relative to the previous four-worker/single-queue diagnostic. These
 results support keeping the multi-worker path experimental and the production
-default at one worker. The measured candidate at `936722960` still uses the
-queue-aware default; the policy correction is a separate follow-up, not a
-change to the measured binary.
+default at one worker. The measured candidate at `936722960` used the
+queue-aware default. The subsequent review fix restores the current default
+to one worker while preserving bounded explicit overrides; the fingerprinted
+measurement binary and its results are unchanged.
 
 ## Method and provenance
 
@@ -187,7 +188,7 @@ Known limitations retained from Task 6: QMP's deadline covers connection but
 not every greeting/reply read; the image digest is recorded while Docker
 execution still names a mutable tag. This run's per-point image IDs agree.
 
-## Reproduction
+## Reproduction of the retained historical image
 
 From the worktree, build in the stated container with the recorded profiling
 change, then copy/fingerprint the produced ISO and restore that source flag:
@@ -214,3 +215,25 @@ and all four arm points using `MATRIX_QUEUES`/`MATRIX_SPECS`, preserving the
 failed preflight and parsed successful first-control evidence. Future binaries
 with a one-worker default must explicitly select four workers for the arm;
 the implicit queue-aware selection above is specific to the measured source.
+For current source, prepare and fingerprint both worker-1 and worker-4 images
+before any measurements, adding `rtio_workers=1` or `rtio_workers=4` to the
+kernel command line. Run the wrapper twice with `MATRIX_QUEUES=1` and
+`MATRIX_QUEUES=4`, respectively, and matching `SOURCE_ART` directories; see the
+[harness README](../scripts/rtio-virtio-multiqueue-20261102/README.md).
+
+## Post-experiment review fixes
+
+The runtime default now remains one worker regardless of CPU or submission
+queue count. Explicit `rtio_workers=N` remains supported up to 16 and no more
+than the advertised queue count; native/WAL behavior stays at one worker.
+The policy ktest was updated and exercised using a host Rust adapter for its
+pure function; kernel and ktest package checks compile the integrated code.
+No new QEMU/device experiment is claimed for this correction.
+
+The standalone runner now acquires a common lock keyed by the verified target
+major:minor, independently of artifact root. The matrix requests read-only
+e2fsck inside the runner so the same lock covers formatting, QEMU, post-run
+checking and cleanup without nested lock acquisition. Non-destructive process
+fixtures prove that different roots cannot concurrently use the same device,
+distinct verified devices have separate locks, and a competitor is excluded
+during the mocked e2fsck. The retained eight-point evidence is unchanged.
