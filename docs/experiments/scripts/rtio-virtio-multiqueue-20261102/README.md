@@ -10,6 +10,10 @@ The real run requires an explicit named target. Only canonical
 `/dev/nvme1n1p1` and `/dev/nvme1n1p2` are accepted. Preflight checks the actual
 host major:minor against lsblk, exact 256 GiB size, `nvme1n1` parent, sysfs
 holders and block descendants, mounted identities, active swap, and open users.
+Before QEMU receives the partition, a scoped privileged helper with the host
+PID namespace and read-only host-root bind repeats the open-user check as host
+root. It verifies UID mapping and records `fuser` diagnostics in
+`open-users-root.log`; an unavailable helper or ambiguous result aborts.
 The selected partition is passed raw to QEMU and may be overwritten by the
 guest. This task does not run the real mode.
 
@@ -46,10 +50,13 @@ dedicated PCIe root port permits that QMP hotplug. The runner saves and pins
 all four IOThreads and attaches the trace before QMP `cont` starts guest I/O.
 While QEMU remains paused, one bounded 4 KiB direct read of the authorized
 target must cause `READY parent=nvme1n1` from the filtered `nvme_queue_rq`
-handler. This readiness request is included in the raw trace and hctx counts.
+handler. Attachment banner text and probe count are ignored. This readiness
+request is included in the raw trace and hctx counts.
 The tracer must survive until the guest exits. It receives SIGINT for controlled
 stop; exit status 0 and a final map boundary are required. Logs, inspect data,
 and wait statuses are retained before container removal even on failure.
+If any capture fails, the stopped container is retained and its name and
+manual `docker logs`/`inspect`/`wait` recovery steps are printed.
 `hctx-counts.json` preserves raw hardware-context IDs and counts. Its
 `accepted` value requires at least four active hctx and a maximum share of
 70% of traced requests. This is only the host mechanism gate; it does not

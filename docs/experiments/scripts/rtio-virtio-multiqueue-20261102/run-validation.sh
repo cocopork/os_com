@@ -52,6 +52,38 @@ confirm_docker_identity() {
     }
 }
 
+authoritative_open_user_check() {
+    local target=$1 parent=$2 status
+    confirm_docker_identity || return 2
+    if docker run --rm --privileged --pid=host --network none -v /:/host:ro "$TOOLS_IMAGE" \
+        chroot /host /bin/sh -c '
+            [ "$(/usr/bin/id -u)" = 0 ] || exit 126
+            read container_uid host_uid mapping_span < /proc/self/uid_map || exit 126
+            [ "$container_uid" = 0 ] && [ "$host_uid" = 0 ] || exit 126
+            printf "ROOT_FUSER_EXECUTED\n"
+            if /usr/bin/fuser -s -- "$1" "$2"; then
+                /usr/bin/fuser -v -- "$1" "$2" >&2 || true
+                exit 0
+            else
+                status=$?
+                exit "$status"
+            fi
+        ' sh "$target" "/dev/$parent" > "$ART/open-users-root.log" 2>&1; then
+        status=0
+    else
+        status=$?
+    fi
+    rg -Fxq 'ROOT_FUSER_EXECUTED' "$ART/open-users-root.log" || {
+        echo "authoritative root fuser did not execute; see $ART/open-users-root.log" >&2
+        return 2
+    }
+    case $status in
+        1) return 0 ;;
+        0) echo "target or parent is in use; see $ART/open-users-root.log" >&2; return 2 ;;
+        *) echo "authoritative root fuser failed ($status); see $ART/open-users-root.log" >&2; return 2 ;;
+    esac
+}
+
 trigger_ready_read() {
     local target=$1
     confirm_docker_identity || return 2
@@ -61,15 +93,10 @@ trigger_ready_read() {
 
 wait_trace_ready() {
     local trace_name=$1 parent=$2 target=$3 attempt
-    for attempt in {1..50}; do
-        [[ $(docker inspect -f '{{.State.Running}}' "$trace_name") == true ]] || return 2
-        docker logs "$trace_name" > "$ART/trace.startup.log" 2>&1 || return 2
-        if rg -q '^Attaching 1 probe' "$ART/trace.startup.log"; then
-            break
-        fi
-        sleep 0.1
-    done
-    [[ $attempt -lt 50 ]] || return 2
+    [[ $(docker inspect -f '{{.State.Running}}' "$trace_name") == true ]] || return 2
+    docker logs "$trace_name" > "$ART/trace.startup.log" 2>&1 || return 2
+    sleep 1
+    [[ $(docker inspect -f '{{.State.Running}}' "$trace_name") == true ]] || return 2
     trigger_ready_read "$target" || return 2
     for attempt in {1..50}; do
         [[ $(docker inspect -f '{{.State.Running}}' "$trace_name") == true ]] || return 2
@@ -115,31 +142,59 @@ require_complete_trace() {
     python3 "$SCRIPT_DIR/summarize.py" trace-counts "$raw_file" > "$counts_file"
 }
 
+capture_and_remove() {
+    local name=$1 log_file=$2 inspect_file=$3 wait_file=$4 finalized=$5
+    local log_status=0 inspect_status=0 wait_status=0
+    local running
+    running=$(docker inspect -f '{{.State.Running}}' "$name") || running=unknown
+    if [[ $running != false ]]; then
+        echo "retaining container $name: state is $running; stop it and recover with docker logs/inspect/wait before docker rm" >&2
+        return 2
+    fi
+    if [[ $finalized -eq 0 ]]; then
+        docker logs "$name" > "$log_file" 2>&1 || log_status=$?
+        docker inspect "$name" > "$inspect_file" 2>&1 || inspect_status=$?
+        docker wait "$name" > "$wait_file" 2>&1 || wait_status=$?
+    fi
+    if [[ $log_status -ne 0 || $inspect_status -ne 0 || $wait_status -ne 0 || ! -f $log_file || ! -s $inspect_file || ! -s $wait_file ]]; then
+        echo "retaining stopped container $name: evidence capture failed; recover with docker logs $name, docker inspect $name, and docker wait $name before docker rm $name" >&2
+        return 2
+    fi
+    docker rm "$name" >/dev/null 2>&1 || {
+        echo "retaining stopped container $name: docker rm failed; inspect it manually" >&2
+        return 2
+    }
+}
+
 cleanup() {
     local result=$?
     trap - EXIT
     set +e
-    if docker inspect "$trace_name" >/dev/null 2>&1; then
-        if [[ $trace_finalized -eq 0 ]]; then
-            if [[ $(docker inspect -f '{{.State.Running}}' "$trace_name") == true ]]; then
-                docker stop --signal=INT "$trace_name" >/dev/null 2>&1
-            fi
-            docker logs "$trace_name" > "$ART/trace.raw" 2>&1
-            docker inspect "$trace_name" > "$ART/trace.inspect.json" 2>&1
-            docker wait "$trace_name" > "$ART/trace.wait-status.txt" 2>&1
-        fi
-        docker rm "$trace_name" >/dev/null 2>&1
-    fi
-    if docker inspect "$qemu_name" >/dev/null 2>&1; then
-        if [[ $qemu_finalized -eq 0 ]]; then
+    if [[ $qemu_created -eq 1 ]]; then
+        if docker inspect "$qemu_name" >/dev/null 2>&1; then
             if [[ $(docker inspect -f '{{.State.Running}}' "$qemu_name") == true ]]; then
-                docker stop --signal=TERM "$qemu_name" >/dev/null 2>&1
+                docker stop --signal=TERM "$qemu_name" >/dev/null 2>&1 || docker kill "$qemu_name" >/dev/null 2>&1
             fi
-            docker logs "$qemu_name" > "$ART/qemu.log" 2>&1
-            docker inspect "$qemu_name" > "$ART/qemu.inspect.json" 2>&1
-            docker wait "$qemu_name" > "$ART/qemu-exit.txt" 2>&1
+        else
+            echo "cannot inspect $qemu_name; retain it if present and recover with docker logs/inspect/wait before docker rm" >&2
+            result=2
         fi
-        docker rm "$qemu_name" >/dev/null 2>&1
+    fi
+    if [[ $trace_created -eq 1 ]]; then
+        if docker inspect "$trace_name" >/dev/null 2>&1; then
+            if [[ $(docker inspect -f '{{.State.Running}}' "$trace_name") == true ]]; then
+                docker stop --signal=INT "$trace_name" >/dev/null 2>&1 || docker kill "$trace_name" >/dev/null 2>&1
+            fi
+        else
+            echo "cannot inspect $trace_name; retain it if present and recover with docker logs/inspect/wait before docker rm" >&2
+            result=2
+        fi
+    fi
+    if [[ $trace_created -eq 1 ]] && docker inspect "$trace_name" >/dev/null 2>&1; then
+        capture_and_remove "$trace_name" "$ART/trace.raw" "$ART/trace.inspect.json" "$ART/trace.wait-status.txt" "$trace_finalized" || result=2
+    fi
+    if [[ $qemu_created -eq 1 ]] && docker inspect "$qemu_name" >/dev/null 2>&1; then
+        capture_and_remove "$qemu_name" "$ART/qemu.log" "$ART/qemu.inspect.json" "$ART/qemu-exit.txt" "$qemu_finalized" || result=2
     fi
     exit "$result"
 }
@@ -189,9 +244,14 @@ qemu_name="rtio-mq-qemu-$$"
 trace_name="rtio-mq-trace-$$"
 qemu_finalized=0
 trace_finalized=0
+qemu_created=0
+trace_created=0
 trap cleanup EXIT
 
 confirm_docker_identity || return 2
+authoritative_open_user_check "$TARGET" "$parent" || return 2
+confirm_docker_identity || return 2
+qemu_created=1
 docker run -d --name "$qemu_name" --pid=host --network none \
     --device /dev/kvm --device "$TARGET:/dev/benchmark-target:rwm" \
     -v "$ART:/benchmark" -w /benchmark "$TOOLS_IMAGE" \
@@ -236,6 +296,7 @@ rg -Fxq 'kprobe:nvme_queue_rq' "$ART/probe-symbols.txt" || {
     echo "nvme_queue_rq probe symbol unavailable" >&2
     exit 2
 }
+trace_created=1
 docker run -d --name "$trace_name" --privileged --pid=host --network none \
     -v /:/host:ro "$TOOLS_IMAGE" \
     chroot /host /usr/bin/bpftrace "$ART/trace-nvme-hctx.bt" > "$ART/trace-container-id.txt"

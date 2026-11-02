@@ -47,10 +47,31 @@ docker_local_preflight() { echo 'unix:///tmp/fake.sock daemon-B'; }
 expect_rejected confirm_docker_identity
 docker_local_preflight() { echo "$docker_identity"; }
 confirm_docker_identity
+TOOLS_IMAGE=fixture-tools
+root_fuser_status=0
+root_fuser_marker=1
+docker() {
+    case "$*" in
+        *'run --rm --privileged --pid=host --network none -v /:/host:ro'*'chroot /host /bin/sh'*'/proc/self/uid_map'*)
+            [[ $root_fuser_marker == 1 ]] && echo ROOT_FUSER_EXECUTED
+            return "$root_fuser_status" ;;
+        *) return 125 ;;
+    esac
+}
+declare -F authoritative_open_user_check >/dev/null || fail "missing authoritative open-user check"
+expect_rejected authoritative_open_user_check /dev/nvme1n1p1 nvme1n1
+root_fuser_status=1
+authoritative_open_user_check /dev/nvme1n1p1 nvme1n1
+root_fuser_marker=0
+expect_rejected authoritative_open_user_check /dev/nvme1n1p1 nvme1n1
+root_fuser_marker=1
+root_fuser_status=125
+expect_rejected authoritative_open_user_check /dev/nvme1n1p1 nvme1n1
+sleep() { :; }
 
 docker() {
     case "$*" in
-        'logs trace') printf 'Attaching 1 probe...\nBEGIN\n@hctx[0]: 10\n@hctx[1]: 10\n@hctx[2]: 10\n@hctx[3]: 10\n' ;;
+        'logs trace') printf 'Attaching 2 probes...\nBEGIN\n@hctx[0]: 10\n@hctx[1]: 10\n@hctx[2]: 10\n@hctx[3]: 10\n' ;;
         *'inspect -f '*'.State.Running'*' trace') echo false ;;
         *) return 1 ;;
     esac
@@ -62,7 +83,7 @@ expect_rejected gate_guest_on_trace trace nvme1n1 /dev/nvme1n1p1
 
 docker() {
     case "$*" in
-        'logs trace') printf 'Attaching 1 probe...\nREADY parent=nvme1n1\n' ;;
+        'logs trace') printf 'Attaching 2 probes...\nREADY parent=nvme1n1\n' ;;
         *'inspect -f '*'.State.Running'*' trace') echo true ;;
         *) return 1 ;;
     esac
@@ -101,6 +122,8 @@ PY
     trace_name=trace
     qemu_finalized=0
     trace_finalized=0
+    qemu_created=1
+    trace_created=1
     docker() {
         case "$1" in
             inspect)
@@ -116,4 +139,51 @@ PY
     cleanup
 )
 [[ -s "$test_root/capture/trace.raw" && -s "$test_root/capture/qemu.log" ]] || fail "failure evidence missing"
+
+(
+    ART="$test_root/capture-failure"
+    mkdir "$ART"
+    qemu_name=qemu
+    trace_name=trace
+    qemu_finalized=0
+    trace_finalized=0
+    qemu_created=1
+    trace_created=1
+    docker() {
+        case "$1" in
+            inspect)
+                if [[ ${2:-} == -f ]]; then echo false; else echo '{"State":{"ExitCode":1}}'; fi ;;
+            logs)
+                if [[ $2 == trace ]]; then echo 'partial trace'; return 7; fi
+                echo 'qemu log' ;;
+            wait) echo 1 ;;
+            rm) echo "$2" >> "$ART/removed" ;;
+            *) return 1 ;;
+        esac
+    }
+    cleanup
+) 2> "$test_root/capture-failure.stderr" && fail "cleanup accepted missing trace logs"
+[[ ! -e "$test_root/capture-failure/removed" || $(< "$test_root/capture-failure/removed") != *trace* ]] || fail "removed tracer after failed capture"
+rg -q 'trace' "$test_root/capture-failure.stderr" || fail "missing retained-container recovery diagnostics"
+
+(
+    ART="$test_root/inspect-failure"
+    mkdir "$ART"
+    qemu_name=qemu
+    trace_name=trace
+    qemu_finalized=0
+    trace_finalized=0
+    qemu_created=1
+    trace_created=1
+    docker() {
+        case "$1" in
+            inspect) return 1 ;;
+            rm) echo "$2" >> "$ART/removed" ;;
+            *) return 1 ;;
+        esac
+    }
+    cleanup
+) 2> "$test_root/inspect-failure.stderr" && fail "cleanup accepted inaccessible container state"
+[[ ! -e "$test_root/inspect-failure/removed" ]] || fail "removed container without inspect"
+rg -q 'trace' "$test_root/inspect-failure.stderr" || fail "missing inspect-failure recovery diagnostics"
 echo "shell orchestration fixtures passed"
