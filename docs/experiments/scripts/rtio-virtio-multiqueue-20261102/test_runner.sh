@@ -50,23 +50,29 @@ confirm_docker_identity
 TOOLS_IMAGE=fixture-tools
 root_fuser_status=0
 root_fuser_marker=1
+root_fuser_stderr=
 docker() {
     case "$*" in
-        *'run --rm --privileged --pid=host --network none -v /:/host:ro'*'chroot /host /bin/sh'*'/proc/self/uid_map'*)
-            [[ $root_fuser_marker == 1 ]] && echo ROOT_FUSER_EXECUTED
+        *'run --rm --privileged --pid=host --userns=host --network none -v /:/host:ro'*'chroot /host /usr/bin/python3'*'root_fuser_check.py'*)
+            : > "$ART/open-users-root.stdout"
+            printf '%s' "$root_fuser_stderr" > "$ART/open-users-root.stderr"
+            [[ $root_fuser_marker == 1 ]] && echo ROOT_FUSER_IDENTITY_VALIDATED
             return "$root_fuser_status" ;;
         *) return 125 ;;
     esac
 }
 declare -F authoritative_open_user_check >/dev/null || fail "missing authoritative open-user check"
-expect_rejected authoritative_open_user_check /dev/nvme1n1p1 nvme1n1
+expect_rejected authoritative_open_user_check /dev/nvme1n1p1 nvme1n1 259:1 259:0
 root_fuser_status=1
-authoritative_open_user_check /dev/nvme1n1p1 nvme1n1
+authoritative_open_user_check /dev/nvme1n1p1 nvme1n1 259:1 259:0
+root_fuser_stderr='lookup failed'
+expect_rejected authoritative_open_user_check /dev/nvme1n1p1 nvme1n1 259:1 259:0
+root_fuser_stderr=
 root_fuser_marker=0
-expect_rejected authoritative_open_user_check /dev/nvme1n1p1 nvme1n1
+expect_rejected authoritative_open_user_check /dev/nvme1n1p1 nvme1n1 259:1 259:0
 root_fuser_marker=1
 root_fuser_status=125
-expect_rejected authoritative_open_user_check /dev/nvme1n1p1 nvme1n1
+expect_rejected authoritative_open_user_check /dev/nvme1n1p1 nvme1n1 259:1 259:0
 sleep() { :; }
 
 docker() {
@@ -91,6 +97,64 @@ docker() {
 qemu_name=qemu
 gate_guest_on_trace trace nvme1n1 /dev/nvme1n1p1
 [[ $(< "$test_root/events") == *read*cont* ]] || fail "readiness did not precede guest resume"
+
+readiness_reads=0
+trigger_ready_read() { readiness_reads=$((readiness_reads + 1)); echo read >> "$test_root/events"; }
+docker() {
+    case "$*" in
+        'logs trace')
+            printf 'Attaching 2 probes...\n'
+            if [[ $readiness_reads -ge 2 ]]; then printf 'READY parent=nvme1n1\n'; fi ;;
+        *'inspect -f '*'.State.Running'*' trace') echo true ;;
+        *) return 1 ;;
+    esac
+}
+gate_guest_on_trace trace nvme1n1 /dev/nvme1n1p1
+[[ $readiness_reads -eq 2 ]] || fail "delayed attachment did not retry the direct read"
+python3 - "$ART/readiness-reads.json" <<'PY' || fail "read count evidence missing"
+import json
+import sys
+assert json.load(open(sys.argv[1]))["read_count"] == 2
+PY
+cont_before=$(rg -c '^cont$' "$test_root/events")
+
+readiness_reads=0
+docker() {
+    case "$*" in
+        'logs trace') printf 'Attaching 2 probes...\n' ;;
+        *'inspect -f '*'.State.Running'*' trace') echo true ;;
+        *) return 1 ;;
+    esac
+}
+expect_rejected gate_guest_on_trace trace nvme1n1 /dev/nvme1n1p1
+[[ $readiness_reads -ge 2 && $readiness_reads -le 5 ]] || fail "readiness retry was not bounded"
+[[ $(rg -c '^cont$' "$test_root/events") == "$cont_before" ]] || fail "resumed after readiness timeout"
+
+readiness_reads=0
+docker() {
+    case "$*" in
+        'logs trace') printf 'Attaching 2 probes...\n' ;;
+        *'inspect -f '*'.State.Running'*' trace')
+            [[ $readiness_reads -eq 0 ]] && echo true || echo false ;;
+        *) return 1 ;;
+    esac
+}
+expect_rejected gate_guest_on_trace trace nvme1n1 /dev/nvme1n1p1
+[[ $(rg -c '^cont$' "$test_root/events") == "$cont_before" ]] || fail "resumed after tracer early exit"
+
+previous_art=$ART
+ART="$test_root/evidence-write-failure"
+mkdir "$ART" "$ART/readiness-reads.json"
+docker() {
+    case "$*" in
+        'logs trace') printf 'READY parent=nvme1n1\n' ;;
+        *'inspect -f '*'.State.Running'*' trace') echo true ;;
+        *) return 1 ;;
+    esac
+}
+expect_rejected gate_guest_on_trace trace nvme1n1 /dev/nvme1n1p1
+[[ $(rg -c '^cont$' "$test_root/events") == "$cont_before" ]] || fail "resumed without readiness-read evidence"
+ART=$previous_art
 
 docker() {
     case "$*" in

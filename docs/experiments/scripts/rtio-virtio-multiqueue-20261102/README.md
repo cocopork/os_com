@@ -11,9 +11,12 @@ The real run requires an explicit named target. Only canonical
 host major:minor against lsblk, exact 256 GiB size, `nvme1n1` parent, sysfs
 holders and block descendants, mounted identities, active swap, and open users.
 Before QEMU receives the partition, a scoped privileged helper with the host
-PID namespace and read-only host-root bind repeats the open-user check as host
-root. It verifies UID mapping and records `fuser` diagnostics in
-`open-users-root.log`; an unavailable helper or ambiguous result aborts.
+PID and user namespaces and read-only host-root bind repeats the open-user
+check as host root. It verifies UID 0 maps to host UID 0 with a positive span,
+then validates both block nodes against the preflight major:minor identities.
+The helper records `fuser` stdout and stderr separately; only status 1 with
+empty stderr and validated identities means no open users. An unavailable
+helper or ambiguous result aborts.
 The selected partition is passed raw to QEMU and may be overwritten by the
 guest. This task does not run the real mode.
 
@@ -48,10 +51,13 @@ The VM starts paused. QMP `device_add` passes a structured JSON
 `iothread-vq-mapping` with virtqueue `i` assigned only to `iothread<i>`; a
 dedicated PCIe root port permits that QMP hotplug. The runner saves and pins
 all four IOThreads and attaches the trace before QMP `cont` starts guest I/O.
-While QEMU remains paused, one bounded 4 KiB direct read of the authorized
-target must cause `READY parent=nvme1n1` from the filtered `nvme_queue_rq`
-handler. Attachment banner text and probe count are ignored. This readiness
-request is included in the raw trace and hctx counts.
+While QEMU remains paused, the runner issues up to five bounded 4 KiB direct
+reads of the authorized target under a 20-second deadline, stopping when the
+filtered `nvme_queue_rq` handler emits `READY parent=nvme1n1`. Attachment
+banner text and probe count are ignored. `readiness-reads.json` records
+attempted and completed reads. Reads made after probe attachment contribute to
+the raw trace and hctx counts; a read missed during attachment remains recorded
+in `readiness-reads.json` but cannot appear in the trace.
 The tracer must survive until the guest exits. It receives SIGINT for controlled
 stop; exit status 0 and a final map boundary are required. Logs, inspect data,
 and wait statuses are retained before container removal even on failure.

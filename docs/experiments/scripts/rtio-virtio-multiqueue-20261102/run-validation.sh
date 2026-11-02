@@ -53,28 +53,22 @@ confirm_docker_identity() {
 }
 
 authoritative_open_user_check() {
-    local target=$1 parent=$2 status
+    local target=$1 parent=$2 target_id=$3 parent_id=$4 status
     confirm_docker_identity || return 2
-    if docker run --rm --privileged --pid=host --network none -v /:/host:ro "$TOOLS_IMAGE" \
-        chroot /host /bin/sh -c '
-            [ "$(/usr/bin/id -u)" = 0 ] || exit 126
-            read container_uid host_uid mapping_span < /proc/self/uid_map || exit 126
-            [ "$container_uid" = 0 ] && [ "$host_uid" = 0 ] || exit 126
-            printf "ROOT_FUSER_EXECUTED\n"
-            if /usr/bin/fuser -s -- "$1" "$2"; then
-                /usr/bin/fuser -v -- "$1" "$2" >&2 || true
-                exit 0
-            else
-                status=$?
-                exit "$status"
-            fi
-        ' sh "$target" "/dev/$parent" > "$ART/open-users-root.log" 2>&1; then
+    if docker run --rm --privileged --pid=host --userns=host --network none -v /:/host:ro "$TOOLS_IMAGE" \
+        chroot /host /usr/bin/python3 "$ART/root_fuser_check.py" "$target" "/dev/$parent" \
+        "$target_id" "$parent_id" "$ART/open-users-root.stdout" "$ART/open-users-root.stderr" \
+        > "$ART/open-users-root.log" 2>&1; then
         status=0
     else
         status=$?
     fi
-    rg -Fxq 'ROOT_FUSER_EXECUTED' "$ART/open-users-root.log" || {
+    rg -Fxq 'ROOT_FUSER_IDENTITY_VALIDATED' "$ART/open-users-root.log" || {
         echo "authoritative root fuser did not execute; see $ART/open-users-root.log" >&2
+        return 2
+    }
+    [[ -f $ART/open-users-root.stdout && -f $ART/open-users-root.stderr && ! -s $ART/open-users-root.stderr ]] || {
+        echo "root fuser output is missing or stderr is nonempty; see $ART/open-users-root.stderr" >&2
         return 2
     }
     case $status in
@@ -85,20 +79,22 @@ authoritative_open_user_check() {
 }
 
 trigger_ready_read() {
-    local target=$1
+    local target=$1 timeout_seconds=${2:-15}
     confirm_docker_identity || return 2
-    timeout 15 docker run --rm --network none --device "$target:/dev/readiness:r" \
+    timeout "$timeout_seconds" docker run --rm --network none --device "$target:/dev/readiness:r" \
         "$TOOLS_IMAGE" dd if=/dev/readiness of=/dev/null bs=4096 count=1 iflag=direct status=none
 }
 
 wait_trace_ready() {
-    local trace_name=$1 parent=$2 target=$3 attempt
-    [[ $(docker inspect -f '{{.State.Running}}' "$trace_name") == true ]] || return 2
-    docker logs "$trace_name" > "$ART/trace.startup.log" 2>&1 || return 2
-    sleep 1
-    [[ $(docker inspect -f '{{.State.Running}}' "$trace_name") == true ]] || return 2
-    trigger_ready_read "$target" || return 2
-    for attempt in {1..50}; do
+    local trace_name=$1 parent=$2 target=$3 attempt remaining deadline=$((SECONDS + 20))
+    printf '{"parent":"%s","read_count":0,"read_attempts":0,"bytes_per_read":4096}\n' "$parent" > "$ART/readiness-reads.json" || return 2
+    for attempt in {1..5}; do
+        [[ $(docker inspect -f '{{.State.Running}}' "$trace_name") == true ]] || return 2
+        remaining=$((deadline - SECONDS))
+        ((remaining > 0)) || break
+        printf '{"parent":"%s","read_count":%d,"read_attempts":%d,"bytes_per_read":4096}\n' "$parent" "$((attempt - 1))" "$attempt" > "$ART/readiness-reads.json" || return 2
+        trigger_ready_read "$target" "$remaining" || return 2
+        printf '{"parent":"%s","read_count":%d,"read_attempts":%d,"bytes_per_read":4096}\n' "$parent" "$attempt" "$attempt" > "$ART/readiness-reads.json" || return 2
         [[ $(docker inspect -f '{{.State.Running}}' "$trace_name") == true ]] || return 2
         docker logs "$trace_name" > "$ART/trace.startup.log" 2>&1 || return 2
         if rg -Fxq "READY parent=$parent" "$ART/trace.startup.log"; then
@@ -201,7 +197,7 @@ cleanup() {
 
 main() {
 if [[ ${1:-} == --self-test && $# -eq 1 ]]; then
-    python3 -m unittest discover -s "$SCRIPT_DIR" -p test_harness.py -v
+    python3 -m unittest discover -s "$SCRIPT_DIR" -p 'test_*.py' -v
     bash "$SCRIPT_DIR/test_runner.sh"
     return
 fi
@@ -218,6 +214,8 @@ done
 
 target_json=$(python3 "$SCRIPT_DIR/summarize.py" target-preflight "$TARGET")
 parent=$(python3 -c 'import json,sys; print(json.load(sys.stdin)["parent"])' <<< "$target_json")
+target_id=$(python3 -c 'import json,sys; print(json.load(sys.stdin)["target_major_minor"])' <<< "$target_json")
+parent_id=$(python3 -c 'import json,sys; print(json.load(sys.stdin)["parent_major_minor"])' <<< "$target_json")
 [[ -d "/sys/block/$parent/mq" ]] || { echo "missing NVMe mq sysfs map" >&2; exit 2; }
 allowed_cpus=$(taskset -pc $$ | sed 's/.*: //')
 
@@ -227,6 +225,7 @@ for file in selected.iso ext2.img exfat.img; do
     cp --reflink=auto -- "$SOURCE_ART/$file" "$ART/$file"
 done
 cp -- "$SCRIPT_DIR/summarize.py" "$ART/summarize.py"
+cp -- "$SCRIPT_DIR/root_fuser_check.py" "$ART/root_fuser_check.py"
 sha256sum "$ART"/{selected.iso,ext2.img,exfat.img} > "$ART/input.sha256"
 docker_identity=$(docker_local_preflight)
 printf '%s\n' "$docker_identity" > "$ART/docker-daemon.txt"
@@ -249,7 +248,7 @@ trace_created=0
 trap cleanup EXIT
 
 confirm_docker_identity || return 2
-authoritative_open_user_check "$TARGET" "$parent" || return 2
+authoritative_open_user_check "$TARGET" "$parent" "$target_id" "$parent_id" || return 2
 confirm_docker_identity || return 2
 qemu_created=1
 docker run -d --name "$qemu_name" --pid=host --network none \
