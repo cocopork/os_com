@@ -182,6 +182,7 @@ impl BlockDevice for Ext4MemoryDisk {
         BlockDeviceMeta {
             max_nr_segments_per_bio: usize::MAX,
             nr_sectors: self.segment.size() / SECTOR_SIZE,
+            nr_submission_queues: 1,
         }
     }
 

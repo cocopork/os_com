@@ -245,6 +245,8 @@ impl From<SubmittedBio> for BioRequest {
 
 #[cfg(ktest)]
 mod tests {
+    use alloc::boxed::Box;
+
     use ::device_id::{DeviceId, MajorId, MinorId};
     use io_util::batch::IoBatch;
     use ostd::prelude::*;
@@ -252,7 +254,8 @@ mod tests {
     use super::*;
     use crate::{
         BlockDevice, BlockDeviceMeta,
-        bio::{Bio, BioDirection, BioSegment, BioStatus},
+        bio::{Bio, BioDirection, BioQueueAffinity, BioSegment, BioStatus},
+        id::Bid,
     };
 
     #[derive(Debug)]
@@ -266,6 +269,7 @@ mod tests {
             BlockDeviceMeta {
                 max_nr_segments_per_bio: self.0.max_nr_segments_per_bio(),
                 nr_sectors: 4096,
+                nr_submission_queues: 1,
             }
         }
         fn name(&self) -> &str {
@@ -301,5 +305,73 @@ mod tests {
                 assert_eq!(device.0.num_requests(), 0);
             }
         }
+    }
+
+    #[ktest]
+    fn bio_queue_affinity_defaults_to_any() {
+        let device = QueueDevice(BioRequestSingleQueue::new());
+        let mut batch = IoBatch::new();
+        Bio::new(BioType::Flush, Sid::new(0), vec![], None)
+            .submit(&device, &mut batch)
+            .unwrap();
+        let request = device.0.dequeue();
+        let bio = request.into_bios().next().unwrap();
+        assert_eq!(bio.queue_affinity(), BioQueueAffinity::Any);
+        bio.complete(BioStatus::Complete);
+
+        Bio::new_on_queue(
+            BioType::Flush,
+            Sid::new(0),
+            vec![],
+            None,
+            BioQueueAffinity::Queue(0),
+        )
+        .submit(&device, &mut batch)
+        .unwrap();
+        let request = device.0.dequeue();
+        let bio = request.into_bios().next().unwrap();
+        assert_eq!(bio.queue_affinity(), BioQueueAffinity::Queue(0));
+        bio.complete(BioStatus::Complete);
+    }
+
+    #[ktest]
+    fn strict_queue_rejection_does_not_enqueue_or_complete() {
+        let device = QueueDevice(BioRequestSingleQueue::new());
+        let completed = Arc::new(AtomicUsize::new(0));
+        let completed_for_callback = completed.clone();
+        let bio = Bio::new_on_queue(
+            BioType::Flush,
+            Sid::new(0),
+            vec![],
+            Some(Box::new(move |_| {
+                completed_for_callback.fetch_add(1, Ordering::Relaxed);
+            })),
+            BioQueueAffinity::Queue(1),
+        );
+        let mut batch = IoBatch::new();
+        assert!(matches!(
+            bio.submit(&device, &mut batch),
+            Err(BioEnqueueError::InvalidQueue)
+        ));
+        assert_eq!(device.0.num_requests(), 0);
+        assert_eq!(completed.load(Ordering::Relaxed), 0);
+        assert_eq!(batch.len(), 0);
+
+        let completed_for_callback = completed.clone();
+        assert!(matches!(
+            (&device as &dyn BlockDevice).write_segments_on_queue_async(
+                Bid::from_offset(0),
+                vec![],
+                BioQueueAffinity::Queue(1),
+                Some(Box::new(move |_| {
+                    completed_for_callback.fetch_add(1, Ordering::Relaxed);
+                })),
+                &mut batch,
+            ),
+            Err(BioEnqueueError::InvalidQueue)
+        ));
+        assert_eq!(device.0.num_requests(), 0);
+        assert_eq!(completed.load(Ordering::Relaxed), 0);
+        assert_eq!(batch.len(), 0);
     }
 }

@@ -232,6 +232,9 @@ impl From<aster_block::bio::BioEnqueueError> for Error {
             aster_block::bio::BioEnqueueError::TooBig => {
                 Error::with_message(Errno::EINVAL, "Bio is too big")
             }
+            aster_block::bio::BioEnqueueError::InvalidQueue => {
+                Error::with_message(Errno::EINVAL, "Invalid bio submission queue")
+            }
         }
     }
 }

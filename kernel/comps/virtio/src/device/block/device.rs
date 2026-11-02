@@ -141,6 +141,7 @@ impl aster_block::BlockDevice for BlockDevice {
         BlockDeviceMeta {
             max_nr_segments_per_bio: self.queue.max_nr_segments_per_bio(),
             nr_sectors: self.device.config_manager.capacity_sectors(),
+            nr_submission_queues: 1,
         }
     }
 

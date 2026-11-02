@@ -59,6 +59,23 @@ impl Bio {
         segments: Vec<BioSegment>,
         complete_fn: Option<BioCompleteFn>,
     ) -> Self {
+        Self::new_on_queue(
+            type_,
+            start_sid,
+            segments,
+            complete_fn,
+            BioQueueAffinity::Any,
+        )
+    }
+
+    /// Constructs a `Bio` with a submission queue affinity.
+    pub fn new_on_queue(
+        type_: BioType,
+        start_sid: Sid,
+        segments: Vec<BioSegment>,
+        complete_fn: Option<BioCompleteFn>,
+        queue_affinity: BioQueueAffinity,
+    ) -> Self {
         let nsectors = segments
             .iter()
             .map(|segment| segment.nsectors().to_raw())
@@ -67,6 +84,7 @@ impl Bio {
         let metadata = Arc::new(BioMetadata {
             type_,
             sid_range: start_sid..start_sid + nsectors,
+            queue_affinity,
             status: AtomicU32::new(BioStatus::Init as u32),
             wait_queue: WaitQueue::new(),
         });
@@ -112,6 +130,12 @@ impl Bio {
         block_device: &dyn BlockDevice,
         io_batch: &mut IoBatch,
     ) -> Result<(), BioEnqueueError> {
+        if let BioQueueAffinity::Queue(queue_id) = self.metadata.queue_affinity
+            && queue_id >= block_device.metadata().nr_submission_queues
+        {
+            return Err(BioEnqueueError::InvalidQueue);
+        }
+
         let Self {
             metadata,
             complete_fn,
@@ -169,6 +193,15 @@ impl Bio {
     }
 }
 
+/// The submission queue selected for a `Bio`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BioQueueAffinity {
+    /// Lets the block device select a queue.
+    Any,
+    /// Requires submission through the specified queue.
+    Queue(u16),
+}
+
 impl Debug for Bio {
     fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
         f.debug_struct("Bio")
@@ -187,6 +220,8 @@ pub enum BioEnqueueError {
     Refused,
     /// Too big bio
     TooBig,
+    /// The requested submission queue is not available.
+    InvalidQueue,
 }
 
 impl From<BioEnqueueError> for Error {
@@ -209,6 +244,11 @@ impl SubmittedBio {
     /// Returns the type.
     pub fn type_(&self) -> BioType {
         self.metadata.type_()
+    }
+
+    /// Returns the requested submission queue affinity.
+    pub fn queue_affinity(&self) -> BioQueueAffinity {
+        self.metadata.queue_affinity
     }
 
     /// Returns the range of target sectors on the device.
@@ -283,6 +323,8 @@ struct BioMetadata {
     type_: BioType,
     /// The logical range of target sectors on device
     sid_range: Range<Sid>,
+    /// The requested submission queue.
+    queue_affinity: BioQueueAffinity,
     /// The I/O status
     status: AtomicU32,
     /// The wait queue for I/O completion

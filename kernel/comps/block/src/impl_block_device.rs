@@ -6,7 +6,7 @@ use ostd::mm::{VmIo, VmReader, VmWriter};
 
 use super::{
     BLOCK_SIZE, BlockDevice, SECTOR_SIZE,
-    bio::{Bio, BioCompleteFn, BioEnqueueError, BioSegment, BioStatus, BioType},
+    bio::{Bio, BioCompleteFn, BioEnqueueError, BioQueueAffinity, BioSegment, BioStatus, BioType},
     id::{Bid, Sid},
 };
 use crate::{
@@ -120,6 +120,25 @@ impl dyn BlockDevice {
         io_batch: &mut IoBatch,
     ) -> Result<(), BioEnqueueError> {
         let bio = Bio::new(BioType::Write, Sid::from(bid), segments, complete_fn);
+        bio.submit(self, io_batch)
+    }
+
+    /// Asynchronously writes segments through the requested submission queue.
+    pub fn write_segments_on_queue_async(
+        &self,
+        bid: Bid,
+        segments: Vec<BioSegment>,
+        affinity: BioQueueAffinity,
+        complete_fn: Option<BioCompleteFn>,
+        io_batch: &mut IoBatch,
+    ) -> Result<(), BioEnqueueError> {
+        let bio = Bio::new_on_queue(
+            BioType::Write,
+            Sid::from(bid),
+            segments,
+            complete_fn,
+            affinity,
+        );
         bio.submit(self, io_batch)
     }
 

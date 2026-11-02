@@ -95,6 +95,8 @@ pub struct BlockDeviceMeta {
     pub max_nr_segments_per_bio: usize,
     /// The total number of sectors of the block device.
     pub nr_sectors: usize,
+    /// The number of submission queues available to this device.
+    pub nr_submission_queues: u16,
     // Additional useful metadata can be added here in the future.
 }
 

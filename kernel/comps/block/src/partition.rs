@@ -285,3 +285,81 @@ impl PartitionNode {
         }
     }
 }
+
+#[cfg(ktest)]
+mod tests {
+    use device_id::{MajorId, MinorId};
+    use io_util::batch::IoBatch;
+    use ostd::{prelude::*, sync::Mutex};
+
+    use super::*;
+    use crate::{
+        bio::{Bio, BioQueueAffinity, BioStatus, BioType},
+        id::Sid,
+        request_queue::BioRequest,
+    };
+
+    #[derive(Debug)]
+    struct RecordingDevice(Mutex<Vec<SubmittedBio>>);
+
+    impl BlockDevice for RecordingDevice {
+        fn enqueue(&self, bio: SubmittedBio) -> Result<(), BioEnqueueError> {
+            self.0.lock().push(bio);
+            Ok(())
+        }
+
+        fn metadata(&self) -> BlockDeviceMeta {
+            BlockDeviceMeta {
+                max_nr_segments_per_bio: usize::MAX,
+                nr_sectors: 4096,
+                nr_submission_queues: 2,
+            }
+        }
+
+        fn name(&self) -> &str {
+            "recording-device"
+        }
+
+        fn id(&self) -> DeviceId {
+            DeviceId::new(MajorId::new(1), MinorId::new(0))
+        }
+    }
+
+    #[ktest]
+    fn partition_preserves_queue_affinity_and_offsets_sector() {
+        let underlying = Arc::new(RecordingDevice(Mutex::new(Vec::new())));
+        let partition = PartitionNode::new(
+            DeviceId::new(MajorId::new(1), MinorId::new(1)),
+            String::from("partition"),
+            underlying.clone(),
+            PartitionInfo::Gpt(GptEntry {
+                type_guid: [1; 16],
+                guid: [2; 16],
+                start_lba: 100,
+                end_lba: 199,
+                attributes: 0,
+                name: [0; 72],
+            }),
+        );
+        assert_eq!(partition.metadata().nr_submission_queues, 2);
+
+        let mut batch = IoBatch::new();
+        Bio::new_on_queue(
+            BioType::Flush,
+            Sid::new(3),
+            vec![],
+            None,
+            BioQueueAffinity::Queue(1),
+        )
+        .submit(&partition, &mut batch)
+        .unwrap();
+
+        let submitted = underlying.0.lock().pop().unwrap();
+        assert_eq!(submitted.queue_affinity(), BioQueueAffinity::Queue(1));
+        let request = BioRequest::from(submitted);
+        assert_eq!(request.sid_range(), &(Sid::new(103)..Sid::new(103)));
+        for bio in request.into_bios() {
+            bio.complete(BioStatus::Complete);
+        }
+    }
+}
