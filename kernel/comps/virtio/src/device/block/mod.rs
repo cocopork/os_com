@@ -11,7 +11,10 @@ use bitflags::bitflags;
 use int_to_c_enum::TryFromInt;
 use ostd_pod::FromZeros;
 
-use crate::transport::{ConfigManager, VirtioTransport};
+use crate::{
+    device::VirtioDeviceError,
+    transport::{ConfigManager, VirtioTransport, VirtioTransportError},
+};
 
 pub const DEVICE_NAME: &str = "Virtio-Block";
 
@@ -32,7 +35,7 @@ bitflags! {
         const DISCARD       = 1 << 13;
         const WRITE_ZEROES  = 1 << 14;
 
-        const ALL_SUPPORTED = Self::BLK_SIZE.bits() | Self::FLUSH.bits();
+        const ALL_SUPPORTED = Self::BLK_SIZE.bits() | Self::FLUSH.bits() | Self::MQ.bits();
     }
 }
 
@@ -141,6 +144,10 @@ impl VirtioBlockConfig {
 }
 
 impl ConfigManager<VirtioBlockConfig> {
+    pub(self) fn num_queues(&self) -> Result<u16, VirtioDeviceError> {
+        read_modern_num_queues(self.is_modern(), |offset| self.read_once(offset))
+    }
+
     pub(self) fn read_config(&self) -> VirtioBlockConfig {
         let mut blk_config = VirtioBlockConfig::new_zeroed();
         // Only following fields are defined in legacy interface.
@@ -198,5 +205,45 @@ impl ConfigManager<VirtioBlockConfig> {
             .unwrap() as usize;
 
         (cap_high << 32) | cap_low
+    }
+}
+
+fn read_modern_num_queues(
+    modern: bool,
+    mut read: impl FnMut(usize) -> Result<u16, VirtioTransportError>,
+) -> Result<u16, VirtioDeviceError> {
+    if !modern {
+        return Err(VirtioDeviceError::UnsupportedConfig);
+    }
+    read(offset_of!(VirtioBlockConfig, num_queues)).map_err(Into::into)
+}
+
+#[cfg(ktest)]
+mod tests {
+    use ostd::prelude::ktest;
+
+    use super::*;
+
+    #[ktest]
+    fn virtio_blk_negotiates_mq_when_offered() {
+        let offered = (BlockFeatures::MQ | BlockFeatures::BLK_SIZE).bits();
+        let negotiated = BlockFeatures::negotiated_with_device(offered);
+        assert!(negotiated.contains(BlockFeatures::MQ));
+        assert!(negotiated.contains(BlockFeatures::BLK_SIZE));
+    }
+
+    #[ktest]
+    fn virtio_blk_reads_modern_num_queues() {
+        let mut reads = 0;
+        let count = read_modern_num_queues(true, |offset| {
+            reads += 1;
+            assert_eq!(offset, offset_of!(VirtioBlockConfig, num_queues));
+            Ok(8)
+        });
+        assert_eq!(count.unwrap(), 8);
+        assert_eq!(reads, 1);
+
+        let legacy = ConfigManager::<VirtioBlockConfig>::new(None, None);
+        assert!(legacy.num_queues().is_err());
     }
 }

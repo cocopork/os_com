@@ -51,6 +51,61 @@ const VIRTIO_DEVICE_MINORS: u32 = 16;
 /// The number of virtio block devices, used to assign minor device numbers.
 static NR_BLOCK_DEVICE: AtomicU32 = AtomicU32::new(0);
 
+const DRIVER_QUEUE_LIMIT: u16 = 16;
+
+fn optional_config_queues(
+    features: BlockFeatures,
+    legacy: bool,
+    read: impl FnOnce() -> Result<u16, VirtioDeviceError>,
+) -> Option<u16> {
+    if !features.contains(BlockFeatures::MQ) || legacy {
+        None
+    } else {
+        read().ok()
+    }
+}
+
+fn active_queue_count(
+    features: BlockFeatures,
+    config_queues: Option<u16>,
+    transport_queues: u16,
+) -> Result<u16, VirtioDeviceError> {
+    if transport_queues == 0 {
+        return Err(VirtioDeviceError::InvalidQueueArgs);
+    }
+    if !features.contains(BlockFeatures::MQ) {
+        return Ok(1);
+    }
+    Ok(config_queues.filter(|count| *count > 0).map_or(1, |count| {
+        count.min(transport_queues).min(DRIVER_QUEUE_LIMIT)
+    }))
+}
+
+fn preflight_queue_sizes(
+    count: u16,
+    mut max_queue_size: impl FnMut(u16) -> Result<u16, VirtioDeviceError>,
+) -> Result<Vec<u16>, VirtioDeviceError> {
+    if count == 0 {
+        return Err(VirtioDeviceError::InvalidQueueArgs);
+    }
+    let mut sizes = Vec::with_capacity(count as usize);
+    for index in 0..count {
+        let size = match max_queue_size(index) {
+            Ok(max) => DeviceInner::QUEUE_SIZE.min(max),
+            Err(error) if index == 0 => return Err(error),
+            Err(_) => return Ok(sizes[..1].to_vec()),
+        };
+        if size < 4 || !size.is_power_of_two() {
+            if index == 0 {
+                return Err(VirtioDeviceError::InvalidQueueArgs);
+            }
+            return Ok(sizes[..1].to_vec());
+        }
+        sizes.push(size);
+    }
+    Ok(sizes)
+}
+
 #[derive(Debug)]
 pub struct BlockDevice {
     device: Arc<DeviceInner>,
@@ -236,20 +291,14 @@ impl DeviceInner {
             return Err(VirtioDeviceError::UnsupportedConfig);
         }
 
-        let num_queues = transport.num_queues();
-        if num_queues != 1 {
-            // TODO: Support Multi-Queue Block IO Queueing Mechanism
-            // (`BlkFeatures::MQ`) to accelerate multi-processor requests for
-            // block devices. When SMP is enabled on x86, the feature is on.
-            ostd::warn!(
-                "Multi-Queue Block IO Queueing Mechanism is not supported yet; using the first queue"
-            );
-        }
-
-        let queue_size = Self::QUEUE_SIZE.min(transport.max_queue_size(0)?);
-        if queue_size < 4 {
-            return Err(VirtioDeviceError::InvalidQueueArgs);
-        }
+        let config_queues = optional_config_queues(features, transport.is_legacy_version(), || {
+            config_manager.num_queues()
+        });
+        let queue_count = active_queue_count(features, config_queues, transport.num_queues())?;
+        let queue_sizes = preflight_queue_sizes(queue_count, |index| {
+            transport.max_queue_size(index).map_err(Into::into)
+        })?;
+        let queue_size = queue_sizes[0];
         let queue = VirtQueue::new(0, queue_size, transport.as_mut())?;
 
         // Every request ID needs its own header and response until completion.
@@ -553,6 +602,97 @@ impl DeviceInner {
                 .insert(token, submitted_request);
             return;
         }
+    }
+}
+
+#[cfg(ktest)]
+mod tests {
+    use ostd::prelude::ktest;
+
+    use super::*;
+
+    #[ktest]
+    fn virtio_blk_uses_one_queue_without_mq() {
+        assert_eq!(
+            optional_config_queues(BlockFeatures::MQ, true, || panic!("legacy config read")),
+            None
+        );
+        assert_eq!(
+            optional_config_queues(BlockFeatures::empty(), false, || panic!("MQ config read")),
+            None
+        );
+        assert_eq!(
+            optional_config_queues(BlockFeatures::MQ, false, || Ok(8)),
+            Some(8)
+        );
+        assert_eq!(
+            active_queue_count(BlockFeatures::empty(), Some(8), 8).unwrap(),
+            1
+        );
+        assert_eq!(active_queue_count(BlockFeatures::MQ, None, 8).unwrap(), 1);
+        assert_eq!(
+            active_queue_count(BlockFeatures::MQ, Some(0), 8).unwrap(),
+            1
+        );
+        assert_eq!(
+            active_queue_count(BlockFeatures::MQ, Some(8), 1).unwrap(),
+            1
+        );
+        assert!(active_queue_count(BlockFeatures::MQ, Some(8), 0).is_err());
+    }
+
+    #[ktest]
+    fn virtio_blk_caps_queue_count_at_sixteen() {
+        assert_eq!(
+            active_queue_count(BlockFeatures::MQ, Some(64), 64).unwrap(),
+            16
+        );
+        assert_eq!(
+            active_queue_count(BlockFeatures::MQ, Some(3), 64).unwrap(),
+            3
+        );
+        assert_eq!(
+            active_queue_count(BlockFeatures::MQ, Some(64), 2).unwrap(),
+            2
+        );
+    }
+
+    #[ktest]
+    fn virtio_blk_falls_back_before_setup_when_mq_preflight_is_unusable() {
+        let mut checked = Vec::new();
+        let sizes = preflight_queue_sizes(3, |index| {
+            checked.push(index);
+            Ok(if index == 1 { 2 } else { 128 })
+        })
+        .unwrap();
+        assert_eq!(checked, [0, 1]);
+        assert_eq!(sizes, [128]);
+
+        let sizes = preflight_queue_sizes(3, |index| Ok(if index == 1 { 5 } else { 128 })).unwrap();
+        assert_eq!(sizes, [128]);
+
+        let sizes = preflight_queue_sizes(3, |index| {
+            if index == 1 {
+                Err(VirtioDeviceError::InvalidQueueArgs)
+            } else {
+                Ok(128)
+            }
+        })
+        .unwrap();
+        assert_eq!(sizes, [128]);
+
+        let result = preflight_queue_sizes(3, |index| {
+            if index == 0 {
+                Err(VirtioDeviceError::InvalidQueueArgs)
+            } else {
+                Ok(128)
+            }
+        });
+        assert!(matches!(result, Err(VirtioDeviceError::InvalidQueueArgs)));
+        assert!(matches!(
+            preflight_queue_sizes(3, |_| Ok(5)),
+            Err(VirtioDeviceError::InvalidQueueArgs)
+        ));
     }
 }
 
