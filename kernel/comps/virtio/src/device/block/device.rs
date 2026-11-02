@@ -440,6 +440,7 @@ struct QueueCounters {
     active_forwarders: AtomicUsize,
     peak_forwarders: AtomicUsize,
     irq_completions: AtomicUsize,
+    in_flight_requests: AtomicUsize,
 }
 
 struct ForwardingGuard<'a>(&'a QueueCounters);
@@ -539,7 +540,7 @@ impl VirtioBlockQueue {
             active_forwarders: self.counters.active_forwarders.load(Ordering::Relaxed),
             peak_forwarders: self.counters.peak_forwarders.load(Ordering::Relaxed),
             irq_completions: self.counters.irq_completions.load(Ordering::Relaxed),
-            in_flight_requests: self.submitted_requests.lock().len(),
+            in_flight_requests: self.counters.in_flight_requests.load(Ordering::Relaxed),
         }
     }
 
@@ -588,8 +589,16 @@ impl VirtioBlockQueue {
             .flat_map(|bio| bio.segments())
             .map(|segment| segment.nblocks())
             .sum::<usize>();
-        let previous = self.submitted_requests.lock().insert(token, request);
-        debug_assert!(previous.is_none());
+        {
+            let mut submitted = self.submitted_requests.lock();
+            let previous = submitted.insert(token, request);
+            debug_assert!(previous.is_none());
+            if previous.is_none() {
+                self.counters
+                    .in_flight_requests
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+        }
         self.counters
             .submitted_bios
             .fetch_add(bios, Ordering::Relaxed);
@@ -614,7 +623,20 @@ impl VirtioBlockQueue {
                 let Ok((token, _)) = queue.pop_used_with_min_bytes(RESP_SIZE) else {
                     return;
                 };
-                self.submitted_requests.lock().remove(&token).unwrap()
+                let mut submitted = self.submitted_requests.lock();
+                let request = submitted.remove(&token).unwrap();
+                // Gauge writers hold this queue's virtqueue and ownership locks.
+                // Check before storing so an invariant violation cannot wrap it.
+                let in_flight = self
+                    .counters
+                    .in_flight_requests
+                    .load(Ordering::Relaxed)
+                    .checked_sub(1)
+                    .expect("completed request must be in flight");
+                self.counters
+                    .in_flight_requests
+                    .store(in_flight, Ordering::Relaxed);
+                request
             };
 
             self.descriptor_waiters.wake_all();
@@ -1055,6 +1077,12 @@ mod tests {
     fn queue_diagnostics_count_pages_and_forwarders() {
         let (device, transport) = QueueDevice::new(1, 4);
         let queue = &device.queues[0];
+        // Snapshots must remain available while completion ownership is locked.
+        let owners = queue.submitted_requests.lock();
+        assert_eq!(queue.diagnostics().in_flight_requests, 0);
+        drop(owners);
+        queue.handle_irq();
+        assert_eq!(queue.diagnostics().in_flight_requests, 0);
         let mut batch = IoBatch::new();
         Bio::new_on_queue(
             BioType::Write,
@@ -1067,7 +1095,10 @@ mod tests {
         .unwrap();
         assert_eq!(queue.diagnostics().queued_pages, 2);
         queue.write(queue.staging.dequeue());
+        let owners = queue.submitted_requests.lock();
         let stats = queue.diagnostics();
+        assert_eq!(queue.counters.in_flight_requests.load(Ordering::Relaxed), 1);
+        drop(owners);
         assert_eq!(stats.submitted_pages, 2);
         assert_eq!(stats.in_flight_requests, 1);
         let forwarder = ForwardingGuard::new(&queue.counters);
@@ -1083,6 +1114,26 @@ mod tests {
         queue.handle_irq();
         assert_eq!(queue.diagnostics().in_flight_requests, 0);
         assert!(batch.wait_all().is_ok());
+        queue.handle_irq();
+        assert_eq!(queue.diagnostics().in_flight_requests, 0);
+
+        let failed_batch = device.enqueue_bio(BioType::Write, BioQueueAffinity::Queue(0));
+        queue.write(queue.staging.dequeue());
+        assert_eq!(queue.diagnostics().in_flight_requests, 1);
+        Slice::new(&queue.block_responses, 0..RESP_SIZE)
+            .write_val(
+                0,
+                &BlockResp {
+                    status: RespStatus::IoErr as u8,
+                },
+            )
+            .unwrap();
+        transport.complete(0, 0, 1);
+        queue.handle_irq();
+        assert!(failed_batch.wait_all().is_err());
+        assert_eq!(queue.diagnostics().in_flight_requests, 0);
+        queue.handle_irq();
+        assert_eq!(queue.diagnostics().in_flight_requests, 0);
     }
 
     #[ktest]
@@ -1112,7 +1163,10 @@ mod tests {
                 let mut ptr = transport.rings[0].0.borrow_vm().cast::<u16>();
                 ptr.add(2);
                 let token = ptr.read_once().unwrap();
-                assert!(queue.submitted_requests.lock().contains_key(&token));
+                let owners = queue.submitted_requests.lock();
+                assert!(owners.contains_key(&token));
+                assert_eq!(queue.diagnostics().in_flight_requests, 1);
+                drop(owners);
                 notifications.fetch_add(1, Ordering::Relaxed);
             },
         );
@@ -1133,6 +1187,7 @@ mod tests {
             queue.write(queue.staging.dequeue());
         }
         assert_eq!(queue.queue.lock().available_desc(), 0);
+        assert_eq!(queue.diagnostics().in_flight_requests, 2);
         let capacity_available = Arc::new(WaitQueue::new());
         let capacity_ready = Arc::new(AtomicUsize::new(0));
         let capacity_queue = queue.clone();
@@ -1161,6 +1216,7 @@ mod tests {
         queue.descriptor_waiters.enqueue(waker0.clone());
         device.queues[1].descriptor_waiters.enqueue(waker1.clone());
         queue.handle_irq();
+        assert_eq!(queue.diagnostics().in_flight_requests, 2);
         assert!(waker0.wake_up(), "empty IRQ must not wake waiters");
         // Re-arm after checking the empty IRQ.
         let (_waiter0, waker0) = Waiter::new_pair();
@@ -1183,6 +1239,7 @@ mod tests {
         assert_eq!(queue.diagnostics().descriptor_wait_count, 1);
         assert!(queue.diagnostics().descriptor_wait_ticks > 0);
         assert_eq!(queue.queue.lock().available_desc(), 2);
+        assert_eq!(queue.diagnostics().in_flight_requests, 1);
         Slice::new(&other_queue.block_responses, 0..RESP_SIZE)
             .write_val(0, &BlockResp { status: 0 })
             .unwrap();
@@ -1194,6 +1251,7 @@ mod tests {
             .unwrap();
         transport.complete(0, 2, 1);
         queue.handle_irq();
+        assert_eq!(queue.diagnostics().in_flight_requests, 0);
         for batch in batches {
             assert!(batch.wait_all().is_ok());
         }
