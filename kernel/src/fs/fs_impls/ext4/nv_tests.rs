@@ -1,10 +1,14 @@
 // SPDX-License-Identifier: MPL-2.0
 
 //! Route tests explicitly initialize a shared pool with default modes off.
-use ostd::prelude::*;
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+use aster_block::bio::{BioEnqueueError, BioQueueAffinity, BioType, SubmittedBio};
+use ostd::{prelude::*, sync::WaitQueue};
 
 use super::{
     Ext4,
+    migration::tests::rnvpce_sync_quiesces_all_queue_bound_workers,
     prelude::*,
     test_utils::{Ext4FixtureBuilder, make_empty_file_inode},
 };
@@ -36,6 +40,10 @@ fn ext4_research_routes() {
         nv_route_rnvpce_completion_publishes_reclaim_work_item,
         nv_route_rnvpce_durability_epoch_coalesces_ready_batches,
         nv_route_rnvpce_durability_epoch_isolates_failed_batch,
+        rnvpce_cross_queue_epoch_issues_one_flush,
+        rnvpce_cross_queue_mixed_data_error_preserves_failed_entry,
+        rnvpce_cross_queue_flush_error_preserves_all_entries,
+        rnvpce_sync_quiesces_all_queue_bound_workers,
         nv_route_rnvpce_first_write_publishes_ssd_baseline,
         nv_route_rnvpce_foreground_allocation_is_independent_of_completion,
         nv_route_rnvpce_batch_allocation_durability,
@@ -55,6 +63,334 @@ fn ext4_research_routes() {
         nv_route_rnvpc_failed_allocation_flush_does_not_append_wal,
         nv_route_mount_rejects_switching_persistent_authority,
     );
+}
+
+/// Keep real EXT4/NVM state and disk I/O; control only device submission timing.
+pub(super) struct QueueRecordingDisk {
+    pub(super) disk: Arc<super::test_utils::Ext4MemoryDisk>,
+    pub(super) writes: Mutex<Vec<BioQueueAffinity>>,
+    pub(super) pause_writes: AtomicUsize,
+    pub(super) entered_writes: AtomicUsize,
+    pub(super) released_writes: AtomicUsize,
+    pub(super) pause_flush: AtomicBool,
+    pub(super) entered_flush: AtomicBool,
+    pub(super) waiters: WaitQueue,
+}
+
+impl Debug for QueueRecordingDisk {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("QueueRecordingDisk")
+            .field("disk", &self.disk)
+            .finish_non_exhaustive()
+    }
+}
+
+impl QueueRecordingDisk {
+    pub(super) fn new(disk: Arc<super::test_utils::Ext4MemoryDisk>) -> Self {
+        Self {
+            disk,
+            writes: Mutex::new(Vec::new()),
+            pause_writes: AtomicUsize::new(0),
+            entered_writes: AtomicUsize::new(0),
+            released_writes: AtomicUsize::new(0),
+            pause_flush: AtomicBool::new(false),
+            entered_flush: AtomicBool::new(false),
+            waiters: WaitQueue::new(),
+        }
+    }
+}
+
+impl BlockDevice for QueueRecordingDisk {
+    fn enqueue(&self, bio: SubmittedBio) -> core::result::Result<(), BioEnqueueError> {
+        if bio.type_() == BioType::Write {
+            self.writes.lock().push(bio.queue_affinity());
+            if let BioQueueAffinity::Queue(queue) = bio.queue_affinity() {
+                let bit = 1 << queue;
+                if self.pause_writes.load(Ordering::Acquire) & bit != 0 {
+                    self.entered_writes.fetch_or(bit, Ordering::AcqRel);
+                    self.waiters.wake_all();
+                    self.waiters.wait_until(|| {
+                        (self.released_writes.load(Ordering::Acquire) & bit != 0).then_some(())
+                    });
+                }
+            }
+        }
+        if bio.type_() == BioType::Flush && self.pause_flush.load(Ordering::Acquire) {
+            self.entered_flush.store(true, Ordering::Release);
+            self.waiters.wake_all();
+            self.waiters
+                .wait_until(|| (!self.pause_flush.load(Ordering::Acquire)).then_some(()));
+        }
+        self.disk.enqueue(bio)
+    }
+
+    fn metadata(&self) -> aster_block::BlockDeviceMeta {
+        aster_block::BlockDeviceMeta {
+            nr_submission_queues: 4,
+            max_nr_segments_per_bio: 1,
+            ..self.disk.metadata()
+        }
+    }
+
+    fn name(&self) -> &str {
+        "rtio-queue-test"
+    }
+
+    fn id(&self) -> device_id::DeviceId {
+        self.disk.id()
+    }
+}
+
+pub(super) fn cross_queue_fixture(uuid: u8) -> (Arc<Ext4>, Arc<QueueRecordingDisk>) {
+    // These scenarios also run inside ext4_research_routes. Distinct mounts
+    // must not recover authority left by an earlier invocation in the same VM.
+    static NEXT_FIXTURE: AtomicUsize = AtomicUsize::new(0);
+    let mut uuid = [uuid; 16];
+    let invocation = (NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed) as u64).to_le_bytes();
+    uuid[1..8].copy_from_slice(&invocation[..7]);
+    crate::fs::rnvpc::init_for_ext4_tests();
+    crate::time::clocks::init_for_ktest();
+    let fixture = Ext4FixtureBuilder::new(2048, 256, 2048)
+        .with_block_bitmap_metadata_marked()
+        .with_free_blocks(128)
+        .with_uuid(uuid)
+        .build()
+        .unwrap();
+    for ino in 11..15 {
+        fixture.write_raw_inode(ino, &make_empty_file_inode());
+    }
+    let disk = Arc::new(QueueRecordingDisk::new(fixture.disk.clone()));
+    drop(fixture);
+    let options = CString::new("rnvpce=on,rtio=off").unwrap();
+    let fs = Ext4::open(disk.clone(), Some(options.as_c_str())).unwrap();
+    (fs, disk)
+}
+
+pub(super) fn cross_queue_write(fs: &Ext4, ino: u32) {
+    fs.read_inode(ino)
+        .unwrap()
+        .write_at(
+            0,
+            &mut VmReader::from([ino as u8; PAGE_SIZE].as_slice()).to_fallible(),
+        )
+        .unwrap();
+}
+
+fn assert_cross_queue_entry(
+    fs: &Ext4,
+    ino: u32,
+    state: crate::fs::rnvpc::redirect_index::NvExtentEntryState,
+) {
+    use crate::fs::rnvpc::{descriptor::NvRedirectAuthority, index::PageKey};
+
+    let entry = crate::fs::rnvpc::pool()
+        .unwrap()
+        .lookup_dirty_nv_entry(PageKey::new(fs.rnvpc_fs_id(), u64::from(ino), 0))
+        .expect("NV authority must survive until reclaim");
+    assert_eq!(entry.state(), state, "inode {ino}");
+    assert_eq!(
+        entry.record().authority().unwrap(),
+        NvRedirectAuthority::NvAuthoritative
+    );
+}
+
+pub(super) fn assert_cross_queue_ssd_page(fs: &Ext4, disk: &QueueRecordingDisk, ino: u32) {
+    use crate::fs::rnvpc::{index::PageKey, write_transaction::current_page_mapping};
+
+    let pool = crate::fs::rnvpc::pool().unwrap();
+    assert!(
+        pool.lookup_dirty_nv_entry(PageKey::new(fs.rnvpc_fs_id(), u64::from(ino), 0))
+            .is_none()
+    );
+    let target = current_page_mapping(pool, fs.rnvpc_fs_id(), u64::from(ino), 0)
+        .unwrap()
+        .unwrap()
+        .ssd_block();
+    let mut bytes = [0; PAGE_SIZE];
+    disk.disk
+        .segment()
+        .read_bytes(target as usize * PAGE_SIZE, &mut bytes)
+        .unwrap();
+    assert_eq!(bytes, [ino as u8; PAGE_SIZE]);
+}
+
+// Catches per-queue coordinators/flushes, premature reclaim, and leaked credits.
+#[ktest]
+fn rnvpce_cross_queue_epoch_issues_one_flush() {
+    use crate::fs::rnvpc::redirect_index::NvExtentEntryState::{IoComplete, Migrating};
+
+    let (fs, disk) = cross_queue_fixture(0xe5);
+    for queue in 0..4 {
+        let ino = 11 + u32::from(queue);
+        cross_queue_write(&fs, ino);
+        assert_eq!(
+            fs.migrate_nv_round_on_queue(1, BioQueueAffinity::Queue(queue))
+                .unwrap(),
+            1
+        );
+        assert_cross_queue_entry(&fs, ino, Migrating);
+    }
+    assert_eq!(
+        *disk.writes.lock(),
+        vec![
+            BioQueueAffinity::Queue(0),
+            BioQueueAffinity::Queue(1),
+            BioQueueAffinity::Queue(2),
+            BioQueueAffinity::Queue(3)
+        ]
+    );
+    assert_eq!(fs.nv_in_flight.load(Ordering::Acquire), 4);
+    assert_eq!(fs.nv_reclaim_pending.load(Ordering::Acquire), 0);
+    assert_eq!(fs.help_nv_reclaim(4).unwrap(), 0);
+    let before = disk.disk.flush_count();
+    assert_eq!(fs.process_nv_completions().unwrap(), 4);
+    // Common sync constructs Any; the concrete virtio queue-0 flush route is
+    // covered by the driver test, below this filesystem recording boundary.
+    assert_eq!(disk.disk.flush_count() - before, 1);
+    for ino in 11..15 {
+        assert_cross_queue_entry(&fs, ino, IoComplete);
+    }
+    assert_eq!(fs.nv_in_flight.load(Ordering::Acquire), 0);
+    assert_eq!(fs.nv_reclaim_pending.load(Ordering::Acquire), 4);
+    assert_eq!(fs.help_nv_reclaim(4).unwrap(), 4);
+    for ino in 11..15 {
+        assert_cross_queue_ssd_page(&fs, &disk, ino);
+    }
+    assert_eq!(fs.process_nv_completions().unwrap(), 0);
+    assert_eq!(disk.disk.flush_count() - before, 1);
+    assert_eq!(fs.nv_in_flight.load(Ordering::Acquire), 0);
+    assert_eq!(fs.nv_reclaim_pending.load(Ordering::Acquire), 0);
+}
+
+// Catches restoring the whole epoch when only one queue's data failed, or
+// publishing the failed entry alongside successful work after the shared flush.
+#[ktest]
+fn rnvpce_cross_queue_mixed_data_error_preserves_failed_entry() {
+    use crate::fs::rnvpc::{
+        redirect_index::NvExtentEntryState::{Dirty, IoComplete},
+        write_transaction::current_page_mapping,
+    };
+
+    let (fs, disk) = cross_queue_fixture(0xe6);
+    let pool = crate::fs::rnvpc::pool().unwrap();
+    for queue in 0..4 {
+        let ino = 11 + u32::from(queue);
+        cross_queue_write(&fs, ino);
+        if queue == 1 {
+            let target = current_page_mapping(pool, fs.rnvpc_fs_id(), 12, 0)
+                .unwrap()
+                .unwrap()
+                .ssd_block();
+            disk.disk.set_fail_write_block(Some(target as usize));
+        }
+        assert_eq!(
+            fs.migrate_nv_round_on_queue(1, BioQueueAffinity::Queue(queue))
+                .unwrap(),
+            1
+        );
+        disk.disk.set_fail_write_block(None);
+    }
+    assert_eq!(fs.nv_in_flight.load(Ordering::Acquire), 4);
+    let before = disk.disk.flush_count();
+    assert_eq!(fs.process_nv_completions().unwrap_err().error(), Errno::EIO);
+    assert_eq!(disk.disk.flush_count() - before, 1);
+    assert_eq!(fs.nv_in_flight.load(Ordering::Acquire), 0);
+    assert_eq!(fs.nv_reclaim_pending.load(Ordering::Acquire), 3);
+    for ino in 11..15 {
+        assert_cross_queue_entry(&fs, ino, if ino == 12 { Dirty } else { IoComplete });
+    }
+    assert_eq!(fs.help_nv_reclaim(4).unwrap(), 3);
+    for ino in [11, 13, 14] {
+        assert_cross_queue_ssd_page(&fs, &disk, ino);
+    }
+    assert_cross_queue_entry(&fs, 12, Dirty);
+    let mut bytes = [0; PAGE_SIZE];
+    fs.read_inode(12)
+        .unwrap()
+        .read_at(0, &mut VmWriter::from(bytes.as_mut_slice()).to_fallible())
+        .unwrap();
+    assert_eq!(
+        bytes, [12; PAGE_SIZE],
+        "failed data must remain readable from NV"
+    );
+    assert_eq!(fs.nv_reclaim_pending.load(Ordering::Acquire), 0);
+    assert_eq!(
+        fs.migrate_nv_round_on_queue(1, BioQueueAffinity::Queue(3))
+            .unwrap(),
+        1
+    );
+    fs.drain_nv_in_flight().unwrap();
+    assert_cross_queue_ssd_page(&fs, &disk, 12);
+    assert_eq!(fs.nv_in_flight.load(Ordering::Acquire), 0);
+    assert_eq!(fs.nv_reclaim_pending.load(Ordering::Acquire), 0);
+}
+
+// Catches publishing any reclaim after an unsuccessful common durability barrier.
+#[ktest]
+fn rnvpce_cross_queue_flush_error_preserves_all_entries() {
+    use crate::fs::rnvpc::{
+        redirect_index::NvExtentEntryState::Dirty, write_transaction::current_page_mapping,
+    };
+
+    let (fs, disk) = cross_queue_fixture(0xe7);
+    let pool = crate::fs::rnvpc::pool().unwrap();
+    let mut targets = Vec::new();
+    for queue in 0..4 {
+        let ino = 11 + u32::from(queue);
+        cross_queue_write(&fs, ino);
+        targets.push(
+            current_page_mapping(pool, fs.rnvpc_fs_id(), u64::from(ino), 0)
+                .unwrap()
+                .unwrap()
+                .ssd_block(),
+        );
+        assert_eq!(
+            fs.migrate_nv_round_on_queue(1, BioQueueAffinity::Queue(queue))
+                .unwrap(),
+            1
+        );
+    }
+    let before = disk.disk.flush_count();
+    disk.disk.set_fail_flushes(true);
+    assert_eq!(fs.process_nv_completions().unwrap_err().error(), Errno::EIO);
+    disk.disk.set_fail_flushes(false);
+    assert_eq!(disk.disk.flush_count() - before, 1);
+    assert_eq!(fs.nv_in_flight.load(Ordering::Acquire), 0);
+    assert_eq!(fs.nv_reclaim_pending.load(Ordering::Acquire), 0);
+    assert_eq!(fs.help_nv_reclaim(4).unwrap(), 0);
+    for (index, target) in targets.into_iter().enumerate() {
+        let ino = 11 + index as u32;
+        assert_cross_queue_entry(&fs, ino, Dirty);
+        assert_eq!(
+            current_page_mapping(pool, fs.rnvpc_fs_id(), u64::from(ino), 0)
+                .unwrap()
+                .unwrap()
+                .ssd_block(),
+            target
+        );
+        let mut bytes = [0; PAGE_SIZE];
+        fs.read_inode(ino)
+            .unwrap()
+            .read_at(0, &mut VmWriter::from(bytes.as_mut_slice()).to_fallible())
+            .unwrap();
+        assert_eq!(bytes, [ino as u8; PAGE_SIZE]);
+    }
+    // Candidate selection is independent of inode order. Check the entire
+    // failed epoch before any retry can move an entry back to Migrating.
+    for queue in [1, 2, 3, 0] {
+        assert_eq!(
+            fs.migrate_nv_round_on_queue(1, BioQueueAffinity::Queue(queue))
+                .unwrap(),
+            1
+        );
+    }
+    fs.drain_nv_in_flight().unwrap();
+    assert_eq!(disk.disk.flush_count() - before, 2);
+    for ino in 11..15 {
+        assert_cross_queue_ssd_page(&fs, &disk, ino);
+    }
+    assert_eq!(fs.nv_in_flight.load(Ordering::Acquire), 0);
+    assert_eq!(fs.nv_reclaim_pending.load(Ordering::Acquire), 0);
 }
 
 fn nv_route_rnvpce_durability_epoch_coalesces_ready_batches() {
@@ -90,8 +426,6 @@ fn nv_route_rnvpce_durability_epoch_coalesces_ready_batches() {
 }
 
 fn nv_route_rnvpce_durability_epoch_isolates_failed_batch() {
-    use core::sync::atomic::Ordering;
-
     use crate::fs::rnvpc::{index::PageKey, redirect_index::NvExtentEntryState};
 
     crate::fs::rnvpc::init_for_ext4_tests();
@@ -264,8 +598,6 @@ fn nv_route_rnvpce_first_write_publishes_ssd_baseline() {
 }
 
 fn nv_route_rnvpce_foreground_allocation_is_independent_of_completion() {
-    use core::sync::atomic::{AtomicUsize, Ordering};
-
     crate::fs::rnvpc::init_for_ext4_tests();
     crate::time::clocks::init_for_ktest();
     let fixture = Ext4FixtureBuilder::new(2048, 256, 2048)
@@ -353,13 +685,7 @@ fn nv_route_rnvpce_completion_publishes_reclaim_work_item() {
 
     assert_eq!(fixture.ext4.migrate_nv_round(4).unwrap(), 4);
     assert_eq!(fixture.ext4.process_nv_completions().unwrap(), 4);
-    assert_eq!(
-        fixture
-            .ext4
-            .nv_reclaim_pending
-            .load(core::sync::atomic::Ordering::Acquire),
-        4
-    );
+    assert_eq!(fixture.ext4.nv_reclaim_pending.load(Ordering::Acquire), 4);
     let pool = crate::fs::rnvpc::pool().unwrap();
     for page_index in 0..4 {
         assert!(
@@ -380,13 +706,7 @@ fn nv_route_rnvpce_completion_publishes_reclaim_work_item() {
         0,
         "entry reclaim must not validate a per-page or shared baseline token"
     );
-    assert_eq!(
-        fixture
-            .ext4
-            .nv_reclaim_pending
-            .load(core::sync::atomic::Ordering::Acquire),
-        0
-    );
+    assert_eq!(fixture.ext4.nv_reclaim_pending.load(Ordering::Acquire), 0);
     for page_index in 0..4 {
         assert!(
             !has_native_redirect(pool, fixture.ext4.rnvpc_fs_id(), 11, page_index),
@@ -623,8 +943,6 @@ fn nv_route_rnvpce_redirect_completion_avoids_leaf() {
 }
 
 fn nv_route_rnvpce_round_budget_is_independent_of_global_in_flight() {
-    use core::sync::atomic::Ordering;
-
     crate::fs::rnvpc::init_for_ext4_tests();
     crate::time::clocks::init_for_ktest();
     let fixture = Ext4FixtureBuilder::new(2048, 256, 2048)
@@ -1023,7 +1341,6 @@ fn rnvpc_capacity_pressure_waits_for_rtio_reclaim() {
 }
 
 fn nv_route_busy_lease_read_and_partial_write_retry() {
-    use core::sync::atomic::{AtomicUsize, Ordering};
     crate::fs::rnvpc::init_for_ext4_tests();
     crate::time::clocks::init_for_ktest();
     let fixture = Ext4FixtureBuilder::new(2048, 256, 2048)
@@ -1169,7 +1486,6 @@ fn nv_route_mount_rejects_switching_persistent_authority() {
 // Reproduces the 64MiB fio EAGAIN without a large filesystem: private staged
 // pages consume the shared data budget, leaving one committed page to migrate.
 fn nv_route_rnvpce_capacity_wait_releases_inode_lock() {
-    use core::sync::atomic::{AtomicUsize, Ordering};
     crate::fs::rnvpc::init_for_ext4_tests();
     crate::time::clocks::init_for_ktest();
     let fixture = Ext4FixtureBuilder::new(2048, 256, 2048)
@@ -1465,7 +1781,6 @@ fn nv_route_rnvpce_recovers_unflushed_target_bitmap() {
 }
 
 fn nv_route_rnvpce_reservation_abort_wakes_writer() {
-    use core::sync::atomic::{AtomicUsize, Ordering};
     crate::fs::rnvpc::init_for_ext4_tests();
     crate::time::clocks::init_for_ktest();
     let fixture = Ext4FixtureBuilder::new(2048, 256, 2048)

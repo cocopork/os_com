@@ -1601,10 +1601,15 @@ impl Ext4 {
 }
 
 #[cfg(ktest)]
-mod tests {
+pub(super) mod tests {
     use ostd::prelude::ktest;
 
-    use super::*;
+    use super::{
+        super::nv_tests::{
+            QueueRecordingDisk, assert_cross_queue_ssd_page, cross_queue_fixture, cross_queue_write,
+        },
+        *,
+    };
     use crate::fs::{
         fs_impls::ext4::{
             allocator::group_selector::AllocationGroupSelector,
@@ -1655,37 +1660,6 @@ mod tests {
         }
     }
 
-    #[derive(Debug)]
-    struct QueueRecordingDisk {
-        disk: Arc<super::super::test_utils::Ext4MemoryDisk>,
-        writes: Mutex<Vec<aster_block::bio::BioQueueAffinity>>,
-    }
-
-    impl BlockDevice for QueueRecordingDisk {
-        fn enqueue(
-            &self,
-            bio: aster_block::bio::SubmittedBio,
-        ) -> core::result::Result<(), aster_block::bio::BioEnqueueError> {
-            if bio.type_() == aster_block::bio::BioType::Write {
-                self.writes.lock().push(bio.queue_affinity());
-            }
-            self.disk.enqueue(bio)
-        }
-        fn metadata(&self) -> aster_block::BlockDeviceMeta {
-            aster_block::BlockDeviceMeta {
-                nr_submission_queues: 4,
-                max_nr_segments_per_bio: 1,
-                ..self.disk.metadata()
-            }
-        }
-        fn name(&self) -> &str {
-            "rtio-queue-test"
-        }
-        fn id(&self) -> device_id::DeviceId {
-            self.disk.id()
-        }
-    }
-
     #[ktest]
     fn rnvpce_workers_keep_stable_distinct_queue_ids() {
         use aster_block::bio::BioQueueAffinity;
@@ -1712,10 +1686,7 @@ mod tests {
                 .error(),
             Errno::EINVAL
         );
-        let disk = Arc::new(QueueRecordingDisk {
-            disk: fixture.disk.clone(),
-            writes: Mutex::new(Vec::new()),
-        });
+        let disk = Arc::new(QueueRecordingDisk::new(fixture.disk.clone()));
         drop(fixture);
         let options = CString::new("rnvpce=on,rtio=off").unwrap();
         let fs = Ext4::open(disk.clone(), Some(options.as_c_str())).unwrap();
@@ -1804,6 +1775,141 @@ mod tests {
         )
         .unwrap();
         assert_eq!(*disk.writes.lock(), vec![BioQueueAffinity::Any]);
+    }
+
+    fn wait_for_queue_test(mut condition: impl FnMut() -> bool) {
+        let deadline = ostd::timer::Jiffies::elapsed().as_duration() + Duration::from_secs(5);
+        while !condition() {
+            assert!(
+                ostd::timer::Jiffies::elapsed().as_duration() < deadline,
+                "queue test progress timed out"
+            );
+            crate::thread::Thread::yield_now();
+        }
+    }
+
+    // Catches sync passing active workers, admitting a late worker while
+    // quiescing, failing to drain, or taking a shared permit under exclusivity.
+    #[ktest]
+    pub(in crate::fs::fs_impls::ext4) fn rnvpce_sync_quiesces_all_queue_bound_workers() {
+        use crate::fs::rnvpc::{index::PageKey, redirect_index::NvExtentEntryState};
+
+        let (fs, disk) = cross_queue_fixture(0xe8);
+        for ino in 11..14 {
+            cross_queue_write(&fs, ino);
+        }
+        disk.writes.lock().clear();
+        disk.pause_writes.store(0b11, Ordering::Release);
+        let mut workers = Vec::new();
+        for queue in 0..2 {
+            let fs = fs.clone();
+            workers.push(
+                crate::thread::kernel_thread::ThreadOptions::new(move || {
+                    assert_eq!(
+                        fs.migrate_nv_round_on_queue(1, BioQueueAffinity::Queue(queue))
+                            .unwrap(),
+                        1
+                    );
+                })
+                .spawn(),
+            );
+        }
+        wait_for_queue_test(|| disk.entered_writes.load(Ordering::Acquire) == 0b11);
+        assert_eq!(fs.nv_in_flight.load(Ordering::Acquire), 2);
+        assert!(fs.nv_completion_queue.lock().is_empty());
+        let sync_done = Arc::new(AtomicBool::new(false));
+        disk.pause_flush.store(true, Ordering::Release);
+        let sync_fs = fs.clone();
+        let sync_done_for_thread = sync_done.clone();
+        let sync = crate::thread::kernel_thread::ThreadOptions::new(move || {
+            sync_fs.export_nv_for_sync().unwrap();
+            sync_done_for_thread.store(true, Ordering::Release);
+        })
+        .spawn();
+        wait_for_queue_test(|| fs.nv_migration_gate.is_quiescing_for_test());
+
+        let late_state = Arc::new(AtomicUsize::new(0));
+        let late_fs = fs.clone();
+        let late_state_for_thread = late_state.clone();
+        let late_worker = crate::thread::kernel_thread::ThreadOptions::new(move || {
+            late_state_for_thread.store(1, Ordering::Release);
+            assert_eq!(
+                late_fs
+                    .migrate_nv_round_on_queue(1, BioQueueAffinity::Queue(2))
+                    .unwrap(),
+                0
+            );
+            late_state_for_thread.store(2, Ordering::Release);
+        })
+        .spawn();
+        wait_for_queue_test(|| late_state.load(Ordering::Acquire) == 1);
+
+        disk.released_writes.store(0b01, Ordering::Release);
+        disk.waiters.wake_all();
+        workers.remove(0).join();
+        // One active shared round still owns queue 1. Sync cannot reach its
+        // data barrier even though queue 0's callback has already completed.
+        assert!(!sync_done.load(Ordering::Acquire));
+        assert!(!disk.entered_flush.load(Ordering::Acquire));
+        assert_eq!(late_state.load(Ordering::Acquire), 1);
+        assert_eq!(fs.nv_completion_queue.lock().len(), 1);
+        assert_eq!(fs.nv_in_flight.load(Ordering::Acquire), 2);
+
+        disk.released_writes.store(0b11, Ordering::Release);
+        disk.waiters.wake_all();
+        workers.pop().unwrap().join();
+        wait_for_queue_test(|| disk.entered_flush.load(Ordering::Acquire));
+        // Exclusive sync has submitted the third dirty page itself on queue 0
+        // and is draining all three pages through the common durability gate.
+        assert_eq!(fs.nv_in_flight.load(Ordering::Acquire), 3);
+        assert_eq!(fs.nv_reclaim_pending.load(Ordering::Acquire), 0);
+        assert_eq!(fs.nv_reclaim_queue.ready_units(), 0);
+        assert!(!sync_done.load(Ordering::Acquire));
+        assert_eq!(late_state.load(Ordering::Acquire), 1);
+        assert!(fs.nv_migration_gate.is_quiescing_for_test());
+        let writes = disk.writes.lock();
+        assert_eq!(writes.len(), 3);
+        assert_eq!(
+            writes
+                .iter()
+                .filter(|&&queue| queue == BioQueueAffinity::Queue(0))
+                .count(),
+            2
+        );
+        assert_eq!(
+            writes
+                .iter()
+                .filter(|&&queue| queue == BioQueueAffinity::Queue(1))
+                .count(),
+            1
+        );
+        drop(writes);
+        let pool = rnvpc::pool().unwrap();
+        for ino in 11..14 {
+            assert_eq!(
+                pool.lookup_dirty_nv_entry(PageKey::new(fs.rnvpc_fs_id(), ino, 0))
+                    .unwrap()
+                    .state(),
+                NvExtentEntryState::Migrating
+            );
+        }
+        disk.pause_flush.store(false, Ordering::Release);
+        disk.waiters.wake_all();
+        wait_for_queue_test(|| {
+            sync_done.load(Ordering::Acquire) && late_state.load(Ordering::Acquire) == 2
+        });
+        sync.join();
+        late_worker.join();
+        assert!(!fs.nv_migration_gate.is_quiescing_for_test());
+        assert_eq!(fs.nv_in_flight.load(Ordering::Acquire), 0);
+        assert_eq!(fs.nv_reclaim_pending.load(Ordering::Acquire), 0);
+        assert!(fs.nv_completion_queue.lock().is_empty());
+        assert_eq!(fs.nv_reclaim_queue.ready_units(), 0);
+        for ino in 11..14 {
+            assert_cross_queue_ssd_page(&fs, &disk, ino);
+        }
+        assert_eq!(fs.process_nv_completions().unwrap(), 0);
+        assert_eq!(fs.help_nv_reclaim(3).unwrap(), 0);
     }
 
     #[ktest]
