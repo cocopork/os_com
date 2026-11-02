@@ -75,10 +75,10 @@ continues to select NVM and recovery safely retries migration.
 
 ## 4. Migration Worker Pool
 
-rNVPCe starts a bounded number of migration workers. The default is:
+rNVPCe supports a bounded number of migration workers. The default is:
 
 ```text
-min(4, max(1, online_cpu_count / 8))
+1
 ```
 
 The kernel command-line parameter `rtio_workers=N` may override the default
@@ -86,6 +86,11 @@ for controlled experiments. Valid values are 1 through 16. Invalid values are
 rejected during configuration rather than silently clamped. rNVPC WAL mode
 uses one worker regardless of this parameter until its per-page completion
 path is redesigned.
+
+The initial real-device validation used a single virtio-blk queue. Four
+submitters increased submission-side contention and capacity-wait time, so
+multiple workers remain opt-in until the device path provides multiple queues
+or a centralized submission layer.
 
 Every worker follows the existing wake policy. Dirty-watermark pressure,
 explicit migration-progress waiters, or any capacity waiter wakes all

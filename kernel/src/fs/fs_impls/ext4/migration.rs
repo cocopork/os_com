@@ -47,7 +47,8 @@ pub(super) fn rtio_worker_count(
     if mode != rnvpc::mode::RnvpcMode::RnvpcExtend {
         return Ok(1);
     }
-    Ok(override_value.unwrap_or_else(|| (cpu_count / 8).clamp(1, 4)))
+    let _ = cpu_count;
+    Ok(override_value.unwrap_or(1))
 }
 
 fn configured_rtio_worker_count(mode: rnvpc::mode::RnvpcMode) -> Result<usize> {
@@ -1525,11 +1526,12 @@ mod tests {
     fn rtio_worker_policy_defaults_and_bounds() {
         assert_eq!(
             rtio_worker_count(RnvpcMode::RnvpcExtend, 64, None).unwrap(),
-            4
+            1,
+            "single-queue validation requires an opt-in for multiple submitters"
         );
         assert_eq!(
             rtio_worker_count(RnvpcMode::RnvpcExtend, 16, None).unwrap(),
-            2
+            1
         );
         assert_eq!(
             rtio_worker_count(RnvpcMode::RnvpcExtend, 4, None).unwrap(),

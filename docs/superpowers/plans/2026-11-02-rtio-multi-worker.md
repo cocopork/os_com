@@ -58,6 +58,12 @@ Expected: compilation or assertions fail because the policy and gate do not exis
 
 Add the exact interfaces above. Store the gate on `Ext4`; shared permits count active submission rounds, while the exclusive guard sets quiescing before waiting, prevents new permits, and waits for the count to reach zero. Parse `rtio_workers=N` once from the kernel command line. Change `start_nv_migration` to return `Result<()>` so `Ext4::open` rejects invalid values before any worker starts.
 
+Validation ruling: the worker pool remains available through
+`rtio_workers=2..16`, but the default is one worker. On the current
+single-queue virtio device, four submitters increased submission contention
+and capacity-wait time. Automatic multi-worker enablement therefore requires
+a future multi-queue or centralized-submission design.
+
 - [ ] **Step 4: Run the focused tests and verify GREEN**
 
 Run the Step 2 command and require all selected tests to pass.
