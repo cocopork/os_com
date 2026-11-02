@@ -3,10 +3,15 @@
 //! Two-worker, bounded asynchronous NV migration. BIO callbacks enqueue only;
 //! process-context completion owns durability and publishes reclaim work items;
 //! foreground or background helpers own SSD publication and NVPage reclamation.
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use aster_block::bio::BioDirection;
-use ostd::{cpu::CpuId, sync::LocalIrqDisabled, util::id_set::Id};
+use ostd::{
+    cpu::CpuId,
+    sync::{LocalIrqDisabled, RwMutexWriteGuard},
+    util::id_set::Id,
+};
+use spin::Once;
 
 use super::{block_group::AllocationGroupLease, fs::Ext4, pipeline_profile as pp, prelude::*};
 use crate::fs::rnvpc::{
@@ -26,6 +31,103 @@ use batch::MigrationBatch;
 use reclaim::ReclaimReadyQueue;
 
 const MIGRATION_BATCH_PAGES: usize = super::writeback::WRITEBACK_BATCH;
+const MAX_RTIO_WORKERS: usize = 16;
+
+static RTIO_WORKERS_PARAM: Once<String> = Once::new();
+aster_cmdline::define_kv_param!("rtio_workers", RTIO_WORKERS_PARAM);
+
+pub(super) fn rtio_worker_count(
+    mode: rnvpc::mode::RnvpcMode,
+    cpu_count: usize,
+    override_value: Option<usize>,
+) -> Result<usize> {
+    if override_value.is_some_and(|workers| !(1..=MAX_RTIO_WORKERS).contains(&workers)) {
+        return_errno_with_message!(Errno::EINVAL, "rtio_workers must be between 1 and 16");
+    }
+    if mode != rnvpc::mode::RnvpcMode::RnvpcExtend {
+        return Ok(1);
+    }
+    Ok(override_value.unwrap_or_else(|| (cpu_count / 8).clamp(1, 4)))
+}
+
+fn configured_rtio_worker_count(mode: rnvpc::mode::RnvpcMode) -> Result<usize> {
+    let override_value = RTIO_WORKERS_PARAM
+        .get()
+        .map(|value| {
+            value
+                .parse::<usize>()
+                .map_err(|_| Error::with_message(Errno::EINVAL, "rtio_workers must be an integer"))
+        })
+        .transpose()?;
+    rtio_worker_count(mode, ostd::cpu::num_cpus(), override_value)
+}
+
+pub(super) struct MigrationGate {
+    access: RwMutex<()>,
+    exclusive_serial: Mutex<()>,
+    quiescing: AtomicBool,
+    shared_waiters: ostd::sync::WaitQueue,
+}
+
+impl MigrationGate {
+    pub(super) const fn new() -> Self {
+        Self {
+            access: RwMutex::new(()),
+            exclusive_serial: Mutex::new(()),
+            quiescing: AtomicBool::new(false),
+            shared_waiters: ostd::sync::WaitQueue::new(),
+        }
+    }
+
+    pub(super) fn enter_shared(&self) -> MigrationPermit<'_> {
+        self.shared_waiters.wait_until(|| {
+            if self.quiescing.load(Ordering::Acquire) {
+                return None;
+            }
+            let access = self.access.try_read()?;
+            if self.quiescing.load(Ordering::Acquire) {
+                drop(access);
+                return None;
+            }
+            Some(MigrationPermit { _access: access })
+        })
+    }
+
+    pub(super) fn enter_exclusive(&self) -> MigrationQuiesceGuard<'_> {
+        let serial = self.exclusive_serial.lock();
+        self.quiescing.store(true, Ordering::Release);
+        let access = self.access.write();
+        MigrationQuiesceGuard {
+            gate: self,
+            access: Some(access),
+            _serial: serial,
+        }
+    }
+
+    #[cfg(ktest)]
+    fn is_quiescing_for_test(&self) -> bool {
+        self.quiescing.load(Ordering::Acquire)
+    }
+}
+
+pub(super) struct MigrationPermit<'a> {
+    _access: RwMutexReadGuard<'a, ()>,
+}
+
+pub(super) struct MigrationQuiesceGuard<'a> {
+    gate: &'a MigrationGate,
+    access: Option<RwMutexWriteGuard<'a, ()>>,
+    _serial: MutexGuard<'a, ()>,
+}
+
+impl Drop for MigrationQuiesceGuard<'_> {
+    fn drop(&mut self) {
+        drop(self.access.take());
+        self.gate.quiescing.store(false, Ordering::Release);
+        self.gate.shared_waiters.wake_all();
+    }
+}
+
 pub(super) type CompletionQueue = Arc<SpinLock<VecDeque<Arc<MigrationBatch>>, LocalIrqDisabled>>;
 
 pub(super) struct CompletionJob {
@@ -140,9 +242,10 @@ impl Ext4 {
         Ok(())
     }
 
-    pub(super) fn start_nv_migration(self: &Arc<Self>) {
+    pub(super) fn start_nv_migration(self: &Arc<Self>) -> Result<()> {
+        let _worker_count = configured_rtio_worker_count(self.rnvpc_mode())?;
         if !self.nv_migration_enabled() {
-            return;
+            return Ok(());
         }
         let weak = Arc::downgrade(self);
         let trigger = self.nv_migration_trigger.clone();
@@ -287,6 +390,7 @@ impl Ext4 {
             })
             .spawn();
         }
+        Ok(())
     }
 
     pub(super) fn request_allocation_writeback(&self) {
@@ -1334,9 +1438,116 @@ mod tests {
     use ostd::prelude::ktest;
 
     use super::*;
-    use crate::fs::fs_impls::ext4::{
-        allocator::group_selector::AllocationGroupSelector, block_group::AllocationWritebackState,
+    use crate::fs::{
+        fs_impls::ext4::{
+            allocator::group_selector::AllocationGroupSelector,
+            block_group::AllocationWritebackState,
+        },
+        rnvpc::mode::RnvpcMode,
     };
+
+    #[ktest]
+    fn rtio_worker_policy_defaults_and_bounds() {
+        assert_eq!(
+            rtio_worker_count(RnvpcMode::RnvpcExtend, 64, None).unwrap(),
+            4
+        );
+        assert_eq!(
+            rtio_worker_count(RnvpcMode::RnvpcExtend, 16, None).unwrap(),
+            2
+        );
+        assert_eq!(
+            rtio_worker_count(RnvpcMode::RnvpcExtend, 4, None).unwrap(),
+            1
+        );
+        assert_eq!(
+            rtio_worker_count(RnvpcMode::RnvpcExtend, 64, Some(1)).unwrap(),
+            1
+        );
+        assert_eq!(
+            rtio_worker_count(RnvpcMode::RnvpcExtend, 64, Some(16)).unwrap(),
+            16
+        );
+        assert_eq!(
+            rtio_worker_count(RnvpcMode::Rnvpc, 64, Some(4)).unwrap(),
+            1,
+            "the legacy WAL path remains single-worker"
+        );
+        assert_eq!(
+            rtio_worker_count(RnvpcMode::Native, 64, Some(4)).unwrap(),
+            1
+        );
+        assert_eq!(
+            rtio_worker_count(RnvpcMode::RnvpcExtend, 64, Some(0))
+                .unwrap_err()
+                .error(),
+            Errno::EINVAL
+        );
+        assert_eq!(
+            rtio_worker_count(RnvpcMode::RnvpcExtend, 64, Some(17))
+                .unwrap_err()
+                .error(),
+            Errno::EINVAL
+        );
+    }
+
+    #[ktest]
+    fn migration_gate_shared_rounds_precede_quiesce() {
+        let gate = Arc::new(MigrationGate::new());
+        let first = gate.enter_shared();
+        let second = gate.enter_shared();
+        let writer_state = Arc::new(AtomicUsize::new(0));
+        let release_writer = Arc::new(AtomicBool::new(false));
+
+        let writer_gate = gate.clone();
+        let writer_state_for_thread = writer_state.clone();
+        let release_writer_for_thread = release_writer.clone();
+        let writer = crate::thread::kernel_thread::ThreadOptions::new(move || {
+            writer_state_for_thread.store(1, Ordering::Release);
+            let exclusive = writer_gate.enter_exclusive();
+            writer_state_for_thread.store(2, Ordering::Release);
+            while !release_writer_for_thread.load(Ordering::Acquire) {
+                crate::thread::Thread::yield_now();
+            }
+            drop(exclusive);
+            writer_state_for_thread.store(3, Ordering::Release);
+        })
+        .spawn();
+        while writer_state.load(Ordering::Acquire) == 0 {
+            crate::thread::Thread::yield_now();
+        }
+        while !gate.is_quiescing_for_test() {
+            crate::thread::Thread::yield_now();
+        }
+
+        let late_reader_entered = Arc::new(AtomicBool::new(false));
+        let late_gate = gate.clone();
+        let late_reader_entered_for_thread = late_reader_entered.clone();
+        let late_reader = crate::thread::kernel_thread::ThreadOptions::new(move || {
+            let _shared = late_gate.enter_shared();
+            late_reader_entered_for_thread.store(true, Ordering::Release);
+        })
+        .spawn();
+
+        drop(first);
+        crate::thread::Thread::yield_now();
+        assert_eq!(writer_state.load(Ordering::Acquire), 1);
+        drop(second);
+        while writer_state.load(Ordering::Acquire) == 1 {
+            crate::thread::Thread::yield_now();
+        }
+        assert_eq!(writer_state.load(Ordering::Acquire), 2);
+        assert!(
+            !late_reader_entered.load(Ordering::Acquire),
+            "a queued exclusive guard must prevent later shared admission"
+        );
+
+        release_writer.store(true, Ordering::Release);
+        writer.join();
+        late_reader.join();
+        assert_eq!(writer_state.load(Ordering::Acquire), 3);
+        assert!(late_reader_entered.load(Ordering::Acquire));
+    }
 
     #[ktest]
     fn rnvpce_group_lease_disjoint_groups_progress_concurrently() {

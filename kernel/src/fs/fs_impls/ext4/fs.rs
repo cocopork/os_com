@@ -243,6 +243,7 @@ pub struct Ext4 {
     rnvpc_mode: RnvpcModeConfig,
     pub(super) cache_pressure: Arc<super::writeback::CachePressure>,
     pub(super) nv_migration_lock: Mutex<()>,
+    pub(super) nv_migration_gate: super::migration::MigrationGate,
     pub(super) nv_migration_trigger: Arc<ostd::sync::WaitQueue>,
     pub(super) nv_migration_epoch: AtomicUsize,
     pub(super) nv_capacity_waiters: AtomicUsize,
@@ -440,6 +441,7 @@ impl Ext4 {
             rnvpc_mode,
             cache_pressure: super::writeback::CachePressure::new(),
             nv_migration_lock: Mutex::new(()),
+            nv_migration_gate: super::migration::MigrationGate::new(),
             nv_migration_trigger: Arc::new(ostd::sync::WaitQueue::new()),
             nv_migration_epoch: AtomicUsize::new(0),
             nv_capacity_waiters: AtomicUsize::new(0),
@@ -586,7 +588,7 @@ impl Ext4 {
             ext4.reconcile_rnvpce_migration_targets()?;
             ext4.reconcile_rnvpce_reservations()?;
         }
-        ext4.start_nv_migration();
+        ext4.start_nv_migration()?;
         // Kernel fixtures opt in explicitly; avoid spawning a worker per fixture.
         #[cfg(not(ktest))]
         ext4.start_cache_writeback();
