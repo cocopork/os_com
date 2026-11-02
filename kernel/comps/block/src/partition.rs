@@ -261,6 +261,10 @@ impl BlockDevice for PartitionNode {
         metadata
     }
 
+    fn queue_diagnostics(&self, queue_id: u16) -> Option<crate::BlockQueueDiagnostics> {
+        self.device.queue_diagnostics(queue_id)
+    }
+
     fn name(&self) -> &str {
         &self.name
     }
@@ -323,6 +327,72 @@ mod tests {
         fn id(&self) -> DeviceId {
             DeviceId::new(MajorId::new(1), MinorId::new(0))
         }
+    }
+
+    #[derive(Debug)]
+    struct DiagnosticDevice;
+
+    impl BlockDevice for DiagnosticDevice {
+        fn enqueue(&self, bio: SubmittedBio) -> Result<(), BioEnqueueError> {
+            bio.complete(BioStatus::Complete);
+            Ok(())
+        }
+        fn metadata(&self) -> BlockDeviceMeta {
+            BlockDeviceMeta {
+                nr_submission_queues: 2,
+                ..BlockDeviceMeta::default()
+            }
+        }
+        fn queue_diagnostics(&self, queue_id: u16) -> Option<crate::BlockQueueDiagnostics> {
+            (queue_id == 1).then_some(crate::BlockQueueDiagnostics {
+                queued_bios: 11,
+                queued_pages: 22,
+                submitted_bios: 33,
+                submitted_pages: 44,
+                staging_depth: 5,
+                max_sampled_staging_depth: 6,
+                descriptor_wait_count: 7,
+                descriptor_wait_ticks: 88,
+                active_forwarders: 1,
+                peak_forwarders: 2,
+                irq_completions: 99,
+                in_flight_requests: 3,
+            })
+        }
+        fn name(&self) -> &str {
+            "diagnostic-device"
+        }
+        fn id(&self) -> DeviceId {
+            DeviceId::new(MajorId::new(1), MinorId::new(0))
+        }
+    }
+
+    #[ktest]
+    fn partition_forwards_queue_diagnostics_and_preserves_unsupported() {
+        let info = PartitionInfo::Gpt(GptEntry {
+            type_guid: [1; 16],
+            guid: [2; 16],
+            start_lba: 100,
+            end_lba: 199,
+            attributes: 0,
+            name: [0; 72],
+        });
+        let device: Arc<dyn BlockDevice> = Arc::new(DiagnosticDevice);
+        let partition =
+            PartitionNode::new(device.id(), String::from("partition"), device.clone(), info);
+        assert_eq!(partition.queue_diagnostics(1), device.queue_diagnostics(1));
+        assert_eq!(partition.queue_diagnostics(1).unwrap().submitted_pages, 44);
+        assert_eq!(partition.queue_diagnostics(0), None);
+        assert_eq!(partition.queue_diagnostics(2), None);
+        let unsupported: Arc<dyn BlockDevice> = Arc::new(RecordingDevice(Mutex::new(Vec::new())));
+        assert_eq!(unsupported.queue_diagnostics(0), None);
+        let partition = PartitionNode::new(
+            unsupported.id(),
+            String::from("unsupported"),
+            unsupported,
+            info,
+        );
+        assert_eq!(partition.queue_diagnostics(0), None);
     }
 
     #[ktest]

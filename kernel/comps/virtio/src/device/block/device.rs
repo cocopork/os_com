@@ -219,6 +219,13 @@ impl aster_block::BlockDevice for BlockDevice {
         }
     }
 
+    fn queue_diagnostics(&self, queue_id: u16) -> Option<aster_block::BlockQueueDiagnostics> {
+        self.device
+            .queues
+            .get(usize::from(queue_id))
+            .map(|queue| queue.diagnostics())
+    }
+
     fn name(&self) -> &str {
         &self.name
     }
@@ -410,23 +417,7 @@ fn enqueue_on_queue(
 }
 
 /// Per-queue counters for diagnosing submission balance and backpressure.
-#[derive(Clone, Copy, Debug)]
-pub struct VirtioBlockQueueDiagnostics {
-    pub queued_bios: usize,
-    pub queued_pages: usize,
-    pub submitted_bios: usize,
-    pub submitted_pages: usize,
-    pub staging_depth: usize,
-    /// Maximum sampled staging depth; a concurrent dequeue may precede sampling.
-    pub max_sampled_staging_depth: usize,
-    pub descriptor_wait_count: usize,
-    /// TSC ticks spent waiting for descriptors (convert with `ostd::arch::tsc_freq()`).
-    pub descriptor_wait_ticks: u64,
-    pub active_forwarders: usize,
-    pub peak_forwarders: usize,
-    pub irq_completions: usize,
-    pub in_flight_requests: usize,
-}
+pub use aster_block::BlockQueueDiagnostics as VirtioBlockQueueDiagnostics;
 
 #[derive(Debug, Default)]
 struct QueueCounters {
@@ -1071,6 +1062,44 @@ mod tests {
         for batch in batches {
             assert!(batch.wait_all().is_ok());
         }
+    }
+
+    #[ktest]
+    fn common_queue_diagnostics_report_selected_queue_and_invalid_ids() {
+        let (queue_device, transport) = QueueDevice::new(2, 4);
+        let mut batch = IoBatch::new();
+        (&queue_device as &dyn aster_block::BlockDevice)
+            .write_segments_on_queue_async(
+                aster_block::id::Bid::new(0),
+                alloc::vec![BioSegment::alloc(2, BioDirection::ToDevice)],
+                BioQueueAffinity::Queue(1),
+                None,
+                &mut batch,
+            )
+            .unwrap();
+        let device = BlockDevice {
+            device: Arc::new(DeviceInner {
+                config_manager: ConfigManager::new(None, None),
+                features: BlockFeatures::empty(),
+                queues: queue_device.queues,
+                max_nr_segments_per_bio: 2,
+                transport: SpinLock::new(Box::new(transport)),
+            }),
+            id: DeviceId::new(MajorId::new(1), MinorId::new(0)),
+            name: String::from("common-diagnostic-test"),
+            partitions: SpinLock::new(None),
+            weak_self: Weak::new(),
+        };
+        let common: &dyn aster_block::BlockDevice = &device;
+        assert_eq!(common.queue_diagnostics(2), None);
+        let stats = common.queue_diagnostics(1).unwrap();
+        assert_eq!(stats.queued_bios, 1);
+        assert_eq!(stats.queued_pages, 2);
+        assert_eq!(stats.staging_depth, 1);
+        assert_eq!(common.queue_diagnostics(0).unwrap().queued_bios, 0);
+        finish_staged(&device.device.queues[1]);
+        assert_eq!(common.queue_diagnostics(1).unwrap().staging_depth, 0);
+        assert!(batch.wait_all().is_ok());
     }
 
     #[ktest]

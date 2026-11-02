@@ -68,6 +68,14 @@ pub trait BlockDevice: Send + Sync + Any + Debug {
     /// Returns the metadata of the block device.
     fn metadata(&self) -> BlockDeviceMeta;
 
+    /// Returns a queue-local diagnostic snapshot, if supported for `queue_id`.
+    ///
+    /// Counters include all users of the underlying queue, including partitions.
+    /// Fields are sampled independently and do not form an atomic snapshot.
+    fn queue_diagnostics(&self, _queue_id: u16) -> Option<BlockQueueDiagnostics> {
+        None
+    }
+
     /// Returns the name of the block device.
     fn name(&self) -> &str;
 
@@ -98,6 +106,29 @@ pub struct BlockDeviceMeta {
     /// The number of submission queues available to this device.
     pub nr_submission_queues: u16,
     // Additional useful metadata can be added here in the future.
+}
+
+/// Read-only submission-queue counters and activity gauges.
+///
+/// Cumulative counters are monotonic; activity gauges may decrease. Drivers that
+/// cannot provide these diagnostics leave `BlockDevice::queue_diagnostics`
+/// unsupported instead of manufacturing zero counters.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct BlockQueueDiagnostics {
+    pub queued_bios: usize,
+    pub queued_pages: usize,
+    pub submitted_bios: usize,
+    pub submitted_pages: usize,
+    pub staging_depth: usize,
+    /// Maximum sampled staging depth; a concurrent dequeue may precede sampling.
+    pub max_sampled_staging_depth: usize,
+    pub descriptor_wait_count: usize,
+    /// TSC ticks spent waiting for descriptors (`ostd::arch::tsc_freq()` per second).
+    pub descriptor_wait_ticks: u64,
+    pub active_forwarders: usize,
+    pub peak_forwarders: usize,
+    pub irq_completions: usize,
+    pub in_flight_requests: usize,
 }
 
 impl dyn BlockDevice {
