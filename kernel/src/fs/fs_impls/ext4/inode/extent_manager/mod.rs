@@ -156,6 +156,9 @@ pub(super) struct ExtentManager {
     state: RwMutex<ExtentTree>,
     /// Cached page count for the `PageCache` backend.
     npages: AtomicUsize,
+    /// Counts rNVPCe native-baseline install transactions in kernel tests.
+    #[cfg(ktest)]
+    preallocated_install_calls: AtomicUsize,
     /// Back-reference to the filesystem, for the block device and allocator.
     fs: Weak<super::super::fs::Ext4>,
     /// The owning inode's `metadata_csum` seed, `Some` only when the feature is
@@ -191,6 +194,8 @@ impl ExtentManager {
         Ok(Self {
             state: RwMutex::new(ExtentTree::try_new(root, sector_count)?),
             npages: AtomicUsize::new(npages),
+            #[cfg(ktest)]
+            preallocated_install_calls: AtomicUsize::new(0),
             fs,
             csum_seed,
             inode_goal,
@@ -243,6 +248,9 @@ impl ExtentManager {
         pblock: Ext4Bid,
         handle: Option<&journal::Handle>,
     ) -> Result<()> {
+        #[cfg(ktest)]
+        self.preallocated_install_calls
+            .fetch_add(1, Ordering::Relaxed);
         match self.map_blocks(iblock)? {
             Mapping::Mapped {
                 pblock: current,
@@ -278,6 +286,142 @@ impl ExtentManager {
                 )
             }
         }
+    }
+
+    /// Installs one physically contiguous, already-written mapping range.
+    ///
+    /// rNVPCe exports a persistent SSD extent through this entry point so a
+    /// large mapping is validated and published as one transaction instead of
+    /// repeating the map/lock/tree route for every block.
+    pub(super) fn install_preallocated_written_range(
+        &self,
+        iblock: Iblock,
+        pblock: Ext4Bid,
+        len: u32,
+        handle: Option<&journal::Handle>,
+    ) -> Result<()> {
+        if len == 0 {
+            return Ok(());
+        }
+        #[cfg(ktest)]
+        self.preallocated_install_calls
+            .fetch_add(1, Ordering::Relaxed);
+
+        let logical_end = (iblock as u64)
+            .checked_add(len as u64)
+            .filter(|end| *end <= u32::MAX as u64 + 1)
+            .ok_or_else(|| Error::new(Errno::EOVERFLOW))?;
+        pblock
+            .checked_add(len as u64 - 1)
+            .ok_or_else(|| Error::new(Errno::EOVERFLOW))?;
+
+        let fs = self.fs()?;
+        let mut tree = self.state.write();
+        let mut overlaps = Vec::new();
+        tree.walk_range(&fs, iblock as u64..logical_end, &mut |extent| {
+            overlaps.push(*extent);
+            core::ops::ControlFlow::Continue(())
+        })?;
+
+        // Validate the complete range before the first tree edit. A retry may
+        // encounter an already-published prefix, but a different mapping is a
+        // stale migration target and must leave the tree untouched.
+        for extent in &overlaps {
+            let overlap_start = (extent.block() as u64).max(iblock as u64);
+            let overlap_end = (extent.block() as u64 + extent.len() as u64).min(logical_end);
+            let current = extent
+                .start()
+                .checked_add(overlap_start - extent.block() as u64)
+                .ok_or_else(|| Error::new(Errno::EOVERFLOW))?;
+            let expected = pblock
+                .checked_add(overlap_start - iblock as u64)
+                .ok_or_else(|| Error::new(Errno::EOVERFLOW))?;
+            if overlap_start >= overlap_end || current != expected {
+                return Err(Error::with_message(
+                    Errno::ESTALE,
+                    "migration target conflicts with native extent range",
+                ));
+            }
+        }
+
+        let mut cursor = iblock as u64;
+        for extent in overlaps {
+            let overlap_start = (extent.block() as u64).max(iblock as u64);
+            let overlap_end = (extent.block() as u64 + extent.len() as u64).min(logical_end);
+            Self::insert_preallocated_hole_range(
+                &mut tree,
+                &fs,
+                cursor,
+                overlap_start,
+                iblock,
+                pblock,
+                handle,
+                self.csum_seed,
+            )?;
+            if extent.is_unwritten() {
+                tree.convert_unwritten(
+                    &fs,
+                    Iblock::try_from(overlap_start).map_err(|_| Error::new(Errno::EOVERFLOW))?,
+                    u32::try_from(overlap_end - overlap_start)
+                        .map_err(|_| Error::new(Errno::EOVERFLOW))?,
+                    handle,
+                    self.csum_seed,
+                )?;
+            }
+            cursor = overlap_end;
+        }
+        Self::insert_preallocated_hole_range(
+            &mut tree,
+            &fs,
+            cursor,
+            logical_end,
+            iblock,
+            pblock,
+            handle,
+            self.csum_seed,
+        )
+    }
+
+    #[expect(clippy::too_many_arguments)]
+    fn insert_preallocated_hole_range(
+        tree: &mut ExtentTree,
+        fs: &super::super::fs::Ext4,
+        mut start: u64,
+        end: u64,
+        range_iblock: Iblock,
+        range_pblock: Ext4Bid,
+        handle: Option<&journal::Handle>,
+        csum_seed: Option<InodeCsumSeed>,
+    ) -> Result<()> {
+        while start < end {
+            let chunk = (end - start).min(node::MAX_WRITTEN_LEN as u64) as u16;
+            let logical = Iblock::try_from(start).map_err(|_| Error::new(Errno::EOVERFLOW))?;
+            let physical = range_pblock
+                .checked_add(start - range_iblock as u64)
+                .ok_or_else(|| Error::new(Errno::EOVERFLOW))?;
+            tree.insert_with_intent(
+                fs,
+                logical,
+                physical,
+                chunk,
+                node::ExtentKind::Written,
+                handle,
+                csum_seed,
+                super::super::fs::AllocIntent::MetadataReserve,
+            )?;
+            start += u64::from(chunk);
+        }
+        Ok(())
+    }
+
+    #[cfg(ktest)]
+    pub(super) fn reset_preallocated_install_calls(&self) {
+        self.preallocated_install_calls.store(0, Ordering::Relaxed);
+    }
+
+    #[cfg(ktest)]
+    pub(super) fn preallocated_install_calls(&self) -> usize {
+        self.preallocated_install_calls.load(Ordering::Relaxed)
     }
 
     pub(super) fn map_blocks(&self, iblock: Iblock) -> Result<Mapping> {

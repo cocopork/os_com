@@ -40,6 +40,7 @@ fn ext4_research_routes() {
         nv_route_rnvpce_recovers_unflushed_target_bitmap,
         nv_route_rnvpce_recovery_prefers_nv_allocation_bitmap,
         nv_route_rnvpce_sync_transfers_allocation_authority_to_ssd,
+        nv_route_rnvpce_sync_exports_contiguous_extent_once,
         nv_route_rnvpce_fragmented_batch_and_partial_rollback,
         nv_route_rnvpce_same_group_entries_submit_independently,
         nv_route_rnvpce_empty_round_skips_target_preparation,
@@ -52,6 +53,41 @@ fn ext4_research_routes() {
         nv_route_rnvpc_failed_allocation_flush_does_not_append_wal,
         nv_route_mount_rejects_switching_persistent_authority,
     );
+}
+
+fn nv_route_rnvpce_sync_exports_contiguous_extent_once() {
+    crate::fs::rnvpc::init_for_ext4_tests();
+    crate::time::clocks::init_for_ktest();
+    let fixture = Ext4FixtureBuilder::new(2048, 256, 2048)
+        .with_block_bitmap_metadata_marked()
+        .with_free_blocks(128)
+        .with_uuid([0xce; 16])
+        .with_mount_options("rnvpce=on,rtio=off")
+        .build()
+        .unwrap();
+    fixture.write_raw_inode(11, &make_empty_file_inode());
+    let inode = fixture.ext4.read_inode(11).unwrap();
+    let input = vec![0x5a; 8 * PAGE_SIZE];
+    inode
+        .write_at(0, &mut VmReader::from(input.as_slice()).to_fallible())
+        .unwrap();
+    assert_eq!(fixture.ext4.migrate_nv_round(64).unwrap(), 8);
+    fixture.ext4.drain_nv_in_flight().unwrap();
+
+    inode.reset_preallocated_install_calls();
+    fixture.ext4.sync_all().unwrap();
+    assert_eq!(
+        inode.preallocated_install_calls(),
+        1,
+        "one contiguous SSD extent must be exported as one native extent transaction"
+    );
+    let first = inode.data_block_of(0).unwrap();
+    for logical in 0..8 {
+        assert_eq!(
+            inode.data_block_of(logical),
+            Some(first + u64::from(logical))
+        );
+    }
 }
 
 fn nv_route_rnvpce_first_write_publishes_ssd_baseline() {

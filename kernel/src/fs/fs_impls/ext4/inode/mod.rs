@@ -1383,8 +1383,8 @@ impl Inode {
         // JBD2 used to coalesce these inode/node writes implicitly. In
         // nojournal mode retain bounded after-images explicitly, rather than
         // synchronously rewriting the same native metadata for every page.
-        const EXPORT_CHUNK_BLOCKS: usize = 64;
-        let mut chunk = Vec::with_capacity(EXPORT_CHUNK_BLOCKS);
+        const EXPORT_CHUNK_EXTENTS: usize = 64;
+        let mut chunk = Vec::with_capacity(EXPORT_CHUNK_EXTENTS);
         crate::fs::rnvpc::write_transaction::visit_ssd_extents(
             pool,
             fs.rnvpc_fs_id(),
@@ -1394,14 +1394,13 @@ impl Inode {
                 else {
                     return_errno!(Errno::EUCLEAN);
                 };
-                for delta in 0..extent.length() as u64 {
-                    let logical = Iblock::try_from(extent.logical_block() + delta)
-                        .map_err(|_| Error::new(Errno::EOVERFLOW))?;
-                    chunk.push((logical, block + delta));
-                    if chunk.len() == EXPORT_CHUNK_BLOCKS {
-                        self.export_rnvpce_extent_chunk(fs, &mut inner, &chunk)?;
-                        chunk.clear();
-                    }
+                let logical = Iblock::try_from(extent.logical_block())
+                    .map_err(|_| Error::new(Errno::EOVERFLOW))?;
+                let length = extent.length();
+                chunk.push((logical, block, length));
+                if chunk.len() == EXPORT_CHUNK_EXTENTS {
+                    self.export_rnvpce_extent_chunk(fs, &mut inner, &chunk)?;
+                    chunk.clear();
                 }
                 Ok(())
             },
@@ -1416,15 +1415,15 @@ impl Inode {
         &self,
         fs: &Ext4,
         inner: &mut InodeInner,
-        mappings: &[(Iblock, Ext4Bid)],
+        mappings: &[(Iblock, Ext4Bid, u32)],
     ) -> Result<()> {
         // rNVPCe mount policy guarantees no journal: admission checks still
         // run, but there is no transaction credit limit across this chunk.
         let em = inner.extent_manager()?.clone();
         let op = fs.begin_op(fs.write_credits(em.root_depth()))?;
         em.with_metadata_batch(|| {
-            for &(logical, physical) in mappings {
-                em.install_preallocated_written(logical, physical, op.get())?;
+            for &(logical, physical, length) in mappings {
+                em.install_preallocated_written_range(logical, physical, length, op.get())?;
             }
             Ok(())
         })?;
@@ -3830,6 +3829,21 @@ impl Inode {
         let extent_manager = inner.extent_manager().ok()?;
         let mapping = extent_manager.map_blocks(iblock).ok()?;
         mapping.mapped_pblock()
+    }
+
+    #[cfg(ktest)]
+    pub(in crate::fs::fs_impls::ext4) fn reset_preallocated_install_calls(&self) {
+        if let Ok(extent_manager) = self.inner.read().extent_manager() {
+            extent_manager.reset_preallocated_install_calls();
+        }
+    }
+
+    #[cfg(ktest)]
+    pub(in crate::fs::fs_impls::ext4) fn preallocated_install_calls(&self) -> usize {
+        self.inner
+            .read()
+            .extent_manager()
+            .map_or(0, |manager| manager.preallocated_install_calls())
     }
 
     /// Reclaims a fully unlinked inode: frees its data blocks and inode bit,
