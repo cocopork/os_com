@@ -27,23 +27,28 @@ pub(super) fn init_in_first_kthread() {
         }
 
         // Spawn threads for virtio block devices
-        if device.downcast_ref::<VirtIoBlockDevice>().is_some() {
-            let device_clone = device.clone();
-            let task_fn = move || {
-                info!("spawn the virtio-block thread");
-                crate::thread::io_test_affinity::trace(
-                    crate::thread::io_test_affinity::Role::Virtio,
-                );
-                let virtio_block_device = device_clone.downcast_ref::<VirtIoBlockDevice>().unwrap();
-                loop {
-                    virtio_block_device.handle_requests();
-                }
-            };
-            ThreadOptions::new(task_fn)
-                .cpu_affinity(crate::thread::io_test_affinity::affinity(
-                    crate::thread::io_test_affinity::Role::Virtio,
-                ))
-                .spawn();
+        if let Some(virtio_device) = device.downcast_ref::<VirtIoBlockDevice>() {
+            let queue_count = virtio_device.nr_submission_queues();
+            for queue_id in 0..queue_count {
+                let device_clone = device.clone();
+                let task_fn = move || {
+                    info!("spawn the virtio-block thread for queue {}", queue_id);
+                    crate::thread::io_test_affinity::trace(
+                        crate::thread::io_test_affinity::Role::Virtio,
+                    );
+                    let virtio_block_device =
+                        device_clone.downcast_ref::<VirtIoBlockDevice>().unwrap();
+                    loop {
+                        virtio_block_device.handle_requests(queue_id);
+                    }
+                };
+                ThreadOptions::new(task_fn)
+                    .cpu_affinity(crate::thread::io_test_affinity::virtio_queue_affinity(
+                        queue_id,
+                        queue_count,
+                    ))
+                    .spawn();
+            }
         }
         // Spawn threads for NVMe block devices
         else if device.downcast_ref::<NvmeBlockDevice>().is_some() {
