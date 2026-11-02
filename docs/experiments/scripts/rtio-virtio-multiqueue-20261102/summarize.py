@@ -4,6 +4,7 @@
 
 import argparse
 import json
+import os
 from pathlib import Path
 import re
 import socket
@@ -13,7 +14,6 @@ import sys
 import time
 
 GIB_256 = 256 * 1024**3
-DISK_NAME = re.compile(r"nvme[0-9]+n[0-9]+")
 
 
 def qemu_preflight(qemu_bin):
@@ -31,29 +31,82 @@ def validate_qemu(version, help_text):
     return {"version": version.strip(), "device_help": help_text}
 
 
-def target_preflight(target, lsblk_bin="lsblk", findmnt_bin="findmnt"):
-    path = Path(target)
-    if not stat.S_ISBLK(path.stat().st_mode):
-        raise ValueError(f"not a block device: {target}")
-    output = subprocess.check_output(
-        [lsblk_bin, "-J", "-b", "-n", "-o", "NAME,TYPE,SIZE,PKNAME", target], text=True
-    )
-    devices = json.loads(output)["blockdevices"]
-    if len(devices) != 1:
-        raise ValueError("target must resolve to exactly one partition")
-    device = devices[0]
-    parent = device.get("pkname")
-    if device.get("type") != "part" or not parent or not DISK_NAME.fullmatch(parent):
-        raise ValueError("target must be an NVMe partition")
-    if int(device.get("size", 0)) != GIB_256:
+def block_identity(path):
+    device = os.stat(path)
+    if not stat.S_ISBLK(device.st_mode):
+        raise ValueError(f"not a block device: {path}")
+    return f"{os.major(device.st_rdev)}:{os.minor(device.st_rdev)}"
+
+
+def target_preflight(target, lsblk_bin="lsblk", findmnt_bin="findmnt", *,
+                     sys_dev_root=Path("/sys/dev/block"), swaps_path=Path("/proc/swaps"),
+                     fuser_bin="fuser", identity_fn=block_identity, canonical_fn=os.path.realpath):
+    allowed = {"/dev/nvme1n1p1", "/dev/nvme1n1p2"}
+    if target not in allowed or canonical_fn(target) != target:
+        raise ValueError("target must be canonical /dev/nvme1n1p1 or /dev/nvme1n1p2")
+    parent_path = "/dev/nvme1n1"
+    target_id = identity_fn(target)
+    parent_id = identity_fn(parent_path)
+
+    def lsblk_device(path):
+        output = subprocess.check_output(
+            [lsblk_bin, "-J", "-b", "-n", "-o", "NAME,TYPE,SIZE,PKNAME,MAJ:MIN,MOUNTPOINTS", path], text=True
+        )
+        devices = json.loads(output)["blockdevices"]
+        if len(devices) != 1:
+            raise ValueError(f"lsblk identity ambiguous: {path}")
+        return devices[0]
+
+    target_data = lsblk_device(target)
+    if target_data.get("type") != "part" or target_data.get("pkname") != "nvme1n1":
+        raise ValueError("target parent must be nvme1n1")
+    if target_data.get("name") != Path(target).name or target_data.get("maj:min") != target_id:
+        raise ValueError("target lsblk major:minor does not match host device")
+    if int(target_data.get("size", 0)) != GIB_256:
         raise ValueError("target must be exactly 256 GiB")
-    for source in (target, f"/dev/{parent}"):
-        mount_check = subprocess.run([findmnt_bin, "-rn", "-S", source], capture_output=True)
-        if mount_check.returncode == 0:
-            raise ValueError(f"mounted source: {source}")
-        if mount_check.returncode != 1:
-            raise ValueError(f"findmnt failed for {source}: {mount_check.stderr.decode().strip()}")
-    return {"target": str(path.resolve()), "parent": parent, "size_bytes": GIB_256}
+    parent_data = lsblk_device(parent_path)
+    if parent_data.get("type") != "disk" or parent_data.get("name") != "nvme1n1" or parent_data.get("maj:min") != parent_id:
+        raise ValueError("parent lsblk major:minor does not match host device")
+    if target_data.get("children"):
+        raise ValueError("target has active block descendant")
+    for device_id in (target_id, parent_id):
+        holders_dir = Path(sys_dev_root) / device_id / "holders"
+        if not holders_dir.is_dir():
+            raise ValueError(f"missing holder identity: {holders_dir}")
+        if any(holders_dir.iterdir()):
+            raise ValueError(f"active holder on {device_id}")
+    for device_data in (target_data, parent_data):
+        if any(mount is not None for mount in device_data.get("mountpoints", [])):
+            raise ValueError("target or parent is mounted")
+
+    mount_output = subprocess.check_output([findmnt_bin, "-J", "-o", "SOURCE,MAJ:MIN,TARGET"], text=True)
+    def mounted(filesystems):
+        for filesystem in filesystems:
+            if filesystem.get("maj:min") in (target_id, parent_id):
+                return True
+            if mounted(filesystem.get("children", [])):
+                return True
+        return False
+    if mounted(json.loads(mount_output).get("filesystems", [])):
+        raise ValueError("mounted target or parent major:minor")
+
+    for line in Path(swaps_path).read_text().splitlines()[1:]:
+        swap_path = line.split()[0]
+        try:
+            swap_id = identity_fn(swap_path)
+        except ValueError:
+            swap_stat = os.stat(swap_path)
+            swap_id = f"{os.major(swap_stat.st_dev)}:{os.minor(swap_stat.st_dev)}"
+        if swap_id in (target_id, parent_id):
+            raise ValueError("target or parent is active swap")
+    for path in (target, parent_path):
+        used = subprocess.run([fuser_bin, "-s", "--", path], capture_output=True)
+        if used.returncode == 0:
+            raise ValueError(f"target or parent is in use: {path}")
+        if used.returncode != 1:
+            raise ValueError(f"fuser failed: {path}")
+    return {"target": target, "parent": "nvme1n1", "size_bytes": GIB_256,
+            "target_major_minor": target_id, "parent_major_minor": parent_id}
 
 
 def expand_cpu_list(value):
@@ -172,8 +225,12 @@ def summarize_counts(counts):
 
 
 def parse_trace(raw):
+    begin = raw.find("TRACE_FINAL_BEGIN\n")
+    end = raw.find("TRACE_FINAL_END\n")
+    if begin < 0 or end <= begin or "READY parent=nvme1n1\n" not in raw[:begin]:
+        raise ValueError("trace lacks ready marker or complete final map")
     counts = {}
-    for hctx, count in re.findall(r"@hctx\[(\d+)\]:\s*(\d+)", raw):
+    for hctx, count in re.findall(r"@hctx\[(\d+)\]:\s*(\d+)", raw[begin:end]):
         counts[int(hctx)] = counts.get(int(hctx), 0) + int(count)
     if not counts:
         raise ValueError("no NVMe hctx submission counts in trace")
