@@ -31,6 +31,9 @@ There is no centralized BIO submitter.
 - Preserve one device FLUSH per ready durability epoch.
 - Make queue selection part of the common block interface and transparently
   preserve it through partitions.
+- Map different virtqueues to different host QEMU IOThreads and host NVMe
+  blk-mq hardware contexts in the real-device experiment, rather than treating
+  a negotiated guest queue count as evidence of host-side parallelism.
 - Keep single-queue block drivers and callers source-compatible through the
   default `Any` queue selection.
 
@@ -169,7 +172,33 @@ migration round. Worker IDs and queue IDs are runtime-only. Candidate claims
 remain atomic `Dirty -> Migrating`, so workers cannot submit the same dirty
 extent entry.
 
-## 9. Completion and Durability
+## 9. Host Backend and NVMe Hardware Queues
+
+The performance harness uses QEMU 9.0 or newer. QEMU 9.0 introduced
+`iothread-vq-mapping` for assigning virtio-blk queues of one disk to different
+IOThreads; the host's installed QEMU 8.2.2 does not expose this property and is
+retained only as a single-IOThread control.
+
+For an N-queue experiment, the harness creates N IOThreads and maps virtqueue
+`i` exclusively to IOThread `i`. After QEMU starts, QMP `query-iothreads`
+provides each host thread ID. The harness reads
+`/sys/block/nvme1n1/mq/*/cpu_list`, selects N host CPUs that map to distinct
+NVMe blk-mq hardware contexts, and pins one IOThread to each selected CPU. The
+target remains a raw, direct host partition; no host filesystem or image cache
+is inserted between QEMU and the authorized NVMe partition.
+
+This mapping is a performance configuration, not a filesystem correctness
+dependency. The experiment must record both mappings:
+
+```text
+rTIO worker -> guest virtqueue -> QEMU IOThread/host CPU -> NVMe hctx
+```
+
+Host tracing at the NVMe queue submission point is the authority for whether
+multiple hardware queues were actually used. Queue counts, configured CPU
+affinity, or guest diagnostics alone are insufficient.
+
+## 10. Completion and Durability
 
 BIO callbacks from every virtqueue publish their `MigrationBatch` to the same
 completion queue. The existing single durability coordinator drains all ready
@@ -195,7 +224,7 @@ Sync first closes the migration gate, waits for all worker submission rounds,
 drains all queue completions and reclaim work, then performs the existing
 allocation metadata and extent export.
 
-## 10. Shutdown and Error Handling
+## 11. Shutdown and Error Handling
 
 - Queue initialization is all-or-nothing before the driver reaches
   `DRIVER_OK`; partial initialization returns an error.
@@ -211,7 +240,7 @@ allocation metadata and extent export.
   change does not introduce a generic block-device unregister/shutdown API.
 - Single-queue behavior remains the fallback for devices without MQ.
 
-## 11. Diagnostics
+## 12. Diagnostics
 
 Add per-queue counters without per-page timing:
 
@@ -227,14 +256,14 @@ Add per-queue counters without per-page timing:
 The performance report must compare queue balance and verify that no queue
 receives all rTIO traffic when multiple workers are enabled.
 
-## 12. Verification
+## 13. Verification
 
 ### Common block layer
 
 - `Any` remains accepted by all existing drivers.
 - exact queue IDs are preserved through `PartitionNode`.
-- invalid queue IDs return `InvalidQueue` before enqueueing the BIO or invoking
-  its completion callback.
+- invalid queue IDs return `InvalidQueue` without changing a staging queue or
+  invoking the BIO completion callback.
 - request merging never crosses queue affinity.
 
 ### VirtIO driver
@@ -260,11 +289,18 @@ receives all rTIO traffic when multiple workers are enabled.
 ### Real-device experiment
 
 Use otherwise identical release images with QEMU `num-queues=1` and
-`num-queues=4`. Run 4 KiB random write and 128 KiB sequential first write at
-1 and 16 jobs, 2 GiB per point, reformatting and running read-only e2fsck each
-time. The mechanism is accepted only if:
+`num-queues=4`. The four-queue arm uses QEMU 9.0+ with four IOThreads, one
+virtqueue per IOThread, and four host CPUs mapped to distinct NVMe hardware
+contexts. Run 4 KiB random write and 128 KiB sequential first write at 1 and
+16 jobs, 2 GiB per point, reformatting and running read-only e2fsck each time.
+Capture guest per-queue counters, QEMU IOThread IDs/affinity, the host
+CPU-to-hctx map, and host NVMe request counts per hctx. The mechanism is
+accepted only if:
 
 - four workers actually use four queues;
+- at least four distinct NVMe hardware contexts issue requests in the
+  four-queue arm, with no single context receiving more than 70% of traced
+  requests; the one-queue control must remain separately identified;
 - there is no correctness failure;
 - `nv_data_submit` contention and cumulative capacity wait fall relative to
   the previous four-worker/single-queue result;
@@ -274,10 +310,16 @@ time. The mechanism is accepted only if:
 If these conditions fail, keep the runtime default at one worker and retain
 multi-queue only as an experimental path.
 
-## 13. Standards Basis
+## 14. Standards Basis
 
 VirtIO 1.3 section 5.2 defines request queues 0 through N-1 when
 `VIRTIO_BLK_F_MQ` is negotiated, states that requests may be serviced out of
 order, and defines FLUSH as the stable-storage completion point for previously
 completed writes. The implementation must not infer cross-queue ordering that
 the standard does not provide.
+
+QEMU 9.0 added support for processing different virtio-blk queues of one disk
+on different IOThreads. Linux blk-mq maps per-CPU software submission contexts
+to device hardware contexts; therefore the host experiment pins IOThreads to
+CPUs selected from distinct NVMe hctx `cpu_list` files and verifies the result
+at the NVMe submission point.
