@@ -35,6 +35,7 @@ fn ext4_research_routes() {
         nv_route_rnvpce_reclaim_ready_queue_contract,
         nv_route_rnvpce_completion_publishes_reclaim_work_item,
         nv_route_rnvpce_durability_epoch_coalesces_ready_batches,
+        nv_route_rnvpce_durability_epoch_isolates_failed_batch,
         nv_route_rnvpce_first_write_publishes_ssd_baseline,
         nv_route_rnvpce_foreground_allocation_is_independent_of_completion,
         nv_route_rnvpce_batch_allocation_durability,
@@ -86,6 +87,82 @@ fn nv_route_rnvpce_durability_epoch_coalesces_ready_batches() {
         "all ready rNVPCe batches in one drain must share one device flush"
     );
     assert_eq!(fixture.ext4.help_nv_reclaim(8).unwrap(), 8);
+}
+
+fn nv_route_rnvpce_durability_epoch_isolates_failed_batch() {
+    use core::sync::atomic::Ordering;
+
+    use crate::fs::rnvpc::{index::PageKey, redirect_index::NvExtentEntryState};
+
+    crate::fs::rnvpc::init_for_ext4_tests();
+    crate::time::clocks::init_for_ktest();
+    let fixture = Ext4FixtureBuilder::new(2048, 256, 2048)
+        .with_block_bitmap_metadata_marked()
+        .with_free_blocks(128)
+        .with_uuid([0xd5; 16])
+        .with_mount_options("rnvpce=on,rtio=off")
+        .build()
+        .unwrap();
+    fixture.write_raw_inode(11, &make_empty_file_inode());
+    fixture.write_raw_inode(12, &make_empty_file_inode());
+    let pool = crate::fs::rnvpc::pool().unwrap();
+    let fs_id = fixture.ext4.rnvpc_fs_id();
+
+    fixture
+        .ext4
+        .read_inode(11)
+        .unwrap()
+        .write_at(
+            0,
+            &mut VmReader::from([0x71; PAGE_SIZE].as_slice()).to_fallible(),
+        )
+        .unwrap();
+    let failed_target =
+        crate::fs::rnvpc::write_transaction::current_page_mapping(pool, fs_id, 11, 0)
+            .unwrap()
+            .unwrap()
+            .ssd_block() as usize;
+    fixture.disk.set_fail_write_block(Some(failed_target));
+    assert_eq!(fixture.ext4.migrate_nv_round(1).unwrap(), 1);
+    fixture.disk.set_fail_write_block(None);
+
+    fixture
+        .ext4
+        .read_inode(12)
+        .unwrap()
+        .write_at(
+            0,
+            &mut VmReader::from([0x72; PAGE_SIZE].as_slice()).to_fallible(),
+        )
+        .unwrap();
+    assert_eq!(fixture.ext4.migrate_nv_round(1).unwrap(), 1);
+
+    assert_eq!(
+        fixture.ext4.process_nv_completions().unwrap_err().error(),
+        Errno::EIO
+    );
+    assert_eq!(fixture.ext4.nv_in_flight.load(Ordering::Acquire), 0);
+    assert_eq!(
+        pool.lookup_dirty_nv_entry(PageKey::new(fs_id, 11, 0))
+            .unwrap()
+            .state(),
+        NvExtentEntryState::Dirty
+    );
+    assert_eq!(
+        pool.lookup_dirty_nv_entry(PageKey::new(fs_id, 12, 0))
+            .unwrap()
+            .state(),
+        NvExtentEntryState::IoComplete
+    );
+    assert_eq!(fixture.ext4.help_nv_reclaim(1).unwrap(), 1);
+    assert!(
+        pool.lookup_dirty_nv_entry(PageKey::new(fs_id, 12, 0))
+            .is_none()
+    );
+    assert!(
+        pool.lookup_dirty_nv_entry(PageKey::new(fs_id, 11, 0))
+            .is_some()
+    );
 }
 
 fn nv_route_rnvpce_sync_exports_contiguous_extent_once() {

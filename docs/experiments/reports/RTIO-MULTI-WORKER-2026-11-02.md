@@ -62,8 +62,8 @@ affinity, or multiple scanners feeding one centralized BIO submitter.
 ## Correctness
 
 - Focused worker policy, quiescence gate, disjoint claim, durability epoch,
-  diagnostic accounting, and the 24-scenario `ext4_research_routes` aggregate
-  passed.
+  mixed successful/failed epoch isolation, diagnostic accounting, and the
+  `ext4_research_routes` aggregate passed.
 - The complete 412-test kernel run was not green. It reached the rNVPC suite
   and reported pre-existing standalone failures including
   `rnvpce_allocation_cache_recovers_selected_image`, slot-reuse generation,

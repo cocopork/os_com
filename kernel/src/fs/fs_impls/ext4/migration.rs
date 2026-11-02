@@ -420,6 +420,9 @@ impl Ext4 {
         // group with the least remaining space before broad free groups.
         resident.sort_by_key(|group| (group.free_blocks != 0, group.free_blocks, group.group));
         let victim = resident[0];
+        // This lock coordinates only the pager with sync's final allocation
+        // export. rNVPCe data migration does not acquire it.
+        let _allocation_export = self.nv_migration_lock.lock();
         let Some(current) = cache.selected_image(self.rnvpc_fs_id(), victim.group)? else {
             return Ok(true);
         };
@@ -1293,6 +1296,7 @@ impl Ext4 {
         }
         // After the device flush, exact-generation transitions transfer
         // authority back to SSD and release the resident bitmap chunks.
+        let _allocation_export = self.nv_migration_lock.lock();
         let cache = rnvpc::allocation_metadata::AllocationMetadataCache::new(pool.clone());
         // Export may allocate native extent metadata after the last rTIO
         // target publication. Refresh every resident group so the generation
