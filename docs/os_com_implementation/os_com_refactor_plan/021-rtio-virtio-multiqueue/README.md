@@ -2,7 +2,18 @@
 
 日期：2026-11-02
 
-状态：设计已批准，待实现。
+状态：实现完成；真实设备正确性与多 hctx 机制验收通过，性能验收失败（2026-11-02）。
+
+8 个 2 GiB 测试点均通过 fio、sync、unmount 和只读 `e2fsck -fn`。
+四 worker 均使用对应 virtqueue，QEMU 10.2.1 将各队列映射到独立 IOThread，
+宿主机 `nvme_queue_rq` 跟踪确认 hctx 0–3 均提交大量请求，最大占比 25.75%–31.07%。
+最终队列全部排空，durability epoch 与设备 FLUSH 数相等。
+
+随机写含 sync 吞吐量在 1/16 job 分别提高 30.2%/36.6%，但 128 KiB 顺序写
+分别回退 46.9%/42.3%，16 job 提交及容量等待也未下降。因此四 worker 不能
+作为默认配置接受。测量版本 `936722960` 的 queue-aware 默认尚未在本实验中修改；
+需在独立后续变更中恢复一个 worker 默认，多队列仅保留为实验路径。
+详见[实验报告](../../../experiments/reports/RTIO-VIRTIO-MULTIQUEUE-2026-11-02.md)。
 
 ## 目标
 
@@ -21,7 +32,7 @@ rTIO worker i
 
 ## 背景
 
-020 已经允许多个 rTIO worker 并发扫描、claim 和提交不同的 NV extent entry，但当前 virtio-blk 仍只有：
+020 已经允许多个 rTIO worker 并发扫描、claim 和提交不同的 NV extent entry，但在 021 实现前 virtio-blk 只有：
 
 - 一个 `BioRequestSingleQueue`；
 - 一个转发内核线程；
@@ -61,7 +72,7 @@ pub enum BioQueueAffinity {
 ### 3. rTIO 队列绑定
 
 - rNVPCe worker `i` 在整个挂载生命周期内固定使用 `Queue(i)`。
-- 默认 worker 数为 `min(4, max(1, online_cpu / 8), nr_submission_queues)`。
+- 测量候选版本的默认 worker 数为 `min(4, max(1, online_cpu / 8), nr_submission_queues)`；性能验收失败，发布前须恢复一个 worker 默认。
 - `rtio_workers=N` 大于设备提交队列数量时挂载返回 `EINVAL`。
 - rNVPC WAL 仍限制为一个 worker。
 - 所有队列的数据 BIO completion 仍汇聚到一个 durability coordinator。

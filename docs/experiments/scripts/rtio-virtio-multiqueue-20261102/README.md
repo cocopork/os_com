@@ -23,7 +23,12 @@ saves Docker stdout as `open-users-root.json`, stderr as
 It accepts only an unused result with matching identities, empty diagnostics,
 and consistent statuses. An unavailable helper or ambiguous result aborts.
 The selected partition is passed raw to QEMU and may be overwritten by the
-guest. This task does not run the real mode.
+guest. `QUEUES=1` selects the one-worker/one-queue/one-IOThread control;
+`QUEUES=4` (the default) selects the four-queue arm. Other values are rejected.
+`FORMAT_TARGET=1` reformats the authorized target as 4 KiB no-journal EXT4.
+Both formatting and QEMU exposure repeat the target and host-root open-user
+checks. The host `fuser` CLI is invoked without `--`, which this host's
+psmisc version rejects; both target paths are already canonical absolute paths.
 
 ```sh
 SOURCE_ART=/path/to/input-images \
@@ -38,7 +43,10 @@ must name a directory that does not yet exist under an existing caller-owned
 parent; the final directory is created atomically. The ISO must be an image whose
 guest workflow exits after its fio run; the Task 7 matrix supplies that image
 and checks fio, sync, unmount, and e2fsck results. The runner itself handles
-one four-queue VM invocation and the host-hctx mechanism gate.
+one VM invocation and the host-hctx mechanism gate. The control records the
+same trace without applying the four-hctx threshold. Exit 3 specifically means
+a completed capture failed that threshold; other nonzero statuses indicate a
+runner failure. QEMU has a 900-second timeout.
 
 The runner rejects non-local Docker endpoints, records the local Unix socket
 and daemon ID, and compares them again before exposing the device. It records
@@ -75,3 +83,43 @@ manual `docker logs`/`inspect`/`wait` recovery steps are printed.
 `accepted` value requires at least four active hctx and a maximum share of
 70% of traced requests. This is only the host mechanism gate; it does not
 replace Task 7 correctness and performance acceptance.
+
+
+## Serialized matrix
+
+Use one release ISO with no `rtio_workers` override: its queue-aware policy
+selects one worker on the control and four on the arm. Build with pipeline
+profiling enabled to capture the required diagnostics, record that build diff
+and restore it after copying/fingerprinting the ISO. Do not rebuild during
+measurements. `run-matrix.sh` injects `guest.sh` and a per-point configuration
+into private copies of the ext2 image, using the ISO's
+`--init-args=/ext2/rebuild-fio.sh` workflow.
+
+```sh
+ROOT_ART=/path/to/existing-external-matrix-directory \
+SOURCE_ART=/path/to/fingerprinted-inputs \
+TOOLS_IMAGE=os-com-recovery-tools:workspace-20261018 \
+bash run-matrix.sh --authorized-destructive-target=/dev/nvme1n1p1
+```
+
+The default matrix is queues 1 then 4; each arm runs `randwrite 4k 1`,
+`randwrite 4k 16`, `write 128k 1`, and `write 128k 16`, 2 GiB each.
+`MATRIX_QUEUES` and newline-separated `MATRIX_SPECS` can select missing points
+without overwriting evidence. A matrix lock prevents concurrent invocations
+in the same artifact directory. Each point is formatted after the full target
+checks. Random writes first prepare SSD-backed files with a direct sequential
+write; sequential points use new files. Both use buffered psync fio, depth 1,
+a 128 MiB NVM pool, and 64 MiB data capacity.
+
+The wrapper requires exactly 2 GiB of successful fio writes, successful sync
+and unmount, and read-only `e2fsck -fn` status 0. A mechanism rejection is
+retained and does not prevent collecting other points; a correctness/capture
+failure stops the matrix. `results.py` removes only known CPU-isolation serial
+messages that can interrupt fio JSON, and writes throughput, latency, complete
+pipeline snapshots, mapping, and hctx counts to each point's `result.json`.
+Raw traces include readiness reads, random-file preparation, metadata and sync
+traffic as well as measured fio traffic. They are not fio-only distributions.
+
+The source image, raw logs, traces, per-point JSON, and disk images stay outside
+Git. The report records acceptance and limitations independently of runner exit
+status.

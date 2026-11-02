@@ -53,7 +53,7 @@ def helper_fixture(argv):
         return original_stat(path, *args, **kwargs)
 
     def run_fuser(command, **kwargs):
-        if command != ["/usr/bin/fuser", "-s", "--", "/dev/nvme1n1p1", "/dev/nvme1n1"]:
+        if command != ["/usr/bin/fuser", "-s", "/dev/nvme1n1p1", "/dev/nvme1n1"]:
             raise AssertionError(f"unexpected fuser command: {command}")
         return subprocess.CompletedProcess(command, int(os.environ.get("FIXTURE_FUSER_STATUS", "1")),
                                            b"", os.environ.get("FIXTURE_FUSER_STDERR", "").encode())
@@ -117,6 +117,20 @@ class RootFuserTests(unittest.TestCase):
             stat_fn=stat_fn or self.stat_device,
             realpath_fn=realpath_fn or (lambda path: path), run_fn=run_fuser,
         )
+
+    def test_real_fuser_recognizes_an_open_file(self):
+        # Exercise the host CLI grammar while replacing only the block-node fixtures.
+        opened = self.root / "open-target"
+        opened.write_text("fixture")
+        with opened.open() as held:
+            def run_fuser(args, **kwargs):
+                return subprocess.run(args[:-2] + [str(opened)], **kwargs)
+            status, record = root_fuser_check.check(
+                "/dev/nvme1n1p1", "/dev/nvme1n1", "259:1", "259:0",
+                uid_map_path=self.uid_map, euid_fn=lambda: 0,
+                stat_fn=self.stat_device, realpath_fn=lambda path: path, run_fn=run_fuser)
+            self.assertEqual(status, 1, record)
+            self.assertEqual(record["outcome"], "in_use")
 
     def test_rejects_bad_uid_mapping_or_zero_span_before_device_lookup(self):
         for text in ("0 1000 1\n", "0 0 0\n", "1 0 1\n"):

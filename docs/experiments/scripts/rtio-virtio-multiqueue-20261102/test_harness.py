@@ -79,6 +79,11 @@ class HarnessTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "in use"):
                     summarize.target_preflight("/dev/nvme1n1p1", str(lsblk), str(findmnt), **kwargs)
 
+            fuser.write_text('#!/bin/sh\necho "lookup failed" >&2\nexit 1\n')
+            with mock.patch.dict(os.environ, {"LSBLK_TARGET": json.dumps(target_data), "LSBLK_PARENT": json.dumps(parent_data), "FINDMNT_FIXTURE": json.dumps({"filesystems": []})}):
+                with self.assertRaisesRegex(ValueError, "fuser"):
+                    summarize.target_preflight("/dev/nvme1n1p1", str(lsblk), str(findmnt), **kwargs)
+
     def test_target_rejects_alternate_parent(self):
         with tempfile.TemporaryDirectory() as directory:
             lsblk = Path(directory) / "lsblk"

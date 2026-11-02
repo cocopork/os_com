@@ -100,10 +100,10 @@ def target_preflight(target, lsblk_bin="lsblk", findmnt_bin="findmnt", *,
         if swap_id in (target_id, parent_id):
             raise ValueError("target or parent is active swap")
     for path in (target, parent_path):
-        used = subprocess.run([fuser_bin, "-s", "--", path], capture_output=True)
+        used = subprocess.run([fuser_bin, "-s", path], capture_output=True)
         if used.returncode == 0:
             raise ValueError(f"target or parent is in use: {path}")
-        if used.returncode != 1:
+        if used.returncode != 1 or used.stdout or used.stderr:
             raise ValueError(f"fuser failed: {path}")
     return {"target": target, "parent": "nvme1n1", "size_bytes": GIB_256,
             "target_major_minor": target_id, "parent_major_minor": parent_id}

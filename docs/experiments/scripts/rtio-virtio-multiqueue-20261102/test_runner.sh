@@ -11,6 +11,29 @@ expect_rejected() {
     fi
 }
 
+configure_queues 1
+[[ $QUEUES == 1 && ${#iothread_args[@]} == 2 && ${iothread_args[1]} == iothread,id=iothread0 ]] || fail "one-queue control IOThreads"
+configure_queues 4
+[[ $QUEUES == 4 && ${#iothread_args[@]} == 8 && ${iothread_args[7]} == iothread,id=iothread3 ]] || fail "four-queue IOThreads"
+expect_rejected configure_queues 0
+expect_rejected configure_queues 2
+expect_rejected configure_queues 16
+
+(
+    target_json='{"target_major_minor":"259:1"}'
+    TARGET=/dev/nvme1n1p1
+    parent=nvme1n1 target_id=259:1 parent_id=259:0
+    authoritative_calls=0
+    python3() { printf '%s\n' "$fixture_target"; }
+    authoritative_open_user_check() { authoritative_calls=$((authoritative_calls + 1)); }
+    fixture_target=$target_json
+    confirm_target_idle
+    [[ $authoritative_calls == 1 ]] || fail "missing repeated host-root check"
+    fixture_target='{"target_major_minor":"259:2"}'
+    expect_rejected confirm_target_idle
+    [[ $authoritative_calls == 1 ]] || fail "accepted changed target identity"
+)
+
 expect_rejected authorize_target --authorized-destructive-target=/dev/nvme1n1p3
 expect_rejected authorize_target --authorized-destructive-target=/dev/nvme0n1p1
 expect_rejected authorize_target --authorized-destructive-target=/dev/../dev/nvme1n1p1

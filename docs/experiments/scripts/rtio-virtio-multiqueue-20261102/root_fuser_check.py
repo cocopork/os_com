@@ -50,7 +50,7 @@ def check(target, parent, target_id, parent_id, *,
                 raise ValueError(f"block major:minor changed for {path}: {node['major_minor']}")
         record["identity"]["validated"] = True
 
-        result = run_fn(["/usr/bin/fuser", "-s", "--", target, parent], capture_output=True)
+        result = run_fn(["/usr/bin/fuser", "-s", target, parent], capture_output=True)
         record["fuser"] = {
             "status": result.returncode,
             "stdout": result.stdout.decode("utf-8", errors="backslashreplace"),

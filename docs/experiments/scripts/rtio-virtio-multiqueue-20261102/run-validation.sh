@@ -3,6 +3,23 @@
 set -euo pipefail
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+configure_queues() {
+    case $1 in 1|4) QUEUES=$1 ;; *) echo "QUEUES must be 1 or 4" >&2; return 2 ;; esac
+    iothread_args=()
+    local queue
+    for ((queue=0; queue<QUEUES; queue++)); do
+        iothread_args+=(-object "iothread,id=iothread$queue")
+    done
+}
+
+confirm_target_idle() {
+    [[ $(python3 "$SCRIPT_DIR/summarize.py" target-preflight "$TARGET") == "$target_json" ]] || {
+        echo "target state changed before device exposure" >&2
+        return 2
+    }
+    authoritative_open_user_check "$TARGET" "$parent" "$target_id" "$parent_id"
+}
+
 authorize_target() {
     case ${1:-} in
         --authorized-destructive-target=/dev/nvme1n1p1|\
@@ -212,7 +229,8 @@ local requested_art=${ART:?set ART to a new external artifact directory}
 SOURCE_ART=${SOURCE_ART:?set SOURCE_ART to a directory containing selected.iso, ext2.img and exfat.img}
 TOOLS_IMAGE=${TOOLS_IMAGE:-os-com-recovery-tools:workspace-20261018}
 QEMU_BIN=${QEMU_BIN:-qemu-system-x86_64}
-QUEUES=4
+configure_queues "${QUEUES:-4}"
+case ${FORMAT_TARGET:-0} in 0|1) ;; *) echo "FORMAT_TARGET must be 0 or 1" >&2; return 2 ;; esac
 for file in selected.iso ext2.img exfat.img; do
     [[ -f "$SOURCE_ART/$file" ]] || { echo "missing input: $SOURCE_ART/$file" >&2; exit 2; }
 done
@@ -253,13 +271,18 @@ trace_created=0
 trap cleanup EXIT
 
 confirm_docker_identity || return 2
-authoritative_open_user_check "$TARGET" "$parent" "$target_id" "$parent_id" || return 2
+confirm_target_idle || return 2
+if [[ ${FORMAT_TARGET:-0} == 1 ]]; then
+    docker run --rm --network none --device "$TARGET:/dev/benchmark-target:rwm" "$TOOLS_IMAGE" \
+        mkfs.ext4 -F -b 4096 -O '^has_journal' /dev/benchmark-target > "$ART/mkfs.log" 2>&1
+    confirm_target_idle || return 2
+fi
 confirm_docker_identity || return 2
 qemu_created=1
 docker run -d --name "$qemu_name" --pid=host --network none \
     --device /dev/kvm --device "$TARGET:/dev/benchmark-target:rwm" \
     -v "$ART:/benchmark" -w /benchmark "$TOOLS_IMAGE" \
-    "$QEMU_BIN" -enable-kvm -cpu host -machine q35 -smp 64 -m 8G \
+    timeout --signal=TERM --kill-after=30 900 "$QEMU_BIN" -enable-kvm -cpu host -machine q35 -smp 64 -m 8G \
     -S -qmp unix:/benchmark/qmp.sock,server=on,wait=off \
     -bios /root/ovmf/release/OVMF.fd -no-reboot -display none -serial stdio \
     -monitor none -nic none -device isa-debug-exit,iobase=0xf4,iosize=0x04 \
@@ -270,8 +293,7 @@ docker run -d --name "$qemu_name" --pid=host --network none \
     -device virtio-blk-pci,drive=aux,disable-legacy=on \
     -drive if=none,format=raw,id=target,file=/dev/benchmark-target,cache=none,aio=threads \
     -device pcie-root-port,id=target-port,chassis=1,slot=1 \
-    -object iothread,id=iothread0 -object iothread,id=iothread1 \
-    -object iothread,id=iothread2 -object iothread,id=iothread3 \
+    "${iothread_args[@]}" \
     > "$ART/qemu-container-id.txt"
 
 docker exec "$qemu_name" python3 /benchmark/summarize.py qmp-add-device /benchmark/qmp.sock "$QUEUES" > "$ART/qmp-device-add.json"
@@ -332,12 +354,13 @@ qemu_status=$(< "$ART/qemu-exit.txt")
     return 2
 }
 require_complete_trace "$ART/trace.wait-status.txt" "$ART/trace.raw" "$ART/hctx-counts.json"
-python3 - "$ART/hctx-counts.json" <<'PY'
+python3 - "$ART/hctx-counts.json" "$QUEUES" <<'PY'
 import json
 import sys
 result = json.load(open(sys.argv[1]))
-if not result["accepted"]:
-    raise SystemExit("multi-hctx acceptance failed: see hctx-counts.json")
+if int(sys.argv[2]) == 4 and not result["accepted"]:
+    print("multi-hctx acceptance failed: see hctx-counts.json", file=sys.stderr)
+    raise SystemExit(3)
 PY
 }
 
