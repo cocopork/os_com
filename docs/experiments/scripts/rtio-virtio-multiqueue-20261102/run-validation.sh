@@ -56,26 +56,17 @@ authoritative_open_user_check() {
     local target=$1 parent=$2 target_id=$3 parent_id=$4 status
     confirm_docker_identity || return 2
     if docker run --rm --privileged --pid=host --userns=host --network none -v /:/host:ro "$TOOLS_IMAGE" \
-        chroot /host /usr/bin/python3 "$ART/root_fuser_check.py" "$target" "/dev/$parent" \
-        "$target_id" "$parent_id" "$ART/open-users-root.stdout" "$ART/open-users-root.stderr" \
-        > "$ART/open-users-root.log" 2>&1; then
+        chroot /host /usr/bin/python3 "$ART/root_fuser_check.py" check "$target" "/dev/$parent" \
+        "$target_id" "$parent_id" \
+        > "$ART/open-users-root.json" 2> "$ART/open-users-root.stderr"; then
         status=0
     else
         status=$?
     fi
-    rg -Fxq 'ROOT_FUSER_IDENTITY_VALIDATED' "$ART/open-users-root.log" || {
-        echo "authoritative root fuser did not execute; see $ART/open-users-root.log" >&2
-        return 2
-    }
-    [[ -f $ART/open-users-root.stdout && -f $ART/open-users-root.stderr && ! -s $ART/open-users-root.stderr ]] || {
-        echo "root fuser output is missing or stderr is nonempty; see $ART/open-users-root.stderr" >&2
-        return 2
-    }
-    case $status in
-        1) return 0 ;;
-        0) echo "target or parent is in use; see $ART/open-users-root.log" >&2; return 2 ;;
-        *) echo "authoritative root fuser failed ($status); see $ART/open-users-root.log" >&2; return 2 ;;
-    esac
+    printf '%s\n' "$status" > "$ART/open-users-root.status" || return 2
+    python3 "$SCRIPT_DIR/root_fuser_check.py" validate-result \
+        "$ART/open-users-root.json" "$ART/open-users-root.stderr" "$status" \
+        "$target" "/dev/$parent" "$target_id" "$parent_id"
 }
 
 trigger_ready_read() {
@@ -86,22 +77,29 @@ trigger_ready_read() {
 }
 
 wait_trace_ready() {
-    local trace_name=$1 parent=$2 target=$3 attempt remaining deadline=$((SECONDS + 20))
+    local trace_name=$1 parent=$2 target=$3 attempt=0 read_count=0 remaining status
+    local started=$SECONDS deadline=$((SECONDS + 20))
     printf '{"parent":"%s","read_count":0,"read_attempts":0,"bytes_per_read":4096}\n' "$parent" > "$ART/readiness-reads.json" || return 2
-    for attempt in {1..5}; do
-        [[ $(docker inspect -f '{{.State.Running}}' "$trace_name") == true ]] || return 2
-        remaining=$((deadline - SECONDS))
-        ((remaining > 0)) || break
-        printf '{"parent":"%s","read_count":%d,"read_attempts":%d,"bytes_per_read":4096}\n' "$parent" "$((attempt - 1))" "$attempt" > "$ART/readiness-reads.json" || return 2
-        trigger_ready_read "$target" "$remaining" || return 2
-        printf '{"parent":"%s","read_count":%d,"read_attempts":%d,"bytes_per_read":4096}\n' "$parent" "$attempt" "$attempt" > "$ART/readiness-reads.json" || return 2
+    : > "$ART/readiness-read-attempts.jsonl" || return 2
+    while ((SECONDS < deadline)); do
         [[ $(docker inspect -f '{{.State.Running}}' "$trace_name") == true ]] || return 2
         docker logs "$trace_name" > "$ART/trace.startup.log" 2>&1 || return 2
+        remaining=$((deadline - SECONDS))
+        ((remaining > 0)) || break
         if rg -Fxq "READY parent=$parent" "$ART/trace.startup.log"; then
             [[ $(docker inspect -f '{{.State.Running}}' "$trace_name") == true ]] || return 2
             return 0
         fi
-        sleep 0.1
+        attempt=$((attempt + 1))
+        printf '{"parent":"%s","read_count":%d,"read_attempts":%d,"bytes_per_read":4096}\n' "$parent" "$read_count" "$attempt" > "$ART/readiness-reads.json" || return 2
+        printf '{"attempt":%d,"event":"started","elapsed_seconds":%d,"timeout_seconds":%d}\n' "$attempt" "$((SECONDS - started))" "$remaining" >> "$ART/readiness-read-attempts.jsonl" || return 2
+        status=0
+        trigger_ready_read "$target" "$remaining" || status=$?
+        printf '{"attempt":%d,"event":"finished","elapsed_seconds":%d,"status":%d}\n' "$attempt" "$((SECONDS - started))" "$status" >> "$ART/readiness-read-attempts.jsonl" || return 2
+        ((status == 0)) || return 2
+        read_count=$((read_count + 1))
+        printf '{"parent":"%s","read_count":%d,"read_attempts":%d,"bytes_per_read":4096}\n' "$parent" "$read_count" "$attempt" > "$ART/readiness-reads.json" || return 2
+        sleep 1
     done
     return 2
 }

@@ -14,9 +14,14 @@ Before QEMU receives the partition, a scoped privileged helper with the host
 PID and user namespaces and read-only host-root bind repeats the open-user
 check as host root. It verifies UID 0 maps to host UID 0 with a positive span,
 then validates both block nodes against the preflight major:minor identities.
-The helper records `fuser` stdout and stderr separately; only status 1 with
-empty stderr and validated identities means no open users. An unavailable
-helper or ambiguous result aborts.
+The helper emits one JSON result with the identity checks, device major:minor
+values, and `fuser` status/stdout/stderr. It writes no evidence files in the
+read-only chroot. Helper exit statuses are 0 for unused, 1 for in-use, and 2
+for validation failure; the embedded `fuser` unused status is 1. The host runner
+saves Docker stdout as `open-users-root.json`, stderr as
+`open-users-root.stderr`, and the exit status as `open-users-root.status`.
+It accepts only an unused result with matching identities, empty diagnostics,
+and consistent statuses. An unavailable helper or ambiguous result aborts.
 The selected partition is passed raw to QEMU and may be overwritten by the
 guest. This task does not run the real mode.
 
@@ -51,11 +56,14 @@ The VM starts paused. QMP `device_add` passes a structured JSON
 `iothread-vq-mapping` with virtqueue `i` assigned only to `iothread<i>`; a
 dedicated PCIe root port permits that QMP hotplug. The runner saves and pins
 all four IOThreads and attaches the trace before QMP `cont` starts guest I/O.
-While QEMU remains paused, the runner issues up to five bounded 4 KiB direct
-reads of the authorized target under a 20-second deadline, stopping when the
-filtered `nvme_queue_rq` handler emits `READY parent=nvme1n1`. Attachment
-banner text and probe count are ignored. `readiness-reads.json` records
-attempted and completed reads. Reads made after probe attachment contribute to
+While QEMU remains paused and the tracer is alive, the runner issues read-only
+4 KiB direct reads of the authorized target until a 20-second deadline or the
+filtered `nvme_queue_rq` handler emits `READY parent=nvme1n1`. Each read's timeout
+is bounded by the remaining deadline, with a one-second interval between reads;
+there is no attempt-count cap. Attachment banner text and probe count are ignored.
+`readiness-reads.json` records attempted and completed read counts, and
+`readiness-read-attempts.jsonl` records each attempt's start, timeout, elapsed
+time, and exit status. Reads made after probe attachment contribute to
 the raw trace and hctx counts; a read missed during attachment remains recorded
 in `readiness-reads.json` but cannot appear in the trace.
 The tracer must survive until the guest exits. It receives SIGINT for controlled
