@@ -138,6 +138,53 @@ for index in range(counts["read_count"]):
 PY
 cont_before=$(rg -c '^cont$' "$test_root/events")
 
+# The last permitted read may finish at the deadline with READY already logged.
+for final_read_case in ready wrong_parent nonexact exited logs_failed; do
+    (
+        unset SECONDS
+        SECONDS=0
+        ART="$test_root/final-read-$final_read_case"
+        mkdir "$ART"
+        readiness_reads=0
+        trigger_ready_read() {
+            [[ $1 == /dev/nvme1n1p1 && $2 -eq $((20 - SECONDS)) ]] || fail "incorrect final-read timeout"
+            readiness_reads=$((readiness_reads + 1))
+            echo read >> "$ART/events"
+            if ((SECONDS == 19)); then SECONDS=20; fi
+        }
+        resume_guest() { echo cont >> "$ART/events"; }
+        docker() {
+            case "$*" in
+                'logs trace')
+                    printf 'Attaching 2 probes...\n'
+                    if ((readiness_reads == 20)); then
+                        case $final_read_case in
+                            wrong_parent) printf 'READY parent=nvme0n1\n' ;;
+                            nonexact) printf 'READY parent=nvme1n1 extra\n' ;;
+                            logs_failed) printf 'READY parent=nvme1n1\n'; return 1 ;;
+                            *) printf 'READY parent=nvme1n1\n' ;;
+                        esac
+                    fi ;;
+                *'inspect -f '*'.State.Running'*' trace')
+                    if [[ $final_read_case == exited && $readiness_reads -eq 20 ]]; then
+                        echo false
+                    else
+                        echo true
+                    fi ;;
+                *) return 1 ;;
+            esac
+        }
+        if [[ $final_read_case == ready ]]; then
+            gate_guest_on_trace trace nvme1n1 /dev/nvme1n1p1 || fail "missed READY from final permitted read"
+            [[ $(< "$ART/events") == *read*cont ]] || fail "final-read readiness did not resume guest"
+        else
+            expect_rejected gate_guest_on_trace trace nvme1n1 /dev/nvme1n1p1
+            [[ $(< "$ART/events") != *cont* ]] || fail "resumed after invalid final-read readiness: $final_read_case"
+        fi
+        [[ $readiness_reads -eq 20 && $SECONDS -eq 20 ]] || fail "final-read fixture did not reach the deadline"
+    )
+done
+
 readiness_reads=0
 readiness_started=$SECONDS
 docker() {

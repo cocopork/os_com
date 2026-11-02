@@ -99,6 +99,13 @@ wait_trace_ready() {
         ((status == 0)) || return 2
         read_count=$((read_count + 1))
         printf '{"parent":"%s","read_count":%d,"read_attempts":%d,"bytes_per_read":4096}\n' "$parent" "$read_count" "$attempt" > "$ART/readiness-reads.json" || return 2
+        # A read in the final second can emit READY without another loop iteration.
+        docker logs "$trace_name" > "$ART/trace.startup.log" 2>&1 || return 2
+        if rg -Fxq "READY parent=$parent" "$ART/trace.startup.log"; then
+            [[ $(docker inspect -f '{{.State.Running}}' "$trace_name") == true ]] || return 2
+            return 0
+        fi
+        ((SECONDS < deadline)) || break
         sleep 1
     done
     return 2
