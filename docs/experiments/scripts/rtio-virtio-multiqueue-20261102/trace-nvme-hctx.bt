@@ -1,0 +1,11 @@
+// SPDX-License-Identifier: MPL-2.0
+// The runner replaces __TARGET_DISK__ with the checked NVMe parent name.
+kprobe:nvme_queue_rq
+{
+    $hctx = (struct blk_mq_hw_ctx *)arg0;
+    $queue_data = (struct blk_mq_queue_data *)arg1;
+    $request = $queue_data->rq;
+    if ($request->q->disk->disk_name == "__TARGET_DISK__") {
+        @hctx[$hctx->queue_num] = count();
+    }
+}
