@@ -34,6 +34,7 @@ fn ext4_research_routes() {
         nv_route_rnvpce_reservation_abort_wakes_writer,
         nv_route_rnvpce_reclaim_ready_queue_contract,
         nv_route_rnvpce_completion_publishes_reclaim_work_item,
+        nv_route_rnvpce_durability_epoch_coalesces_ready_batches,
         nv_route_rnvpce_first_write_publishes_ssd_baseline,
         nv_route_rnvpce_foreground_allocation_is_independent_of_completion,
         nv_route_rnvpce_batch_allocation_durability,
@@ -53,6 +54,38 @@ fn ext4_research_routes() {
         nv_route_rnvpc_failed_allocation_flush_does_not_append_wal,
         nv_route_mount_rejects_switching_persistent_authority,
     );
+}
+
+fn nv_route_rnvpce_durability_epoch_coalesces_ready_batches() {
+    crate::fs::rnvpc::init_for_ext4_tests();
+    crate::time::clocks::init_for_ktest();
+    let fixture = Ext4FixtureBuilder::new(2048, 256, 2048)
+        .with_block_bitmap_metadata_marked()
+        .with_free_blocks(128)
+        .with_uuid([0xd4; 16])
+        .with_mount_options("rnvpce=on,rtio=off")
+        .build()
+        .unwrap();
+    fixture.write_raw_inode(11, &make_empty_file_inode());
+    fixture.write_raw_inode(12, &make_empty_file_inode());
+    let input = [0x6d; 4 * PAGE_SIZE];
+    for ino in [11, 12] {
+        fixture
+            .ext4
+            .read_inode(ino)
+            .unwrap()
+            .write_at(0, &mut VmReader::from(input.as_slice()).to_fallible())
+            .unwrap();
+        assert_eq!(fixture.ext4.migrate_nv_round(4).unwrap(), 4);
+    }
+    let before = fixture.disk.flush_count();
+    assert_eq!(fixture.ext4.process_nv_completions().unwrap(), 8);
+    assert_eq!(
+        fixture.disk.flush_count() - before,
+        1,
+        "all ready rNVPCe batches in one drain must share one device flush"
+    );
+    assert_eq!(fixture.ext4.help_nv_reclaim(8).unwrap(), 8);
 }
 
 fn nv_route_rnvpce_sync_exports_contiguous_extent_once() {
@@ -1070,7 +1103,7 @@ fn nv_route_rnvpce_capacity_wait_releases_inode_lock() {
         .unwrap();
     fixture.write_raw_inode(11, &make_empty_file_inode());
     let inode = fixture.ext4.read_inode(11).unwrap();
-    let migration = fixture.ext4.nv_migration_lock.lock();
+    let migration = fixture.ext4.nv_migration_gate.enter_exclusive();
     let payload = [0x61u8; PAGE_SIZE];
     inode
         .write_at(0, &mut VmReader::from(payload.as_slice()).to_fallible())
@@ -1366,7 +1399,7 @@ fn nv_route_rnvpce_reservation_abort_wakes_writer() {
         .unwrap();
     fixture.write_raw_inode(11, &make_empty_file_inode());
     let inode = fixture.ext4.read_inode(11).unwrap();
-    let migration = fixture.ext4.nv_migration_lock.lock();
+    let migration = fixture.ext4.nv_migration_gate.enter_exclusive();
     let pool = crate::fs::rnvpc::pool().unwrap();
     let mut staged = Vec::new();
     while let Ok(page) = pool.alloc_data_page() {

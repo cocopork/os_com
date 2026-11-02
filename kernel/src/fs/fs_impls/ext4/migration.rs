@@ -416,7 +416,6 @@ impl Ext4 {
         // group with the least remaining space before broad free groups.
         resident.sort_by_key(|group| (group.free_blocks != 0, group.free_blocks, group.group));
         let victim = resident[0];
-        let _migration = self.nv_migration_lock.lock();
         let Some(current) = cache.selected_image(self.rnvpc_fs_id(), victim.group)? else {
             return Ok(true);
         };
@@ -523,6 +522,17 @@ impl Ext4 {
             let _serial = self.nv_migration_lock.lock();
             self.migrate_nv_round_inner(budget)
         }
+    }
+
+    fn migrate_rnvpce_round_quiesced(
+        &self,
+        guard: &MigrationQuiesceGuard<'_>,
+        budget: usize,
+    ) -> Result<usize> {
+        if !core::ptr::eq(guard.gate, &self.nv_migration_gate) {
+            return_errno_with_message!(Errno::EINVAL, "migration guard belongs to another fs");
+        }
+        self.migrate_nv_round_inner(budget)
     }
 
     fn migrate_nv_round_inner(&self, budget: usize) -> Result<usize> {
@@ -975,16 +985,18 @@ impl Ext4 {
             .map(|batch| batch.page_count())
             .sum::<usize>();
         let mut failure = None;
-        while let Some(batch) = drained.pop_front() {
-            match self.finish_nv_completion_batch(batch) {
-                Ok(true) => {}
-                Ok(false) => {}
-                Err(error) => {
+        if self.rnvpc_extend_enabled() {
+            if let Err(error) = self.finish_rnvpce_durability_epoch(drained.into_iter().collect()) {
+                failure = Some(error);
+            }
+        } else {
+            while let Some(batch) = drained.pop_front() {
+                if let Err(error) = self.finish_nv_completion_batch(batch) {
                     failure = Some(error);
                 }
             }
+            drop(drained);
         }
-        drop(drained);
         self.nv_in_flight.fetch_sub(count, Ordering::AcqRel);
         self.request_nv_migration();
         match failure {
@@ -993,7 +1005,86 @@ impl Ext4 {
         }
     }
 
-    fn finish_nv_completion_batch(&self, batch: Arc<MigrationBatch>) -> Result<bool> {
+    pub(super) fn finish_rnvpce_durability_epoch(
+        &self,
+        batches: Vec<Arc<MigrationBatch>>,
+    ) -> Result<usize> {
+        let pool = rnvpc::pool().ok_or_else(|| Error::new(Errno::EINVAL))?;
+        let mut successful = Vec::new();
+        let mut io_failed = false;
+        let mut successful_pages = 0usize;
+        for batch in batches {
+            let completion_started = batch.completion_started();
+            let jobs = batch.take_jobs();
+            if jobs.iter().any(|job| job.status != BioStatus::Complete) {
+                self.restore_failed_migration_jobs(&pool, jobs);
+                io_failed = true;
+                continue;
+            }
+            successful_pages = successful_pages.saturating_add(batch.page_count());
+            successful.push((batch, jobs, completion_started));
+        }
+
+        if !successful.is_empty() {
+            let started = batch_metrics::now();
+            let device_flush_started = pp::now();
+            match self.block_device().sync() {
+                Ok(BioStatus::Complete) => {}
+                Ok(_) => {
+                    for (_, jobs, _) in successful {
+                        self.restore_failed_migration_jobs(&pool, jobs);
+                    }
+                    return_errno!(Errno::EIO);
+                }
+                Err(error) => {
+                    for (_, jobs, _) in successful {
+                        self.restore_failed_migration_jobs(&pool, jobs);
+                    }
+                    return Err(error.into());
+                }
+            }
+            pp::NV_DEVICE_FLUSH.record_since(device_flush_started, successful_pages);
+            batch_metrics::elapsed(Phase::DataBarrier, started);
+
+            for (batch, jobs, completion_started) in successful {
+                drop(jobs);
+                let entries = batch.take_nv_entry_leases();
+                if entries.is_empty() {
+                    return_errno_with_message!(
+                        Errno::EUCLEAN,
+                        "rNVPCe completion lost entry leases"
+                    );
+                }
+                drop(batch.take_migration_leases());
+                let reclaim_batch = ReclaimBatch::new(entries.len());
+                for entry in entries {
+                    let entry_pages = usize::from(entry.entry().page_count());
+                    pool.complete_nv_entry(&entry)?;
+                    self.nv_reclaim_pending
+                        .fetch_add(entry_pages, Ordering::AcqRel);
+                    self.nv_reclaim_queue.publish(
+                        ReclaimWorkItem {
+                            entry,
+                            batch: reclaim_batch.clone(),
+                            ready_at_ns: pp::now(),
+                        },
+                        entry_pages,
+                    );
+                    if self.nv_capacity_waiters.load(Ordering::Acquire) <= 1 {
+                        self.nv_reclaim_trigger.wake_one();
+                    }
+                    pool.wake_one_data_capacity_waiter();
+                }
+                pp::NV_COMPLETION_TOTAL.record_since(completion_started, batch.page_count());
+            }
+        }
+        if io_failed {
+            return_errno_with_message!(Errno::EIO, "orderless migration batch I/O failed");
+        }
+        Ok(successful_pages)
+    }
+
+    fn finish_nv_completion_batch(&self, batch: Arc<MigrationBatch>) -> Result<()> {
         let completion_started = batch.completion_started();
         let page_count = batch.page_count();
         let pool = rnvpc::pool().ok_or_else(|| Error::new(Errno::EINVAL))?;
@@ -1004,51 +1095,9 @@ impl Ext4 {
         }
         let started = batch_metrics::now();
         let device_flush_started = pp::now();
-        if self.rnvpc_extend_enabled() {
-            match self.block_device().sync() {
-                Ok(BioStatus::Complete) => {}
-                Ok(_) => {
-                    self.restore_failed_migration_jobs(pool, jobs);
-                    return_errno!(Errno::EIO);
-                }
-                Err(error) => {
-                    self.restore_failed_migration_jobs(pool, jobs);
-                    return Err(error.into());
-                }
-            }
-        } else {
-            self.persist_nv_allocations()?;
-        }
+        self.persist_nv_allocations()?;
         pp::NV_DEVICE_FLUSH.record_since(device_flush_started, page_count);
         batch_metrics::elapsed(Phase::DataBarrier, started);
-        if self.rnvpc_extend_enabled() {
-            let entries = batch.take_nv_entry_leases();
-            if entries.is_empty() {
-                return_errno_with_message!(Errno::EUCLEAN, "rNVPCe completion lost entry leases");
-            }
-            drop(batch.take_migration_leases());
-            let reclaim_batch = ReclaimBatch::new(entries.len());
-            for entry in entries {
-                let entry_pages = usize::from(entry.entry().page_count());
-                pool.complete_nv_entry(&entry)?;
-                self.nv_reclaim_pending
-                    .fetch_add(entry_pages, Ordering::AcqRel);
-                self.nv_reclaim_queue.publish(
-                    ReclaimWorkItem {
-                        entry,
-                        batch: reclaim_batch.clone(),
-                        ready_at_ns: pp::now(),
-                    },
-                    entry_pages,
-                );
-                if self.nv_capacity_waiters.load(Ordering::Acquire) <= 1 {
-                    self.nv_reclaim_trigger.wake_one();
-                }
-                pool.wake_one_data_capacity_waiter();
-            }
-            pp::NV_COMPLETION_TOTAL.record_since(completion_started, page_count);
-            return Ok(true);
-        }
         let mut groups: BTreeMap<(u64, u64, u64), Vec<PendingPage>> = BTreeMap::new();
         let mut failure = None;
         for job in jobs {
@@ -1104,7 +1153,7 @@ impl Ext4 {
             return Err(error);
         }
         pp::NV_COMPLETION_TOTAL.record_since(completion_started, page_count);
-        Ok(false)
+        Ok(())
     }
 
     pub(super) fn help_nv_reclaim(&self, budget: usize) -> Result<usize> {
@@ -1209,12 +1258,14 @@ impl Ext4 {
         if !self.rnvpc_extend_enabled() {
             return Ok(());
         }
+        let migration = self.nv_migration_gate.enter_exclusive();
         loop {
-            let (submitted, deferred) = match self.migrate_nv_round(MIGRATION_BATCH_PAGES) {
-                Ok(submitted) => (submitted, false),
-                Err(error) if error.error() == Errno::EAGAIN => (0, true),
-                Err(error) => return Err(error),
-            };
+            let (submitted, deferred) =
+                match self.migrate_rnvpce_round_quiesced(&migration, MIGRATION_BATCH_PAGES) {
+                    Ok(submitted) => (submitted, false),
+                    Err(error) if error.error() == Errno::EAGAIN => (0, true),
+                    Err(error) => return Err(error),
+                };
             self.drain_nv_in_flight()?;
             if deferred {
                 continue;
@@ -1228,10 +1279,8 @@ impl Ext4 {
             self.read_inode(ino.try_into().map_err(|_| Error::new(Errno::EOVERFLOW))?)?
                 .export_rnvpce_extents(self)?;
         }
-        // Serialize the final allocation-metadata writeback against target assignment.
         // After the device flush, exact-generation transitions transfer
         // authority back to SSD and release the resident bitmap chunks.
-        let _migration = self.nv_migration_lock.lock();
         let cache = rnvpc::allocation_metadata::AllocationMetadataCache::new(pool.clone());
         // Export may allocate native extent metadata after the last rTIO
         // target publication. Refresh every resident group so the generation
