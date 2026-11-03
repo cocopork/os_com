@@ -18,6 +18,8 @@ use crate::{
 pub(crate) struct DurabilityArbiter {
     leader: AtomicBool,
     ready_batches: AtomicUsize,
+    pending_data_pages: AtomicUsize,
+    ready_pages: AtomicUsize,
     generation: AtomicUsize,
 }
 
@@ -26,17 +28,36 @@ impl DurabilityArbiter {
         Self {
             leader: AtomicBool::new(false),
             ready_batches: AtomicUsize::new(0),
+            pending_data_pages: AtomicUsize::new(0),
+            ready_pages: AtomicUsize::new(0),
             generation: AtomicUsize::new(0),
         }
     }
 
-    pub(super) fn note_ready_batch(&self) {
+    pub(super) fn note_submitted_pages(&self, pages: usize) {
+        debug_assert_ne!(pages, 0);
+        self.pending_data_pages.fetch_add(pages, Ordering::AcqRel);
+    }
+
+    pub(super) fn note_ready_batch(&self, pages: usize) {
+        debug_assert_ne!(pages, 0);
+        let previous = self.pending_data_pages.fetch_sub(pages, Ordering::AcqRel);
+        debug_assert!(previous >= pages);
+        self.ready_pages.fetch_add(pages, Ordering::AcqRel);
         self.ready_batches.fetch_add(1, Ordering::AcqRel);
         self.generation.fetch_add(1, Ordering::Release);
     }
 
     pub(crate) fn ready_batch_count(&self) -> usize {
         self.ready_batches.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn pending_data_page_count(&self) -> usize {
+        self.pending_data_pages.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn ready_page_count(&self) -> usize {
+        self.ready_pages.load(Ordering::Acquire)
     }
 
     pub(super) fn generation(&self) -> usize {
@@ -80,8 +101,11 @@ impl DurabilityArbiter {
         if batches.is_empty() {
             return Ok(0);
         }
+        let ready_pages = batches.iter().map(|batch| batch.page_count()).sum();
         self.ready_batches
             .fetch_sub(batches.len(), Ordering::AcqRel);
+        let previous = self.ready_pages.fetch_sub(ready_pages, Ordering::AcqRel);
+        debug_assert!(previous >= ready_pages);
 
         let epoch_batches = batches.len();
         let mut successful = Vec::new();
@@ -144,5 +168,26 @@ impl DurabilityArbiter {
             durable,
         });
         Ok(())
+    }
+}
+
+#[cfg(ktest)]
+mod tests {
+    use ostd::prelude::ktest;
+
+    use super::*;
+
+    #[ktest]
+    fn submitted_pages_move_from_pending_to_ready_once() {
+        let arbiter = DurabilityArbiter::new();
+
+        arbiter.note_submitted_pages(7);
+        assert_eq!(arbiter.pending_data_page_count(), 7);
+        assert_eq!(arbiter.ready_page_count(), 0);
+
+        arbiter.note_ready_batch(7);
+        assert_eq!(arbiter.pending_data_page_count(), 0);
+        assert_eq!(arbiter.ready_page_count(), 7);
+        assert_eq!(arbiter.ready_batch_count(), 1);
     }
 }

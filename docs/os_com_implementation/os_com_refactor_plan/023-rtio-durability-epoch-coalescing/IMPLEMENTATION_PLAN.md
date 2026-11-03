@@ -37,11 +37,11 @@
 **Interfaces:**
 - Produces: `note_submitted_pages`, page-aware `note_ready_batch`, and pending/ready snapshots.
 
-- [ ] Write ktests that assert submitted pages move exactly once from pending to ready.
-- [ ] Run the focused tests and observe failure because page accounting is absent.
-- [ ] Add atomic page accounting before BIO submission and at owner queue publication.
-- [ ] Run focused and aggregate tests.
-- [ ] Commit with message `Track rTIO durability page states`.
+- [x] Write ktests that assert submitted pages move exactly once from pending to ready.
+- [x] Run the focused tests and observe failure because page accounting is absent.
+- [x] Add atomic page accounting before BIO submission and at owner queue publication.
+- [x] Run focused and aggregate tests.
+- [x] Commit with message `Track rTIO durability page states`.
 
 ### Task 2: Gate background epoch closure
 

@@ -46,11 +46,12 @@ impl RtioWorkerRuntime {
         arbiter: &DurabilityArbiter,
     ) {
         debug_assert_eq!(batch.owner_worker_id(), Some(self.worker_id));
+        let pages = batch.page_count();
         {
             let mut queue = self.data_complete.lock();
             queue.push_back(batch);
             self.data_complete_batches.fetch_add(1, Ordering::Release);
-            arbiter.note_ready_batch();
+            arbiter.note_ready_batch(pages);
         }
         self.trigger.wake_one();
     }

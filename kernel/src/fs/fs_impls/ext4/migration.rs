@@ -835,6 +835,7 @@ impl Ext4 {
         let submitted_bios = submissions.len();
         let in_flight = self.nv_in_flight.fetch_add(submitted, Ordering::AcqRel) + submitted;
         if self.rnvpc_extend_enabled() {
+            self.rtio_durability.note_submitted_pages(submitted);
             pp::record_rtio_submission(submitted, submitted_bios, in_flight);
         }
         let mut submit_error = None;
@@ -1928,6 +1929,7 @@ pub(super) mod tests {
         let (fs, disk) = cross_queue_fixture(0xed);
         let batch0 = MigrationBatch::new(1, 1, Vec::new(), Vec::new(), Some(0));
         let batch1 = MigrationBatch::new(1, 1, Vec::new(), Vec::new(), Some(1));
+        fs.rtio_durability.note_submitted_pages(2);
         batch0.complete_data_for_owner(
             CompletionJob {
                 status: BioStatus::Complete,
@@ -1948,12 +1950,14 @@ pub(super) mod tests {
         let before = disk.disk.flush_count();
         assert_eq!(fs.rtio_durability.try_advance(&fs, None).unwrap(), 2);
         assert_eq!(disk.disk.flush_count() - before, 1);
+        assert_eq!(fs.rtio_durability.ready_page_count(), 0);
         assert_eq!(fs.rtio_worker_runtimes[0].durable_result_depth(), 1);
         assert_eq!(fs.rtio_worker_runtimes[1].durable_result_depth(), 1);
         assert_eq!(fs.rtio_worker_runtimes[2].durable_result_depth(), 0);
         assert_eq!(fs.rtio_worker_runtimes[3].durable_result_depth(), 0);
 
         let late = MigrationBatch::new(1, 1, Vec::new(), Vec::new(), Some(2));
+        fs.rtio_durability.note_submitted_pages(1);
         late.complete_data_for_owner(
             CompletionJob {
                 status: BioStatus::Complete,
