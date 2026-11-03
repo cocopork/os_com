@@ -325,7 +325,10 @@ impl Ext4 {
                                 error!("rTIO owner completion failed: {error:?}");
                                 fs.fail_nv_migration();
                             }
-                            match fs.rtio_durability.try_advance(&fs, Some(worker_id)) {
+                            match fs
+                                .rtio_durability
+                                .try_advance_background(&fs, Some(worker_id))
+                            {
                                 Ok(_) => {}
                                 Err(error) => {
                                     error!("rTIO durability failed: {error:?}");
@@ -1969,6 +1972,86 @@ pub(super) mod tests {
         assert_eq!(fs.rtio_durability.try_advance(&fs, None).unwrap(), 1);
         assert_eq!(disk.disk.flush_count() - before, 2);
         assert_eq!(fs.rtio_worker_runtimes[2].durable_result_depth(), 1);
+    }
+
+    fn publish_test_data_complete_batch(fs: &Ext4, owner: usize, pages: usize) {
+        let batch = MigrationBatch::new(1, pages, Vec::new(), Vec::new(), Some(owner));
+        batch.complete_data_for_owner(
+            CompletionJob {
+                status: BioStatus::Complete,
+                pages: Vec::new(),
+            },
+            &fs.rtio_worker_runtimes[owner],
+            &fs.rtio_durability,
+        );
+    }
+
+    #[ktest]
+    fn rnvpce_durability_coalescing_defers_small_epoch_with_pending_data() {
+        let (fs, disk) = cross_queue_fixture(0xf1);
+        fs.rtio_durability.note_submitted_pages(2);
+        publish_test_data_complete_batch(&fs, 0, 1);
+
+        let before = disk.disk.flush_count();
+        assert_eq!(
+            fs.rtio_durability
+                .try_advance_background(&fs, Some(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(disk.disk.flush_count(), before);
+        assert_eq!(fs.rtio_durability.pending_data_page_count(), 1);
+        assert_eq!(fs.rtio_durability.ready_page_count(), 1);
+        assert_eq!(fs.rtio_worker_runtimes[0].data_complete_depth(), 1);
+    }
+
+    #[ktest]
+    fn rnvpce_durability_coalescing_flushes_tail_without_pending_data() {
+        let (fs, disk) = cross_queue_fixture(0xf2);
+        fs.rtio_durability.note_submitted_pages(1);
+        publish_test_data_complete_batch(&fs, 0, 1);
+
+        let before = disk.disk.flush_count();
+        assert_eq!(
+            fs.rtio_durability
+                .try_advance_background(&fs, Some(0))
+                .unwrap(),
+            1
+        );
+        assert_eq!(disk.disk.flush_count() - before, 1);
+        assert_eq!(fs.rtio_durability.ready_page_count(), 0);
+    }
+
+    #[ktest]
+    fn rnvpce_durability_coalescing_flushes_full_epoch_with_pending_data() {
+        let (fs, disk) = cross_queue_fixture(0xf3);
+        fs.rtio_durability
+            .note_submitted_pages(MIGRATION_BATCH_PAGES + 1);
+        publish_test_data_complete_batch(&fs, 0, MIGRATION_BATCH_PAGES);
+
+        let before = disk.disk.flush_count();
+        assert_eq!(
+            fs.rtio_durability
+                .try_advance_background(&fs, Some(0))
+                .unwrap(),
+            MIGRATION_BATCH_PAGES
+        );
+        assert_eq!(disk.disk.flush_count() - before, 1);
+        assert_eq!(fs.rtio_durability.pending_data_page_count(), 1);
+        assert_eq!(fs.rtio_durability.ready_page_count(), 0);
+    }
+
+    #[ktest]
+    fn rnvpce_durability_force_advance_ignores_coalescing_threshold() {
+        let (fs, disk) = cross_queue_fixture(0xf4);
+        fs.rtio_durability.note_submitted_pages(2);
+        publish_test_data_complete_batch(&fs, 0, 1);
+
+        let before = disk.disk.flush_count();
+        assert_eq!(fs.rtio_durability.try_advance(&fs, None).unwrap(), 1);
+        assert_eq!(disk.disk.flush_count() - before, 1);
+        assert_eq!(fs.rtio_durability.pending_data_page_count(), 1);
+        assert_eq!(fs.rtio_durability.ready_page_count(), 0);
     }
 
     // Catches sync passing active workers, admitting a late worker while

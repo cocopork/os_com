@@ -41,9 +41,12 @@ impl DurabilityArbiter {
 
     pub(super) fn note_ready_batch(&self, pages: usize) {
         debug_assert_ne!(pages, 0);
+        // Publish ready credit before removing pending credit. A concurrent
+        // worker may defer once, but it must not mistake this transfer for an
+        // empty tail and close the preceding epoch early.
+        self.ready_pages.fetch_add(pages, Ordering::AcqRel);
         let previous = self.pending_data_pages.fetch_sub(pages, Ordering::AcqRel);
         debug_assert!(previous >= pages);
-        self.ready_pages.fetch_add(pages, Ordering::AcqRel);
         self.ready_batches.fetch_add(1, Ordering::AcqRel);
         self.generation.fetch_add(1, Ordering::Release);
     }
@@ -62,6 +65,20 @@ impl DurabilityArbiter {
 
     pub(super) fn generation(&self) -> usize {
         self.generation.load(Ordering::Acquire)
+    }
+
+    pub(super) fn try_advance_background(
+        &self,
+        fs: &Ext4,
+        contender: Option<usize>,
+    ) -> Result<usize> {
+        let ready_pages = self.ready_page_count();
+        if ready_pages == 0
+            || (ready_pages < super::MIGRATION_BATCH_PAGES && self.pending_data_page_count() != 0)
+        {
+            return Ok(0);
+        }
+        self.try_advance(fs, contender)
     }
 
     pub(super) fn try_advance(&self, fs: &Ext4, contender: Option<usize>) -> Result<usize> {

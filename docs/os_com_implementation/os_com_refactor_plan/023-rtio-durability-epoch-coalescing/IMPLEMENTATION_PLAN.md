@@ -54,11 +54,11 @@
 - Consumes: Task 1 pending/ready counters.
 - Produces: coalesced background advance and forced drain advance.
 
-- [ ] Add failing tests for below-threshold defer, 1024-page threshold, immediate tail and force drain.
-- [ ] Run focused tests and verify the expected assertion failures.
-- [ ] Implement background eligibility and retain force mode for sync/drain.
-- [ ] Run focused tests, `ext4_research_routes`, package checks and formatting.
-- [ ] Commit with message `Coalesce rTIO durability epochs`.
+- [x] Add failing tests for below-threshold defer, 1024-page threshold, immediate tail and force drain.
+- [x] Run focused tests and verify the expected assertion failures.
+- [x] Implement background eligibility and retain force mode for sync/drain.
+- [x] Run focused tests, `ext4_research_routes`, package checks and formatting.
+- [x] Commit with message `Coalesce rTIO durability epochs`.
 
 ### Task 3: Profile and validate the real-device matrix
 
