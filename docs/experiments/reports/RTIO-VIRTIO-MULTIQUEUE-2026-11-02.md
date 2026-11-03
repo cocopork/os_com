@@ -1,85 +1,44 @@
-# rTIO VirtIO Multi-queue Validation — 2026-11-02
+# rTIO VirtIO 多队列验证报告 - 2026-11-02
 
-## Verdict
+## 结论
 
-The queue-affine mechanism passed the real-device correctness and hardware-queue
-gates. All eight 2 GiB points completed fio, sync, unmount and read-only
-`e2fsck -fn` successfully. Every four-worker point submitted on four distinct
-virtqueues and used NVMe hctx 0–3 with a largest observed share below 32%.
-All queues drained and each ready durability epoch issued one device FLUSH.
+队列亲和机制通过了真实设备后端的正确性检查和硬件队列门槛。8 个 2 GiB 测试点均成功完成 fio、sync、卸载和只读 `e2fsck -fn`。每个四 worker 测试点都通过四个不同的 virtqueue 提交请求，并使用 NVMe hctx 0-3；观测到的单个 hctx 最大占比低于 32%。最终所有队列均已排空，每个就绪的持久化 epoch 只发出一次设备 FLUSH。
 
-Performance acceptance **failed**. Random writes improved, but sequential
-including-sync throughput regressed 46.9% with one job and 42.3% with 16 jobs.
-The 16-job sequential arm also increased cumulative submission and capacity-wait
-time relative to the previous four-worker/single-queue diagnostic. These
-results support keeping the multi-worker path experimental and the production
-default at one worker. The measured candidate at `936722960` used the
-queue-aware default. The subsequent review fix restores the current default
-to one worker while preserving bounded explicit overrides; the fingerprinted
-measurement binary and its results are unchanged.
+性能验收**失败**。随机写性能有所提升，但计入 sync 后，单 job 顺序写吞吐量回退 46.9%，16 job 顺序写吞吐量回退 42.3%。与此前四 worker/单队列诊断相比，16 job 顺序写还增加了累计提交时间和容量等待时间。因此，多 worker 路径应继续作为实验功能，生产默认值保持一个 worker。测试候选版本 `936722960` 采用按队列数自动选择 worker 的默认策略；后续审查修复已将当前默认值恢复为一个 worker，同时保留有上限的显式配置。该修复没有改变已固化的测试镜像及其结果。
 
-## Method and provenance
+## 测试方法与来源
 
-- Source: `936722960e29285bcf80c732580535f5a7ed85d3`; one temporary build diff
-  set `pipeline_profile::ENABLED` from `false` to `true`. It was saved as
-  `build-source.diff` and restored immediately after copying the release ISO.
-  No other kernel source changed for measurement; no rebuild ran during it.
-- Release kernel check and build both exited 0. This is an instrumented release
-  experiment, with one sample per point, not an uninstrumented performance
-  result or a statistical confidence interval.
-- One ISO for all eight points, SHA-256:
-  `fbb3259fe8322138ead265868e930dfd0eb7e468400db4e5b0ae1e52cf553e35`.
-- Tools: `os-com-recovery-tools:workspace-20261018`, image ID
-  `sha256:6a1ae86b819913bdb9e39b0a8b47fc802ea73aed93e2f5d6bc7f9839d56d4254`;
-  container QEMU 10.2.1. Host QEMU 8.2.2 was not used.
-- Host: Linux `6.8.0-147-generic`, x86-64; DAPUSTOR
-  `DPRP5104T0TG03T8000`, firmware `FC003126`, scheduler `none`.
-- Only `/dev/nvme1n1p1`, exact 274,877,906,944 bytes, major:minor `259:6`,
-  parent `nvme1n1` (`259:2`), was exposed. It was reformatted before each
-  measured point as 4 KiB no-journal EXT4. p2, p3 and the whole disk were not
-  written. Target identity, mounts, swap, holders, descendants and host-root
-  open-user checks ran immediately before formatting and QEMU exposure.
-- VM: KVM, q35, 64 vCPU, 8 GiB RAM, OVMF, raw target with `cache=none`,
-  `aio=threads`, virtqueue depth 1024. Request merging, discard, write-zeroes,
-  event index and indirect descriptors disabled for the target.
-- rNVPCe: 128 MiB NVM pool, 64 MiB metadata reserve, 64 MiB data limit,
-  simulated persistence `fast`, CPU isolation and tracing enabled. The ISO
-  has no worker override: the measured candidate selects 1 worker for 1 queue
-  and 4 workers for 4 queues. Native/WAL mounts remain single-worker.
-- fio: buffered `psync`, depth 1 per thread, CPU set 0–31, exactly 2 GiB total,
-  1 or 16 jobs, fixed random seed. Random points first prepare files using a
-  direct sequential write on native EXT4; the measured pass is the first
-  rNVPCe random pass over those existing SSD-backed files. Sequential points
-  write new files. Each point begins with a fresh filesystem.
-- The controls ran first, then the four-queue arm, serialized. The guest's
-  including-sync interval spans fio start through final sync, before unmount;
-  profiling/serial overhead inside that interval is included.
+本实验不是 fio 直接读写裸分区。宿主机真实分区 `/dev/nvme1n1p1` 作为 raw 块设备直通给 QEMU；星绽系统通过 virtio-blk 访问它，在来宾系统中格式化并挂载 nojournal EXT4/rNVPCe，然后 fio 对挂载点内的文件执行 buffered `psync` 写入。因此，报告中的“真实设备”表示后端是真实 NVMe 分区，不表示 fio 使用裸设备 direct I/O。
 
-Raw evidence is under
-`/home/zn/asterinas-build-env/rtio-virtio-multiqueue-20261102/`, outside Git.
-Each `q{1,4}-{randwrite-4k,write-128k}-j{1,16}` directory contains the ISO and
-input hashes, QEMU log and status, mkfs/e2fsck logs, complete pipeline snapshots,
-QMP replies, IOThread TIDs, affinity, sysfs queue map, probe source and preflight,
-raw trace, final hctx counts, root-helper evidence and parsed `result.json`.
+- 源码版本：`936722960e29285bcf80c732580535f5a7ed85d3`。构建时仅有一项临时差异：将 `pipeline_profile::ENABLED` 从 `false` 改为 `true`。差异保存为 `build-source.diff`；复制 release ISO 后立即恢复。测试期间没有修改其他内核源码，也没有重新构建。
+- release 内核检查和构建均以状态 0 结束。这是启用插桩的 release 实验，每个测试点只运行一次，不是无插桩性能结果，也不构成统计置信区间。
+- 8 个测试点共用一个 ISO，SHA-256 为 `fbb3259fe8322138ead265868e930dfd0eb7e468400db4e5b0ae1e52cf553e35`。
+- 工具镜像：`os-com-recovery-tools:workspace-20261018`，镜像 ID 为 `sha256:6a1ae86b819913bdb9e39b0a8b47fc802ea73aed93e2f5d6bc7f9839d56d4254`。使用容器内 QEMU 10.2.1，没有使用宿主机 QEMU 8.2.2。
+- 宿主机：Linux `6.8.0-147-generic`，x86-64；DAPUSTOR `DPRP5104T0TG03T8000`，固件 `FC003126`，调度器 `none`。
+- 只直通了 `/dev/nvme1n1p1`：精确容量 274,877,906,944 字节，major:minor 为 `259:6`，父设备为 `nvme1n1`（`259:2`）。每个测试点开始前都将它重新格式化为 4 KiB nojournal EXT4。没有写入 p2、p3 或整个磁盘。格式化和 QEMU 直通前均重新检查目标身份、挂载、swap、holders、子设备以及宿主 root 视角下的打开者。
+- 虚拟机：KVM、q35、64 vCPU、8 GiB 内存、OVMF；raw 后端使用 `cache=none` 和 `aio=threads`，virtqueue 深度为 1024。目标设备关闭请求合并、discard、write-zeroes、event index 和 indirect descriptors。
+- rNVPCe：128 MiB NVM 池、64 MiB 元数据预留、64 MiB data limit；持久化模拟模式为 `fast`，启用 CPU 隔离和跟踪。ISO 没有设置 worker override：测试候选版本在 1 队列时选择 1 worker，在 4 队列时选择 4 worker。Native/WAL 挂载仍为单 worker。
+- fio：buffered `psync`，每线程深度 1，使用 CPU 0-31，总数据量精确为 2 GiB，1 或 16 job，固定随机种子。随机写测试先在 native EXT4 下通过 direct 顺序写准备文件；被测阶段是 rNVPCe 对这些已有 SSD 后端文件的首次随机覆盖写。顺序写测试创建新文件。每个测试点均从新格式化的文件系统开始。
+- 先串行运行单队列对照组，再串行运行四队列实验组。来宾系统中的 including-sync 区间从 fio 开始持续到最终 sync 完成、卸载之前；该区间包含 profiling 和串口输出开销。
 
-## Throughput
+原始证据位于 Git 仓库之外：`/home/zn/asterinas-build-env/rtio-virtio-multiqueue-20261102/`。每个 `q{1,4}-{randwrite-4k,write-128k}-j{1,16}` 目录都包含 ISO 与输入哈希、QEMU 日志和状态、mkfs/e2fsck 日志、完整流水线快照、QMP 回复、IOThread TID、亲和性、sysfs 队列映射、探针源码和预检结果、原始跟踪、最终 hctx 计数、root helper 证据以及解析后的 `result.json`。
 
-All rates are MiB/s. Change compares including-sync throughput, 4 queues / 1 queue.
+## 吞吐量
 
-| Workload | Jobs | 1q fio | 4q fio | 1q including sync | 4q including sync | Change |
+所有速率单位均为 MiB/s。“变化”比较计入 sync 后的四队列和单队列吞吐量。
+
+| 工作负载 | job 数 | 1 队列 fio | 4 队列 fio | 1 队列（含 sync） | 4 队列（含 sync） | 变化 |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
 | randwrite-4k | 1 | 204.15 | 267.96 | 189.28 | 246.45 | +30.2% |
 | randwrite-4k | 16 | 199.12 | 287.64 | 185.51 | 253.47 | +36.6% |
 | write-128k | 1 | 2409.41 | 1030.70 | 1312.82 | 696.60 | -46.9% |
 | write-128k | 16 | 801.88 | 400.78 | 607.72 | 350.68 | -42.3% |
 
-## Latency and pipeline counters
+## 延迟与流水线计数器
 
-Mean is fio total write latency; p99 is fio completion latency, both in µs.
-Submission and capacity-wait columns are cumulative seconds across callers,
-not elapsed wall time. Epoch/FLUSH counts are equal at the final snapshot.
+平均延迟是 fio 总写延迟，p99 是 fio completion latency，单位均为 us。提交时间和容量等待时间是所有调用者的累计秒数，不是墙钟时间。最终快照中 epoch 数与 FLUSH 数相等。
 
-| Point | Mean µs | p99 µs | `nv_data_submit` s | Capacity wait s | Epochs / FLUSHes | Peak in-flight pages |
+| 测试点 | 平均延迟 us | p99 us | `nv_data_submit` s | 容量等待 s | epoch / FLUSH | 峰值在途页数 |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
 | q1-randwrite-4k-j1 | 18.83 | 25.73 | 9.882 | 3.492 | 512 / 512 | 2048 |
 | q1-randwrite-4k-j16 | 310.09 | 8978.43 | 9.961 | 73.037 | 512 / 512 | 2048 |
@@ -90,27 +49,13 @@ not elapsed wall time. Epoch/FLUSH counts are equal at the final snapshot.
 | q4-write-128k-j1 | 120.92 | 329.73 | 3.330 | 0.639 | 227 / 227 | 16384 |
 | q4-write-128k-j16 | 4916.78 | 39583.74 | 8.741 | 30.742 | 221 / 221 | 16384 |
 
-For 16-job sequential writes, the previous four-worker/single-queue diagnostic
-reported submission 4.74 s and capacity wait 18.16 s; this arm measured 8.74 s
-and 30.74 s. The reduction gate therefore fails as well. The historical run
-used a different kernel path and is contextual evidence; the same-image 1q
-comparison above independently demonstrates the regression. Four-queue
-sequential runs create many more ready batches (2,489 at one job, 1,437 at
-16 jobs, versus 512 in each control), while sharing fewer FLUSHes (227 and
-221). More fragmented migration and accumulated submission delay remain
-observations requiring investigation; these measurements do not establish a
-specific lock as the cause.
+此前四 worker/单队列诊断中，16 job 顺序写的提交时间为 4.74 s，容量等待为 18.16 s；本实验相应结果为 8.74 s 和 30.74 s，因此该下降门槛同样未通过。历史实验使用不同的内核路径，只作为背景证据；上表中相同镜像的单队列对比已经独立证明性能回退。四队列顺序写产生了更多 ready batch：单 job 为 2,489，16 job 为 1,437，而两个对照点均为 512；同时，它们将更多批次合并到较少的 FLUSH（分别为 227 和 221）。迁移更碎片化和累计提交延迟仍需继续调查；本次测量不能据此确定某一把锁就是原因。
 
-## Queue balance and drain
+## 队列均衡与排空状态
 
-Slash-separated entries are queue 0/1/2/3 in order; controls have queue 0 only.
-Worker BIO counts exclude the final quiesced queue-0 sync drain. Driver counters
-include native preparation, metadata and sync I/O. Depth is the maximum sampled
-staging depth; descriptor ticks are the driver's raw TSC ticks, not nanoseconds.
-Every final queue had staging depth 0 and in-flight requests 0. Every queue
-reported one active forwarding thread and peak forwarding count 1.
+表中以斜杠分隔的值依次对应队列 0/1/2/3；对照组只有队列 0。worker BIO 计数不包含最终静止阶段由队列 0 执行的 sync 排空。驱动计数包含 native 准备、元数据和 sync I/O。深度为采样到的最大 staging depth；descriptor wait ticks 是驱动读取的原始 TSC tick，不是纳秒。最终每个队列的 staging depth 和在途请求数都为 0。每个队列都报告一个活动转发线程，转发线程峰值也为 1。
 
-| Point | Worker submitted BIOs | Worker submitted pages | Max staging depth | Descriptor waits | Descriptor wait ticks | IRQ completions |
+| 测试点 | worker 提交 BIO | worker 提交页数 | 最大 staging depth | descriptor 等待次数 | descriptor 等待 tick | IRQ completion 数 |
 | --- | --- | --- | --- | --- | --- | --- |
 | q1-randwrite-4k-j1 | 517120 | 517120 | 107 | 0 | 0 | 572525 |
 | q1-randwrite-4k-j16 | 517120 | 517120 | 184 | 37 | 11713220 | 575257 |
@@ -121,77 +66,38 @@ reported one active forwarding thread and peak forwarding count 1.
 | q4-write-128k-j1 | 4093/3895/3787/4179 | 130944/124608/121184/133696 | 11/8/3/9 | 0/0/0/0 | 0/0/0/0 | 4962/3912/5967/6369 |
 | q4-write-128k-j16 | 3479/4433/4122/4302 | 111328/141632/131904/137664 | 21/11/17/9 | 0/0/0/0 | 0/0/0/0 | 5966/4447/6354/4676 |
 
-All four-worker logs contain worker→queue mappings `0→0, 1→1, 2→2, 3→3`
-and nonzero data BIOs/pages from each worker. Full queued/submitted BIO and page
-counts are retained in each `result.json`. The final shared-coordinator
-snapshots report active workers 0; the four-queue arm reached peak workers 4.
-The separate cross-queue fault tests in Task 5 establish failure semantics;
-this successful-I/O matrix adds physical-device evidence and does not repeat
-fault injection or claim a new full-kernel regression pass.
+所有四 worker 日志都包含 worker 到队列映射 `0->0, 1->1, 2->2, 3->3`，且每个 worker 都提交了非零的数据 BIO 和页。完整的排队/提交 BIO 与页计数保留在各自的 `result.json` 中。共享协调器的最终快照显示活动 worker 数为 0；四队列实验组的 worker 峰值为 4。Task 5 的独立跨队列故障测试已经验证失败语义；本次成功 I/O 矩阵补充了物理设备证据，但没有重复故障注入，也不宣称重新执行了完整内核回归测试。
 
-## Authoritative host hardware-queue evidence
+## 宿主机硬件队列的权威证据
 
-QMP mapped virtqueue `i` only to `iothread<i>`. The selected host CPU/hctx pairs
-were `(1,0)`, `(3,1)`, `(5,2)`, `(7,3)`; the control used only `(1,0)`.
-The harness recorded QMP host TIDs, applied affinity before resume, and saved
-`taskset` output. The typed `kprobe:nvme_queue_rq` probe filtered the parent
-request queue and counted `blk_mq_hw_ctx.queue_num`. Every trace observed the
-readiness marker, remained alive through guest exit, then exited 0 on SIGINT
-with a final map boundary. All QEMU runs exited 33 via the guest debug-exit.
+QMP 将 virtqueue `i` 只映射到 `iothread<i>`。选定的宿主 CPU/hctx 组合为 `(1,0)`、`(3,1)`、`(5,2)`、`(7,3)`；对照组只使用 `(1,0)`。工具记录了 QMP 返回的宿主 TID，在恢复虚拟机运行前设置亲和性，并保存 `taskset` 输出。类型化 `kprobe:nvme_queue_rq` 探针过滤父 request queue，统计 `blk_mq_hw_ctx.queue_num`。每次跟踪都观测到就绪标记，探针一直存活到来宾退出，然后经 SIGINT 正常退出并产生完整的最终 map 边界。所有 QEMU 都通过来宾 debug-exit 以状态 33 退出。
 
-| Point | hctx 0/1/2/3 requests | Other hctx requests | Active hctx | Largest share | Four-hctx gate |
+| 测试点 | hctx 0/1/2/3 请求数 | 其他 hctx 请求 | 活动 hctx 数 | 最大占比 | 四 hctx 门槛 |
 | --- | --- | --- | ---: | ---: | --- |
-| q1-randwrite-4k-j1 | 572026/0/0/0 | 48:1, 105:1 | 3 | 100.00% | control; not applied |
-| q1-randwrite-4k-j16 | 576520/0/0/0 | 14:1 | 2 | 100.00% | control; not applied |
-| q1-write-128k-j1 | 20980/0/0/0 | 6:1, 90:1 | 3 | 99.99% | control; not applied |
-| q1-write-128k-j16 | 21218/0/0/0 | 15:1, 87:1 | 3 | 99.99% | control; not applied |
-| q4-randwrite-4k-j1 | 135108/123952/135342/177763 | 86:1, 127:1 | 6 | 31.07% | PASS |
-| q4-randwrite-4k-j16 | 140648/141832/148329/145122 | 98:1, 124:1 | 6 | 25.75% | PASS |
-| q4-write-128k-j1 | 4732/3912/5967/6369 | 32:1, 122:1 | 6 | 30.35% | PASS |
-| q4-write-128k-j16 | 5734/4448/6354/4676 | 47:1, 48:1 | 6 | 29.95% | PASS |
+| q1-randwrite-4k-j1 | 572026/0/0/0 | 48:1, 105:1 | 3 | 100.00% | 对照组，不适用 |
+| q1-randwrite-4k-j16 | 576520/0/0/0 | 14:1 | 2 | 100.00% | 对照组，不适用 |
+| q1-write-128k-j1 | 20980/0/0/0 | 6:1, 90:1 | 3 | 99.99% | 对照组，不适用 |
+| q1-write-128k-j16 | 21218/0/0/0 | 15:1, 87:1 | 3 | 99.99% | 对照组，不适用 |
+| q4-randwrite-4k-j1 | 135108/123952/135342/177763 | 86:1, 127:1 | 6 | 31.07% | 通过 |
+| q4-randwrite-4k-j16 | 140648/141832/148329/145122 | 98:1, 124:1 | 6 | 25.75% | 通过 |
+| q4-write-128k-j1 | 4732/3912/5967/6369 | 32:1, 122:1 | 6 | 30.35% | 通过 |
+| q4-write-128k-j16 | 5734/4448/6354/4676 | 47:1, 48:1 | 6 | 29.95% | 通过 |
 
-The one or two requests on other hctx are consistent with the recorded
-read-only readiness reads. The trace does not label requests by phase.
-Traces cover the whole guest run, including random-file preparation, metadata,
-measured fio and sync; they are not fio-only distributions. In each four-queue
-point, hctx 0–3 independently carry thousands of requests, so readiness reads
-do not create the observed four-queue result. The 70% gate applies to all traced
-requests exactly as specified.
+其他 hctx 上的一两个请求与记录的只读就绪探测吻合。跟踪数据不区分请求阶段，覆盖整个来宾运行过程，包括随机文件准备、元数据操作、被测 fio 和 sync，并非仅统计 fio。在每个四队列测试点中，hctx 0-3 都独立承载了数千个请求，因此就绪探测不会造成观测到的四队列结果。70% 门槛按设计应用于所有被跟踪请求。
 
-## Harness corrections and verification
+## 测试工具修复与验证
 
-The initial preflight attempt stopped before formatting because host psmisc
-`fuser -s -- PATH` prints usage and status 1. Its evidence is retained under
-`failed-fuser/`. A regression test invoking the real CLI on an open temporary
-file failed, then passed after removing `--` from the canonical absolute-path
-arguments. The root-helper status/output/identity checks remain strict; the preliminary
-host check also rejects diagnostic output with status 1, covered by a failing
-then passing fixture.
+首次预检在格式化前停止，因为宿主 psmisc 的 `fuser -s -- PATH` 会输出用法并返回状态 1。证据保存在 `failed-fuser/` 下。调用真实 CLI 检查已打开临时文件的回归测试先失败；从规范化绝对路径参数中删除 `--` 后通过。root helper 对状态、输出和身份的检查仍然严格；初步宿主检查也会拒绝状态为 1 且带诊断输出的情况，该行为由先失败后通过的测试覆盖。
 
-The first successful control's fio JSON was interrupted inside a key by a
-CPU-isolation serial line. Its workload and e2fsck were successful; no rerun
-was needed. A failing parser regression was added, then known CPU-isolation
-messages and ANSI color codes were stripped while preserving byte-level line
-endings. All eight retained raw logs now parse and require exactly 2 GiB,
-fio error 0, sync 0, unmount 0 and e2fsck 0. New negative fixtures reject
-short writes, fio/sync failures, idle or misrouted workers, outstanding requests,
-extra FLUSHes and failed hctx gates.
+首个成功对照点的 fio JSON 键名被一条 CPU 隔离串口日志从中间打断。该工作负载和 e2fsck 已成功，无需重跑。新增解析器回归测试并确认失败后，只过滤已知 CPU 隔离消息和 ANSI 颜色码，同时保留字节级行尾。现在 8 份原始日志均可解析，并强制要求数据量精确为 2 GiB、fio error 为 0、sync 为 0、unmount 为 0、e2fsck 为 0。新增反向测试会拒绝短写、fio/sync 失败、空闲或错误路由的 worker、未完成请求、额外 FLUSH 和未通过的 hctx 门槛。
 
-The harness gained tested one/four-queue selection, matching IOThread objects,
-repeated target checks, explicit formatting, a 900-second VM bound, and a
-serialized matrix wrapper. A mechanism-only rejection has status 3; correctness
-or incomplete capture stops the wrapper. `--self-test`, shell syntax checks,
-Python compilation and `git diff --check` passed after these changes. No raw
-images, JSON, logs or traces are tracked.
+工具新增并测试了 1/4 队列选择、匹配的 IOThread 对象、重复目标检查、显式格式化、900 秒虚拟机时限和串行矩阵封装。只有机制门槛失败时返回状态 3；正确性失败或证据不完整会停止矩阵。修改后，`--self-test`、Shell 语法检查、Python 编译和 `git diff --check` 均通过。Git 没有跟踪原始镜像、JSON、日志或跟踪数据。
 
-Known limitations retained from Task 6: QMP's deadline covers connection but
-not every greeting/reply read; the image digest is recorded while Docker
-execution still names a mutable tag. This run's per-point image IDs agree.
+Task 6 遗留的已知限制：QMP 时限覆盖连接过程，但没有覆盖所有 greeting/reply 读取；工具记录了镜像 digest，但 Docker 执行仍使用可变 tag。本次每个测试点记录的镜像 ID 均一致。
 
-## Reproduction of the retained historical image
+## 历史测试镜像复现方法
 
-From the worktree, build in the stated container with the recorded profiling
-change, then copy/fingerprint the produced ISO and restore that source flag:
+在工作树中，使用上述容器和已记录的 profiling 修改进行构建，然后复制并计算生成 ISO 的指纹，最后恢复源码标志：
 
 ```sh
 cargo osdk check --release --package aster-kernel
@@ -199,8 +105,7 @@ cargo osdk build --release --init-args='/ext2/rebuild-fio.sh' \
   --kcmd-args='console=ttyS0 ostd.log_level=error rnvpc=off rnvpc_extend=off rtio=off rnvpc_size=128M rnvpc_meta_reserve=64M rnvpc_data_limit=64M rnvpc_sim_mode=fast rtio_cpu_isolation=on rtio_cpu_trace=on'
 ```
 
-With a caller-owned external artifact parent and the fingerprinted ISO,
-`ext2.img` and `exfat.img` under `SOURCE_ART`:
+准备一个由调用者管理的外部证据目录，并将已固化的 ISO、`ext2.img` 和 `exfat.img` 放在 `SOURCE_ART` 下：
 
 ```sh
 ROOT_ART=/path/to/new-matrix-root \
@@ -210,30 +115,10 @@ bash docs/experiments/scripts/rtio-virtio-multiqueue-20261102/run-matrix.sh \
   --authorized-destructive-target=/dev/nvme1n1p1
 ```
 
-The recorded run split this into the first control, remaining three controls,
-and all four arm points using `MATRIX_QUEUES`/`MATRIX_SPECS`, preserving the
-failed preflight and parsed successful first-control evidence. Future binaries
-with a one-worker default must explicitly select four workers for the arm;
-the implicit queue-aware selection above is specific to the measured source.
-For current source, prepare and fingerprint both worker-1 and worker-4 images
-before any measurements, adding `rtio_workers=1` or `rtio_workers=4` to the
-kernel command line. Run the wrapper twice with `MATRIX_QUEUES=1` and
-`MATRIX_QUEUES=4`, respectively, and matching `SOURCE_ART` directories; see the
-[harness README](../scripts/rtio-virtio-multiqueue-20261102/README.md).
+已记录的实验使用 `MATRIX_QUEUES`/`MATRIX_SPECS`，依次运行首个对照点、其余三个对照点和全部四队列测试点，同时保留失败预检以及重新解析后的首个成功对照证据。当前及未来版本默认只有一个 worker；四 worker 实验必须显式配置。复现当前源码时，应在开始任何测量前分别准备并固化 worker-1 和 worker-4 镜像，在内核命令行中分别加入 `rtio_workers=1` 或 `rtio_workers=4`。随后使用对应的 `SOURCE_ART` 目录，分别以 `MATRIX_QUEUES=1` 和 `MATRIX_QUEUES=4` 运行封装脚本。更多说明见[测试工具 README](../scripts/rtio-virtio-multiqueue-20261102/README.md)。
 
-## Post-experiment review fixes
+## 实验后审查修复
 
-The runtime default now remains one worker regardless of CPU or submission
-queue count. Explicit `rtio_workers=N` remains supported up to 16 and no more
-than the advertised queue count; native/WAL behavior stays at one worker.
-The policy ktest was updated and exercised using a host Rust adapter for its
-pure function; kernel and ktest package checks compile the integrated code.
-No new QEMU/device experiment is claimed for this correction.
+当前运行时默认值固定为一个 worker，不再根据 CPU 数量或提交队列数量自动增加。仍支持显式 `rtio_workers=N`，上限为 16，且不能超过设备声明的队列数；native/WAL 行为仍固定为一个 worker。策略 ktest 已更新，并通过宿主 Rust 适配器执行其中的纯函数；kernel 和 ktest 包检查也验证了集成代码可以编译。该修复没有重新执行 QEMU/真实设备实验。
 
-The standalone runner now acquires a common lock keyed by the verified target
-major:minor, independently of artifact root. The matrix requests read-only
-e2fsck inside the runner so the same lock covers formatting, QEMU, post-run
-checking and cleanup without nested lock acquisition. Non-destructive process
-fixtures prove that different roots cannot concurrently use the same device,
-distinct verified devices have separate locks, and a competitor is excluded
-during the mocked e2fsck. The retained eight-point evidence is unchanged.
+独立运行器现在按验证后的目标 major:minor 获取公共锁，不再依赖证据目录。矩阵要求运行器在同一锁生命周期内执行只读 e2fsck，因此格式化、QEMU、运行后检查和清理都受同一把锁保护，同时不会产生嵌套加锁。非破坏性进程测试证明：不同证据目录不能同时使用同一设备，不同的已验证设备使用不同锁，而且模拟 e2fsck 执行时竞争者也会被排除。已有 8 个测试点的证据不受该修复影响。
