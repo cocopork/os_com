@@ -76,4 +76,3 @@ FLUSH 期间不持有 worker 队列、inode 或 extent 锁。
 70,790 降至 1,791，含 sync 带宽提高 3.6%；128 KiB/16 job epoch 从 14,307 降至
 2,549，但含 sync 带宽下降 11.5%。机制消除了 FLUSH 放大，新的权衡是 completion
 等待增加。完整数据见[实验报告](../../../experiments/reports/RTIO-DURABILITY-EPOCH-COALESCING-2026-11-03.md)。
-

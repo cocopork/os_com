@@ -76,4 +76,3 @@
 - [x] Compare epoch count, throughput, latency and capacity wait against 022.
 - [x] Document exact pass/fail status and residual bottlenecks.
 - [x] Commit with message `Validate rTIO durability epoch coalescing`.
-
