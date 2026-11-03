@@ -26,10 +26,15 @@ use crate::fs::rnvpc::{
 };
 
 mod batch;
+mod durability;
 mod reclaim;
+mod worker;
 
 use batch::MigrationBatch;
+pub(super) use durability::DurabilityArbiter;
 use reclaim::ReclaimReadyQueue;
+use worker::DurableBatchResult;
+pub(super) use worker::RtioWorkerRuntime;
 
 const MIGRATION_BATCH_PAGES: usize = super::writeback::WRITEBACK_BATCH;
 const MAX_RTIO_WORKERS: usize = 16;
@@ -308,6 +313,7 @@ impl Ext4 {
             crate::thread::kernel_thread::ThreadOptions::new(move || {
                 loop {
                     let observed;
+                    let durability_generation;
                     {
                         let Some(fs) = weak.upgrade() else {
                             break;
@@ -316,6 +322,16 @@ impl Ext4 {
                             break;
                         }
                         observed = fs.nv_migration_worker_epochs[worker_id].load(Ordering::Acquire);
+                        durability_generation = fs.rtio_durability.generation();
+                        if uses_shared_migration_rounds(fs.rnvpc_mode()) {
+                            match fs.rtio_durability.try_advance(&fs) {
+                                Ok(_) => {}
+                                Err(error) => {
+                                    error!("rTIO durability failed: {error:?}");
+                                    fs.fail_nv_migration();
+                                }
+                            }
+                        }
                         if uses_shared_migration_rounds(fs.rnvpc_mode())
                             || rnvpc::needs_flush_watermark()
                             || fs.nv_capacity_waiters.load(Ordering::Acquire) != 0
@@ -349,6 +365,10 @@ impl Ext4 {
                                         || fs.nv_migration_worker_epochs[worker_id]
                                             .load(Ordering::Acquire)
                                             != observed
+                                        || (uses_shared_migration_rounds(fs.rnvpc_mode())
+                                            && (fs.rtio_durability.generation()
+                                                != durability_generation
+                                                || fs.rtio_durability.ready_batch_count() != 0))
                                 })
                                 .then_some(())
                         },
@@ -411,7 +431,17 @@ impl Ext4 {
                     }
                 }
                 let _ = trigger.wait_until_or_timeout(
-                    || (!queue.lock().is_empty()).then_some(()),
+                    || {
+                        (!queue.lock().is_empty()
+                            || weak.upgrade().is_some_and(|fs| {
+                                fs.rtio_durability.ready_batch_count() != 0
+                                    || fs
+                                        .rtio_worker_runtimes
+                                        .iter()
+                                        .any(|worker| worker.durable_result_depth() != 0)
+                            }))
+                        .then_some(())
+                    },
                     &Duration::from_millis(10),
                 );
             }
@@ -789,7 +819,19 @@ impl Ext4 {
                 submissions.push((target, segments, run));
             }
         }
-        let batch = MigrationBatch::new(submissions.len(), submitted, migration_leases, nv_entries);
+        let owner_worker_id = self.rnvpc_extend_enabled().then(|| match submitter {
+            MigrationSubmitter::Worker(queue_id) | MigrationSubmitter::Quiesced(queue_id) => {
+                usize::from(queue_id)
+            }
+            MigrationSubmitter::Legacy => 0,
+        });
+        let batch = MigrationBatch::new(
+            submissions.len(),
+            submitted,
+            migration_leases,
+            nv_entries,
+            owner_worker_id,
+        );
         let submitted_bios = submissions.len();
         let in_flight = self.nv_in_flight.fetch_add(submitted, Ordering::AcqRel) + submitted;
         if self.rnvpc_extend_enabled() {
@@ -799,6 +841,9 @@ impl Ext4 {
         for (target, segments, run) in submissions {
             let completed = self.nv_completion_queue.clone();
             let trigger = self.nv_completion_trigger.clone();
+            let owner_runtime =
+                owner_worker_id.and_then(|owner| self.rtio_worker_runtimes.get(owner).cloned());
+            let durability = self.rtio_durability.clone();
             let callback_batch = batch.clone();
             let callback_pages: Arc<SpinLock<Option<Vec<PendingPage>>, LocalIrqDisabled>> =
                 Arc::new(SpinLock::new(Some(run)));
@@ -809,7 +854,20 @@ impl Ext4 {
                     .lock()
                     .take()
                     .expect("migration BIO callback must run exactly once");
-                callback_batch.complete_data(CompletionJob { status, pages }, &completed, &trigger);
+                if let Some(runtime) = owner_runtime.as_ref() {
+                    callback_batch.complete_data_for_owner(
+                        CompletionJob { status, pages },
+                        runtime,
+                        &durability,
+                        &trigger,
+                    );
+                } else {
+                    callback_batch.complete_data(
+                        CompletionJob { status, pages },
+                        &completed,
+                        &trigger,
+                    );
+                }
             });
             let mut io_batch = IoBatch::new();
             let pages = segments.iter().map(BioSegment::nblocks).sum();
@@ -836,14 +894,26 @@ impl Ext4 {
                     .lock()
                     .take()
                     .expect("failed migration submission must retain its pages");
-                batch.complete_data(
-                    CompletionJob {
-                        status: BioStatus::IoError,
-                        pages,
-                    },
-                    &self.nv_completion_queue,
-                    &self.nv_completion_trigger,
-                );
+                let job = CompletionJob {
+                    status: BioStatus::IoError,
+                    pages,
+                };
+                if let Some(runtime) =
+                    owner_worker_id.and_then(|owner| self.rtio_worker_runtimes.get(owner))
+                {
+                    batch.complete_data_for_owner(
+                        job,
+                        runtime,
+                        &self.rtio_durability,
+                        &self.nv_completion_trigger,
+                    );
+                } else {
+                    batch.complete_data(
+                        job,
+                        &self.nv_completion_queue,
+                        &self.nv_completion_trigger,
+                    );
+                }
                 submit_error = Some(error);
             }
         }
@@ -1126,6 +1196,26 @@ impl Ext4 {
 
     pub(super) fn process_nv_completions(&self) -> Result<usize> {
         let _serial = self.nv_completion_lock.lock();
+        if self.rnvpc_extend_enabled() {
+            let mut failure = self.rtio_durability.try_advance(self).err();
+            let mut count = 0usize;
+            for runtime in self.rtio_worker_runtimes.iter() {
+                for result in runtime.take_durable_results() {
+                    count = count.saturating_add(result.batch.page_count());
+                    if let Err(error) = self.finish_rnvpce_durable_result(result) {
+                        failure = Some(error);
+                    }
+                }
+            }
+            if count != 0 {
+                self.nv_in_flight.fetch_sub(count, Ordering::AcqRel);
+                self.request_nv_migration();
+            }
+            return match failure {
+                Some(error) => Err(error),
+                None => Ok(count),
+            };
+        }
         // Move the whole backing queue to process context without allocating
         // or releasing object leases while holding its IRQ-safe spinlock.
         let mut drained = VecDeque::new();
@@ -1138,18 +1228,12 @@ impl Ext4 {
             .map(|batch| batch.page_count())
             .sum::<usize>();
         let mut failure = None;
-        if self.rnvpc_extend_enabled() {
-            if let Err(error) = self.finish_rnvpce_durability_epoch(drained.into_iter().collect()) {
+        while let Some(batch) = drained.pop_front() {
+            if let Err(error) = self.finish_nv_completion_batch(batch) {
                 failure = Some(error);
             }
-        } else {
-            while let Some(batch) = drained.pop_front() {
-                if let Err(error) = self.finish_nv_completion_batch(batch) {
-                    failure = Some(error);
-                }
-            }
-            drop(drained);
         }
+        drop(drained);
         self.nv_in_flight.fetch_sub(count, Ordering::AcqRel);
         self.request_nv_migration();
         match failure {
@@ -1158,86 +1242,40 @@ impl Ext4 {
         }
     }
 
-    pub(super) fn finish_rnvpce_durability_epoch(
-        &self,
-        batches: Vec<Arc<MigrationBatch>>,
-    ) -> Result<usize> {
-        let epoch_batches = batches.len();
+    fn finish_rnvpce_durable_result(&self, result: DurableBatchResult) -> Result<()> {
         let pool = rnvpc::pool().ok_or_else(|| Error::new(Errno::EINVAL))?;
-        let mut successful = Vec::new();
-        let mut io_failed = false;
-        let mut successful_pages = 0usize;
-        for batch in batches {
-            let completion_started = batch.completion_started();
-            let jobs = batch.take_jobs();
-            if jobs.iter().any(|job| job.status != BioStatus::Complete) {
-                self.restore_failed_migration_jobs(&pool, jobs);
-                io_failed = true;
-                continue;
-            }
-            successful_pages = successful_pages.saturating_add(batch.page_count());
-            successful.push((batch, jobs, completion_started));
-        }
-
-        pp::record_rtio_epoch(epoch_batches, successful_pages, !successful.is_empty());
-
-        if !successful.is_empty() {
-            let started = batch_metrics::now();
-            let device_flush_started = pp::now();
-            match self.block_device().sync() {
-                Ok(BioStatus::Complete) => {}
-                Ok(_) => {
-                    for (_, jobs, _) in successful {
-                        self.restore_failed_migration_jobs(&pool, jobs);
-                    }
-                    return_errno!(Errno::EIO);
-                }
-                Err(error) => {
-                    for (_, jobs, _) in successful {
-                        self.restore_failed_migration_jobs(&pool, jobs);
-                    }
-                    return Err(error.into());
-                }
-            }
-            pp::NV_DEVICE_FLUSH.record_since(device_flush_started, successful_pages);
-            batch_metrics::elapsed(Phase::DataBarrier, started);
-
-            for (batch, jobs, completion_started) in successful {
-                drop(jobs);
-                let entries = batch.take_nv_entry_leases();
-                if entries.is_empty() {
-                    return_errno_with_message!(
-                        Errno::EUCLEAN,
-                        "rNVPCe completion lost entry leases"
-                    );
-                }
-                drop(batch.take_migration_leases());
-                let reclaim_batch = ReclaimBatch::new(entries.len());
-                for entry in entries {
-                    let entry_pages = usize::from(entry.entry().page_count());
-                    pool.complete_nv_entry(&entry)?;
-                    self.nv_reclaim_pending
-                        .fetch_add(entry_pages, Ordering::AcqRel);
-                    self.nv_reclaim_queue.publish(
-                        ReclaimWorkItem {
-                            entry,
-                            batch: reclaim_batch.clone(),
-                            ready_at_ns: pp::now(),
-                        },
-                        entry_pages,
-                    );
-                    if self.nv_capacity_waiters.load(Ordering::Acquire) <= 1 {
-                        self.nv_reclaim_trigger.wake_one();
-                    }
-                    pool.wake_one_data_capacity_waiter();
-                }
-                pp::NV_COMPLETION_TOTAL.record_since(completion_started, batch.page_count());
-            }
-        }
-        if io_failed {
+        let completion_started = result.batch.completion_started();
+        if !result.durable {
+            self.restore_failed_migration_jobs(&pool, result.jobs);
             return_errno_with_message!(Errno::EIO, "orderless migration batch I/O failed");
         }
-        Ok(successful_pages)
+        drop(result.jobs);
+        let entries = result.batch.take_nv_entry_leases();
+        if entries.is_empty() {
+            return_errno_with_message!(Errno::EUCLEAN, "rNVPCe completion lost entry leases");
+        }
+        drop(result.batch.take_migration_leases());
+        let reclaim_batch = ReclaimBatch::new(entries.len());
+        for entry in entries {
+            let entry_pages = usize::from(entry.entry().page_count());
+            pool.complete_nv_entry(&entry)?;
+            self.nv_reclaim_pending
+                .fetch_add(entry_pages, Ordering::AcqRel);
+            self.nv_reclaim_queue.publish(
+                ReclaimWorkItem {
+                    entry,
+                    batch: reclaim_batch.clone(),
+                    ready_at_ns: pp::now(),
+                },
+                entry_pages,
+            );
+            if self.nv_capacity_waiters.load(Ordering::Acquire) <= 1 {
+                self.nv_reclaim_trigger.wake_one();
+            }
+            pool.wake_one_data_capacity_waiter();
+        }
+        pp::NV_COMPLETION_TOTAL.record_since(completion_started, result.batch.page_count());
+        Ok(())
     }
 
     fn finish_nv_completion_batch(&self, batch: Arc<MigrationBatch>) -> Result<()> {
@@ -1852,6 +1890,53 @@ pub(super) mod tests {
         }
     }
 
+    #[ktest]
+    fn rnvpce_ready_owners_share_one_durability_flush() {
+        let (fs, disk) = cross_queue_fixture(0xed);
+        let batch0 = MigrationBatch::new(1, 1, Vec::new(), Vec::new(), Some(0));
+        let batch1 = MigrationBatch::new(1, 1, Vec::new(), Vec::new(), Some(1));
+        batch0.complete_data_for_owner(
+            CompletionJob {
+                status: BioStatus::Complete,
+                pages: Vec::new(),
+            },
+            &fs.rtio_worker_runtimes[0],
+            &fs.rtio_durability,
+            &fs.nv_completion_trigger,
+        );
+        batch1.complete_data_for_owner(
+            CompletionJob {
+                status: BioStatus::Complete,
+                pages: Vec::new(),
+            },
+            &fs.rtio_worker_runtimes[1],
+            &fs.rtio_durability,
+            &fs.nv_completion_trigger,
+        );
+
+        let before = disk.disk.flush_count();
+        assert_eq!(fs.rtio_durability.try_advance(&fs).unwrap(), 2);
+        assert_eq!(disk.disk.flush_count() - before, 1);
+        assert_eq!(fs.rtio_worker_runtimes[0].durable_result_depth(), 1);
+        assert_eq!(fs.rtio_worker_runtimes[1].durable_result_depth(), 1);
+        assert_eq!(fs.rtio_worker_runtimes[2].durable_result_depth(), 0);
+        assert_eq!(fs.rtio_worker_runtimes[3].durable_result_depth(), 0);
+
+        let late = MigrationBatch::new(1, 1, Vec::new(), Vec::new(), Some(2));
+        late.complete_data_for_owner(
+            CompletionJob {
+                status: BioStatus::Complete,
+                pages: Vec::new(),
+            },
+            &fs.rtio_worker_runtimes[2],
+            &fs.rtio_durability,
+            &fs.nv_completion_trigger,
+        );
+        assert_eq!(fs.rtio_durability.try_advance(&fs).unwrap(), 1);
+        assert_eq!(disk.disk.flush_count() - before, 2);
+        assert_eq!(fs.rtio_worker_runtimes[2].durable_result_depth(), 1);
+    }
+
     // Catches sync passing active workers, admitting a late worker while
     // quiescing, failing to drain, or taking a shared permit under exclusivity.
     #[ktest]
@@ -1916,7 +2001,8 @@ pub(super) mod tests {
         assert!(!sync_done.load(Ordering::Acquire));
         assert!(!disk.entered_flush.load(Ordering::Acquire));
         assert_eq!(late_state.load(Ordering::Acquire), 1);
-        assert_eq!(fs.nv_completion_queue.lock().len(), 1);
+        assert!(fs.nv_completion_queue.lock().is_empty());
+        assert_eq!(fs.rtio_worker_runtimes[0].data_complete_depth(), 1);
         assert_eq!(fs.nv_in_flight.load(Ordering::Acquire), 2);
 
         disk.released_writes.store(0b11, Ordering::Release);

@@ -248,6 +248,8 @@ pub struct Ext4 {
     pub(super) rtio_profile: super::pipeline_profile::RtioQueueProfile,
     pub(super) nv_migration_triggers: Box<[Arc<ostd::sync::WaitQueue>]>,
     pub(super) nv_migration_worker_epochs: Box<[AtomicUsize]>,
+    pub(super) rtio_worker_runtimes: Box<[Arc<super::migration::RtioWorkerRuntime>]>,
+    pub(super) rtio_durability: Arc<super::migration::DurabilityArbiter>,
     pub(super) nv_capacity_waiters: AtomicUsize,
     pub(super) nv_migration_progress_waiters: AtomicUsize,
     pub(super) nv_completion_lock: Mutex<()>,
@@ -402,7 +404,7 @@ impl Ext4 {
             submission_queues,
         );
         let migration_worker_slots = if rnvpc_mode.mode() == RnvpcMode::RnvpcExtend {
-            rtio_workers
+            usize::from(submission_queues)
         } else {
             1
         };
@@ -412,6 +414,14 @@ impl Ext4 {
             .into_boxed_slice();
         let nv_migration_worker_epochs = (0..migration_worker_slots)
             .map(|_| AtomicUsize::new(0))
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        let rtio_worker_runtimes = nv_migration_triggers
+            .iter()
+            .enumerate()
+            .map(|(worker_id, trigger)| {
+                super::migration::RtioWorkerRuntime::new(worker_id, trigger.clone())
+            })
             .collect::<Vec<_>>()
             .into_boxed_slice();
         if rnvpc_mode.mode() != RnvpcMode::Native && crate::fs::rnvpc::pool().is_none() {
@@ -471,6 +481,8 @@ impl Ext4 {
             rtio_profile,
             nv_migration_triggers,
             nv_migration_worker_epochs,
+            rtio_worker_runtimes,
+            rtio_durability: Arc::new(super::migration::DurabilityArbiter::new()),
             nv_capacity_waiters: AtomicUsize::new(0),
             nv_migration_progress_waiters: AtomicUsize::new(0),
             nv_completion_lock: Mutex::new(()),

@@ -6,7 +6,9 @@ use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use ostd::sync::LocalIrqDisabled;
 
-use super::{CompletionJob, CompletionQueue};
+use super::{
+    CompletionJob, CompletionQueue, durability::DurabilityArbiter, worker::RtioWorkerRuntime,
+};
 use crate::{
     fs::{
         fs_impls::ext4::{block_group::AllocationGroupLease, pipeline_profile as pp},
@@ -21,6 +23,7 @@ pub(crate) struct MigrationBatch {
     page_count: usize,
     created_at_ns: u64,
     ready_at_ns: AtomicU64,
+    owner_worker_id: Option<usize>,
     migration_leases: Mutex<Option<Vec<AllocationGroupLease>>>,
     nv_entry_leases: Mutex<Option<Vec<NvExtentEntryLease>>>,
     jobs: SpinLock<Vec<CompletionJob>, LocalIrqDisabled>,
@@ -32,6 +35,7 @@ impl MigrationBatch {
         page_count: usize,
         migration_leases: Vec<AllocationGroupLease>,
         nv_entry_leases: Vec<NvExtentEntryLease>,
+        owner_worker_id: Option<usize>,
     ) -> Arc<Self> {
         debug_assert!(data_requests != 0);
         Arc::new(Self {
@@ -40,6 +44,7 @@ impl MigrationBatch {
             page_count,
             created_at_ns: pp::now(),
             ready_at_ns: AtomicU64::new(0),
+            owner_worker_id,
             migration_leases: Mutex::new(Some(migration_leases)),
             nv_entry_leases: Mutex::new(Some(nv_entry_leases)),
             jobs: SpinLock::new(Vec::with_capacity(data_requests)),
@@ -48,6 +53,10 @@ impl MigrationBatch {
 
     pub(super) const fn page_count(&self) -> usize {
         self.page_count
+    }
+
+    pub(super) const fn owner_worker_id(&self) -> Option<usize> {
+        self.owner_worker_id
     }
 
     pub(super) fn take_migration_leases(&self) -> Vec<AllocationGroupLease> {
@@ -78,6 +87,24 @@ impl MigrationBatch {
         debug_assert!(previous != 0);
         if previous == 1 {
             self.try_queue(queue, trigger);
+        }
+    }
+
+    pub(super) fn complete_data_for_owner(
+        self: &Arc<Self>,
+        job: CompletionJob,
+        runtime: &RtioWorkerRuntime,
+        arbiter: &DurabilityArbiter,
+        compatibility_trigger: &ostd::sync::WaitQueue,
+    ) {
+        self.jobs.lock().push(job);
+        let previous = self.remaining_data.fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(previous != 0);
+        if previous == 1 && !self.queued.swap(true, Ordering::AcqRel) {
+            let ready_at = pp::now();
+            pp::NV_ASYNC_READY_WAIT.record_since(self.created_at_ns, self.page_count);
+            self.ready_at_ns.store(ready_at, Ordering::Release);
+            runtime.publish_data_complete(self.clone(), arbiter, compatibility_trigger);
         }
     }
 
@@ -115,7 +142,7 @@ mod tests {
     fn orderless_batch_waits_for_all_data_once() {
         let trigger = ostd::sync::WaitQueue::new();
         let completed = queue();
-        let batch = MigrationBatch::new(1, 7, Vec::new(), Vec::new());
+        let batch = MigrationBatch::new(1, 7, Vec::new(), Vec::new(), None);
         batch.complete_data(
             CompletionJob {
                 status: BioStatus::Complete,
@@ -129,5 +156,11 @@ mod tests {
         assert_eq!(ready.page_count(), 7);
         let jobs = ready.take_jobs();
         assert_eq!(jobs.len(), 1);
+    }
+
+    #[ktest]
+    fn rnvpce_batch_retains_immutable_owner() {
+        let batch = MigrationBatch::new(1, 7, Vec::new(), Vec::new(), Some(3));
+        assert_eq!(batch.owner_worker_id(), Some(3));
     }
 }
