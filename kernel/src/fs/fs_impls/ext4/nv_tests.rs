@@ -389,6 +389,8 @@ fn rnvpce_cross_queue_mixed_data_error_preserves_failed_entry() {
     assert_eq!(disk.disk.flush_count() - before, 1);
     assert_eq!(fs.nv_in_flight.load(Ordering::Acquire), 0);
     assert_eq!(fs.nv_reclaim_pending.load(Ordering::Acquire), 3);
+    assert_eq!(fs.rtio_durability.pending_data_page_count(), 0);
+    assert_eq!(fs.rtio_durability.ready_page_count(), 0);
     for ino in 11..15 {
         assert_cross_queue_entry(&fs, ino, if ino == 12 { Dirty } else { IoComplete });
     }
@@ -454,6 +456,8 @@ fn rnvpce_cross_queue_flush_error_preserves_all_entries() {
     assert_eq!(disk.disk.flush_count() - before, 1);
     assert_eq!(fs.nv_in_flight.load(Ordering::Acquire), 0);
     assert_eq!(fs.nv_reclaim_pending.load(Ordering::Acquire), 0);
+    assert_eq!(fs.rtio_durability.pending_data_page_count(), 0);
+    assert_eq!(fs.rtio_durability.ready_page_count(), 0);
     assert_eq!(fs.help_nv_reclaim(4).unwrap(), 0);
     for (index, target) in targets.into_iter().enumerate() {
         let ino = 11 + index as u32;

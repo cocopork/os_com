@@ -2212,6 +2212,8 @@ pub(super) mod tests {
         assert_eq!(fs.nv_reclaim_pending.load(Ordering::Acquire), 0);
         assert!(fs.nv_completion_queue.lock().is_empty());
         assert_eq!(fs.rtio_durability.ready_batch_count(), 0);
+        assert_eq!(fs.rtio_durability.pending_data_page_count(), 0);
+        assert_eq!(fs.rtio_durability.ready_page_count(), 0);
         for runtime in fs.rtio_worker_runtimes.iter() {
             assert_eq!(runtime.data_complete_depth(), 0);
             assert_eq!(runtime.durable_result_depth(), 0);

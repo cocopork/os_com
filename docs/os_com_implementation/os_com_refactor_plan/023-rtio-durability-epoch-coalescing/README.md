@@ -36,12 +36,14 @@ batch 开始提交前一次性增加 `pending_data_pages`。最后一个数据 B
 时，将整个 batch 的页数从 pending 转入 ready。leader 快照各 owner 队列后，从 ready
 扣除快照页数。计数只描述 DRAM 调度状态，不参与掉电恢复。
 
-后台 worker 在以下任一条件满足时才竞争 leader：
+后台 worker 分两个阶段竞争 leader：
 
-1. `ready_pages >= WRITEBACK_BATCH`，当前为 1024 页；
-2. `pending_data_pages == 0`，即没有更多已提交数据可能加入当前 epoch。
+1. 繁忙阶段仅在 `ready_pages >= WRITEBACK_BATCH` 时推进，当前阈值为 1024 页；
+2. 候选选择未提交任何页后进入 idle 阶段；此时仅当 `pending_data_pages == 0` 才推进
+   小尾部。
 
-第二个条件负责低负载和尾部进展，因此不需要定时器。显式 drain 使用 force 模式，只要
+候选选择结果和 pending 计数共同负责低负载与尾部进展，因此不需要定时器。单独使用
+`pending_data_pages == 0` 不能证明 dirty 工作耗尽。显式 drain 使用 force 模式，只要
 存在 ready batch 就立即推进。
 
 ## 4. 并发与一致性

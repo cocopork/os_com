@@ -4,7 +4,7 @@
 
 **Goal:** Coalesce rTIO ready batches without a timer while preserving immediate tail and sync progress.
 
-**Architecture:** Track submitted-but-incomplete and ready page counts in `DurabilityArbiter`. Background workers close an epoch at the 1024-page writeback boundary or when no data BIO remains pending; explicit drain always forces progress.
+**Architecture:** Track submitted-but-incomplete and ready page counts in `DurabilityArbiter`. Busy workers close an epoch at the 1024-page writeback boundary; a sub-threshold tail closes only after candidate selection submits zero pages and no data BIO remains pending. Explicit drain always forces progress.
 
 **Tech Stack:** Rust, Asterinas kernel threads, atomic counters, OSDK ktests, fio/QEMU real-device harness.
 
@@ -20,7 +20,7 @@
 ## Review Focus
 
 - A callback racing initial submission accounting must not underflow pending pages.
-- A tail smaller than 1024 pages must progress when the last pending BIO completes.
+- A tail smaller than 1024 pages must progress after candidate selection is idle and the last pending BIO completes.
 - A post-snapshot completion must remain queued for a successor epoch.
 - Explicit sync must not wait for the background threshold.
 - Data/FLUSH failure must leave all page and owner counters balanced.
