@@ -2,7 +2,7 @@
 
 日期：2026-11-03
 
-状态：设计已确认，进入实现。
+状态：已实现并完成真实 NVMe 验证；机制通过，性能部分通过。
 
 ## 1. 问题
 
@@ -63,4 +63,15 @@ FLUSH 期间不持有 worker 队列、inode 或 extent 锁。
 - 回归：跨队列失败、sync quiescence、完整 EXT4 research routes；
 - 真实 NVMe：复测 4 KiB 随机写和 128 KiB 顺序写的 1/16 job、1/4 worker 矩阵，
   比较 epoch/FLUSH 数、含 sync 带宽、容量等待和尾延迟。
+
+## 6. 实现与实验结论
+
+实现最终将后台推进拆成两个入口：繁忙阶段只在 ready 达到 1024 页时推进；候选选择
+提交零页后才允许推进小尾部。第一次实验发现仅使用 `pending_data_pages == 0` 会在候选
+选择前误判尾部，该时序已由 ktest 覆盖并修复。
+
+最终八点真实 NVMe 矩阵全部通过正确性门禁。四 worker 的 4 KiB/16 job epoch 从
+70,790 降至 1,791，含 sync 带宽提高 3.6%；128 KiB/16 job epoch 从 14,307 降至
+2,549，但含 sync 带宽下降 11.5%。机制消除了 FLUSH 放大，新的权衡是 completion
+等待增加。完整数据见[实验报告](../../../experiments/reports/RTIO-DURABILITY-EPOCH-COALESCING-2026-11-03.md)。
 

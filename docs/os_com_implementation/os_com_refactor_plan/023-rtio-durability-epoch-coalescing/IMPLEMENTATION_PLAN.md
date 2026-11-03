@@ -71,9 +71,9 @@
 - Consumes: Task 2 implementation and existing 022 experiment harness.
 - Produces: retained correctness and performance evidence.
 
-- [ ] Build and fingerprint profiling images with the source flag restored afterward.
-- [ ] Run the authorized serialized eight-point NVMe matrix with fio/sync/umount/e2fsck gates.
-- [ ] Compare epoch count, throughput, latency and capacity wait against 022.
-- [ ] Document exact pass/fail status and residual bottlenecks.
-- [ ] Commit with message `Validate rTIO durability epoch coalescing`.
+- [x] Build and fingerprint profiling images with the source flag restored afterward.
+- [x] Run the authorized serialized eight-point NVMe matrix with fio/sync/umount/e2fsck gates.
+- [x] Compare epoch count, throughput, latency and capacity wait against 022.
+- [x] Document exact pass/fail status and residual bottlenecks.
+- [x] Commit with message `Validate rTIO durability epoch coalescing`.
 
