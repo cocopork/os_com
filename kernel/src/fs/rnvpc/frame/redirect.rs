@@ -145,6 +145,34 @@ impl Rnvpc {
         Ok(leases)
     }
 
+    pub(crate) fn configure_migration_workers(&self, fs_id: u64, workers: usize) -> Result<()> {
+        self.redirects.configure_migration_workers(fs_id, workers)
+    }
+
+    pub(crate) fn nv_entry_owner_worker(&self, fs_id: u64, inode: u64) -> Option<usize> {
+        self.redirects.owner_worker(fs_id, inode)
+    }
+
+    pub(crate) fn claim_ready_nv_entries_for_worker(
+        &self,
+        fs_id: u64,
+        worker_id: usize,
+        page_budget: usize,
+    ) -> Result<Vec<NvExtentEntryLease>> {
+        self.ensure_publication_certain()?;
+        let leases =
+            self.redirects
+                .claim_ready_entries_for_worker(fs_id, worker_id, page_budget)?;
+        for lease in &leases {
+            self.objects.claim_data_range_owner(lease.entry())?;
+            lease.wait_for_writers();
+        }
+        if !leases.is_empty() {
+            note_data_page_lease_change();
+        }
+        Ok(leases)
+    }
+
     pub(crate) fn lookup_dirty_nv_entry(&self, key: PageKey) -> Option<Arc<DirtyNvExtentEntry>> {
         self.redirects.lookup_dirty_entry(key)
     }
