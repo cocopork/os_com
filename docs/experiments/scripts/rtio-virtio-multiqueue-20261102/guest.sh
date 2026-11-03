@@ -5,6 +5,7 @@ set -eu
 . /ext2/rebuild-fio.cfg
 MNT=/rebuild-ext4
 FIO=/benchmark/bin/fio
+FIO_JSON=/tmp/rebuild-fio.json
 NATIVE_OPTIONS=delalloc,rnvpc=off,rnvpc_extend=off,rtio=off
 
 now_ns() { awk '{printf "%.0f", $1 * 1000000000}' /proc/uptime; }
@@ -51,20 +52,23 @@ echo "PRELIM_MOUNT case=$CASE options=$OPTIONS"
 cat /proc/cmdline
 
 T0=$(now_ns)
-echo "PRELIM_FIO_START $CASE"
 status=0
+rm -f "$FIO_JSON"
+: > "$FIO_JSON"
 "$FIO" --name="$CASE" --rw="$WORKLOAD" --bs="$BS" --ioengine=psync \
     --direct=0 --fsync=0 --numjobs="$JOBS" --thread=1 --iodepth=1 \
     --cpus_allowed=0-31 --cpus_allowed_policy=split --group_reporting=1 \
     --directory="$MNT/data" --filename_format='f.$jobnum' \
     --size="$((TOTAL_MIB / JOBS))M" --filesize="$((TOTAL_MIB / JOBS))M" \
     --fallocate=none --randrepeat=1 --randseed=20261030 \
-    --runtime="${RUNTIME:-1200}" --output-format=json || status=$?
-echo "PRELIM_FIO_END $CASE"
+    --runtime="${RUNTIME:-1200}" --output-format=json --output="$FIO_JSON" || status=$?
 T1=$(now_ns)
 sync_status=0
 sync || sync_status=$?
 T2=$(now_ns)
 umount_status=0
 umount "$MNT" || umount_status=$?
+echo "PRELIM_FIO_START $CASE"
+cat "$FIO_JSON"
+echo "PRELIM_FIO_END $CASE"
 echo "PRELIM_COMPLETE $CASE fio_status=$status start_ns=$T0 fio_end_ns=$T1 sync_end_ns=$T2 sync_status=$sync_status umount_status=$umount_status"

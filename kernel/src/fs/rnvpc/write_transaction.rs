@@ -1562,7 +1562,7 @@ where
             return Err(error);
         }
     };
-    pool.activate_redirect_entries(&published_entries);
+    pool.activate_redirect_entries(&published_entries)?;
     if !request.allocations.is_empty() {
         let mut used = newly_mapped;
         for allocation in request.allocations {
@@ -1777,7 +1777,7 @@ where
             return Err(error);
         }
     };
-    pool.activate_redirect_entries(&published_entries);
+    pool.activate_redirect_entries(&published_entries)?;
     Ok(Some(CommittedRangeWrite {
         copied,
         inode: inode_ref,

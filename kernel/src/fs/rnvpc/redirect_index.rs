@@ -622,8 +622,7 @@ impl RedirectDirectory {
 
     pub(crate) fn publish_entries(&self, new_entries: &[Arc<DirtyNvExtentEntry>]) -> Result<()> {
         self.prepare_entries(new_entries)?;
-        self.activate_prepared_entries(new_entries);
-        Ok(())
+        self.activate_prepared_entries_atomically(new_entries)
     }
 
     pub(crate) fn prepare_entries(&self, new_entries: &[Arc<DirtyNvExtentEntry>]) -> Result<()> {
@@ -659,11 +658,25 @@ impl RedirectDirectory {
         Ok(())
     }
 
-    pub(crate) fn activate_prepared_entries(&self, entries: &[Arc<DirtyNvExtentEntry>]) {
+    pub(crate) fn activate_prepared_entries_atomically(
+        &self,
+        entries: &[Arc<DirtyNvExtentEntry>],
+    ) -> Result<()> {
         for entry in entries {
+            let inode_map = self
+                .inode_map(entry.fs_id(), entry.inode(), false)?
+                .ok_or_else(|| Error::new(Errno::ESTALE))?;
+            let mapped_entries = inode_map.entries.lock();
+            if !mapped_entries
+                .get(&entry.logical_start())
+                .is_some_and(|mapped| Arc::ptr_eq(mapped, entry))
+            {
+                return_errno_with_message!(Errno::ESTALE, "prepared NV extent entry disappeared");
+            }
             entry.activate_publication();
-            self.schedule_dirty_entry(entry);
+            self.schedule_dirty_entry_in_map(entry, &inode_map);
         }
+        Ok(())
     }
 
     pub(crate) fn discard_prepared_entries(
@@ -693,14 +706,17 @@ impl RedirectDirectory {
             return_errno_with_message!(Errno::EBUSY, "NV extent entry overlaps an existing entry");
         }
         entries.insert(range.start, entry.clone());
-        drop(entries);
         if expected_state == NvExtentEntryState::Dirty {
-            self.schedule_dirty_entry(&entry);
+            self.schedule_dirty_entry_in_map(&entry, &inode_map);
         }
         Ok(())
     }
 
-    fn schedule_dirty_entry(&self, entry: &Arc<DirtyNvExtentEntry>) {
+    fn schedule_dirty_entry_in_map(
+        &self,
+        entry: &Arc<DirtyNvExtentEntry>,
+        inode_map: &Arc<InodeRedirectMap>,
+    ) {
         let Some(workers) = self.migration_worker_set(entry.fs_id()) else {
             return;
         };
@@ -711,12 +727,7 @@ impl RedirectDirectory {
         {
             return;
         }
-        let inode_map = self
-            .inode_map(entry.fs_id(), entry.inode(), false)
-            .ok()
-            .flatten()
-            .expect("published entry has an inode redirect map");
-        workers.publish_dirty(&inode_map, usize::from(entry.page_count()));
+        workers.publish_dirty(inode_map, usize::from(entry.page_count()));
     }
 
     pub(crate) fn configure_migration_workers(&self, fs_id: u64, workers: usize) -> Result<()> {
@@ -1752,6 +1763,31 @@ mod tests {
         )
     }
 
+    fn publishing_entry(
+        fs_id: u64,
+        inode: u64,
+        logical_start: u64,
+        page_count: u16,
+        nv_slot_start: u64,
+        ssd_block_start: u64,
+    ) -> Arc<DirtyNvExtentEntry> {
+        Arc::new(
+            DirtyNvExtentEntry::new_publishing(
+                NvRedirectExtentRecord::new(
+                    fs_id,
+                    inode,
+                    logical_start,
+                    page_count,
+                    nv_slot_start,
+                    ssd_block_start,
+                    NvRedirectAuthority::NvAuthoritative,
+                )
+                .unwrap(),
+            )
+            .unwrap(),
+        )
+    }
+
     fn dirty_nv_entry_preserves_persistent_entry_boundaries() {
         let directory = RedirectDirectory::new().unwrap();
         let first = dirty_entry(0x91, 7, 0, 4, 100, 1000);
@@ -1953,6 +1989,30 @@ mod tests {
         assert_eq!(first_load.queued_dirty_pages, 0);
         assert_eq!(first_load.in_flight_pages, 8);
         assert_eq!(first_load.owned_inodes, 1);
+    }
+
+    #[ktest]
+    fn rnvpce_batch_activation_registers_pages_before_dirty_visibility() {
+        let fs_id = 0xa5;
+        let inode = 50;
+        let directory = RedirectDirectory::new().unwrap();
+        let entries = [
+            publishing_entry(fs_id, inode, 0, 4, 500, 5000),
+            publishing_entry(fs_id, inode, 4, 4, 504, 5004),
+        ];
+        directory.prepare_entries(&entries).unwrap();
+        directory.configure_migration_workers(fs_id, 1).unwrap();
+
+        directory
+            .activate_prepared_entries_atomically(&entries)
+            .unwrap();
+        let claims = directory
+            .claim_ready_entries_for_worker(fs_id, 0, 8)
+            .unwrap();
+        assert_eq!(claims.len(), 2);
+        let load = directory.migration_worker_load_snapshot(fs_id, 0).unwrap();
+        assert_eq!(load.queued_dirty_pages, 0);
+        assert_eq!(load.in_flight_pages, 8);
     }
 
     #[ktest]

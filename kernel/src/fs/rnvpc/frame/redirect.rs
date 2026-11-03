@@ -157,6 +157,15 @@ impl Rnvpc {
         self.redirects.migration_worker_count(fs_id)
     }
 
+    pub(crate) fn migration_worker_load_snapshot(
+        &self,
+        fs_id: u64,
+        worker_id: usize,
+    ) -> Option<crate::fs::rnvpc::redirect_index::MigrationWorkerLoadSnapshot> {
+        self.redirects
+            .migration_worker_load_snapshot(fs_id, worker_id)
+    }
+
     pub(crate) fn claim_ready_nv_entries_for_worker(
         &self,
         fs_id: u64,
@@ -720,8 +729,11 @@ impl Rnvpc {
         )
     }
 
-    pub(crate) fn activate_redirect_entries(&self, entries: &[Arc<DirtyNvExtentEntry>]) {
-        self.redirects.activate_prepared_entries(entries);
+    pub(crate) fn activate_redirect_entries(
+        &self,
+        entries: &[Arc<DirtyNvExtentEntry>],
+    ) -> Result<()> {
+        self.redirects.activate_prepared_entries_atomically(entries)
     }
 
     pub(crate) fn abort_redirect_entries(&self, entries: &[Arc<DirtyNvExtentEntry>]) -> Result<()> {
@@ -949,7 +961,8 @@ impl Rnvpc {
             self.account_unpin();
         }
         if legacy {
-            self.redirects.activate_prepared_entries(&entries);
+            self.redirects
+                .activate_prepared_entries_atomically(&entries)?;
         }
         batch_metrics::count(batch_metrics::Event::RedirectPublishBatches, 1);
         batch_metrics::count(batch_metrics::Event::RedirectPublishedPages, prepared.len());

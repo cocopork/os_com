@@ -21,6 +21,14 @@ def mechanism_gates(profiles, queues, hctx_accepted):
         'queues_drained': set(block) == set(range(queues)) and all(
             row['in_flight_requests'] == '0' and row['staging_depth'] == '0'
             for row in block.values()),
+        'owner_queues_drained': bool(workers) and all(
+            row.get('data_complete_depth') == '0'
+            and row.get('durable_result_depth') == '0'
+            and row.get('queued_dirty_pages') == '0'
+            and row.get('in_flight_pages') == '0'
+            and row.get('completion_pending_pages') == '0'
+            and row.get('owned_inodes') == '0'
+            for row in workers.values()),
         'one_flush_per_epoch': bool(last) and last['configured'] == str(queues)
             and last['active'] == '0' and int(last['epochs']) > 0
             and last['epochs'] == last['device_flushes'],
@@ -31,6 +39,7 @@ def mechanism_gates(profiles, queues, hctx_accepted):
 def parse_guest(raw, case):
     raw = raw.replace('\r', '')
     raw = re.sub(r'\x1b\[[0-9;]*m', '', raw)
+    raw = re.sub(r'\x1b\[(?=\s*(?:\"|-?\d))', '', raw)
     # Kernel serial output can interrupt a userspace write even inside a JSON key.
     raw = re.sub(r'\[CPU-ISOLATION\] role=\w+ cpu=\d+\n', '', raw)
     match = re.search(r'^PRELIM_COMPLETE ' + re.escape(case) + r' (.*)$', raw, re.M)

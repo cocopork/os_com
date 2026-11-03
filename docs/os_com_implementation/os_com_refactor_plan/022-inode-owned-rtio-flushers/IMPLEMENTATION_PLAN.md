@@ -231,31 +231,31 @@ git commit -m "Complete rTIO migration in inode owners"
 - Consumes: Task 4 worker counters, queues and durability arbiter.
 - Produces: mount-local owner/batch/completion metrics and retained experiment report.
 
-- [ ] **Step 1: Write failing diagnostics tests**
+- [x] **Step 1: Write failing diagnostics tests**
 
 Add tests for owned-inode counts, ready-inode dequeue, per-worker batch pages, local queue depths, leader attempts/wins, owner completion/reclaim and assignment release. Snapshot reads must not take inode or pool-wide locks.
 
-- [ ] **Step 2: Run focused tests and verify RED**
+- [x] **Step 2: Run focused tests and verify RED**
 
 Expected: failure on absent fields or counters.
 
-- [ ] **Step 3: Implement diagnostics and update the parser**
+- [x] **Step 3: Implement diagnostics and update the parser**
 
 Add mount-local counters and extend the existing report parser without changing raw-data tracking policy. Keep counters disabled outside profiling/ktest where current metrics are disabled.
 
-- [ ] **Step 4: Run non-destructive validation first**
+- [x] **Step 4: Run non-destructive validation first**
 
 Run all Task 4 checks plus harness self-tests. Build and fingerprint one profiling-enabled release image; restore the profiling-only source flag after copying the ISO.
 
-- [ ] **Step 5: Run the authorized serialized real-device matrix**
+- [x] **Step 5: Run the authorized serialized real-device matrix**
 
 On the already authorized `/dev/nvme1n1p1` (or p2 only if p1 is occupied and p2 passes all guards), run 1x1 and explicit 4x4 configurations for 4 KiB random and 128 KiB sequential first writes at jobs 1 and 16, 2 GiB each. Reformat each point, require fio/sync/unmount success and read-only `e2fsck -fn`, and retain raw artifacts outside Git.
 
-- [ ] **Step 6: Evaluate and document**
+- [x] **Step 6: Evaluate and document**
 
 Compare throughput, latency, capacity wait, batch-page distribution, owner balance, local completion queues, durability FLUSH and hctx usage. A single-file point may use one worker; multi-file points must demonstrate cross-inode distribution. Update 022 and the refactor index with exact pass/fail status, without changing the one-worker production default based on one instrumented run.
 
-- [ ] **Step 7: Commit tracked evidence**
+- [x] **Step 7: Commit tracked evidence**
 
 ```bash
 git add kernel/src/fs/fs_impls/ext4/pipeline_profile.rs \

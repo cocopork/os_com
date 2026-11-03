@@ -276,12 +276,28 @@ pub(super) struct RtioQueueProfile {
 struct RtioQueueSubmissions {
     pages: AtomicU64,
     bios: AtomicU64,
+    leader_attempts: AtomicU64,
+    leader_wins: AtomicU64,
+    completion_batches: AtomicU64,
+    completion_pages: AtomicU64,
+    max_data_complete_depth: AtomicU64,
+    max_durable_result_depth: AtomicU64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct RtioQueueSubmissionSnapshot {
     pub(super) pages: u64,
     pub(super) bios: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct RtioOwnerSnapshot {
+    pub(super) leader_attempts: u64,
+    pub(super) leader_wins: u64,
+    pub(super) completion_batches: u64,
+    pub(super) completion_pages: u64,
+    pub(super) max_data_complete_depth: u64,
+    pub(super) max_durable_result_depth: u64,
 }
 
 impl RtioQueueProfile {
@@ -292,6 +308,12 @@ impl RtioQueueProfile {
                 .map(|_| RtioQueueSubmissions {
                     pages: AtomicU64::new(0),
                     bios: AtomicU64::new(0),
+                    leader_attempts: AtomicU64::new(0),
+                    leader_wins: AtomicU64::new(0),
+                    completion_batches: AtomicU64::new(0),
+                    completion_pages: AtomicU64::new(0),
+                    max_data_complete_depth: AtomicU64::new(0),
+                    max_durable_result_depth: AtomicU64::new(0),
                 })
                 .collect(),
         }
@@ -333,16 +355,100 @@ impl RtioQueueProfile {
         })
     }
 
-    fn dump_snapshot(&self, device: &dyn aster_block::BlockDevice) {
+    pub(super) fn record_leader_attempt(&self, worker_id: usize, won: bool) {
+        if !rtio_metrics_enabled() {
+            return;
+        }
+        let Some(worker) = self.submissions.get(worker_id) else {
+            return;
+        };
+        worker.leader_attempts.fetch_add(1, Ordering::Relaxed);
+        if won {
+            worker.leader_wins.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    pub(super) fn record_owner_completion(
+        &self,
+        worker_id: usize,
+        pages: usize,
+        batches: usize,
+        data_complete_depth: usize,
+        durable_result_depth: usize,
+    ) {
+        if !rtio_metrics_enabled() {
+            return;
+        }
+        let Some(worker) = self.submissions.get(worker_id) else {
+            return;
+        };
+        worker
+            .completion_batches
+            .fetch_add(batches as u64, Ordering::Relaxed);
+        worker
+            .completion_pages
+            .fetch_add(pages as u64, Ordering::Relaxed);
+        worker
+            .max_data_complete_depth
+            .fetch_max(data_complete_depth as u64, Ordering::Relaxed);
+        worker
+            .max_durable_result_depth
+            .fetch_max(durable_result_depth as u64, Ordering::Relaxed);
+    }
+
+    pub(super) fn owner_snapshot(&self, worker_id: usize) -> Option<RtioOwnerSnapshot> {
+        let worker = self.submissions.get(worker_id)?;
+        Some(RtioOwnerSnapshot {
+            leader_attempts: worker.leader_attempts.load(Ordering::Relaxed),
+            leader_wins: worker.leader_wins.load(Ordering::Relaxed),
+            completion_batches: worker.completion_batches.load(Ordering::Relaxed),
+            completion_pages: worker.completion_pages.load(Ordering::Relaxed),
+            max_data_complete_depth: worker.max_data_complete_depth.load(Ordering::Relaxed),
+            max_durable_result_depth: worker.max_durable_result_depth.load(Ordering::Relaxed),
+        })
+    }
+
+    fn dump_snapshot(
+        &self,
+        device: &dyn aster_block::BlockDevice,
+        fs_id: u64,
+        runtimes: &[Arc<super::migration::worker::RtioWorkerRuntime>],
+    ) {
         for worker_id in 0..self.workers {
             let submission = self.submission_snapshot(worker_id as u16).unwrap();
+            let owner = self.owner_snapshot(worker_id).unwrap();
+            let load = crate::fs::rnvpc::pool()
+                .and_then(|pool| pool.migration_worker_load_snapshot(fs_id, worker_id))
+                .unwrap_or_default();
+            let (data_complete_depth, durable_result_depth) = runtimes
+                .get(worker_id)
+                .map(|runtime| {
+                    (
+                        runtime.data_complete_depth(),
+                        runtime.durable_result_depth(),
+                    )
+                })
+                .unwrap_or_default();
             ostd::error!(
-                "[PIPELINE] name=rtio_worker device={} worker={} queue={} submitted_pages={} submitted_bios={}",
+                "[PIPELINE] name=rtio_worker device={} worker={} queue={} submitted_pages={} submitted_bios={} leader_attempts={} leader_wins={} completion_batches={} completion_pages={} max_data_complete_depth={} max_durable_result_depth={} data_complete_depth={} durable_result_depth={} owned_inodes={} queued_dirty_pages={} in_flight_pages={} completion_pending_pages={} ready_inode_dequeues={}",
                 device.name(),
                 worker_id,
                 worker_id,
                 submission.pages,
-                submission.bios
+                submission.bios,
+                owner.leader_attempts,
+                owner.leader_wins,
+                owner.completion_batches,
+                owner.completion_pages,
+                owner.max_data_complete_depth,
+                owner.max_durable_result_depth,
+                data_complete_depth,
+                durable_result_depth,
+                load.owned_inodes,
+                load.queued_dirty_pages,
+                load.in_flight_pages,
+                load.completion_pending_pages,
+                load.ready_inode_dequeues,
             );
         }
         // Queue snapshots are taken only at the existing report boundary.
@@ -376,11 +482,16 @@ impl RtioQueueProfile {
     }
 }
 
-pub(super) fn dump_snapshot(device: &dyn aster_block::BlockDevice, queues: &RtioQueueProfile) {
+pub(super) fn dump_snapshot(
+    device: &dyn aster_block::BlockDevice,
+    queues: &RtioQueueProfile,
+    fs_id: u64,
+    runtimes: &[Arc<super::migration::worker::RtioWorkerRuntime>],
+) {
     if !ENABLED {
         return;
     }
-    queues.dump_snapshot(device);
+    queues.dump_snapshot(device, fs_id, runtimes);
     if NATIVE_FOREGROUND_TOTAL.count.load(Ordering::Relaxed) == 0
         && NV_FOREGROUND_TOTAL.count.load(Ordering::Relaxed) == 0
     {
@@ -547,5 +658,24 @@ mod tests {
         assert_eq!(snapshot.submitted_pages, 96);
         assert_eq!(snapshot.submitted_bios, 3);
         assert_eq!(snapshot.max_in_flight_pages, 96);
+    }
+
+    #[ktest]
+    fn rtio_owner_diagnostics_are_mount_scoped() {
+        let profile = RtioQueueProfile::new(2, 4);
+        profile.record_leader_attempt(0, true);
+        profile.record_leader_attempt(1, false);
+        profile.record_owner_completion(0, 32, 2, 3, 1);
+        let first = profile.owner_snapshot(0).unwrap();
+        let second = profile.owner_snapshot(1).unwrap();
+        assert_eq!(first.leader_attempts, 1);
+        assert_eq!(first.leader_wins, 1);
+        assert_eq!(first.completion_batches, 2);
+        assert_eq!(first.completion_pages, 32);
+        assert_eq!(first.max_data_complete_depth, 3);
+        assert_eq!(first.max_durable_result_depth, 1);
+        assert_eq!(second.leader_attempts, 1);
+        assert_eq!(second.leader_wins, 0);
+        assert_eq!(second.completion_pages, 0);
     }
 }

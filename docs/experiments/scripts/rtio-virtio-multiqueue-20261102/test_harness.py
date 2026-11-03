@@ -13,6 +13,11 @@ import summarize
 
 
 class HarnessTests(unittest.TestCase):
+    def test_fio_json_is_emitted_only_after_sync_and_unmount(self):
+        guest = (Path(__file__).parent / "guest.sh").read_text()
+        self.assertIn('--output="$FIO_JSON"', guest)
+        self.assertGreater(guest.index('cat "$FIO_JSON"'), guest.rindex('umount "$MNT"'))
+
     def test_qemu_822_is_rejected_even_with_mapping_help(self):
         with tempfile.TemporaryDirectory() as directory:
             qemu = Path(directory) / "qemu"

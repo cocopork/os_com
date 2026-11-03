@@ -28,7 +28,7 @@ use crate::fs::rnvpc::{
 mod batch;
 mod durability;
 mod reclaim;
-mod worker;
+pub(crate) mod worker;
 
 use batch::MigrationBatch;
 pub(super) use durability::DurabilityArbiter;
@@ -325,7 +325,7 @@ impl Ext4 {
                                 error!("rTIO owner completion failed: {error:?}");
                                 fs.fail_nv_migration();
                             }
-                            match fs.rtio_durability.try_advance(&fs) {
+                            match fs.rtio_durability.try_advance(&fs, Some(worker_id)) {
                                 Ok(_) => {}
                                 Err(error) => {
                                     error!("rTIO durability failed: {error:?}");
@@ -1190,7 +1190,7 @@ impl Ext4 {
 
     pub(super) fn process_nv_completions(&self) -> Result<usize> {
         if self.rnvpc_extend_enabled() {
-            let mut failure = self.rtio_durability.try_advance(self).err();
+            let mut failure = self.rtio_durability.try_advance(self, None).err();
             let mut count = 0usize;
             for worker_id in 0..self.rtio_worker_runtimes.len() {
                 match self.process_rtio_worker_completions(worker_id) {
@@ -1235,9 +1235,13 @@ impl Ext4 {
             .rtio_worker_runtimes
             .get(worker_id)
             .ok_or_else(|| Error::new(Errno::EINVAL))?;
+        let data_complete_depth = runtime.data_complete_depth();
+        let durable_result_depth = runtime.durable_result_depth();
         let mut count = 0usize;
+        let mut batches = 0usize;
         let mut failure = None;
         for result in runtime.take_durable_results() {
+            batches = batches.saturating_add(1);
             count = count.saturating_add(result.batch.page_count());
             if let Err(error) = self.finish_rnvpce_durable_result(worker_id, result) {
                 failure = Some(error);
@@ -1247,6 +1251,13 @@ impl Ext4 {
             self.nv_in_flight.fetch_sub(count, Ordering::AcqRel);
             self.request_nv_migration();
         }
+        self.rtio_profile.record_owner_completion(
+            worker_id,
+            count,
+            batches,
+            data_complete_depth,
+            durable_result_depth,
+        );
         match failure {
             Some(error) => Err(error),
             None => Ok(count),
@@ -1935,7 +1946,7 @@ pub(super) mod tests {
         );
 
         let before = disk.disk.flush_count();
-        assert_eq!(fs.rtio_durability.try_advance(&fs).unwrap(), 2);
+        assert_eq!(fs.rtio_durability.try_advance(&fs, None).unwrap(), 2);
         assert_eq!(disk.disk.flush_count() - before, 1);
         assert_eq!(fs.rtio_worker_runtimes[0].durable_result_depth(), 1);
         assert_eq!(fs.rtio_worker_runtimes[1].durable_result_depth(), 1);
@@ -1951,7 +1962,7 @@ pub(super) mod tests {
             &fs.rtio_worker_runtimes[2],
             &fs.rtio_durability,
         );
-        assert_eq!(fs.rtio_durability.try_advance(&fs).unwrap(), 1);
+        assert_eq!(fs.rtio_durability.try_advance(&fs, None).unwrap(), 1);
         assert_eq!(disk.disk.flush_count() - before, 2);
         assert_eq!(fs.rtio_worker_runtimes[2].durable_result_depth(), 1);
     }

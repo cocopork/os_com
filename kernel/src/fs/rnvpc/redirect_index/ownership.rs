@@ -13,6 +13,7 @@ pub(crate) struct MigrationWorkerLoadSnapshot {
     pub(crate) in_flight_pages: usize,
     pub(crate) completion_pending_pages: usize,
     pub(crate) owned_inodes: usize,
+    pub(crate) ready_inode_dequeues: usize,
 }
 
 #[derive(Default)]
@@ -33,6 +34,7 @@ struct MigrationWorkerState {
     in_flight_pages: AtomicUsize,
     completion_pending_pages: AtomicUsize,
     owned_inodes: AtomicUsize,
+    ready_inode_dequeues: AtomicUsize,
 }
 
 impl MigrationWorkerState {
@@ -43,6 +45,7 @@ impl MigrationWorkerState {
             in_flight_pages: AtomicUsize::new(0),
             completion_pending_pages: AtomicUsize::new(0),
             owned_inodes: AtomicUsize::new(0),
+            ready_inode_dequeues: AtomicUsize::new(0),
         }
     }
 
@@ -58,6 +61,7 @@ impl MigrationWorkerState {
             in_flight_pages: self.in_flight_pages.load(Ordering::Acquire),
             completion_pending_pages: self.completion_pending_pages.load(Ordering::Acquire),
             owned_inodes: self.owned_inodes.load(Ordering::Acquire),
+            ready_inode_dequeues: self.ready_inode_dequeues.load(Ordering::Acquire),
         }
     }
 }
@@ -161,6 +165,7 @@ impl MigrationWorkerSet {
         let Some(inode_map) = worker.ready_inodes.lock().pop_front() else {
             return Ok(None);
         };
+        worker.ready_inode_dequeues.fetch_add(1, Ordering::Relaxed);
         let mut migration = inode_map.migration.lock();
         if migration.owner == Some(worker_id) {
             migration.ready_queued = false;

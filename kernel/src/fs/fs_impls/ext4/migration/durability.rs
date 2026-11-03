@@ -43,13 +43,18 @@ impl DurabilityArbiter {
         self.generation.load(Ordering::Acquire)
     }
 
-    pub(super) fn try_advance(&self, fs: &Ext4) -> Result<usize> {
-        if self.ready_batch_count() == 0
-            || self
-                .leader
-                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-                .is_err()
-        {
+    pub(super) fn try_advance(&self, fs: &Ext4, contender: Option<usize>) -> Result<usize> {
+        if self.ready_batch_count() == 0 {
+            return Ok(0);
+        }
+        let won = self
+            .leader
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok();
+        if let Some(worker_id) = contender {
+            fs.rtio_profile.record_leader_attempt(worker_id, won);
+        }
+        if !won {
             return Ok(0);
         }
 

@@ -71,6 +71,8 @@ impl FileSystem for Ext4 {
         super::super::pipeline_profile::dump_snapshot(
             self.block_device().as_ref(),
             &self.rtio_profile,
+            self.rnvpc_fs_id(),
+            &self.rtio_worker_runtimes,
         );
         super::super::fs::dump_nvpage_profile();
         Ok(())

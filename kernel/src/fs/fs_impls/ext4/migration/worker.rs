@@ -85,7 +85,7 @@ impl RtioWorkerRuntime {
         self.data_complete_batches.load(Ordering::Acquire)
     }
 
-    pub(super) fn durable_result_depth(&self) -> usize {
+    pub(crate) fn durable_result_depth(&self) -> usize {
         self.durable_result_batches.load(Ordering::Acquire)
     }
 

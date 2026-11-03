@@ -2,7 +2,7 @@
 
 日期：2026-11-03
 
-状态：设计已确认，等待实现。
+状态：已实现并完成真实 NVMe 前期性能扫描；多 inode 验收通过，单 inode 保持单 owner。
 
 ## 1. 背景与目标
 
@@ -261,3 +261,34 @@ worker 退出或 mount-wide 失败时不得遗失本地队列中的 batch。失�
 - 021 的单 completion 线程只保留在 rNVPC WAL 兼容路径，rNVPCe 使用本设计。
 
 实现步骤见[实现计划](IMPLEMENTATION_PLAN.md)。
+
+## 11. 实现与验证结果（2026-11-03）
+
+当前实现已经完成：
+
+- 为每个 inode 增加短持有的迁移调度状态；owner 查询和释放不获取 VFS inode 锁或
+  pool-wide 大锁；
+- 每个 flusher 使用自己的 ready-inode、data-complete 和 durable-result 队列；
+- rNVPCe 不再创建专用 completion 线程，原线程只服务 rNVPC WAL；
+- BIO callback 将批次投递回不可变 owner，owner 负责 completion 和 reclaim；
+- durability arbiter 采用非阻塞 leader 竞争，每个封闭 epoch 最多执行一次设备 FLUSH；
+- sync 在 exclusive migration gate 下逐 owner 排空所有队列，并验证 owner 和负载计数归零；
+- profiling 快照只读取每 worker 原子计数和本地队列深度，不扫描 inode；
+- 前台批量发布修复为在同一个 inode entry-map 临界区内完成 `Publishing -> Dirty` 和
+  owner/queued-page 登记，worker 不再能观察到半登记 entry。
+
+非破坏性验证通过 focused ktest、`ext4_research_routes`、普通/ktest 包检查、格式检查，
+以及实验工具 32 项自测。真实 `/dev/nvme1n1p1` 的 8 个 2 GiB 测试点全部通过
+fio、sync、umount 和只读 `e2fsck -fn`。四 worker 相对单 worker 的含 sync 结果为：
+
+- 4 KiB 随机写，1 job：`+7.0%`；16 job：`+77.9%`；
+- 128 KiB 顺序写，1 job：`+8.0%`；16 job：`+14.4%`。
+
+16-job 点的迁移页在四个 owner 间分布均衡，本地完成队列最终均为零，owner 全部释放，
+且 `epochs == device_flushes`。单文件不要求四 worker/hctx 均衡；4 KiB 单文件点因此未
+通过旧的四 hctx 最大占比门槛，但正确性和 owner 队列排空均通过。
+
+性能验收结论为“多 inode 并行通过，仍有 durability epoch 粒度问题”：4 KiB/16 job
+在四 worker 下产生 70,790 个 epoch，而单 worker 只有 520 个。后续应聚合短时间内到达
+的 ready batch，减少设备 FLUSH 次数；不应为此放宽单 inode owner 约束。完整数据和
+镜像指纹见[实验报告](../../../experiments/reports/RTIO-INODE-OWNED-FLUSHERS-2026-11-03.md)。
