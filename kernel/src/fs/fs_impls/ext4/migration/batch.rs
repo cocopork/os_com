@@ -95,7 +95,6 @@ impl MigrationBatch {
         job: CompletionJob,
         runtime: &RtioWorkerRuntime,
         arbiter: &DurabilityArbiter,
-        compatibility_trigger: &ostd::sync::WaitQueue,
     ) {
         self.jobs.lock().push(job);
         let previous = self.remaining_data.fetch_sub(1, Ordering::AcqRel);
@@ -104,7 +103,7 @@ impl MigrationBatch {
             let ready_at = pp::now();
             pp::NV_ASYNC_READY_WAIT.record_since(self.created_at_ns, self.page_count);
             self.ready_at_ns.store(ready_at, Ordering::Release);
-            runtime.publish_data_complete(self.clone(), arbiter, compatibility_trigger);
+            runtime.publish_data_complete(self.clone(), arbiter);
         }
     }
 

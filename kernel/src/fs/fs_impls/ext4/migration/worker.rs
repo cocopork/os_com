@@ -44,7 +44,6 @@ impl RtioWorkerRuntime {
         &self,
         batch: Arc<MigrationBatch>,
         arbiter: &DurabilityArbiter,
-        compatibility_trigger: &ostd::sync::WaitQueue,
     ) {
         debug_assert_eq!(batch.owner_worker_id(), Some(self.worker_id));
         {
@@ -54,8 +53,6 @@ impl RtioWorkerRuntime {
             arbiter.note_ready_batch();
         }
         self.trigger.wake_one();
-        // Removed with the dedicated rNVPCe completion thread in Task 4.
-        compatibility_trigger.wake_one();
     }
 
     pub(super) fn take_data_complete(&self) -> VecDeque<Arc<MigrationBatch>> {

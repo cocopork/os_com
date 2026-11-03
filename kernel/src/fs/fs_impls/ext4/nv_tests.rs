@@ -342,6 +342,12 @@ fn rnvpce_cross_queue_epoch_issues_one_flush() {
     assert_eq!(fs.help_nv_reclaim(4).unwrap(), 4);
     for ino in 11..15 {
         assert_cross_queue_ssd_page(&fs, &disk, ino);
+        assert_eq!(
+            crate::fs::rnvpc::pool()
+                .unwrap()
+                .nv_entry_owner_worker(fs.rnvpc_fs_id(), u64::from(ino)),
+            None
+        );
     }
     assert_eq!(fs.process_nv_completions().unwrap(), 0);
     assert!((1..=4).contains(&(disk.disk.flush_count() - before)));
