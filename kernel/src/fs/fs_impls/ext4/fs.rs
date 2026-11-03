@@ -246,8 +246,8 @@ pub struct Ext4 {
     pub(super) nv_migration_lock: Mutex<()>,
     pub(super) nv_migration_gate: super::migration::MigrationGate,
     pub(super) rtio_profile: super::pipeline_profile::RtioQueueProfile,
-    pub(super) nv_migration_trigger: Arc<ostd::sync::WaitQueue>,
-    pub(super) nv_migration_epoch: AtomicUsize,
+    pub(super) nv_migration_triggers: Box<[Arc<ostd::sync::WaitQueue>]>,
+    pub(super) nv_migration_worker_epochs: Box<[AtomicUsize]>,
     pub(super) nv_capacity_waiters: AtomicUsize,
     pub(super) nv_migration_progress_waiters: AtomicUsize,
     pub(super) nv_completion_lock: Mutex<()>,
@@ -260,7 +260,6 @@ pub struct Ext4 {
     pub(super) nv_allocation_pager_epoch: AtomicUsize,
     pub(super) nv_in_flight: AtomicUsize,
     pub(super) nv_migration_failed: AtomicBool,
-    pub(super) nv_inodes: Mutex<BTreeSet<Ext4Ino>>,
     rnvpc_fs_id: u64,
     block_capacity: Arc<Capacity>,
     /// Immutable geometry avoids even a superblock read on allocation.
@@ -402,6 +401,19 @@ impl Ext4 {
             },
             submission_queues,
         );
+        let migration_worker_slots = if rnvpc_mode.mode() == RnvpcMode::RnvpcExtend {
+            rtio_workers
+        } else {
+            1
+        };
+        let nv_migration_triggers = (0..migration_worker_slots)
+            .map(|_| Arc::new(ostd::sync::WaitQueue::new()))
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        let nv_migration_worker_epochs = (0..migration_worker_slots)
+            .map(|_| AtomicUsize::new(0))
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
         if rnvpc_mode.mode() != RnvpcMode::Native && crate::fs::rnvpc::pool().is_none() {
             return_errno_with_message!(Errno::EINVAL, "rNVPC mount requires a configured pool");
         }
@@ -457,8 +469,8 @@ impl Ext4 {
             nv_migration_lock: Mutex::new(()),
             nv_migration_gate: super::migration::MigrationGate::new(),
             rtio_profile,
-            nv_migration_trigger: Arc::new(ostd::sync::WaitQueue::new()),
-            nv_migration_epoch: AtomicUsize::new(0),
+            nv_migration_triggers,
+            nv_migration_worker_epochs,
             nv_capacity_waiters: AtomicUsize::new(0),
             nv_migration_progress_waiters: AtomicUsize::new(0),
             nv_completion_lock: Mutex::new(()),
@@ -471,7 +483,6 @@ impl Ext4 {
             nv_allocation_pager_epoch: AtomicUsize::new(0),
             nv_in_flight: AtomicUsize::new(0),
             nv_migration_failed: AtomicBool::new(false),
-            nv_inodes: Mutex::new(BTreeSet::new()),
             rnvpc_fs_id,
             block_capacity: Arc::new(Capacity::new(initial_free_blocks)),
             allocation_geometry,

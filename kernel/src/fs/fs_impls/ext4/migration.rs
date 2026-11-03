@@ -87,7 +87,7 @@ const fn uses_shared_migration_rounds(mode: rnvpc::mode::RnvpcMode) -> bool {
 
 enum MigrationSubmitter {
     Worker(u16),
-    Quiesced,
+    Quiesced(u16),
     Legacy,
 }
 
@@ -95,7 +95,7 @@ impl MigrationSubmitter {
     fn affinity(&self) -> BioQueueAffinity {
         match self {
             Self::Worker(queue_id) => BioQueueAffinity::Queue(*queue_id),
-            Self::Quiesced => BioQueueAffinity::Queue(0),
+            Self::Quiesced(queue_id) => BioQueueAffinity::Queue(*queue_id),
             Self::Legacy => BioQueueAffinity::Any,
         }
     }
@@ -289,6 +289,9 @@ impl Ext4 {
         };
         if uses_shared_migration_rounds(self.rnvpc_mode()) {
             pp::configure_rtio_workers(worker_count);
+            rnvpc::pool()
+                .ok_or_else(|| Error::new(Errno::EINVAL))?
+                .configure_migration_workers(self.rnvpc_fs_id(), worker_count)?;
         }
         if !self.nv_migration_enabled() {
             return Ok(());
@@ -301,7 +304,7 @@ impl Ext4 {
                     .record_worker_mapping(self.block_device().as_ref(), worker_id);
             }
             let weak = Arc::downgrade(self);
-            let trigger = self.nv_migration_trigger.clone();
+            let trigger = self.nv_migration_triggers[worker_id].clone();
             crate::thread::kernel_thread::ThreadOptions::new(move || {
                 loop {
                     let observed;
@@ -312,8 +315,9 @@ impl Ext4 {
                         if fs.is_shutdown() || fs.nv_migration_failed.load(Ordering::Acquire) {
                             break;
                         }
-                        observed = fs.nv_migration_epoch.load(Ordering::Acquire);
-                        if rnvpc::needs_flush_watermark()
+                        observed = fs.nv_migration_worker_epochs[worker_id].load(Ordering::Acquire);
+                        if uses_shared_migration_rounds(fs.rnvpc_mode())
+                            || rnvpc::needs_flush_watermark()
                             || fs.nv_capacity_waiters.load(Ordering::Acquire) != 0
                             || fs.nv_migration_progress_waiters.load(Ordering::Acquire) != 0
                         {
@@ -342,7 +346,9 @@ impl Ext4 {
                             weak.upgrade()
                                 .is_none_or(|fs| {
                                     fs.is_shutdown()
-                                        || fs.nv_migration_epoch.load(Ordering::Acquire) != observed
+                                        || fs.nv_migration_worker_epochs[worker_id]
+                                            .load(Ordering::Acquire)
+                                            != observed
                                 })
                                 .then_some(())
                         },
@@ -498,8 +504,32 @@ impl Ext4 {
     }
 
     pub(super) fn request_nv_migration(&self) {
-        self.nv_migration_epoch.fetch_add(1, Ordering::Release);
-        self.nv_migration_trigger.wake_all();
+        for (epoch, trigger) in self
+            .nv_migration_worker_epochs
+            .iter()
+            .zip(self.nv_migration_triggers.iter())
+        {
+            epoch.fetch_add(1, Ordering::Release);
+            trigger.wake_one();
+        }
+    }
+
+    pub(super) fn request_nv_migration_for_inode(&self, inode: u64) {
+        let Some(pool) = rnvpc::pool() else {
+            return;
+        };
+        let Some(worker_id) = pool.nv_entry_owner_worker(self.rnvpc_fs_id(), inode) else {
+            return;
+        };
+        let Some((epoch, trigger)) = self
+            .nv_migration_worker_epochs
+            .get(worker_id)
+            .zip(self.nv_migration_triggers.get(worker_id))
+        else {
+            return;
+        };
+        epoch.fetch_add(1, Ordering::Release);
+        trigger.wake_one();
     }
 
     /// Sleeps outside inode/publication locks until a migration round completes.
@@ -609,7 +639,23 @@ impl Ext4 {
             return_errno_with_message!(Errno::EINVAL, "migration guard belongs to another fs");
         }
         // Exclusive quiescence owns this round; no worker/shared permit is taken.
-        self.migrate_nv_round_inner(budget, MigrationSubmitter::Quiesced)
+        // Preserve logical owner and hardware-queue affinity while the sync
+        // context temporarily performs the owner's submission work.
+        let worker_count = rnvpc::pool()
+            .and_then(|pool| pool.migration_worker_count(self.rnvpc_fs_id()))
+            .ok_or_else(|| Error::new(Errno::EINVAL))?;
+        for worker_id in 0..worker_count {
+            let submitted = self.migrate_nv_round_inner(
+                budget,
+                MigrationSubmitter::Quiesced(
+                    u16::try_from(worker_id).map_err(|_| Error::new(Errno::EOVERFLOW))?,
+                ),
+            )?;
+            if submitted != 0 {
+                return Ok(submitted);
+            }
+        }
+        Ok(0)
     }
 
     fn migrate_nv_round_inner(
@@ -634,7 +680,13 @@ impl Ext4 {
         let mut pages = Vec::new();
         let mut nv_entries = Vec::new();
         if self.rnvpc_extend_enabled() {
-            nv_entries = pool.claim_ready_nv_entries(self.rnvpc_fs_id(), budget)?;
+            let worker_id = match submitter {
+                MigrationSubmitter::Worker(queue_id) => usize::from(queue_id),
+                MigrationSubmitter::Quiesced(queue_id) => usize::from(queue_id),
+                MigrationSubmitter::Legacy => 0,
+            };
+            nv_entries =
+                pool.claim_ready_nv_entries_for_worker(self.rnvpc_fs_id(), worker_id, budget)?;
             for lease in &nv_entries {
                 batch_metrics::count(Event::CandidateRanges, 1);
                 batch_metrics::count(
@@ -1698,6 +1750,10 @@ pub(super) mod tests {
         drop(fixture);
         let options = CString::new("rnvpce=on,rtio=off").unwrap();
         let fs = Ext4::open(disk.clone(), Some(options.as_c_str())).unwrap();
+        rnvpc::pool()
+            .unwrap()
+            .configure_migration_workers(fs.rnvpc_fs_id(), 4)
+            .unwrap();
         for ino in 11..19 {
             fs.read_inode(ino)
                 .unwrap()
@@ -1867,7 +1923,8 @@ pub(super) mod tests {
         disk.waiters.wake_all();
         workers.pop().unwrap().join();
         wait_for_queue_test(|| disk.entered_flush.load(Ordering::Acquire));
-        // Exclusive sync has submitted the third dirty page itself on queue 0
+        // Exclusive sync has submitted the third dirty page itself on its
+        // owner queue 2
         // and is draining all three pages through the common durability gate.
         assert_eq!(fs.nv_in_flight.load(Ordering::Acquire), 3);
         assert_eq!(fs.nv_reclaim_pending.load(Ordering::Acquire), 0);
@@ -1882,12 +1939,19 @@ pub(super) mod tests {
                 .iter()
                 .filter(|&&queue| queue == BioQueueAffinity::Queue(0))
                 .count(),
-            2
+            1
         );
         assert_eq!(
             writes
                 .iter()
                 .filter(|&&queue| queue == BioQueueAffinity::Queue(1))
+                .count(),
+            1
+        );
+        assert_eq!(
+            writes
+                .iter()
+                .filter(|&&queue| queue == BioQueueAffinity::Queue(2))
                 .count(),
             1
         );

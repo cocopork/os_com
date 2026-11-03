@@ -153,6 +153,10 @@ impl Rnvpc {
         self.redirects.owner_worker(fs_id, inode)
     }
 
+    pub(crate) fn migration_worker_count(&self, fs_id: u64) -> Option<usize> {
+        self.redirects.migration_worker_count(fs_id)
+    }
+
     pub(crate) fn claim_ready_nv_entries_for_worker(
         &self,
         fs_id: u64,

@@ -89,6 +89,16 @@ impl MigrationWorkerSet {
         self.workers.len()
     }
 
+    pub(super) fn is_idle(&self) -> bool {
+        self.workers.iter().all(|worker| {
+            worker.owned_inodes.load(Ordering::Acquire) == 0
+                && worker.queued_dirty_pages.load(Ordering::Acquire) == 0
+                && worker.in_flight_pages.load(Ordering::Acquire) == 0
+                && worker.completion_pending_pages.load(Ordering::Acquire) == 0
+                && worker.ready_inodes.lock().is_empty()
+        })
+    }
+
     fn choose_worker(&self) -> usize {
         let start = self.tie_break.fetch_add(1, Ordering::Relaxed) % self.workers.len();
         let mut selected = start;

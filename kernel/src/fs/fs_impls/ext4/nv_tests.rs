@@ -163,7 +163,85 @@ pub(super) fn cross_queue_fixture(uuid: u8) -> (Arc<Ext4>, Arc<QueueRecordingDis
     drop(fixture);
     let options = CString::new("rnvpce=on,rtio=off").unwrap();
     let fs = Ext4::open(disk.clone(), Some(options.as_c_str())).unwrap();
+    crate::fs::rnvpc::pool()
+        .unwrap()
+        .configure_migration_workers(fs.rnvpc_fs_id(), 4)
+        .unwrap();
     (fs, disk)
+}
+
+#[ktest]
+fn rnvpce_foreground_publication_keeps_owner_and_wakes_only_its_worker() {
+    crate::fs::rnvpc::init_for_ext4_tests();
+    crate::time::clocks::init_for_ktest();
+    let fixture = Ext4FixtureBuilder::new(2048, 256, 2048)
+        .with_block_bitmap_metadata_marked()
+        .with_free_blocks(128)
+        .with_uuid([0xeb; 16])
+        .with_mount_options("rnvpce=on,rtio=off")
+        .build()
+        .unwrap();
+    fixture.write_raw_inode(11, &make_empty_file_inode());
+    let inode = fixture.ext4.read_inode(11).unwrap();
+    let before = fixture.ext4.nv_migration_worker_epochs[0].load(Ordering::Acquire);
+    inode
+        .write_at(
+            0,
+            &mut VmReader::from([0x41; PAGE_SIZE].as_slice()).to_fallible(),
+        )
+        .unwrap();
+    let pool = crate::fs::rnvpc::pool().unwrap();
+    let owner = pool
+        .nv_entry_owner_worker(fixture.ext4.rnvpc_fs_id(), 11)
+        .unwrap();
+    assert_eq!(owner, 0);
+    assert!(fixture.ext4.nv_migration_worker_epochs[owner].load(Ordering::Acquire) > before);
+
+    inode
+        .write_at(
+            PAGE_SIZE,
+            &mut VmReader::from([0x42; PAGE_SIZE].as_slice()).to_fallible(),
+        )
+        .unwrap();
+    assert_eq!(
+        pool.nv_entry_owner_worker(fixture.ext4.rnvpc_fs_id(), 11),
+        Some(owner)
+    );
+}
+
+#[ktest]
+fn rnvpce_owner_wake_migrates_below_global_watermark() {
+    crate::fs::rnvpc::init_for_ext4_tests();
+    crate::time::clocks::init_for_ktest();
+    let fixture = Ext4FixtureBuilder::new(2048, 256, 2048)
+        .with_block_bitmap_metadata_marked()
+        .with_free_blocks(128)
+        .with_uuid([0xec; 16])
+        .with_mount_options("rnvpce=on,rtio=on")
+        .build()
+        .unwrap();
+    fixture.write_raw_inode(11, &make_empty_file_inode());
+    fixture
+        .ext4
+        .read_inode(11)
+        .unwrap()
+        .write_at(
+            0,
+            &mut VmReader::from([0x51; PAGE_SIZE].as_slice()).to_fallible(),
+        )
+        .unwrap();
+
+    let pool = crate::fs::rnvpc::pool().unwrap();
+    let deadline = ostd::timer::Jiffies::elapsed().as_duration() + Duration::from_secs(2);
+    while has_native_redirect(pool, fixture.ext4.rnvpc_fs_id(), 11, 0)
+        && ostd::timer::Jiffies::elapsed().as_duration() < deadline
+    {
+        crate::thread::Thread::yield_now();
+    }
+    assert!(
+        !has_native_redirect(pool, fixture.ext4.rnvpc_fs_id(), 11, 0),
+        "owner notification must drive ordinary dirty work below the global watermark"
+    );
 }
 
 pub(super) fn cross_queue_write(fs: &Ext4, ino: u32) {
@@ -314,9 +392,13 @@ fn rnvpce_cross_queue_mixed_data_error_preserves_failed_entry() {
         "failed data must remain readable from NV"
     );
     assert_eq!(fs.nv_reclaim_pending.load(Ordering::Acquire), 0);
+    let retry_owner = pool.nv_entry_owner_worker(fs.rnvpc_fs_id(), 12).unwrap();
     assert_eq!(
-        fs.migrate_nv_round_on_queue(1, BioQueueAffinity::Queue(3))
-            .unwrap(),
+        fs.migrate_nv_round_on_queue(
+            1,
+            BioQueueAffinity::Queue(u16::try_from(retry_owner).unwrap()),
+        )
+        .unwrap(),
         1
     );
     fs.drain_nv_in_flight().unwrap();
@@ -659,6 +741,7 @@ fn nv_route_rnvpce_foreground_allocation_is_independent_of_completion() {
     fixture.ext4.drain_nv_in_flight().unwrap();
     worker.join();
     assert_eq!(state.load(Ordering::Acquire), 2);
+    fixture.ext4.sync_all().unwrap();
 }
 
 fn nv_route_rnvpce_reclaim_ready_queue_contract() {

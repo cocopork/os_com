@@ -4,7 +4,7 @@
 
 use core::{
     ops::Range,
-    sync::atomic::{AtomicU8, AtomicUsize, Ordering},
+    sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering},
 };
 
 use ostd::sync::WaitQueue;
@@ -64,6 +64,7 @@ pub(crate) struct DirtyNvExtentEntry {
     state: AtomicU8,
     readers: AtomicUsize,
     writers: AtomicUsize,
+    migration_registered: AtomicBool,
     waiters: WaitQueue,
 }
 
@@ -86,6 +87,7 @@ impl DirtyNvExtentEntry {
             state: AtomicU8::new(state as u8),
             readers: AtomicUsize::new(0),
             writers: AtomicUsize::new(0),
+            migration_registered: AtomicBool::new(false),
             waiters: WaitQueue::new(),
         })
     }
@@ -702,6 +704,13 @@ impl RedirectDirectory {
         let Some(workers) = self.migration_worker_set(entry.fs_id()) else {
             return;
         };
+        if entry
+            .migration_registered
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
         let inode_map = self
             .inode_map(entry.fs_id(), entry.inode(), false)
             .ok()
@@ -716,9 +725,44 @@ impl RedirectDirectory {
             if current.worker_count() == workers {
                 return Ok(());
             }
-            return_errno_with_message!(Errno::EBUSY, "migration workers already configured");
+            if !current.is_idle() {
+                return_errno_with_message!(Errno::EBUSY, "migration workers are active");
+            }
         }
-        configured.insert(fs_id, Arc::new(MigrationWorkerSet::new(workers)?));
+        let workers = Arc::new(MigrationWorkerSet::new(workers)?);
+        configured.insert(fs_id, workers.clone());
+        drop(configured);
+        let inode_maps = self
+            .inode_maps
+            .iter()
+            .flat_map(|partition| {
+                partition
+                    .lock()
+                    .iter()
+                    .filter_map(|(&(owner_fs_id, _), map)| {
+                        (owner_fs_id == fs_id).then(|| map.clone())
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        for inode_map in inode_maps {
+            let entries = inode_map
+                .entries
+                .lock()
+                .values()
+                .cloned()
+                .collect::<Vec<_>>();
+            for entry in entries {
+                if entry.state() == NvExtentEntryState::Dirty
+                    && entry
+                        .migration_registered
+                        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                        .is_ok()
+                {
+                    workers.publish_dirty(&inode_map, usize::from(entry.page_count()));
+                }
+            }
+        }
         Ok(())
     }
 
@@ -727,9 +771,8 @@ impl RedirectDirectory {
     }
 
     pub(crate) fn owner_worker(&self, fs_id: u64, inode: u64) -> Option<usize> {
-        let workers = self.migration_worker_set(fs_id)?;
         let inode_map = self.inode_map(fs_id, inode, false).ok().flatten()?;
-        workers.owner(&inode_map)
+        inode_map.migration.lock().owner
     }
 
     pub(crate) fn migration_worker_load_snapshot(
@@ -738,6 +781,11 @@ impl RedirectDirectory {
         worker_id: usize,
     ) -> Option<MigrationWorkerLoadSnapshot> {
         self.migration_worker_set(fs_id)?.snapshot(worker_id)
+    }
+
+    pub(crate) fn migration_worker_count(&self, fs_id: u64) -> Option<usize> {
+        self.migration_worker_set(fs_id)
+            .map(|workers| workers.worker_count())
     }
 
     pub(crate) fn lookup_dirty_entry(&self, key: PageKey) -> Option<Arc<DirtyNvExtentEntry>> {
@@ -1676,8 +1724,6 @@ impl RedirectDirectory {
 
 #[cfg(ktest)]
 mod tests {
-    use core::sync::atomic::AtomicBool;
-
     use ostd::{prelude::ktest, sync::LocalIrqDisabled};
 
     use super::*;
@@ -1935,6 +1981,31 @@ mod tests {
         assert_ne!(
             new_owner, old_owner,
             "tie-breaking must rotate after release"
+        );
+    }
+
+    #[ktest]
+    fn rnvpce_recovered_entries_are_assigned_when_workers_register() {
+        let fs_id = 0xa3;
+        let directory = RedirectDirectory::new().unwrap();
+        directory
+            .publish_dirty_entry(dirty_entry(fs_id, 30, 0, 2, 400, 4000))
+            .unwrap();
+        assert_eq!(directory.owner_worker(fs_id, 30), None);
+
+        directory.configure_migration_workers(fs_id, 2).unwrap();
+        let owner = directory.owner_worker(fs_id, 30).unwrap();
+        let claimed = directory
+            .claim_ready_entries_for_worker(fs_id, owner, 2)
+            .unwrap();
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(
+            directory
+                .claim_ready_entries_for_worker(fs_id, owner, 2)
+                .unwrap()
+                .len(),
+            0,
+            "recovery registration must queue an entry only once"
         );
     }
 

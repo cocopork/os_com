@@ -1442,7 +1442,6 @@ impl Inode {
             .ok_or_else(|| Error::with_message(Errno::EINVAL, "rNVPC pool is not configured"))?
             .clone();
         pool.ensure_publication_certain()?;
-        fs.nv_inodes.lock().insert(self.ino);
         let fs_id = fs.rnvpc_fs_id();
         let inode_id = self.ino as u64;
         if crate::fs::rnvpc::write_transaction::authoritative_inode_state(&pool, fs_id, inode_id)?
@@ -1790,7 +1789,6 @@ impl Inode {
             .ok_or_else(|| Error::with_message(Errno::EINVAL, "rNVPC pool is not configured"))?
             .clone();
         pool.ensure_publication_certain()?;
-        fs.nv_inodes.lock().insert(self.ino);
         let fs_id = fs.rnvpc_fs_id();
         let inode_id = self.ino as u64;
         loop {
@@ -2093,9 +2091,7 @@ impl Inode {
                     )?
                     .ok_or_else(|| Error::new(Errno::EUCLEAN))?;
                     inner.desc.set_sector_count(state.block_count());
-                    if crate::fs::rnvpc::needs_flush_watermark() {
-                        fs.request_nv_migration();
-                    }
+                    fs.request_nv_migration_for_inode(inode_id);
                     Ok(committed.copied())
                 }
                 Err(error) if error.error() == Errno::EAGAIN => {
