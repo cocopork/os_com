@@ -364,6 +364,23 @@ impl Ext4 {
                                     break;
                                 }
                             }
+                            match fs.rtio_durability.try_advance_idle(&fs, Some(worker_id)) {
+                                Ok(processed) if processed != 0 => {
+                                    if let Err(error) =
+                                        fs.process_rtio_worker_completions(worker_id)
+                                    {
+                                        error!("rTIO owner completion failed: {error:?}");
+                                        fs.fail_nv_migration();
+                                    }
+                                    continue;
+                                }
+                                Ok(_) => {}
+                                Err(error) => {
+                                    error!("rTIO durability failed: {error:?}");
+                                    fs.fail_nv_migration();
+                                    break;
+                                }
+                            }
                         }
                     }
                     // The timeout only retries idle/stalled candidates. Successful
@@ -2006,8 +2023,8 @@ pub(super) mod tests {
     }
 
     #[ktest]
-    fn rnvpce_durability_coalescing_flushes_tail_without_pending_data() {
-        let (fs, disk) = cross_queue_fixture(0xf2);
+    fn rnvpce_durability_busy_worker_does_not_mistake_no_pending_bio_for_idle() {
+        let (fs, disk) = cross_queue_fixture(0xf5);
         fs.rtio_durability.note_submitted_pages(1);
         publish_test_data_complete_batch(&fs, 0, 1);
 
@@ -2016,6 +2033,21 @@ pub(super) mod tests {
             fs.rtio_durability
                 .try_advance_background(&fs, Some(0))
                 .unwrap(),
+            0
+        );
+        assert_eq!(disk.disk.flush_count(), before);
+        assert_eq!(fs.rtio_durability.ready_page_count(), 1);
+    }
+
+    #[ktest]
+    fn rnvpce_durability_coalescing_flushes_tail_without_pending_data() {
+        let (fs, disk) = cross_queue_fixture(0xf2);
+        fs.rtio_durability.note_submitted_pages(1);
+        publish_test_data_complete_batch(&fs, 0, 1);
+
+        let before = disk.disk.flush_count();
+        assert_eq!(
+            fs.rtio_durability.try_advance_idle(&fs, Some(0)).unwrap(),
             1
         );
         assert_eq!(disk.disk.flush_count() - before, 1);

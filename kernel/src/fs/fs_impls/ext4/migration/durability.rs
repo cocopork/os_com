@@ -72,10 +72,14 @@ impl DurabilityArbiter {
         fs: &Ext4,
         contender: Option<usize>,
     ) -> Result<usize> {
-        let ready_pages = self.ready_page_count();
-        if ready_pages == 0
-            || (ready_pages < super::MIGRATION_BATCH_PAGES && self.pending_data_page_count() != 0)
-        {
+        if self.ready_page_count() < super::MIGRATION_BATCH_PAGES {
+            return Ok(0);
+        }
+        self.try_advance(fs, contender)
+    }
+
+    pub(super) fn try_advance_idle(&self, fs: &Ext4, contender: Option<usize>) -> Result<usize> {
+        if self.pending_data_page_count() != 0 {
             return Ok(0);
         }
         self.try_advance(fs, contender)
