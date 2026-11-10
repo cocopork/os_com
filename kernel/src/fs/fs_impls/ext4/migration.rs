@@ -363,9 +363,16 @@ impl Ext4 {
                             let total_dirty_pages = pool
                                 .migration_queued_dirty_pages(fs.rnvpc_fs_id())
                                 .unwrap_or(0);
-                            let worker_dirty_pages = pool
+                            let worker_load = pool
                                 .migration_worker_load_snapshot(fs.rnvpc_fs_id(), worker_id)
-                                .map_or(0, |load| load.queued_dirty_pages);
+                                .unwrap_or_default();
+                            fs.rtio_profile.record_worker_load(
+                                worker_id,
+                                worker_load.queued_dirty_pages,
+                                worker_load.in_flight_pages,
+                                worker_load.completion_pending_pages,
+                            );
+                            let worker_dirty_pages = worker_load.queued_dirty_pages;
                             should_run_background_migration(
                                 worker_dirty_pages,
                                 total_dirty_pages,
@@ -424,6 +431,7 @@ impl Ext4 {
                     }
                     // The timeout only retries idle/stalled candidates. Successful
                     // rounds have no timer delay; completion wakes all workers.
+                    let wait_started = pp::now();
                     let _ = trigger.wait_until_or_timeout(
                         || {
                             weak.upgrade()
@@ -441,6 +449,10 @@ impl Ext4 {
                         },
                         &Duration::from_millis(10),
                     );
+                    if let Some(fs) = weak.upgrade() {
+                        fs.rtio_profile
+                            .record_worker_wait(worker_id, pp::now().saturating_sub(wait_started));
+                    }
                 }
             })
             .spawn();
@@ -720,7 +732,14 @@ impl Ext4 {
         }
         let _permit = self.nv_migration_gate.enter_shared();
         let _active_worker = pp::enter_rtio_worker_round();
-        self.migrate_nv_round_inner(budget, MigrationSubmitter::Worker(queue_id))
+        let started = pp::now();
+        let result = self.migrate_nv_round_inner(budget, MigrationSubmitter::Worker(queue_id));
+        self.rtio_profile.record_worker_round(
+            usize::from(queue_id),
+            pp::now().saturating_sub(started),
+            result.as_ref().copied().unwrap_or(0),
+        );
+        result
     }
 
     fn migrate_rnvpce_round_quiesced(

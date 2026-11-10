@@ -409,10 +409,19 @@ fn enqueue_on_queue(
         .counters
         .queued_pages
         .fetch_add(pages, Ordering::Relaxed);
+    let staging_depth = queue.staging.num_requests();
     queue
         .counters
         .max_sampled_staging_depth
-        .fetch_max(queue.staging.num_requests(), Ordering::Relaxed);
+        .fetch_max(staging_depth, Ordering::Relaxed);
+    queue
+        .counters
+        .staging_depth_samples
+        .fetch_add(1, Ordering::Relaxed);
+    queue
+        .counters
+        .staging_depth_sum
+        .fetch_add(staging_depth, Ordering::Relaxed);
     Ok(())
 }
 
@@ -426,12 +435,15 @@ struct QueueCounters {
     submitted_bios: AtomicUsize,
     submitted_pages: AtomicUsize,
     max_sampled_staging_depth: AtomicUsize,
+    staging_depth_samples: AtomicUsize,
+    staging_depth_sum: AtomicUsize,
     descriptor_wait_count: AtomicUsize,
     descriptor_wait_ticks: AtomicU64,
     active_forwarders: AtomicUsize,
     peak_forwarders: AtomicUsize,
     irq_completions: AtomicUsize,
     in_flight_requests: AtomicUsize,
+    max_in_flight_requests: AtomicUsize,
 }
 
 struct ForwardingGuard<'a>(&'a QueueCounters);
@@ -526,12 +538,15 @@ impl VirtioBlockQueue {
                 .counters
                 .max_sampled_staging_depth
                 .load(Ordering::Relaxed),
+            staging_depth_samples: self.counters.staging_depth_samples.load(Ordering::Relaxed),
+            staging_depth_sum: self.counters.staging_depth_sum.load(Ordering::Relaxed),
             descriptor_wait_count: self.counters.descriptor_wait_count.load(Ordering::Relaxed),
             descriptor_wait_ticks: self.counters.descriptor_wait_ticks.load(Ordering::Relaxed),
             active_forwarders: self.counters.active_forwarders.load(Ordering::Relaxed),
             peak_forwarders: self.counters.peak_forwarders.load(Ordering::Relaxed),
             irq_completions: self.counters.irq_completions.load(Ordering::Relaxed),
             in_flight_requests: self.counters.in_flight_requests.load(Ordering::Relaxed),
+            max_in_flight_requests: self.counters.max_in_flight_requests.load(Ordering::Relaxed),
         }
     }
 
@@ -585,9 +600,14 @@ impl VirtioBlockQueue {
             let previous = submitted.insert(token, request);
             debug_assert!(previous.is_none());
             if previous.is_none() {
-                self.counters
+                let in_flight = self
+                    .counters
                     .in_flight_requests
-                    .fetch_add(1, Ordering::Relaxed);
+                    .fetch_add(1, Ordering::Relaxed)
+                    + 1;
+                self.counters
+                    .max_in_flight_requests
+                    .fetch_max(in_flight, Ordering::Relaxed);
             }
         }
         self.counters
@@ -1001,6 +1021,8 @@ mod tests {
         assert_eq!(stats.queued_bios, 1);
         assert_eq!(stats.staging_depth, 1);
         assert_eq!(stats.max_sampled_staging_depth, 1);
+        assert_eq!(stats.staging_depth_samples, 1);
+        assert_eq!(stats.staging_depth_sum, 1);
         assert_eq!(device.queues[0].diagnostics().queued_bios, 0);
         finish_staged(&device.queues[2]);
         assert_eq!(device.queues[2].diagnostics().staging_depth, 0);
@@ -1130,6 +1152,7 @@ mod tests {
         drop(owners);
         assert_eq!(stats.submitted_pages, 2);
         assert_eq!(stats.in_flight_requests, 1);
+        assert_eq!(stats.max_in_flight_requests, 1);
         let forwarder = ForwardingGuard::new(&queue.counters);
         assert_eq!(queue.diagnostics().active_forwarders, 1);
         assert_eq!(queue.diagnostics().peak_forwarders, 1);

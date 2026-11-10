@@ -351,12 +351,15 @@ mod tests {
                 submitted_pages: 44,
                 staging_depth: 5,
                 max_sampled_staging_depth: 6,
+                staging_depth_samples: 10,
+                staging_depth_sum: 40,
                 descriptor_wait_count: 7,
                 descriptor_wait_ticks: 88,
                 active_forwarders: 1,
                 peak_forwarders: 2,
                 irq_completions: 99,
                 in_flight_requests: 3,
+                max_in_flight_requests: 4,
             })
         }
         fn name(&self) -> &str {

@@ -122,6 +122,10 @@ pub struct BlockQueueDiagnostics {
     pub staging_depth: usize,
     /// Maximum sampled staging depth; a concurrent dequeue may precede sampling.
     pub max_sampled_staging_depth: usize,
+    /// Number of staging-depth samples taken after enqueue.
+    pub staging_depth_samples: usize,
+    /// Sum of staging-depth samples; divide by `staging_depth_samples` for the mean.
+    pub staging_depth_sum: usize,
     pub descriptor_wait_count: usize,
     /// TSC ticks spent waiting for descriptors (`ostd::arch::tsc_freq()` per second).
     pub descriptor_wait_ticks: u64,
@@ -129,6 +133,7 @@ pub struct BlockQueueDiagnostics {
     pub peak_forwarders: usize,
     pub irq_completions: usize,
     pub in_flight_requests: usize,
+    pub max_in_flight_requests: usize,
 }
 
 impl dyn BlockDevice {

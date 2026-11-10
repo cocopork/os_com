@@ -9,7 +9,7 @@ use core::{
 
 use crate::prelude::*;
 
-pub(crate) const ENABLED: bool = false;
+pub(crate) const ENABLED: bool = true;
 const HISTOGRAM_BINS: usize = 48;
 
 pub(crate) struct Metric {
@@ -296,6 +296,20 @@ struct RtioQueueSubmissions {
     completion_pages: AtomicU64,
     max_data_complete_depth: AtomicU64,
     max_durable_result_depth: AtomicU64,
+    migration_rounds: AtomicU64,
+    productive_rounds: AtomicU64,
+    migration_ns: AtomicU64,
+    max_migration_ns: AtomicU64,
+    idle_waits: AtomicU64,
+    idle_wait_ns: AtomicU64,
+    max_idle_wait_ns: AtomicU64,
+    load_samples: AtomicU64,
+    queued_dirty_page_samples: AtomicU64,
+    in_flight_page_samples: AtomicU64,
+    completion_pending_page_samples: AtomicU64,
+    max_queued_dirty_pages: AtomicU64,
+    max_in_flight_pages: AtomicU64,
+    max_completion_pending_pages: AtomicU64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -312,6 +326,20 @@ pub(super) struct RtioOwnerSnapshot {
     pub(super) completion_pages: u64,
     pub(super) max_data_complete_depth: u64,
     pub(super) max_durable_result_depth: u64,
+    pub(super) migration_rounds: u64,
+    pub(super) productive_rounds: u64,
+    pub(super) migration_ns: u64,
+    pub(super) max_migration_ns: u64,
+    pub(super) idle_waits: u64,
+    pub(super) idle_wait_ns: u64,
+    pub(super) max_idle_wait_ns: u64,
+    pub(super) load_samples: u64,
+    pub(super) queued_dirty_page_samples: u64,
+    pub(super) in_flight_page_samples: u64,
+    pub(super) completion_pending_page_samples: u64,
+    pub(super) max_queued_dirty_pages: u64,
+    pub(super) max_in_flight_pages: u64,
+    pub(super) max_completion_pending_pages: u64,
 }
 
 impl RtioQueueProfile {
@@ -328,6 +356,20 @@ impl RtioQueueProfile {
                     completion_pages: AtomicU64::new(0),
                     max_data_complete_depth: AtomicU64::new(0),
                     max_durable_result_depth: AtomicU64::new(0),
+                    migration_rounds: AtomicU64::new(0),
+                    productive_rounds: AtomicU64::new(0),
+                    migration_ns: AtomicU64::new(0),
+                    max_migration_ns: AtomicU64::new(0),
+                    idle_waits: AtomicU64::new(0),
+                    idle_wait_ns: AtomicU64::new(0),
+                    max_idle_wait_ns: AtomicU64::new(0),
+                    load_samples: AtomicU64::new(0),
+                    queued_dirty_page_samples: AtomicU64::new(0),
+                    in_flight_page_samples: AtomicU64::new(0),
+                    completion_pending_page_samples: AtomicU64::new(0),
+                    max_queued_dirty_pages: AtomicU64::new(0),
+                    max_in_flight_pages: AtomicU64::new(0),
+                    max_completion_pending_pages: AtomicU64::new(0),
                 })
                 .collect(),
         }
@@ -410,6 +452,76 @@ impl RtioQueueProfile {
             .fetch_max(durable_result_depth as u64, Ordering::Relaxed);
     }
 
+    pub(super) fn record_worker_round(
+        &self,
+        worker_id: usize,
+        elapsed_ns: u64,
+        submitted_pages: usize,
+    ) {
+        if !rtio_metrics_enabled() {
+            return;
+        }
+        let Some(worker) = self.submissions.get(worker_id) else {
+            return;
+        };
+        worker.migration_rounds.fetch_add(1, Ordering::Relaxed);
+        if submitted_pages != 0 {
+            worker.productive_rounds.fetch_add(1, Ordering::Relaxed);
+        }
+        worker.migration_ns.fetch_add(elapsed_ns, Ordering::Relaxed);
+        worker
+            .max_migration_ns
+            .fetch_max(elapsed_ns, Ordering::Relaxed);
+    }
+
+    pub(super) fn record_worker_wait(&self, worker_id: usize, elapsed_ns: u64) {
+        if !rtio_metrics_enabled() {
+            return;
+        }
+        let Some(worker) = self.submissions.get(worker_id) else {
+            return;
+        };
+        worker.idle_waits.fetch_add(1, Ordering::Relaxed);
+        worker.idle_wait_ns.fetch_add(elapsed_ns, Ordering::Relaxed);
+        worker
+            .max_idle_wait_ns
+            .fetch_max(elapsed_ns, Ordering::Relaxed);
+    }
+
+    pub(super) fn record_worker_load(
+        &self,
+        worker_id: usize,
+        queued_dirty_pages: usize,
+        in_flight_pages: usize,
+        completion_pending_pages: usize,
+    ) {
+        if !rtio_metrics_enabled() {
+            return;
+        }
+        let Some(worker) = self.submissions.get(worker_id) else {
+            return;
+        };
+        worker.load_samples.fetch_add(1, Ordering::Relaxed);
+        worker
+            .queued_dirty_page_samples
+            .fetch_add(queued_dirty_pages as u64, Ordering::Relaxed);
+        worker
+            .in_flight_page_samples
+            .fetch_add(in_flight_pages as u64, Ordering::Relaxed);
+        worker
+            .completion_pending_page_samples
+            .fetch_add(completion_pending_pages as u64, Ordering::Relaxed);
+        worker
+            .max_queued_dirty_pages
+            .fetch_max(queued_dirty_pages as u64, Ordering::Relaxed);
+        worker
+            .max_in_flight_pages
+            .fetch_max(in_flight_pages as u64, Ordering::Relaxed);
+        worker
+            .max_completion_pending_pages
+            .fetch_max(completion_pending_pages as u64, Ordering::Relaxed);
+    }
+
     pub(super) fn owner_snapshot(&self, worker_id: usize) -> Option<RtioOwnerSnapshot> {
         let worker = self.submissions.get(worker_id)?;
         Some(RtioOwnerSnapshot {
@@ -419,6 +531,24 @@ impl RtioQueueProfile {
             completion_pages: worker.completion_pages.load(Ordering::Relaxed),
             max_data_complete_depth: worker.max_data_complete_depth.load(Ordering::Relaxed),
             max_durable_result_depth: worker.max_durable_result_depth.load(Ordering::Relaxed),
+            migration_rounds: worker.migration_rounds.load(Ordering::Relaxed),
+            productive_rounds: worker.productive_rounds.load(Ordering::Relaxed),
+            migration_ns: worker.migration_ns.load(Ordering::Relaxed),
+            max_migration_ns: worker.max_migration_ns.load(Ordering::Relaxed),
+            idle_waits: worker.idle_waits.load(Ordering::Relaxed),
+            idle_wait_ns: worker.idle_wait_ns.load(Ordering::Relaxed),
+            max_idle_wait_ns: worker.max_idle_wait_ns.load(Ordering::Relaxed),
+            load_samples: worker.load_samples.load(Ordering::Relaxed),
+            queued_dirty_page_samples: worker.queued_dirty_page_samples.load(Ordering::Relaxed),
+            in_flight_page_samples: worker.in_flight_page_samples.load(Ordering::Relaxed),
+            completion_pending_page_samples: worker
+                .completion_pending_page_samples
+                .load(Ordering::Relaxed),
+            max_queued_dirty_pages: worker.max_queued_dirty_pages.load(Ordering::Relaxed),
+            max_in_flight_pages: worker.max_in_flight_pages.load(Ordering::Relaxed),
+            max_completion_pending_pages: worker
+                .max_completion_pending_pages
+                .load(Ordering::Relaxed),
         })
     }
 
@@ -444,7 +574,7 @@ impl RtioQueueProfile {
                 })
                 .unwrap_or_default();
             ostd::error!(
-                "[PIPELINE] name=rtio_worker device={} worker={} queue={} submitted_pages={} submitted_bios={} leader_attempts={} leader_wins={} completion_batches={} completion_pages={} max_data_complete_depth={} max_durable_result_depth={} data_complete_depth={} durable_result_depth={} owned_inodes={} queued_dirty_pages={} in_flight_pages={} completion_pending_pages={} ready_inode_dequeues={}",
+                "[PIPELINE] name=rtio_worker device={} worker={} queue={} submitted_pages={} submitted_bios={} leader_attempts={} leader_wins={} completion_batches={} completion_pages={} max_data_complete_depth={} max_durable_result_depth={} migration_rounds={} productive_rounds={} migration_ns={} max_migration_ns={} idle_waits={} idle_wait_ns={} max_idle_wait_ns={} load_samples={} queued_dirty_page_samples={} in_flight_page_samples={} completion_pending_page_samples={} max_queued_dirty_pages={} max_in_flight_pages={} max_completion_pending_pages={} data_complete_depth={} durable_result_depth={} owned_inodes={} queued_dirty_pages={} in_flight_pages={} completion_pending_pages={} ready_inode_dequeues={}",
                 device.name(),
                 worker_id,
                 worker_id,
@@ -456,6 +586,20 @@ impl RtioQueueProfile {
                 owner.completion_pages,
                 owner.max_data_complete_depth,
                 owner.max_durable_result_depth,
+                owner.migration_rounds,
+                owner.productive_rounds,
+                owner.migration_ns,
+                owner.max_migration_ns,
+                owner.idle_waits,
+                owner.idle_wait_ns,
+                owner.max_idle_wait_ns,
+                owner.load_samples,
+                owner.queued_dirty_page_samples,
+                owner.in_flight_page_samples,
+                owner.completion_pending_page_samples,
+                owner.max_queued_dirty_pages,
+                owner.max_in_flight_pages,
+                owner.max_completion_pending_pages,
                 data_complete_depth,
                 durable_result_depth,
                 load.owned_inodes,
@@ -476,7 +620,7 @@ impl RtioQueueProfile {
                 continue;
             };
             ostd::error!(
-                "[PIPELINE] name=block_submission_queue device={} queue={} supported=true queued_bios={} queued_pages={} submitted_bios={} submitted_pages={} staging_depth={} max_sampled_staging_depth={} descriptor_wait_count={} descriptor_wait_ticks={} active_forwarders={} peak_forwarders={} irq_completions={} in_flight_requests={}",
+                "[PIPELINE] name=block_submission_queue device={} queue={} supported=true queued_bios={} queued_pages={} submitted_bios={} submitted_pages={} staging_depth={} max_sampled_staging_depth={} staging_depth_samples={} staging_depth_sum={} descriptor_wait_count={} descriptor_wait_ticks={} active_forwarders={} peak_forwarders={} irq_completions={} in_flight_requests={} max_in_flight_requests={}",
                 device.name(),
                 queue_id,
                 queue.queued_bios,
@@ -485,12 +629,15 @@ impl RtioQueueProfile {
                 queue.submitted_pages,
                 queue.staging_depth,
                 queue.max_sampled_staging_depth,
+                queue.staging_depth_samples,
+                queue.staging_depth_sum,
                 queue.descriptor_wait_count,
                 queue.descriptor_wait_ticks,
                 queue.active_forwarders,
                 queue.peak_forwarders,
                 queue.irq_completions,
                 queue.in_flight_requests,
+                queue.max_in_flight_requests,
             );
         }
     }
@@ -717,5 +864,32 @@ mod tests {
         assert_eq!(second.leader_attempts, 1);
         assert_eq!(second.leader_wins, 0);
         assert_eq!(second.completion_pages, 0);
+    }
+
+    #[ktest]
+    fn rtio_worker_activity_tracks_rounds_waits_and_load_samples() {
+        let profile = RtioQueueProfile::new(2, 4);
+        profile.record_worker_round(0, 40, 32);
+        profile.record_worker_round(0, 10, 0);
+        profile.record_worker_wait(0, 100);
+        profile.record_worker_wait(0, 50);
+        profile.record_worker_load(0, 8, 4, 2);
+        profile.record_worker_load(0, 2, 6, 4);
+
+        let snapshot = profile.owner_snapshot(0).unwrap();
+        assert_eq!(snapshot.migration_rounds, 2);
+        assert_eq!(snapshot.productive_rounds, 1);
+        assert_eq!(snapshot.migration_ns, 50);
+        assert_eq!(snapshot.max_migration_ns, 40);
+        assert_eq!(snapshot.idle_waits, 2);
+        assert_eq!(snapshot.idle_wait_ns, 150);
+        assert_eq!(snapshot.max_idle_wait_ns, 100);
+        assert_eq!(snapshot.load_samples, 2);
+        assert_eq!(snapshot.queued_dirty_page_samples, 10);
+        assert_eq!(snapshot.in_flight_page_samples, 10);
+        assert_eq!(snapshot.completion_pending_page_samples, 6);
+        assert_eq!(snapshot.max_queued_dirty_pages, 8);
+        assert_eq!(snapshot.max_in_flight_pages, 6);
+        assert_eq!(snapshot.max_completion_pending_pages, 4);
     }
 }
