@@ -33,6 +33,8 @@
 //! while syncing an inode (`sync_inodes` clones the `Arc`s out and drops the read
 //! lock first).
 
+use core::sync::atomic::{AtomicU64, Ordering};
+
 use aster_block::bio::BioDirection;
 use ostd::mm::io::util::HasVmReaderWriter;
 
@@ -928,6 +930,10 @@ pub struct Inode {
     /// I/O, no allocation, no other lock) and drops it before touching the
     /// page cache, so it never nests under `inner`.
     ra: SpinLock<RaState>,
+    /// Best-effort physical end of this inode's latest rNVPCe allocation.
+    /// It is only a locality hint; stale values are revalidated by the group
+    /// bitmap allocator and are therefore harmless.
+    rnvpce_allocation_hint: AtomicU64,
     /// The VFS extension slot (flock, POSIX locks, inotify); must exist from
     /// day one or the VFS layer panics on inodes that use these features.
     extension: Extension,
@@ -1008,6 +1014,7 @@ impl Inode {
             self_weak: self_weak.clone(),
             pipe,
             ra: SpinLock::new(RaState::cold()),
+            rnvpce_allocation_hint: AtomicU64::new(inode_goal),
             extension: Extension::new(),
         });
         if type_ == InodeType::File {
@@ -1792,6 +1799,7 @@ impl Inode {
         let fs_id = fs.rnvpc_fs_id();
         let inode_id = self.ino as u64;
         loop {
+            let pre_guard_started = pp::now();
             let lease_epoch = pool.data_page_lease_epoch();
             let first_page = offset / PAGE_SIZE;
             let last_page = end.div_ceil(PAGE_SIZE);
@@ -1841,18 +1849,24 @@ impl Inode {
                     None,
                 )?;
             }
+            pp::NV_FOREGROUND_PRE_GUARD.record_since(pre_guard_started, write_len);
+            let publication_started = pp::now();
             let mutation = crate::fs::rnvpc::extent_mutation::ExtentMutation::new(
                 pool.clone(),
                 fs_id,
                 inode_id,
             )?;
+            pp::NV_FOREGROUND_PUBLICATION_ACQUIRE.record_since(publication_started, write_len);
+            let guarded_authority_started = pp::now();
             let authority = crate::fs::rnvpc::write_transaction::authoritative_inode_state(
                 &pool, fs_id, inode_id,
             )?
             .ok_or_else(|| Error::new(Errno::EUCLEAN))?;
+            pp::NV_FOREGROUND_GUARDED_AUTHORITY.record_since(guarded_authority_started, write_len);
             let first_page = offset / PAGE_SIZE;
             let last_page = end.div_ceil(PAGE_SIZE);
             let page_count = last_page - first_page;
+            let plan_started = pp::now();
             let plan = crate::fs::rnvpc::write_transaction::plan_range_write(
                 &pool,
                 fs_id,
@@ -1861,12 +1875,14 @@ impl Inode {
                 write_len,
                 authority.file_size(),
             )?;
+            pp::NV_FOREGROUND_PLAN.record_since(plan_started, write_len);
             if plan.inode_generation != authority.generation() {
                 drop(mutation);
                 drop(inner);
                 continue;
             }
             let mut spans = Vec::new();
+            let span_prepare_started = pp::now();
             let mut newly_reserved = 0u64;
             let mut has_in_flight = false;
             let lease_epoch = pool.data_page_lease_epoch();
@@ -1933,7 +1949,19 @@ impl Inode {
                 continue;
             }
             let needed = plan.new_data_pages()?;
-            let reservation = match pool.reserve_native_data_pages(needed) {
+            let data_reserve_started = pp::now();
+            let exact_slot = crate::fs::rnvpc::write_transaction::redirect_extension_slot_for_pages(
+                &pool, fs_id, inode_id, &spans, needed,
+            );
+            let reserved = match exact_slot {
+                Some(start) => match pool.try_reserve_native_data_pages_at(start, needed) {
+                    Ok(Some(reservation)) => Ok(reservation),
+                    Ok(None) => pool.reserve_native_data_pages(needed),
+                    Err(error) => Err(error),
+                },
+                None => pool.reserve_native_data_pages(needed),
+            };
+            let reservation = match reserved {
                 Ok(reservation) => reservation,
                 Err(error) if error.error() == Errno::EAGAIN => {
                     // Nothing has consumed reader bytes or SSD admission credits yet.
@@ -1946,27 +1974,21 @@ impl Inode {
                 }
                 Err(error) => return Err(error),
             };
+            pp::NV_FOREGROUND_DATA_RESERVE.record_since(data_reserve_started, needed);
             fs.reserve_rnvpce_blocks(newly_reserved)?;
-            let allocation_goal = spans
-                .first()
-                .and_then(|page| page.logical_block().checked_sub(1))
-                .map(|logical_block| {
-                    crate::fs::rnvpc::write_transaction::current_page_mapping(
-                        &pool,
-                        fs_id,
-                        inode_id,
-                        logical_block,
-                    )
-                })
-                .transpose()?
-                .flatten()
-                .map(|mapping| {
-                    mapping
-                        .ssd_block()
-                        .checked_add(1)
-                        .ok_or_else(|| Error::new(Errno::EOVERFLOW))
-                })
-                .transpose()?;
+            let allocation_goal = if newly_reserved == 0 {
+                None
+            } else {
+                let allocation_goal_started = pp::now();
+                let inode_allocation_hint =
+                    match self.rnvpce_allocation_hint.load(Ordering::Relaxed) {
+                        0 => None,
+                        hint => Some(hint),
+                    };
+                let goal = plan.ssd_allocation_goal(inode_allocation_hint)?;
+                pp::NV_FOREGROUND_ALLOCATION_GOAL.record_since(allocation_goal_started, 1);
+                goal
+            };
             let allocation_started = pp::now();
             let allocation_count =
                 u32::try_from(newly_reserved).map_err(|_| Error::new(Errno::EOVERFLOW))?;
@@ -1993,6 +2015,10 @@ impl Inode {
                         return Err(error);
                     }
                 };
+            if let Some(range) = allocated_ranges.last() {
+                self.rnvpce_allocation_hint
+                    .store(range.end, Ordering::Relaxed);
+            }
             let mut allocations = Vec::new();
             allocations
                 .try_reserve_exact(allocated_ranges.len())
@@ -2021,6 +2047,7 @@ impl Inode {
             // Physical allocation and its NVM-authoritative bitmap now replace
             // the earlier count-only admission promise.
             fs.release_rnvpce_blocks(newly_reserved)?;
+            let request_build_started = pp::now();
             let request = crate::fs::rnvpc::write_transaction::RangeWriteBatch::new(
                 authority
                     .generation()
@@ -2035,6 +2062,8 @@ impl Inode {
                 (BLOCK_SIZE / 512) as u64,
             )?
             .with_plan(plan)?;
+            pp::NV_FOREGROUND_REQUEST_BUILD.record_since(request_build_started, write_len);
+            pp::NV_FOREGROUND_SPAN_PREPARE.record_since(span_prepare_started, write_len);
             let persist_started = pp::now();
             let result = crate::fs::rnvpc::write_transaction::commit_range_write_with_mutation(
                 pool.clone(),
@@ -2062,6 +2091,7 @@ impl Inode {
             );
             return match result {
                 Ok(committed) => {
+                    let post_commit_started = pp::now();
                     let mut cleanup_complete = true;
                     for allocation in committed.unused_allocations() {
                         let end = allocation
@@ -2092,6 +2122,7 @@ impl Inode {
                     .ok_or_else(|| Error::new(Errno::EUCLEAN))?;
                     inner.desc.set_sector_count(state.block_count());
                     fs.request_nv_migration_for_inode(inode_id);
+                    pp::NV_FOREGROUND_POST_COMMIT.record_since(post_commit_started, write_len);
                     Ok(committed.copied())
                 }
                 Err(error) if error.error() == Errno::EAGAIN => {

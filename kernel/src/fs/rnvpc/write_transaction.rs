@@ -802,6 +802,7 @@ pub(crate) struct RangeWritePlan {
     pub(crate) first_page_offset: usize,
     pub(crate) last_page_end: usize,
     pub(crate) extents: Vec<WriteExtent>,
+    ssd_allocation_predecessor: Option<u64>,
 }
 
 impl RangeWritePlan {
@@ -826,6 +827,17 @@ impl RangeWritePlan {
             .iter()
             .find(|extent| extent.logical_range().contains(&logical_block))
             .ok_or_else(|| Error::new(Errno::EUCLEAN))
+    }
+
+    pub(crate) fn ssd_allocation_goal(&self, inode_hint: Option<u64>) -> Result<Option<u64>> {
+        if !self
+            .extents
+            .iter()
+            .any(|extent| matches!(extent, WriteExtent::NewAllocation { .. }))
+        {
+            return Ok(None);
+        }
+        Ok(self.ssd_allocation_predecessor.or(inode_hint))
     }
 }
 
@@ -881,17 +893,24 @@ pub(crate) fn plan_range_write(
         .ok_or_else(|| Error::new(Errno::EOVERFLOW))?
         / PAGE_SIZE as u64;
     let logical_range = first_page..page_end;
+    let plan_inode_started = pp::now();
     let inode_ref =
         authoritative_inode_ref(pool, fs_id, inode)?.ok_or_else(|| Error::new(Errno::ENOENT))?;
     let inode_record = pool.read_authoritative_metadata::<InodeRecord>(inode_ref)?;
+    pp::NV_FOREGROUND_PLAN_INODE.record_since(plan_inode_started, 1);
+    let plan_redirect_started = pp::now();
     let redirects = pool.lookup_dirty_nv_overlaps(fs_id, inode, logical_range.clone())?;
-    let ssd_extents = lookup_tree_extent_ranges(
+    pp::NV_FOREGROUND_PLAN_REDIRECT.record_since(plan_redirect_started, redirects.len());
+    let plan_tree_started = pp::now();
+    let (ssd_extents, tree_predecessor) = lookup_tree_extent_ranges(
         pool,
         fs_id,
         inode,
         inode_record.extent_root(),
         logical_range.clone(),
     )?;
+    pp::NV_FOREGROUND_PLAN_TREE.record_since(plan_tree_started, ssd_extents.len());
+    let plan_build_started = pp::now();
     let old_eof_page = (old_file_size % PAGE_SIZE as u64 == 0)
         .then_some(old_file_size / PAGE_SIZE as u64)
         .filter(|page| *page > logical_range.start && *page < logical_range.end);
@@ -900,6 +919,8 @@ pub(crate) fn plan_range_write(
     let mut cursor = logical_range.start;
     let mut redirect_index = 0usize;
     let mut ssd_index = 0usize;
+    let mut ssd_allocation_predecessor = tree_predecessor;
+    let mut saw_new_allocation = false;
     while cursor < logical_range.end {
         while redirect_index < redirects.len()
             && redirects[redirect_index].logical_range().end <= cursor
@@ -928,6 +949,15 @@ pub(crate) fn plan_range_write(
                 entry: entry.clone(),
                 logical_range: cursor..end,
             });
+            if !saw_new_allocation {
+                ssd_allocation_predecessor = Some(
+                    entry
+                        .ssd_block_range()
+                        .start
+                        .checked_add(end - entry.logical_start())
+                        .ok_or_else(|| Error::new(Errno::EOVERFLOW))?,
+                );
+            }
             cursor = end;
             continue;
         }
@@ -948,6 +978,13 @@ pub(crate) fn plan_range_write(
                 ssd_start,
                 written: ssd.written,
             });
+            if !saw_new_allocation {
+                ssd_allocation_predecessor = Some(
+                    ssd_start
+                        .checked_add(end - cursor)
+                        .ok_or_else(|| Error::new(Errno::EOVERFLOW))?,
+                );
+            }
             cursor = end;
             continue;
         }
@@ -965,12 +1002,13 @@ pub(crate) fn plan_range_write(
         extents.push(WriteExtent::NewAllocation {
             logical_range: cursor..end,
         });
+        saw_new_allocation = true;
         cursor = end;
     }
 
     let last_page_end =
         usize::try_from(write_end % PAGE_SIZE as u64).map_err(|_| Error::new(Errno::EOVERFLOW))?;
-    Ok(RangeWritePlan {
+    let result = RangeWritePlan {
         inode_generation: inode_record.header().generation(),
         file_offset,
         write_len,
@@ -981,7 +1019,10 @@ pub(crate) fn plan_range_write(
             last_page_end
         },
         extents,
-    })
+        ssd_allocation_predecessor,
+    };
+    pp::NV_FOREGROUND_PLAN_BUILD.record_since(plan_build_started, result.extents.len());
+    Ok(result)
 }
 
 impl RangeWritePage {
@@ -1174,7 +1215,14 @@ where
 {
     let mutation = ExtentMutation::new(pool.clone(), fs_id, inode)?;
     let pages = range_write_new_pages(&pool, fs_id, inode, request)?;
-    let reservation = pool.reserve_native_data_pages(pages)?;
+    let reservation =
+        match redirect_extension_slot_for_pages(&pool, fs_id, inode, request.pages, pages) {
+            Some(start) => match pool.try_reserve_native_data_pages_at(start, pages)? {
+                Some(reservation) => reservation,
+                None => pool.reserve_native_data_pages(pages)?,
+            },
+            None => pool.reserve_native_data_pages(pages)?,
+        };
     commit_range_write_with_mutation(
         pool,
         fs_id,
@@ -1186,6 +1234,35 @@ where
         mutation,
         reservation,
     )
+}
+
+pub(crate) fn redirect_extension_slot_for_pages(
+    pool: &Arc<Rnvpc>,
+    fs_id: u64,
+    inode: u64,
+    pages: &[RangeWritePage],
+    new_pages: usize,
+) -> Option<usize> {
+    let (first, _) = pages.split_first()?;
+    if new_pages != pages.len()
+        || first.logical_block == 0
+        || pages.windows(2).any(|pair| {
+            pair[0].logical_block.checked_add(1) != Some(pair[1].logical_block)
+                || pair[0].ssd_block.checked_add(1) != Some(pair[1].ssd_block)
+        })
+    {
+        return None;
+    }
+    let entry = pool.lookup_dirty_nv_entry(PageKey::new(fs_id, inode, first.logical_block - 1))?;
+    if entry.state() != super::redirect_index::NvExtentEntryState::Dirty
+        || entry.logical_range().end != first.logical_block
+        || entry.ssd_block_range().end != first.ssd_block
+        || usize::from(entry.page_count()).checked_add(new_pages)?
+            > super::redirect_index::MAX_DIRTY_MIGRATION_EXTENT_PAGES
+    {
+        return None;
+    }
+    usize::try_from(entry.nv_slot_range().end).ok()
 }
 
 /// Counts new data pages before consuming user bytes or SSD credits.
@@ -1231,6 +1308,7 @@ where
 {
     pool.ensure_publication_certain()?;
     let body_started = read_ns();
+    let extension_reservation = pool.reservation_supports_redirect_extension(&reservation);
     let started = read_ns();
     let current_inode_ref =
         authoritative_inode_ref(&pool, fs_id, inode)?.ok_or_else(|| Error::new(Errno::ENOENT))?;
@@ -1272,6 +1350,7 @@ where
         inode_fault,
         &mutation,
         &mut reservation,
+        extension_reservation,
         current_inode_ref,
         &current_inode,
         plan,
@@ -1628,6 +1707,7 @@ fn try_commit_existing_baseline_redirect_write<F>(
     inode_fault: Option<FaultPoint>,
     mutation: &ExtentMutation,
     reservation: &mut super::frame::CapacityReservation,
+    extension_reservation: bool,
     current_inode_ref: PersistentObjectRef,
     current_inode: &InodeRecord,
     plan: &RangeWritePlan,
@@ -1738,43 +1818,73 @@ where
         .file_offset
         .checked_add(copied as u64)
         .ok_or_else(|| Error::new(Errno::EOVERFLOW))?;
+    let visible_size = current_inode.file_size().max(visible_end);
+    let inode_unchanged = root.reference() == current_inode.extent_root()
+        && visible_size == current_inode.file_size()
+        && request.old_block_count == current_inode.block_count();
+    let redirect_generation = if inode_unchanged {
+        current_inode.header().generation()
+    } else {
+        request.generation
+    };
     let mut published_entries = Vec::new();
     published_entries
         .try_reserve_exact(pending.len())
         .map_err(|_| Error::new(Errno::ENOMEM))?;
-    for batch in pending.chunks(128) {
-        match pool.publish_redirect_entries(batch, request.generation, None) {
-            Ok(entries) => published_entries.extend(entries),
+    let extended_existing = if inode_unchanged && extension_reservation {
+        match try_extend_preceding_redirect(pool, &pending) {
+            Ok(extended) => extended,
             Err(error) => {
                 if !pool.redirect_publication_uncertain() {
-                    pool.abort_redirect_entries(&published_entries)?;
                     for (page, _, _) in &pending {
-                        if !published_entries
-                            .iter()
-                            .any(|entry| entry.nv_slot_range().contains(&(page.index() as u64)))
-                        {
-                            let _ = pool.free_native_data_range(page.index()..page.index() + 1);
-                        }
+                        let _ = pool.free_native_data_range(page.index()..page.index() + 1);
                     }
                 }
                 return Err(error);
             }
         }
+    } else {
+        false
+    };
+    if !extended_existing {
+        for batch in pending.chunks(128) {
+            match pool.publish_redirect_entries(batch, redirect_generation, None) {
+                Ok(entries) => published_entries.extend(entries),
+                Err(error) => {
+                    if !pool.redirect_publication_uncertain() {
+                        pool.abort_redirect_entries(&published_entries)?;
+                        for (page, _, _) in &pending {
+                            if !published_entries
+                                .iter()
+                                .any(|entry| entry.nv_slot_range().contains(&(page.index() as u64)))
+                            {
+                                let _ = pool.free_native_data_range(page.index()..page.index() + 1);
+                            }
+                        }
+                    }
+                    return Err(error);
+                }
+            }
+        }
     }
 
-    let inode_ref = match mutation.publish_inode_state_with_generation(
-        current_inode_ref,
-        current_inode.extent_root(),
-        &root,
-        request.generation,
-        request.old_file_size.max(visible_end),
-        request.old_block_count,
-        inode_fault,
-    ) {
-        Ok(inode_ref) => inode_ref,
-        Err(error) => {
-            pool.abort_redirect_entries(&published_entries)?;
-            return Err(error);
+    let inode_ref = if inode_unchanged {
+        current_inode_ref
+    } else {
+        match mutation.publish_inode_state_with_generation(
+            current_inode_ref,
+            current_inode.extent_root(),
+            &root,
+            request.generation,
+            visible_size,
+            request.old_block_count,
+            inode_fault,
+        ) {
+            Ok(inode_ref) => inode_ref,
+            Err(error) => {
+                pool.abort_redirect_entries(&published_entries)?;
+                return Err(error);
+            }
         }
     };
     pool.activate_redirect_entries(&published_entries)?;
@@ -1785,6 +1895,52 @@ where
         unused_allocations: Vec::new(),
         allocation_records: Vec::new(),
     }))
+}
+
+fn try_extend_preceding_redirect(
+    pool: &Arc<Rnvpc>,
+    pending: &[(NvPageId, PageKey, u64)],
+) -> Result<bool> {
+    let Some((_, first_key, _)) = pending.first() else {
+        return Ok(false);
+    };
+    let Some(predecessor_page) = first_key.page_index.checked_sub(1) else {
+        return Ok(false);
+    };
+    let Some(entry) = pool.lookup_dirty_nv_entry(PageKey::new(
+        first_key.fs_id,
+        first_key.inode,
+        predecessor_page,
+    )) else {
+        return Ok(false);
+    };
+    if entry.state() != super::redirect_index::NvExtentEntryState::Dirty
+        || usize::from(entry.page_count()).saturating_add(pending.len())
+            > super::redirect_index::MAX_DIRTY_MIGRATION_EXTENT_PAGES
+    {
+        return Ok(false);
+    }
+    let logical_start = entry.logical_range().end;
+    let nv_start =
+        usize::try_from(entry.nv_slot_range().end).map_err(|_| Error::new(Errno::EOVERFLOW))?;
+    let ssd_start = entry.ssd_block_range().end;
+    if pending
+        .iter()
+        .enumerate()
+        .any(|(offset, (page, key, ssd_block))| {
+            (key.fs_id, key.inode) != (entry.fs_id(), entry.inode())
+                || key.page_index != logical_start + offset as u64
+                || page.index() != nv_start + offset
+                || *ssd_block != ssd_start + offset as u64
+        })
+    {
+        return Ok(false);
+    }
+    match pool.extend_redirect_entry(&entry, pending, None) {
+        Ok(()) => Ok(true),
+        Err(error) if error.error() == Errno::EBUSY => Ok(false),
+        Err(error) => Err(error),
+    }
 }
 
 fn begin_plan_nv_mutations(
@@ -3181,16 +3337,19 @@ fn lookup_tree_extent_ranges(
     inode: u64,
     root: PersistentObjectRef,
     logical_range: Range<u64>,
-) -> Result<Vec<SsdWriteExtent>> {
+) -> Result<(Vec<SsdWriteExtent>, Option<u64>)> {
     #[cfg(ktest)]
     pool.note_extent_tree_lookup();
     if logical_range.start >= logical_range.end || root.is_none() {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), None));
     }
     let mut current = root;
     let mut expected_level = None;
+    let mut predecessor = None;
     loop {
+        let read_started = pp::now();
         let mut node = pool.read_authoritative_metadata_boxed::<ExtentNodeRecord>(current)?;
+        pp::NV_FOREGROUND_PLAN_TREE_READ.record_since(read_started, 1);
         if node.header().fs_id() != fs_id || node.header().inode() != inode {
             return_errno_with_message!(Errno::EUCLEAN, "extent node belongs to another inode");
         }
@@ -3203,8 +3362,10 @@ fn lookup_tree_extent_ranges(
             && let Some(sibling_slot) = node.right_sibling_slot()
         {
             let sibling_ref = pool.persistent_metadata_ref_from_slot(sibling_slot)?;
+            let read_started = pp::now();
             let sibling =
                 pool.read_authoritative_metadata_boxed::<ExtentNodeRecord>(sibling_ref)?;
+            pp::NV_FOREGROUND_PLAN_TREE_READ.record_since(read_started, 1);
             let boundary = sibling
                 .entries()?
                 .first()
@@ -3223,6 +3384,16 @@ fn lookup_tree_extent_ranges(
                         .logical_block()
                         .checked_add(u64::from(entry.length()))
                         .ok_or_else(|| Error::new(Errno::EOVERFLOW))?;
+                    if entry_end <= logical_range.start
+                        && let ExtentDataRef::Ssd(ssd_base) = entry.data_ref()?
+                        && ssd_base != 0
+                    {
+                        predecessor = Some(
+                            ssd_base
+                                .checked_add(u64::from(entry.length()))
+                                .ok_or_else(|| Error::new(Errno::EOVERFLOW))?,
+                        );
+                    }
                     let start = entry.logical_block().max(logical_range.start);
                     let end = entry_end.min(logical_range.end);
                     if start >= end {
@@ -3262,8 +3433,10 @@ fn lookup_tree_extent_ranges(
                     break;
                 };
                 let sibling_ref = pool.persistent_metadata_ref_from_slot(sibling_slot)?;
+                let read_started = pp::now();
                 let sibling =
                     pool.read_authoritative_metadata_boxed::<ExtentNodeRecord>(sibling_ref)?;
+                pp::NV_FOREGROUND_PLAN_TREE_READ.record_since(read_started, 1);
                 if sibling.header().fs_id() != fs_id
                     || sibling.header().inode() != inode
                     || sibling.level() != 0
@@ -3280,7 +3453,7 @@ fn lookup_tree_extent_ranges(
                 }
                 node = sibling;
             }
-            return Ok(ranges);
+            return Ok((ranges, predecessor));
         }
         let entries = node.entries()?;
         let child_slot = entries

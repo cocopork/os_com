@@ -93,6 +93,13 @@ impl MigrationWorkerSet {
         self.workers.len()
     }
 
+    pub(super) fn queued_dirty_pages(&self) -> usize {
+        self.workers
+            .iter()
+            .map(|worker| worker.queued_dirty_pages.load(Ordering::Acquire))
+            .sum()
+    }
+
     pub(super) fn is_idle(&self) -> bool {
         self.workers.iter().all(|worker| {
             worker.owned_inodes.load(Ordering::Acquire) == 0
@@ -142,6 +149,46 @@ impl MigrationWorkerSet {
         self.workers[owner]
             .queued_dirty_pages
             .fetch_add(pages, Ordering::AcqRel);
+        if enqueue {
+            self.workers[owner]
+                .ready_inodes
+                .lock()
+                .push_back(inode_map.clone());
+        }
+    }
+
+    pub(super) fn extend_dirty(&self, inode_map: &Arc<InodeRedirectMap>, pages: usize) {
+        let (owner, enqueue) = {
+            let mut migration = inode_map.migration.lock();
+            let owner = migration
+                .owner
+                .expect("a registered dirty entry has a migration owner");
+            migration.queued_dirty_pages = migration.queued_dirty_pages.saturating_add(pages);
+            let enqueue = !migration.ready_queued;
+            migration.ready_queued = true;
+            (owner, enqueue)
+        };
+        self.workers[owner]
+            .queued_dirty_pages
+            .fetch_add(pages, Ordering::AcqRel);
+        if enqueue {
+            self.workers[owner]
+                .ready_inodes
+                .lock()
+                .push_back(inode_map.clone());
+        }
+    }
+
+    pub(super) fn ensure_dirty_ready(&self, inode_map: &Arc<InodeRedirectMap>) {
+        let (owner, enqueue) = {
+            let mut migration = inode_map.migration.lock();
+            let Some(owner) = migration.owner else {
+                return;
+            };
+            let enqueue = !migration.ready_queued;
+            migration.ready_queued = true;
+            (owner, enqueue)
+        };
         if enqueue {
             self.workers[owner]
                 .ready_inodes

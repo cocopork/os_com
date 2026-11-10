@@ -65,6 +65,31 @@ fn ext4_research_routes() {
     );
 }
 
+#[ktest]
+fn rnvpce_invalid_allocation_hint_falls_back() {
+    crate::fs::rnvpc::init_for_ext4_tests();
+    crate::time::clocks::init_for_ktest();
+    let fixture = Ext4FixtureBuilder::new(2048, 256, 2048)
+        .with_block_bitmap_metadata_marked()
+        .with_free_blocks(128)
+        .with_uuid([0xce; 16])
+        .with_mount_options("rnvpce=on,rtio=off")
+        .build()
+        .unwrap();
+
+    let ranges = fixture
+        .ext4
+        .allocate_rnvpce_foreground_blocks(1, Some(2048))
+        .expect("an out-of-range locality hint must fall back to normal group selection");
+    assert_eq!(
+        ranges
+            .iter()
+            .map(|range| range.end - range.start)
+            .sum::<u64>(),
+        1
+    );
+}
+
 /// Keep real EXT4/NVM state and disk I/O; control only device submission timing.
 pub(super) struct QueueRecordingDisk {
     pub(super) disk: Arc<super::test_utils::Ext4MemoryDisk>,
@@ -267,7 +292,7 @@ fn assert_cross_queue_entry(
         .expect("NV authority must survive until reclaim");
     assert_eq!(entry.state(), state, "inode {ino}");
     assert_eq!(
-        entry.record().authority().unwrap(),
+        entry.record_snapshot().unwrap().authority().unwrap(),
         NvRedirectAuthority::NvAuthoritative
     );
 }

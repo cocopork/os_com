@@ -148,6 +148,71 @@ impl ObjectTable {
         Ok(start..end)
     }
 
+    pub(super) fn extend_data_range_owner(
+        &self,
+        entry: &Arc<DirtyNvExtentEntry>,
+        expected_pages: u16,
+        committed_pages: u16,
+    ) -> Result<()> {
+        let start = usize::try_from(entry.nv_slot_range().start)
+            .map_err(|_| Error::new(Errno::EOVERFLOW))?;
+        let expected_end = start
+            .checked_add(usize::from(expected_pages))
+            .ok_or_else(|| Error::new(Errno::EOVERFLOW))?;
+        let committed_end = start
+            .checked_add(usize::from(committed_pages))
+            .filter(|end| *end <= self.slots.len())
+            .ok_or_else(|| Error::new(Errno::EINVAL))?;
+        let mut ranges = self.lock_data_ranges();
+        let owner = ranges
+            .get(&start)
+            .ok_or_else(|| Error::new(Errno::ESTALE))?;
+        if owner.end != expected_end
+            || !owner
+                .owner
+                .upgrade()
+                .is_some_and(|candidate| Arc::ptr_eq(&candidate, entry))
+            || ranges
+                .range((
+                    core::ops::Bound::Excluded(start),
+                    core::ops::Bound::Unbounded,
+                ))
+                .next()
+                .is_some_and(|(next, _)| *next < committed_end)
+        {
+            return_errno_with_message!(Errno::ESTALE, "NV data range cannot be extended");
+        }
+        ranges.get_mut(&start).unwrap().end = committed_end;
+        Ok(())
+    }
+
+    pub(super) fn shrink_data_range_owner(
+        &self,
+        entry: &Arc<DirtyNvExtentEntry>,
+        committed_pages: u16,
+        expected_pages: u16,
+    ) {
+        let Ok(start) = usize::try_from(entry.nv_slot_range().start) else {
+            return;
+        };
+        let Some(committed_end) = start.checked_add(usize::from(committed_pages)) else {
+            return;
+        };
+        let Some(expected_end) = start.checked_add(usize::from(expected_pages)) else {
+            return;
+        };
+        let mut ranges = self.lock_data_ranges();
+        if let Some(owner) = ranges.get_mut(&start)
+            && owner.end == committed_end
+            && owner
+                .owner
+                .upgrade()
+                .is_some_and(|candidate| Arc::ptr_eq(&candidate, entry))
+        {
+            owner.end = expected_end;
+        }
+    }
+
     pub(super) fn data_range_owner(&self, entry: &Arc<DirtyNvExtentEntry>) -> Result<Range<usize>> {
         let start = usize::try_from(entry.nv_slot_range().start)
             .map_err(|_| Error::new(Errno::EOVERFLOW))?;

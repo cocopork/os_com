@@ -15,6 +15,12 @@
 验收后已恢复一个 worker 默认，`rtio_workers=N` 保留为受设备队列数限制的实验选项。
 详见[实验报告](../../../experiments/reports/RTIO-VIRTIO-MULTIQUEUE-2026-11-02.md)。
 
+**2026-11-05 策略更新：**上述结论保留为 2026-11-02 版本的历史实验结果。
+后续 inode 归属 flusher 和 durability epoch 聚合已经改变多 worker 的调度路径；
+按当前测试策略，rNVPCe 默认 worker 数改为
+`min(4, submission_queue_count)`。显式 `rtio_workers=N` 仍可覆盖默认值，
+rNVPC WAL 仍固定使用一个 worker。
+
 ## 目标
 
 把已经实现的 rTIO 多迁移线程从“多个生产者竞争一个 virtqueue”改为端到端并行的数据路径：
@@ -72,7 +78,7 @@ pub enum BioQueueAffinity {
 ### 3. rTIO 队列绑定
 
 - rNVPCe worker `i` 在整个挂载生命周期内固定使用 `Queue(i)`。
-- 当前默认 worker 数为 1，与 CPU/队列数无关；测量候选版本的 queue-aware 默认因性能验收失败已撤回。
+- 当前默认 worker 数为 `min(4, submission_queue_count)`；单队列设备仍为一个 worker。
 - `rtio_workers=N` 大于设备提交队列数量时挂载返回 `EINVAL`。
 - rNVPC WAL 仍限制为一个 worker。
 - 所有队列的数据 BIO completion 仍汇聚到一个 durability coordinator。

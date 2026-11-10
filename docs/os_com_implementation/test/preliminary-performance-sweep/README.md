@@ -47,12 +47,33 @@ journal状态，避免根据请求参数推断实际状态。
 - 模拟NVDIMM：`rnvpc_size=128M`、`rnvpc_meta_reserve=64M`、
   `rnvpc_data_limit=64M`、`rnvpc_sim_mode=fast`。
 - 吞吐测试使用release、error级日志，关闭延迟插桩、分配器统计和逐操作日志。
-- fio：`ioengine=psync,direct=0,fsync=0,iodepth=1,thread=1`，每个job独立文件，
-  `group_reporting=1,fallocate=none`。
+- fio：`ioengine=psync,direct=0,fsync=0,iodepth=1,thread=1`；默认每个job使用
+  同一预建文件中的独立非重叠区间，`group_reporting=1,fallocate=none`。每job独立文件
+  仅用于明确的多inode实验。
 - 每点总工作集约2 GiB。不能整除线程数时，每个job使用
   `floor(2048 / jobs)` MiB，并以实际完成字节数计算含sync带宽。
 - 固定随机种子，并在manifest中记录代码提交、工作区状态、ISO哈希、设备身份、
   格式化参数、挂载参数和fio完整命令。
+
+### 默认文件布局与分配语义
+
+除非测试名称和目的明确写明包含SSD分配元数据操作，所有性能点默认测量已有文件上的
+覆盖写，不在计时区间创建文件、扩展文件、分配数据块或修改allocation bitmap/GDT及
+extent树结构。
+
+- 默认先用原生EXT4 direct顺序写创建一个完整目标文件，`sync`并重新挂载后再测量；
+- 多job默认访问该文件中互不重叠的等长区间，避免job数改变inode数量和磁盘布局；
+- 若实验目的要求每个job独立inode，必须逐文件串行完成顺序初始化，禁止多个job并发
+  创建基线文件；
+- 初始化后使用只读`debugfs stat`或等价结构化工具记录文件大小、data extent数量和
+  extent index block数量；
+- 同一sweep各点的extent布局必须保持低碎片且可比。出现数量级差异的点无效，必须重新
+  构造布局，不能把布局变化解释为线程或块大小效应；
+- harness支持时，优先冻结一份已准备的文件系统状态并为各坐标恢复同一份基线。
+
+只有明确命名为“首次写”“fresh-file”或“allocation-included”的实验，才在计时阶段
+使用空文件/空洞并包含SSD块、bitmap、GDT和extent节点分配。这类结果必须单独成表，
+不得与默认覆盖写曲线拼接。
 
 ## 测试矩阵
 
@@ -62,12 +83,13 @@ journal状态，避免根据请求参数推断实际状态。
 
 - 块大小固定为4 KiB；
 - jobs为`1,4,8,12,16,20,24,28,32`；
-- `randwrite`为已有文件上的随机覆盖写；
-- `write`为fresh文件上的顺序首次写入。
+- `randwrite`为预建低碎片文件上的随机覆盖写；
+- `write`默认为同一预建文件范围内的顺序覆盖写；顺序首次写必须另列为
+  `first-write`或`allocation-included`实验。
 
-随机覆盖写在测量前使用原生direct I/O顺序初始化每个job的完整文件范围，执行
-`sync`并重新挂载，再启动被测模式。初始化耗时不计入测量，但其成功状态和完成
-字节数必须保留。
+默认覆盖写在测量前按“默认文件布局与分配语义”初始化完整文件范围，执行`sync`并
+重新挂载，再启动被测模式。初始化耗时不计入测量，但其成功状态、完成字节数和extent
+布局必须保留。
 
 ### Block-size sweep
 
@@ -76,7 +98,7 @@ journal状态，避免根据请求参数推断实际状态。
 - jobs固定为1；
 - 块大小为`4,8,16,32,64,128,256,512,1024 KiB`；
 - 随机写沿用完整范围预初始化规则；
-- 顺序写使用fresh文件。
+- 顺序写默认也使用预初始化范围；需要测量fresh文件分配时单独运行并标记。
 
 4 KiB、1线程会同时出现在thread sweep和bs sweep中。两个点均保留，不去重，
 用作同批次重复观测；若差异明显，先进行重复测量，而不是从其中选择更有利的值。
@@ -95,11 +117,13 @@ journal状态，避免根据请求参数推断实际状态。
 - 最终`sync`耗时、卸载状态和QEMU退出状态；
 - 后置`e2fsck -fn`结果；
 - 随机写初始化阶段的完成字节数和状态。
+- 被测文件的大小、data extent数量和extent index block数量。
 
 只有同时满足以下条件的点才能进入比较表：fio错误码为0、完成预期字节数、最终
 `sync`成功、正常卸载、guest完成标记存在、QEMU按约定退出、后置`e2fsck -fn`
-通过。e2fsck只验证SSD文件系统结构，不证明rNVPC/rNVPCe掉电一致性或文件内容
-正确；崩溃一致性必须由独立故障注入测试验证。
+通过，并且默认覆盖写点的文件布局满足低碎片与跨坐标可比要求。e2fsck只验证SSD
+文件系统结构，不证明rNVPC/rNVPCe掉电一致性或文件内容正确；崩溃一致性必须由独立
+故障注入测试验证。
 
 本阶段可以先执行每点一轮以发现瓶颈。任何将要作为优化前后收益依据、或用于判断
 小于10%的性能变化的坐标，都必须在相同镜像和环境下至少重复3轮，并报告中位数

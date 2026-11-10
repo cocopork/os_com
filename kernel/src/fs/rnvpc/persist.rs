@@ -6,7 +6,7 @@ use core::sync::atomic::{AtomicBool, Ordering};
 
 use super::{
     backend::NvMemoryBackend,
-    descriptor::{NvDescriptor, NvRedirectExtentRecord},
+    descriptor::{NV_REDIRECT_EXTENT_HEADER_OFFSET, NvDescriptor, NvRedirectExtentRecord},
     fault::{FaultPoint, inject},
     id::NvPageId,
     layout::{
@@ -164,6 +164,79 @@ impl PersistEngine {
         self.backend.store_control_u64(commit, next)?;
         self.backend.persist_control(commit, size_of::<u64>())?;
         self.backend.fence()
+    }
+
+    pub(super) fn extend_redirect_extent(
+        &self,
+        head: usize,
+        expected_pages: u16,
+        committed_pages: u16,
+        data_slots: &[usize],
+        fault: Option<FaultPoint>,
+    ) -> Result<()> {
+        self.ensure_writable()?;
+        self.check_index(head)?;
+        if committed_pages <= expected_pages
+            || usize::from(committed_pages - expected_pages) != data_slots.len()
+        {
+            return_errno_with_message!(Errno::EINVAL, "invalid redirect extent extension");
+        }
+        let current = self
+            .read_redirect_extent(head)?
+            .ok_or_else(|| Error::new(Errno::ESTALE))?;
+        if current.nv_slot_start() != head as u64
+            || current.page_count() != expected_pages
+            || current.authority()? != super::descriptor::NvRedirectAuthority::NvAuthoritative
+        {
+            return_errno_with_message!(Errno::ESTALE, "redirect extent changed before extension");
+        }
+        let expected_slot = head
+            .checked_add(usize::from(expected_pages))
+            .ok_or_else(|| Error::new(Errno::EOVERFLOW))?;
+        if data_slots
+            .iter()
+            .copied()
+            .enumerate()
+            .any(|(offset, slot)| expected_slot.checked_add(offset) != Some(slot))
+        {
+            return_errno_with_message!(Errno::EINVAL, "redirect extension slots are not adjacent");
+        }
+        let updated = current.with_page_count(committed_pages)?;
+
+        inject(fault, FaultPoint::BeforeContentPersist)?;
+        for slot in data_slots {
+            self.check_index(*slot)?;
+            self.backend.persist(*slot * PAGE_SIZE, PAGE_SIZE)?;
+        }
+        self.backend.fence()?;
+        inject(fault, FaultPoint::AfterContentPersist)?;
+
+        let mut header_stored = false;
+        let publication = (|| {
+            let selector = self.backend.load_control_u64(commit_offset(head)?)?;
+            if selector == 0 || self.read_redirect_extent(head)? != Some(current) {
+                return_errno_with_message!(
+                    Errno::ESTALE,
+                    "redirect extent changed during extension"
+                );
+            }
+            let header_offset = redirect_extent_offset(head, selector)?
+                .checked_add(NV_REDIRECT_EXTENT_HEADER_OFFSET)
+                .ok_or_else(|| Error::new(Errno::EOVERFLOW))?;
+            self.backend
+                .store_control_u64(header_offset, updated.header_word())?;
+            header_stored = true;
+            inject(fault, FaultPoint::AfterCommitStore)?;
+            self.backend
+                .persist_control(header_offset, size_of::<u64>())?;
+            inject(fault, FaultPoint::AfterCommitPersist)?;
+            self.backend.fence()?;
+            inject(fault, FaultPoint::AfterCommitFence)
+        })();
+        if publication.is_err() && header_stored {
+            self.publication_uncertain.store(true, Ordering::Release);
+        }
+        publication
     }
 
     /// Persists all data pages, then publishes one selector per redirect range.

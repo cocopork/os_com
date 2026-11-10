@@ -8,10 +8,9 @@ use super::descriptor::{NvDescriptor, NvRedirectExtentRecord};
 use crate::prelude::*;
 
 pub(super) const NV_IMAGE_MAGIC: u64 = 0x4e56_504f_4f4c_3031;
-/// Version 9 adds the redirect visibility generation used to order selector
-/// publication before inode reachability. Metadata and WAL data retain
-/// per-slot descriptors.
-pub(super) const NV_IMAGE_VERSION: u32 = 9;
+/// Version 10 permits an active redirect copy's aligned header word to advance
+/// its committed page count after newly appended data reaches persistence.
+pub(super) const NV_IMAGE_VERSION: u32 = 10;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Pod)]

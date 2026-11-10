@@ -78,19 +78,22 @@ continues to select NVM and recovery safely retries migration.
 rNVPCe supports a bounded number of migration workers. The default is:
 
 ```text
-1
+min(4, submission_queue_count)
 ```
 
 The kernel command-line parameter `rtio_workers=N` may override the default
 for controlled experiments. Valid values are 1 through 16. Invalid values are
-rejected during configuration rather than silently clamped. rNVPC WAL mode
-uses one worker regardless of this parameter until its per-page completion
-path is redesigned.
+rejected during configuration rather than silently clamped. A single-queue
+device therefore still starts one rNVPCe worker; devices with two or three
+queues start two or three workers. rNVPC WAL mode uses one worker regardless
+of this parameter until its per-page completion path is redesigned.
 
-The initial real-device validation used a single virtio-blk queue. Four
-submitters increased submission-side contention and capacity-wait time, so
-multiple workers remain opt-in until the device path provides multiple queues
-or a centralized submission layer.
+The initial real-device validation used a single virtio-blk queue and therefore
+kept multiple workers opt-in. The later end-to-end multiqueue path, inode-owned
+flusher scheduling, and durability-epoch aggregation removed that configuration
+constraint. From 2026-11-05 onward, tests use four workers by default when the
+device exposes at least four submission queues. Older reports retain their
+original explicit/default worker count as historical evidence.
 
 Every worker follows the existing wake policy. Dirty-watermark pressure,
 explicit migration-progress waiters, or any capacity waiter wakes all

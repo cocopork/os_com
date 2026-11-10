@@ -11,6 +11,16 @@ expect_rejected() {
     fi
 }
 
+configure_guest linux
+[[ ${guest_files[*]} == 'vmlinuz initramfs.cpio.gz ext2.img exfat.img' ]] || fail "linux guest inputs"
+[[ ${boot_args[*]} == *'-kernel /benchmark/vmlinuz -initrd /benchmark/initramfs.cpio.gz'* ]] || fail "linux kernel boot arguments"
+[[ ${boot_args[*]} == *'fio/raw_virtio_thread_sweep linux'* ]] || fail "linux benchmark entrypoint"
+[[ ${network_args[*]} == *'-netdev user,id=net01'* && ${network_args[*]} == *'virtio-net-pci'* ]] || fail "linux guest network"
+configure_guest aster
+[[ ${guest_files[*]} == 'selected.iso ext2.img exfat.img' ]] || fail "Asterinas guest inputs"
+[[ ${boot_args[*]} == '-cdrom /benchmark/selected.iso' ]] || fail "Asterinas CD-ROM boot arguments"
+[[ ${network_args[*]} == '-nic none' ]] || fail "Asterinas disabled network"
+
 configure_queues 1
 [[ $QUEUES == 1 && ${#iothread_args[@]} == 2 && ${iothread_args[1]} == iothread,id=iothread0 ]] || fail "one-queue control IOThreads"
 configure_queues 4
@@ -18,6 +28,12 @@ configure_queues 4
 expect_rejected configure_queues 0
 expect_rejected configure_queues 2
 expect_rejected configure_queues 16
+
+configure_filesystem_format nojournal
+[[ ${mkfs_args[*]} == "-F -b 4096 -O ^has_journal" ]] || fail "nojournal mkfs arguments"
+configure_filesystem_format journal
+[[ ${mkfs_args[*]} == "-F -b 4096" ]] || fail "journal mkfs arguments"
+expect_rejected configure_filesystem_format invalid
 
 (
     target_json='{"target_major_minor":"259:1"}'

@@ -10,7 +10,9 @@ pub(crate) const NV_DESCRIPTOR_MAGIC: u64 = 0x4e56_4445_5343_3032;
 /// 描述符版本。
 pub(crate) const NV_DESCRIPTOR_VERSION: u32 = 1;
 pub(crate) const NV_REDIRECT_EXTENT_MAGIC: u64 = 0x4e56_5245_5854_3031;
-pub(crate) const NV_REDIRECT_EXTENT_VERSION: u32 = 2;
+pub(crate) const NV_REDIRECT_EXTENT_VERSION: u32 = 3;
+pub(crate) const NV_REDIRECT_EXTENT_HEADER_OFFSET: usize =
+    core::mem::offset_of!(NvRedirectExtentRecord, version);
 const NV_DESCRIPTOR_MIGRATION_TARGET: u16 = 1 << 0;
 const NV_DESCRIPTOR_MIGRATION_CREDIT_RELEASED: u16 = 1 << 1;
 
@@ -129,6 +131,28 @@ impl NvRedirectExtentRecord {
 
     pub(crate) const fn page_count(&self) -> u16 {
         self.page_count
+    }
+
+    pub(crate) fn with_page_count(&self, page_count: u16) -> Result<Self> {
+        Self::new_with_visibility(
+            self.fs_id,
+            self.inode,
+            self.logical_start,
+            page_count,
+            self.nv_slot_start,
+            self.ssd_block_start,
+            self.authority()?,
+            self.visibility_generation,
+        )
+    }
+
+    pub(crate) fn header_word(&self) -> u64 {
+        let mut bytes = [0; size_of::<u64>()];
+        bytes.copy_from_slice(
+            &self.as_bytes()[NV_REDIRECT_EXTENT_HEADER_OFFSET
+                ..NV_REDIRECT_EXTENT_HEADER_OFFSET + size_of::<u64>()],
+        );
+        u64::from_ne_bytes(bytes)
     }
 
     pub(crate) const fn nv_slot_start(&self) -> u64 {

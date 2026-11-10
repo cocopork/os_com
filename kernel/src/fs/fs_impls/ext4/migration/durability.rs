@@ -67,6 +67,10 @@ impl DurabilityArbiter {
         self.generation.load(Ordering::Acquire)
     }
 
+    fn idle_tail_ready(&self, queued_dirty_pages: usize) -> bool {
+        queued_dirty_pages == 0 && self.pending_data_page_count() == 0
+    }
+
     pub(super) fn try_advance_background(
         &self,
         fs: &Ext4,
@@ -78,8 +82,13 @@ impl DurabilityArbiter {
         self.try_advance(fs, contender)
     }
 
-    pub(super) fn try_advance_idle(&self, fs: &Ext4, contender: Option<usize>) -> Result<usize> {
-        if self.pending_data_page_count() != 0 {
+    pub(super) fn try_advance_idle(
+        &self,
+        fs: &Ext4,
+        contender: Option<usize>,
+        queued_dirty_pages: usize,
+    ) -> Result<usize> {
+        if !self.idle_tail_ready(queued_dirty_pages) {
             return Ok(0);
         }
         self.try_advance(fs, contender)
@@ -210,5 +219,16 @@ mod tests {
         assert_eq!(arbiter.pending_data_page_count(), 0);
         assert_eq!(arbiter.ready_page_count(), 7);
         assert_eq!(arbiter.ready_batch_count(), 1);
+    }
+
+    #[ktest]
+    fn idle_epoch_waits_until_dirty_queue_is_drained() {
+        let arbiter = DurabilityArbiter::new();
+
+        arbiter.note_submitted_pages(1);
+        arbiter.note_ready_batch(1);
+
+        assert!(!arbiter.idle_tail_ready(1));
+        assert!(arbiter.idle_tail_ready(0));
     }
 }

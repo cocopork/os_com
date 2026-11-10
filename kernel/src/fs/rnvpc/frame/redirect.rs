@@ -83,6 +83,92 @@ impl Rnvpc {
         Ok(NvPageId::try_from(slots.start)?..NvPageId::try_from(slots.end)?)
     }
 
+    pub(crate) fn begin_nv_entry_extension(
+        &self,
+        entry: &Arc<DirtyNvExtentEntry>,
+        expected_pages: u16,
+        committed_pages: u16,
+    ) -> Result<NvExtentEntryExtension> {
+        self.ensure_publication_certain()?;
+        entry.begin_extension(expected_pages, committed_pages)
+    }
+
+    #[cfg(ktest)]
+    pub(crate) fn abort_nv_entry_extension_for_test(&self, extension: NvExtentEntryExtension) {
+        self.redirects.abort_entry_extension(extension, true);
+    }
+
+    pub(crate) fn finish_nv_entry_extension(
+        &self,
+        extension: NvExtentEntryExtension,
+    ) -> Result<()> {
+        let expected_pages = extension.expected_pages();
+        let committed_pages = extension.committed_pages();
+        let entry = extension.entry().clone();
+        self.objects
+            .extend_data_range_owner(&entry, expected_pages, committed_pages)?;
+        if let Err(error) = self.redirects.finish_entry_extension(extension) {
+            self.objects
+                .shrink_data_range_owner(&entry, committed_pages, expected_pages);
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn extend_redirect_entry(
+        &self,
+        entry: &Arc<DirtyNvExtentEntry>,
+        pages: &[(NvPageId, PageKey, u64)],
+        fault: Option<FaultPoint>,
+    ) -> Result<()> {
+        if pages.is_empty() {
+            return_errno_with_message!(Errno::EINVAL, "empty redirect extent extension");
+        }
+        let expected_pages = entry.page_count();
+        let committed_pages = usize::from(expected_pages)
+            .checked_add(pages.len())
+            .and_then(|pages| u16::try_from(pages).ok())
+            .ok_or_else(|| Error::new(Errno::EOVERFLOW))?;
+        let logical_start = entry.logical_range().end;
+        let nv_start =
+            usize::try_from(entry.nv_slot_range().end).map_err(|_| Error::new(Errno::EOVERFLOW))?;
+        let ssd_start = entry.ssd_block_range().end;
+        for (offset, (page, key, ssd_block)) in pages.iter().enumerate() {
+            if (key.fs_id, key.inode) != (entry.fs_id(), entry.inode())
+                || key.page_index != logical_start + offset as u64
+                || page.index() != nv_start + offset
+                || *ssd_block != ssd_start + offset as u64
+            {
+                return_errno_with_message!(Errno::EINVAL, "redirect extension is not contiguous");
+            }
+        }
+        let extension = self.begin_nv_entry_extension(entry, expected_pages, committed_pages)?;
+        let slots = pages
+            .iter()
+            .map(|(page, _, _)| page.index())
+            .collect::<Vec<_>>();
+        let persist_result = self.persist.extend_redirect_extent(
+            usize::try_from(entry.nv_slot_range().start)
+                .map_err(|_| Error::new(Errno::EOVERFLOW))?,
+            expected_pages,
+            committed_pages,
+            &slots,
+            fault,
+        );
+        if let Err(error) = persist_result {
+            self.redirects
+                .abort_entry_extension(extension, !self.persist.publication_uncertain());
+            return Err(error);
+        }
+        if let Err(error) = self.finish_nv_entry_extension(extension) {
+            self.persist.latch_publication_uncertain();
+            return Err(error);
+        }
+        batch_metrics::count(batch_metrics::Event::RedirectPublishBatches, 1);
+        batch_metrics::count(batch_metrics::Event::RedirectPublishedPages, pages.len());
+        Ok(())
+    }
+
     pub(crate) fn data_range_segments(
         &self,
         entry: &Arc<DirtyNvExtentEntry>,
@@ -113,6 +199,25 @@ impl Rnvpc {
     }
 
     #[cfg(ktest)]
+    pub(crate) fn extend_persisted_redirect_extent_for_test(
+        &self,
+        head_slot: usize,
+        expected_pages: u16,
+        committed_pages: u16,
+        pages: &[NvPageId],
+        fault: Option<FaultPoint>,
+    ) -> Result<()> {
+        let slots = pages.iter().map(|page| page.index()).collect::<Vec<_>>();
+        self.persist.extend_redirect_extent(
+            head_slot,
+            expected_pages,
+            committed_pages,
+            &slots,
+            fault,
+        )
+    }
+
+    #[cfg(ktest)]
     pub(crate) fn persistent_slot_is_selected_for_test(&self, slot: usize) -> Result<bool> {
         self.persist.slot_is_selected_for_test(slot)
     }
@@ -123,7 +228,7 @@ impl Rnvpc {
         entry: &DirtyNvExtentEntry,
     ) -> Result<()> {
         let pending = entry
-            .record()
+            .record_snapshot()?
             .with_authority(NvRedirectAuthority::SsdAuthoritativePendingFree)?;
         self.persist.publish_redirect_extent(&pending, None)
     }
@@ -164,6 +269,10 @@ impl Rnvpc {
     ) -> Option<crate::fs::rnvpc::redirect_index::MigrationWorkerLoadSnapshot> {
         self.redirects
             .migration_worker_load_snapshot(fs_id, worker_id)
+    }
+
+    pub(crate) fn migration_queued_dirty_pages(&self, fs_id: u64) -> Option<usize> {
+        self.redirects.migration_queued_dirty_pages(fs_id)
     }
 
     pub(crate) fn claim_ready_nv_entries_for_worker(
@@ -294,11 +403,11 @@ impl Rnvpc {
         lease.begin_reclaim_and_wait_for_readers()?;
         let entry = lease.entry();
         let pending = entry
-            .record()
+            .record_snapshot()?
             .with_authority(NvRedirectAuthority::SsdAuthoritativePendingFree)?;
         self.persist.publish_redirect_extent(&pending, None)?;
 
-        if entry.record().visibility_generation() == 0 {
+        if entry.record_snapshot()?.visibility_generation() == 0 {
             return self.reclaim_legacy_nv_entry(lease);
         }
 

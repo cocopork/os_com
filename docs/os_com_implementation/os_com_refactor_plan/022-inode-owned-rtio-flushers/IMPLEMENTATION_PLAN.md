@@ -20,7 +20,9 @@
 - BIO callbacks only record status, enqueue the completed batch and wake its owner.
 - One closed durability epoch issues at most one device FLUSH; FLUSH failure retains NVM authority.
 - No arbitrary work stealing and no same-inode subdivision in this implementation.
-- Default rTIO worker count remains one; four workers require explicit `rtio_workers=4`.
+- Historical implementation constraint: the first validation retained one
+  default worker. Superseded on 2026-11-05: rNVPCe now defaults to
+  `min(4, submission_queue_count)`; explicit `rtio_workers=N` still overrides it.
 - Preserve the untracked `kernel/test` symlink and do not track raw experiment artifacts.
 
 ## Review Focus

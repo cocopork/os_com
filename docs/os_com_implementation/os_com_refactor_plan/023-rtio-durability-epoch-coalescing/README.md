@@ -76,3 +76,25 @@ FLUSH 期间不持有 worker 队列、inode 或 extent 锁。
 70,790 降至 1,791，含 sync 带宽提高 3.6%；128 KiB/16 job epoch 从 14,307 降至
 2,549，但含 sync 带宽下降 11.5%。机制消除了 FLUSH 放大，新的权衡是 completion
 等待增加。完整数据见[实验报告](../../../experiments/reports/RTIO-DURABILITY-EPOCH-COALESCING-2026-11-03.md)。
+
+## 7. Dirty 队列批量门控（2026-11-04）
+
+后续 4 KiB 覆盖写诊断发现，durability epoch 已聚合并不等于候选提交已聚合。原实现每次
+发布 dirty entry 都唤醒 inode owner；当数据池处于高水位状态时，worker 会立即 claim
+刚发布的少量 entry。两个前台线程因此把 524,288 页拆成约 521,443 个迁移 batch。
+
+rNVPCe 后台迁移现增加挂载级 dirty 页计数门控：
+
+- 普通后台迁移仅在所有 owner 的 queued dirty 页总数达到 `WRITEBACK_BATCH`（1024 页）
+  时开始；本 owner 没有 dirty 页时不参与空扫描；
+- 高水位状态本身不能绕过批量门槛；
+- 容量等待和显式 migration-progress 等待可以强制处理不足一批的尾项；
+- sync、unmount 继续使用 exclusive drain，不受后台门槛限制；
+- idle durability 推进还必须确认 queued dirty 页为零，不能把尚未 claim 的 dirty entry
+  误判为尾部已经排空。
+
+真实 NVMe 诊断中，双线程测量阶段的 migration batch 从约 521,443 降至 1,013，候选
+选择从约 3,809,397 次降至约 1,020 次，设备 FLUSH 从 221,394 次降至约 509 次。机制
+达到预期，但 release 吞吐仅从 56.19 MiB/s 变为 57.23 MiB/s，说明当前双线程瓶颈已不
+再是候选唤醒或 durability 封闭频率。完整证据见
+[实验报告](../../../experiments/reports/RTIO-FLUSHER-BATCH-GATING-2026-11-04.md)。

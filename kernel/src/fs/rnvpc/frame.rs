@@ -44,7 +44,8 @@ use super::{
     recover,
     redirect_index::{
         DescriptorHandle, DirtyNvExtentEntry, MigrationConflict, MigrationExtentLease,
-        NvExtentEntryLease, NvExtentReadGuard, NvExtentWriteGuard, RedirectDirectory,
+        NvExtentEntryExtension, NvExtentEntryLease, NvExtentReadGuard, NvExtentWriteGuard,
+        RedirectDirectory,
     },
     slot_allocator::NvSlotAllocator,
 };
@@ -144,6 +145,7 @@ pub(crate) struct CapacityReservation {
     pool: Arc<Rnvpc>,
     pages: Vec<NvPageId>,
     native_ranges: bool,
+    predecessor_contiguous: bool,
 }
 
 impl Debug for CapacityReservation {
@@ -1534,6 +1536,7 @@ impl Rnvpc {
             pool: self.clone(),
             pages: Vec::new(),
             native_ranges: false,
+            predecessor_contiguous: false,
         };
         reservation
             .pages
@@ -1620,6 +1623,7 @@ impl Rnvpc {
             pool: self.clone(),
             pages: Vec::new(),
             native_ranges: true,
+            predecessor_contiguous: false,
         };
         reservation
             .pages
@@ -1641,6 +1645,56 @@ impl Rnvpc {
             self.wake_high_water();
         }
         Ok(reservation)
+    }
+
+    pub(crate) fn try_reserve_native_data_pages_at(
+        self: &Arc<Self>,
+        start: usize,
+        pages: usize,
+    ) -> Result<Option<CapacityReservation>> {
+        if pages == 0 || pages > self.config.data_limit_pages() {
+            return Ok(None);
+        }
+        let end = start
+            .checked_add(pages)
+            .ok_or_else(|| Error::new(Errno::EOVERFLOW))?;
+        let wake = self.allocation.capacity.reserve(PoolClass::Data, pages)?;
+        if !self
+            .allocation
+            .slots
+            .try_mark_allocated_after_predecessor(start..end)?
+        {
+            self.allocation.capacity.release(PoolClass::Data, pages);
+            return Ok(None);
+        }
+        let mut reserved = Vec::new();
+        if reserved.try_reserve_exact(pages).is_err() {
+            self.allocation.slots.free_range(start..end)?;
+            self.allocation.capacity.release(PoolClass::Data, pages);
+            return Err(Error::with_message(
+                Errno::ENOMEM,
+                "RNVPC exact reservation allocation",
+            ));
+        }
+        for slot in (start..end).rev() {
+            reserved.push(NvPageId::try_from(slot)?);
+        }
+        if wake {
+            self.wake_high_water();
+        }
+        Ok(Some(CapacityReservation {
+            pool: self.clone(),
+            pages: reserved,
+            native_ranges: true,
+            predecessor_contiguous: true,
+        }))
+    }
+
+    pub(crate) const fn reservation_supports_redirect_extension(
+        &self,
+        reservation: &CapacityReservation,
+    ) -> bool {
+        reservation.predecessor_contiguous
     }
 
     pub(crate) fn free_native_data_range(&self, range: Range<usize>) -> Result<()> {

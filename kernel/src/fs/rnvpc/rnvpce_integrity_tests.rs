@@ -1066,7 +1066,7 @@ fn rnvpce_random_overwrites_leave_baseline_leaf_unchanged() {
         let pages =
             [RangeWritePage::new(logical, SSD_START + logical, 0, PAGE_SIZE, false).unwrap()];
         let request = RangeWriteBatch::new(
-            iteration + 2,
+            2,
             logical * PAGE_SIZE as u64,
             PAGE_SIZE,
             &[],
@@ -1111,6 +1111,8 @@ fn rnvpce_random_overwrites_leave_baseline_leaf_unchanged() {
     let root_after = pool
         .read_authoritative_metadata_boxed::<ExtentNodeRecord>(record_after.extent_root())
         .unwrap();
+    assert_eq!(inode_after, inode_before);
+    assert_eq!(record_after.header().generation(), 1);
     assert_eq!(root_before.as_bytes(), root_after.as_bytes());
 }
 
@@ -1566,7 +1568,7 @@ fn rnvpce_redirect_io_128k_overwrite_publishes_one_redirect_range() {
     let before = pool
         .lookup_dirty_nv_entry(PageKey::new(FS_ID, INODE, 7))
         .unwrap();
-    let selector = *before.record();
+    let selector = before.record_snapshot().unwrap();
     let overwrite_span = [RangeWritePage::new(7, 40_007, 0, PAGE_SIZE, false).unwrap()];
     let overwrite = RangeWriteBatch::new(
         3,
@@ -1594,7 +1596,7 @@ fn rnvpce_redirect_io_128k_overwrite_publishes_one_redirect_range() {
         .lookup_dirty_nv_entry(PageKey::new(FS_ID, INODE, 7))
         .unwrap();
     assert!(Arc::ptr_eq(&before, &after));
-    assert_eq!(*after.record(), selector);
+    assert_eq!(after.record_snapshot().unwrap(), selector);
     assert_eq!(pool.dirty_nv_entry_count_for_test(FS_ID, INODE), 1);
     assert_eq!(
         pool.native_redirect_page_handle_count_for_test(FS_ID, INODE),
@@ -1846,6 +1848,7 @@ fn rnvpce_range_write_plan() {
     assert_eq!(plan.first_page_offset, 0);
     assert_eq!(plan.last_page_end, PAGE_SIZE);
     assert_eq!(shape(&plan), vec![(1, 0, 32, 40_000, true)]);
+    assert_eq!(plan.ssd_allocation_goal(Some(99_000)).unwrap(), None);
     assert_eq!(contiguous.extent_tree_range_lookups() - tree_lookups, 1);
     assert_eq!(contiguous.redirect_overlap_lookups() - redirect_lookups, 1);
 
@@ -1888,6 +1891,41 @@ fn rnvpce_range_write_plan() {
             (2, 16, 20, 0, false),
             (1, 20, 24, 70_000, false),
         ]
+    );
+    assert_eq!(
+        plan.ssd_allocation_goal(Some(99_000)).unwrap(),
+        Some(60_008)
+    );
+
+    let hole_only = plan_range_write(
+        &discontinuous,
+        FS_ID,
+        INODE + 1,
+        16 * PAGE_SIZE as u64,
+        4 * PAGE_SIZE,
+        24 * PAGE_SIZE as u64,
+    )
+    .unwrap();
+    assert_eq!(shape(&hole_only), vec![(2, 16, 20, 0, false)]);
+    assert_eq!(
+        hole_only.ssd_allocation_goal(Some(99_000)).unwrap(),
+        Some(60_008)
+    );
+
+    let empty = test_pool(64, 16, 48, None);
+    bootstrap_inode_authority(
+        empty.clone(),
+        FS_ID,
+        INODE + 4,
+        &AuthoritySnapshot::new(1, &[], 0, 0, 0o100644, 0).unwrap(),
+        None,
+    )
+    .unwrap();
+    let initial_plan = plan_range_write(&empty, FS_ID, INODE + 4, 0, PAGE_SIZE, 0).unwrap();
+    assert_eq!(shape(&initial_plan), vec![(2, 0, 1, 0, false)]);
+    assert_eq!(
+        initial_plan.ssd_allocation_goal(Some(99_000)).unwrap(),
+        Some(99_000)
     );
 
     let eof_plan = plan_range_write(
@@ -2565,6 +2603,154 @@ fn rnvpce_data_slot_recovery() {
             .unwrap()
             .is_empty()
     );
+}
+
+#[ktest]
+fn rnvpce_redirect_extent_extension_recovery_boundaries() {
+    const FS_ID: u64 = 0xb20d;
+    const INODE: u64 = 82;
+
+    let (before_image, before_config, before_pool) = restartable_pool(16);
+    publish_test_redirect_range(&before_pool, FS_ID, INODE, 1);
+    let before_entry = before_pool
+        .lookup_dirty_nv_entry(PageKey::new(FS_ID, INODE, 0))
+        .unwrap();
+    let before_head = before_entry.nv_slot_range().start as usize;
+    let before_tail = staged_redirect_page(&before_pool, 0xa2);
+    assert_eq!(before_tail.index(), before_head + 1);
+    assert!(
+        before_pool
+            .extend_persisted_redirect_extent_for_test(
+                before_head,
+                1,
+                2,
+                &[before_tail],
+                Some(FaultPoint::AfterContentPersist),
+            )
+            .is_err()
+    );
+    drop(before_entry);
+    drop(before_pool);
+    before_image.simulate_crash();
+    let before_recovered =
+        Arc::new(Rnvpc::recover(Arc::new(before_image.attach()), before_config, None).unwrap());
+    assert_eq!(
+        before_recovered
+            .lookup_dirty_nv_entry(PageKey::new(FS_ID, INODE, 0))
+            .unwrap()
+            .logical_range(),
+        0..1,
+    );
+    assert!(
+        before_recovered
+            .lookup_dirty_nv_entry(PageKey::new(FS_ID, INODE, 1))
+            .is_none()
+    );
+    assert_eq!(before_recovered.stats().data_pages, 1);
+
+    let (after_image, after_config, after_pool) = restartable_pool(16);
+    publish_test_redirect_range(&after_pool, FS_ID + 1, INODE + 1, 1);
+    let after_entry = after_pool
+        .lookup_dirty_nv_entry(PageKey::new(FS_ID + 1, INODE + 1, 0))
+        .unwrap();
+    let after_head = after_entry.nv_slot_range().start as usize;
+    let after_tail = staged_redirect_page(&after_pool, 0xb3);
+    assert_eq!(after_tail.index(), after_head + 1);
+    assert!(
+        after_pool
+            .extend_persisted_redirect_extent_for_test(
+                after_head,
+                1,
+                2,
+                &[after_tail],
+                Some(FaultPoint::AfterCommitPersist),
+            )
+            .is_err()
+    );
+    drop(after_entry);
+    drop(after_pool);
+    after_image.simulate_crash();
+    let after_recovered =
+        Arc::new(Rnvpc::recover(Arc::new(after_image.attach()), after_config, None).unwrap());
+    let recovered_entry = after_recovered
+        .lookup_dirty_nv_entry(PageKey::new(FS_ID + 1, INODE + 1, 1))
+        .unwrap();
+    assert_eq!(recovered_entry.logical_range(), 0..2);
+    let guard = recovered_entry.try_read().unwrap();
+    let mut bytes = [0; PAGE_SIZE];
+    let mut writer = VmWriter::from(bytes.as_mut_slice()).to_fallible();
+    after_recovered
+        .copy_entry_to_writer(&guard, 1, 0, &mut writer, PAGE_SIZE)
+        .unwrap();
+    assert!(bytes.iter().all(|byte| *byte == 0xb3));
+}
+
+#[ktest]
+fn rnvpce_redirect_extent_runtime_extension_keeps_one_entry() {
+    const FS_ID: u64 = 0xb20f;
+    const INODE: u64 = 84;
+    let pool = test_pool(16, 2, 14, None);
+    pool.configure_migration_workers(FS_ID, 1).unwrap();
+    publish_test_redirect_range(&pool, FS_ID, INODE, 1);
+
+    let entry = pool
+        .lookup_dirty_nv_entry(PageKey::new(FS_ID, INODE, 0))
+        .unwrap();
+    let head = entry.nv_slot_range().start as usize;
+    let tail = staged_redirect_page(&pool, 0xc4);
+    assert_eq!(tail.index(), head + 1);
+    assert_eq!(pool.migration_queued_dirty_pages(FS_ID), Some(1));
+
+    let extension = pool.begin_nv_entry_extension(&entry, 1, 2).unwrap();
+    assert_eq!(entry.state(), NvExtentEntryState::Extending);
+    assert!(
+        pool.claim_ready_nv_entries_for_worker(FS_ID, 0, 2)
+            .unwrap()
+            .is_empty()
+    );
+    pool.finish_nv_entry_extension(extension).unwrap();
+
+    assert_eq!(entry.state(), NvExtentEntryState::Dirty);
+    assert_eq!(entry.logical_range(), 0..2);
+    assert_eq!(entry.nv_slot_range(), head as u64..head as u64 + 2);
+    assert_eq!(pool.migration_queued_dirty_pages(FS_ID), Some(2));
+    let extended = pool
+        .lookup_dirty_nv_entry(PageKey::new(FS_ID, INODE, 1))
+        .unwrap();
+    assert!(Arc::ptr_eq(&entry, &extended));
+    let guard = extended.try_read().unwrap();
+    let mut bytes = [0; PAGE_SIZE];
+    let mut writer = VmWriter::from(bytes.as_mut_slice()).to_fallible();
+    pool.copy_entry_to_writer(&guard, 1, 0, &mut writer, PAGE_SIZE)
+        .unwrap();
+    assert!(bytes.iter().all(|byte| *byte == 0xc4));
+}
+
+#[ktest]
+fn rnvpce_aborted_redirect_extension_restores_migration_readiness() {
+    const FS_ID: u64 = 0xb210;
+    const INODE: u64 = 85;
+    let pool = test_pool(16, 2, 14, None);
+    pool.configure_migration_workers(FS_ID, 1).unwrap();
+    publish_test_redirect_range(&pool, FS_ID, INODE, 1);
+
+    let entry = pool
+        .lookup_dirty_nv_entry(PageKey::new(FS_ID, INODE, 0))
+        .unwrap();
+    let extension = pool.begin_nv_entry_extension(&entry, 1, 2).unwrap();
+    assert!(
+        pool.claim_ready_nv_entries_for_worker(FS_ID, 0, 2)
+            .unwrap()
+            .is_empty(),
+        "the worker consumes the old ready item while the entry is extending"
+    );
+
+    pool.abort_nv_entry_extension_for_test(extension);
+    assert_eq!(entry.state(), NvExtentEntryState::Dirty);
+    assert_eq!(entry.page_count(), 1);
+    let ready = pool.claim_ready_nv_entries_for_worker(FS_ID, 0, 2).unwrap();
+    assert_eq!(ready.len(), 1);
+    assert!(Arc::ptr_eq(ready[0].entry(), &entry));
 }
 
 #[allow(dead_code)]
@@ -3394,7 +3580,7 @@ fn rnvpce_existing_baseline_overwrite_uses_no_extent_update_session() {
     const INODE: u64 = 35;
     const FILE_PAGES: u64 = 8;
     const SSD_START: u64 = 70_000;
-    let (_image, _config, pool) = restartable_pool(32);
+    let (image, config, pool) = restartable_pool(32);
     let initial = [ExtentRecordEntry::leaf(0, FILE_PAGES as u32, SSD_START, false).unwrap()];
     let snapshot = AuthoritySnapshot::new(
         1,
@@ -3406,6 +3592,7 @@ fn rnvpce_existing_baseline_overwrite_uses_no_extent_update_session() {
     )
     .unwrap();
     bootstrap_inode_authority(pool.clone(), FS_ID, INODE, &snapshot, None).unwrap();
+    let inode_before = pool.fixed_inode_ref(FS_ID, INODE).unwrap().unwrap();
 
     let pages = [
         RangeWritePage::new(2, SSD_START + 2, 0, PAGE_SIZE, false).unwrap(),
@@ -3424,7 +3611,7 @@ fn rnvpce_existing_baseline_overwrite_uses_no_extent_update_session() {
     .unwrap();
     let input = [0x66u8; 2 * PAGE_SIZE];
     let before = pool.extent_field_update_sessions();
-    commit_range_write(
+    let committed = commit_range_write(
         pool.clone(),
         FS_ID,
         INODE,
@@ -3436,6 +3623,18 @@ fn rnvpce_existing_baseline_overwrite_uses_no_extent_update_session() {
     .unwrap();
 
     assert_eq!(pool.extent_field_update_sessions() - before, 0);
+    assert_eq!(committed.inode(), inode_before);
+    assert_eq!(
+        pool.fixed_inode_ref(FS_ID, INODE).unwrap(),
+        Some(inode_before)
+    );
+    assert_eq!(
+        authoritative_inode_state(&pool, FS_ID, INODE)
+            .unwrap()
+            .unwrap()
+            .generation(),
+        1,
+    );
     assert!(
         pool.lookup_dirty_nv_entry(PageKey::new(FS_ID, INODE, 2))
             .is_some()
@@ -3452,6 +3651,32 @@ fn rnvpce_existing_baseline_overwrite_uses_no_extent_update_session() {
                 .ssd_block(),
             SSD_START + logical,
         );
+    }
+    drop(pool);
+    image.simulate_crash();
+    let recovered = Arc::new(Rnvpc::recover(Arc::new(image.attach()), config, None).unwrap());
+    assert_eq!(
+        recovered.fixed_inode_ref(FS_ID, INODE).unwrap(),
+        Some(inode_before)
+    );
+    assert_eq!(
+        authoritative_inode_state(&recovered, FS_ID, INODE)
+            .unwrap()
+            .unwrap()
+            .generation(),
+        1,
+    );
+    for (logical, expected) in [(2, 0x66), (3, 0x66)] {
+        let entry = recovered
+            .lookup_dirty_nv_entry(PageKey::new(FS_ID, INODE, logical))
+            .unwrap();
+        let guard = entry.try_read().unwrap();
+        let mut bytes = [0; PAGE_SIZE];
+        let mut writer = VmWriter::from(bytes.as_mut_slice()).to_fallible();
+        recovered
+            .copy_entry_to_writer(&guard, logical, 0, &mut writer, PAGE_SIZE)
+            .unwrap();
+        assert!(bytes.iter().all(|byte| *byte == expected));
     }
 }
 
@@ -4138,6 +4363,88 @@ fn rnvpce_short_copy_retains_unused_physical_allocation_ownership() {
         pool.reclaim_committed_metadata(*reference).unwrap();
     }
     assert_eq!(allocation_record_count(&pool), 0);
+}
+
+#[ktest]
+fn rnvpce_adjacent_overwrite_syscalls_extend_one_redirect_entry() {
+    const FS_ID: u64 = 0x9928;
+    const INODE: u64 = 38;
+    const FILE_PAGES: u64 = 8;
+    const SSD_START: u64 = 72_000;
+    let (image, config, pool) = restartable_pool(32);
+    bootstrap_inode_authority(
+        pool.clone(),
+        FS_ID,
+        INODE,
+        &AuthoritySnapshot::new(
+            1,
+            &[ExtentRecordEntry::leaf(0, FILE_PAGES as u32, SSD_START, false).unwrap()],
+            FILE_PAGES * PAGE_SIZE as u64,
+            FILE_PAGES * (PAGE_SIZE / 512) as u64,
+            0o100644,
+            0,
+        )
+        .unwrap(),
+        None,
+    )
+    .unwrap();
+
+    for (logical, fill) in [(2, 0x42), (3, 0x53)] {
+        let pages =
+            [RangeWritePage::new(logical, SSD_START + logical, 0, PAGE_SIZE, false).unwrap()];
+        let request = RangeWriteBatch::new(
+            2,
+            logical * PAGE_SIZE as u64,
+            PAGE_SIZE,
+            &[],
+            &pages,
+            FILE_PAGES * PAGE_SIZE as u64,
+            FILE_PAGES * (PAGE_SIZE / 512) as u64,
+            (PAGE_SIZE / 512) as u64,
+        )
+        .unwrap();
+        commit_range_write(
+            pool.clone(),
+            FS_ID,
+            INODE,
+            &request,
+            &mut VmReader::from(&[fill; PAGE_SIZE][..]).to_fallible(),
+            |_, _| panic!("full-page overwrite must not read SSD"),
+            None,
+        )
+        .unwrap();
+    }
+
+    let first = pool
+        .lookup_dirty_nv_entry(PageKey::new(FS_ID, INODE, 2))
+        .unwrap();
+    let second = pool
+        .lookup_dirty_nv_entry(PageKey::new(FS_ID, INODE, 3))
+        .unwrap();
+    assert!(Arc::ptr_eq(&first, &second));
+    assert_eq!(first.logical_range(), 2..4);
+    assert_eq!(pool.dirty_nv_entry_count_for_test(FS_ID, INODE), 1);
+    let head = first.nv_slot_range().start as usize;
+    assert!(!pool.persistent_slot_is_selected_for_test(head + 1).unwrap());
+
+    drop(first);
+    drop(second);
+    drop(pool);
+    image.simulate_crash();
+    let recovered = Arc::new(Rnvpc::recover(Arc::new(image.attach()), config, None).unwrap());
+    let entry = recovered
+        .lookup_dirty_nv_entry(PageKey::new(FS_ID, INODE, 3))
+        .unwrap();
+    assert_eq!(entry.logical_range(), 2..4);
+    for (logical, expected) in [(2, 0x42), (3, 0x53)] {
+        let guard = entry.try_read().unwrap();
+        let mut bytes = [0; PAGE_SIZE];
+        let mut writer = VmWriter::from(bytes.as_mut_slice()).to_fallible();
+        recovered
+            .copy_entry_to_writer(&guard, logical, 0, &mut writer, PAGE_SIZE)
+            .unwrap();
+        assert!(bytes.iter().all(|byte| *byte == expected));
+    }
 }
 
 #[ktest]

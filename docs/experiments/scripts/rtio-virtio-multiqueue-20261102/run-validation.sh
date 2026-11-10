@@ -39,6 +39,37 @@ configure_queues() {
     done
 }
 
+configure_filesystem_format() {
+    case $1 in
+        journal) mkfs_args=(-F -b 4096) ;;
+        nojournal) mkfs_args=(-F -b 4096 -O '^has_journal') ;;
+        *) echo "FILESYSTEM_FORMAT must be journal or nojournal" >&2; return 2 ;;
+    esac
+}
+
+configure_guest() {
+    case $1 in
+        aster)
+            guest_files=(selected.iso ext2.img exfat.img)
+            boot_args=(-cdrom /benchmark/selected.iso)
+            network_args=(-nic none)
+            ;;
+        linux)
+            guest_files=(vmlinuz initramfs.cpio.gz ext2.img exfat.img)
+            boot_args=(
+                -kernel /benchmark/vmlinuz
+                -initrd /benchmark/initramfs.cpio.gz
+                -append "console=ttyS0 rdinit=/benchmark/common/bench_runner.sh fio/raw_virtio_thread_sweep linux"
+            )
+            network_args=(
+                -netdev user,id=net01
+                -device virtio-net-pci,netdev=net01,disable-legacy=on,disable-modern=off
+            )
+            ;;
+        *) echo "GUEST_KIND must be aster or linux" >&2; return 2 ;;
+    esac
+}
+
 confirm_target_idle() {
     [[ $(python3 "$SCRIPT_DIR/summarize.py" target-preflight "$TARGET") == "$target_json" ]] || {
         echo "target state changed before device exposure" >&2
@@ -257,9 +288,11 @@ SOURCE_ART=${SOURCE_ART:?set SOURCE_ART to a directory containing selected.iso, 
 TOOLS_IMAGE=${TOOLS_IMAGE:-os-com-recovery-tools:workspace-20261018}
 QEMU_BIN=${QEMU_BIN:-qemu-system-x86_64}
 configure_queues "${QUEUES:-4}"
+configure_guest "${GUEST_KIND:-aster}"
+configure_filesystem_format "${FILESYSTEM_FORMAT:-nojournal}"
 case ${FORMAT_TARGET:-0} in 0|1) ;; *) echo "FORMAT_TARGET must be 0 or 1" >&2; return 2 ;; esac
 case ${CHECK_FILESYSTEM:-0} in 0|1) ;; *) echo "CHECK_FILESYSTEM must be 0 or 1" >&2; return 2 ;; esac
-for file in selected.iso ext2.img exfat.img; do
+for file in "${guest_files[@]}"; do
     [[ -f "$SOURCE_ART/$file" ]] || { echo "missing input: $SOURCE_ART/$file" >&2; exit 2; }
 done
 
@@ -273,12 +306,12 @@ allowed_cpus=$(taskset -pc $$ | sed 's/.*: //')
 
 create_artifact "$requested_art"
 printf '%s\n' "$target_json" > "$ART/target.json"
-for file in selected.iso ext2.img exfat.img; do
+for file in "${guest_files[@]}"; do
     cp --reflink=auto -- "$SOURCE_ART/$file" "$ART/$file"
 done
 cp -- "$SCRIPT_DIR/summarize.py" "$ART/summarize.py"
 cp -- "$SCRIPT_DIR/root_fuser_check.py" "$ART/root_fuser_check.py"
-sha256sum "$ART"/{selected.iso,ext2.img,exfat.img} > "$ART/input.sha256"
+sha256sum "${guest_files[@]/#/$ART/}" > "$ART/input.sha256"
 docker_identity=$(docker_local_preflight)
 printf '%s\n' "$docker_identity" > "$ART/docker-daemon.txt"
 docker image inspect "$TOOLS_IMAGE" --format '{{.Id}}' > "$ART/tools-image-id.txt"
@@ -303,7 +336,7 @@ confirm_docker_identity || return 2
 confirm_target_idle || return 2
 if [[ ${FORMAT_TARGET:-0} == 1 ]]; then
     docker run --rm --network none --device "$TARGET:/dev/benchmark-target:rwm" "$TOOLS_IMAGE" \
-        mkfs.ext4 -F -b 4096 -O '^has_journal' /dev/benchmark-target > "$ART/mkfs.log" 2>&1
+        mkfs.ext4 "${mkfs_args[@]}" /dev/benchmark-target > "$ART/mkfs.log" 2>&1
     confirm_target_idle || return 2
 fi
 confirm_docker_identity || return 2
@@ -314,8 +347,8 @@ docker run -d --name "$qemu_name" --pid=host --network none \
     timeout --signal=TERM --kill-after=30 900 "$QEMU_BIN" -enable-kvm -cpu host -machine q35 -smp 64 -m 8G \
     -S -qmp unix:/benchmark/qmp.sock,server=on,wait=off \
     -bios /root/ovmf/release/OVMF.fd -no-reboot -display none -serial stdio \
-    -monitor none -nic none -device isa-debug-exit,iobase=0xf4,iosize=0x04 \
-    -cdrom /benchmark/selected.iso \
+    -monitor none "${network_args[@]}" -device isa-debug-exit,iobase=0xf4,iosize=0x04 \
+    "${boot_args[@]}" \
     -drive if=none,format=raw,id=bootdata,file=/benchmark/ext2.img \
     -device virtio-blk-pci,drive=bootdata,disable-legacy=on \
     -drive if=none,format=raw,id=aux,file=/benchmark/exfat.img \

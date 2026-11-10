@@ -386,6 +386,27 @@ impl NvSlotAllocator {
         Ok(())
     }
 
+    pub(super) fn try_mark_allocated_after_predecessor(&self, range: Range<usize>) -> Result<bool> {
+        let Some(predecessor) = range.start.checked_sub(1) else {
+            return Ok(false);
+        };
+        let (domain, local) = match self.resolve_range(range) {
+            Ok(resolved) => resolved,
+            Err(error) if error.error() == Errno::EINVAL => return Ok(false),
+            Err(error) => return Err(error),
+        };
+        if !core::ptr::eq(domain, self.domain_for_slot(predecessor)?) {
+            return Ok(false);
+        }
+        let mut state = domain.state.lock();
+        if local.clone().any(|slot| !state.free_ranges.is_free(slot)) {
+            return Ok(false);
+        }
+        state.free_ranges.allocate(local)?;
+        Self::publish_domain_state(domain, &state);
+        Ok(true)
+    }
+
     pub(super) fn stats(&self) -> NvSlotAllocatorStats {
         NvSlotAllocatorStats {
             total_pages: self.total_pages,
@@ -498,6 +519,11 @@ mod tests {
         assert_eq!(
             allocator.allocate_contiguous(1_024, 0).unwrap(),
             Some(0..1_024)
+        );
+        assert!(
+            !allocator
+                .try_mark_allocated_after_predecessor(1_024..1_025)
+                .unwrap()
         );
         assert_eq!(
             allocator.allocate_contiguous(8, 0).unwrap(),

@@ -3,8 +3,8 @@
 //! Volatile exact-page redirect and contiguous-page-range indexes for rNVPCe.
 
 use core::{
-    ops::Range,
-    sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering},
+    ops::{Bound, Range},
+    sync::atomic::{AtomicBool, AtomicU8, AtomicU16, AtomicUsize, Ordering},
 };
 
 use ostd::sync::WaitQueue;
@@ -39,10 +39,11 @@ pub(crate) struct DescriptorHandle {
 pub(crate) enum NvExtentEntryState {
     Publishing = 1,
     Dirty = 2,
-    Migrating = 3,
-    IoComplete = 4,
-    Reclaiming = 5,
-    Reclaimed = 6,
+    Extending = 3,
+    Migrating = 4,
+    IoComplete = 5,
+    Reclaiming = 6,
+    Reclaimed = 7,
 }
 
 impl NvExtentEntryState {
@@ -50,10 +51,11 @@ impl NvExtentEntryState {
         match value {
             1 => Self::Publishing,
             2 => Self::Dirty,
-            3 => Self::Migrating,
-            4 => Self::IoComplete,
-            5 => Self::Reclaiming,
-            6 => Self::Reclaimed,
+            3 => Self::Extending,
+            4 => Self::Migrating,
+            5 => Self::IoComplete,
+            6 => Self::Reclaiming,
+            7 => Self::Reclaimed,
             _ => panic!("invalid NV extent entry state"),
         }
     }
@@ -61,6 +63,7 @@ impl NvExtentEntryState {
 
 pub(crate) struct DirtyNvExtentEntry {
     record: NvRedirectExtentRecord,
+    committed_pages: AtomicU16,
     state: AtomicU8,
     readers: AtomicUsize,
     writers: AtomicUsize,
@@ -83,6 +86,7 @@ impl DirtyNvExtentEntry {
             return_errno_with_message!(Errno::EINVAL, "dirty entry is not NV authoritative");
         }
         Ok(Self {
+            committed_pages: AtomicU16::new(record.page_count()),
             record,
             state: AtomicU8::new(state as u8),
             readers: AtomicUsize::new(0),
@@ -92,8 +96,8 @@ impl DirtyNvExtentEntry {
         })
     }
 
-    pub(crate) const fn record(&self) -> &NvRedirectExtentRecord {
-        &self.record
+    pub(crate) fn record_snapshot(&self) -> Result<NvRedirectExtentRecord> {
+        self.record.with_page_count(self.page_count())
     }
 
     pub(crate) fn state(&self) -> NvExtentEntryState {
@@ -112,26 +116,30 @@ impl DirtyNvExtentEntry {
         self.record.logical_start()
     }
 
-    pub(crate) const fn page_count(&self) -> u16 {
-        self.record.page_count()
+    pub(crate) fn page_count(&self) -> u16 {
+        self.committed_pages.load(Ordering::Acquire)
     }
 
     pub(crate) fn logical_range(&self) -> Range<u64> {
-        self.record
-            .logical_range()
-            .expect("validated dirty entry has a bounded logical range")
+        self.logical_start()..self.logical_start() + u64::from(self.page_count())
     }
 
     pub(crate) fn nv_slot_range(&self) -> Range<u64> {
-        self.record
+        let start = self
+            .record
             .nv_slot_range()
             .expect("validated dirty entry has a bounded NV range")
+            .start;
+        start..start + u64::from(self.page_count())
     }
 
     pub(crate) fn ssd_block_range(&self) -> Range<u64> {
-        self.record
+        let start = self
+            .record
             .ssd_block_range()
             .expect("validated dirty entry has a bounded SSD range")
+            .start;
+        start..start + u64::from(self.page_count())
     }
 
     fn transition(&self, from: NvExtentEntryState, to: NvExtentEntryState) -> Result<()> {
@@ -160,6 +168,7 @@ impl DirtyNvExtentEntry {
             if !matches!(
                 state,
                 NvExtentEntryState::Dirty
+                    | NvExtentEntryState::Extending
                     | NvExtentEntryState::Migrating
                     | NvExtentEntryState::IoComplete
             ) {
@@ -169,6 +178,7 @@ impl DirtyNvExtentEntry {
             if matches!(
                 self.state(),
                 NvExtentEntryState::Dirty
+                    | NvExtentEntryState::Extending
                     | NvExtentEntryState::Migrating
                     | NvExtentEntryState::IoComplete
             ) {
@@ -198,6 +208,28 @@ impl DirtyNvExtentEntry {
         return_errno_with_message!(Errno::EBUSY, "NV extent entry is migrating")
     }
 
+    pub(crate) fn begin_extension(
+        self: &Arc<Self>,
+        expected_pages: u16,
+        committed_pages: u16,
+    ) -> Result<NvExtentEntryExtension> {
+        if self.page_count() != expected_pages
+            || committed_pages <= expected_pages
+            || usize::from(committed_pages) > MAX_DIRTY_MIGRATION_EXTENT_PAGES
+        {
+            return_errno_with_message!(Errno::EINVAL, "invalid NV extent extension");
+        }
+        self.transition(NvExtentEntryState::Dirty, NvExtentEntryState::Extending)
+            .map_err(|_| Error::new(Errno::EBUSY))?;
+        self.wait_for_writers();
+        Ok(NvExtentEntryExtension {
+            entry: self.clone(),
+            expected_pages,
+            committed_pages,
+            committed: false,
+        })
+    }
+
     fn wait_for_writers(&self) {
         let _ = self
             .waiters
@@ -220,6 +252,54 @@ impl DirtyNvExtentEntry {
             NvExtentEntryState::Reclaiming,
             NvExtentEntryState::Reclaimed,
         )
+    }
+}
+
+pub(crate) struct NvExtentEntryExtension {
+    entry: Arc<DirtyNvExtentEntry>,
+    expected_pages: u16,
+    committed_pages: u16,
+    committed: bool,
+}
+
+impl NvExtentEntryExtension {
+    pub(crate) fn entry(&self) -> &Arc<DirtyNvExtentEntry> {
+        &self.entry
+    }
+
+    pub(crate) const fn expected_pages(&self) -> u16 {
+        self.expected_pages
+    }
+
+    pub(crate) const fn committed_pages(&self) -> u16 {
+        self.committed_pages
+    }
+
+    fn commit(mut self) {
+        self.entry
+            .committed_pages
+            .store(self.committed_pages, Ordering::Release);
+        self.entry
+            .transition(NvExtentEntryState::Extending, NvExtentEntryState::Dirty)
+            .expect("exclusive NV extent extension state changed");
+        self.committed = true;
+    }
+
+    fn abort(mut self) {
+        self.entry
+            .transition(NvExtentEntryState::Extending, NvExtentEntryState::Dirty)
+            .expect("exclusive NV extent extension state changed");
+        self.committed = true;
+    }
+}
+
+impl Drop for NvExtentEntryExtension {
+    fn drop(&mut self) {
+        if !self.committed {
+            let _ = self
+                .entry
+                .transition(NvExtentEntryState::Extending, NvExtentEntryState::Dirty);
+        }
     }
 }
 
@@ -620,6 +700,54 @@ impl RedirectDirectory {
         self.publish_one_entry(entry, NvExtentEntryState::Dirty)
     }
 
+    pub(crate) fn finish_entry_extension(&self, extension: NvExtentEntryExtension) -> Result<()> {
+        let entry = extension.entry().clone();
+        let inode_map = self
+            .inode_map(entry.fs_id(), entry.inode(), false)?
+            .ok_or_else(|| Error::new(Errno::ESTALE))?;
+        let entries = inode_map.entries.lock();
+        if !entries
+            .get(&entry.logical_start())
+            .is_some_and(|mapped| Arc::ptr_eq(mapped, &entry))
+        {
+            return_errno_with_message!(Errno::ESTALE, "extended NV entry disappeared");
+        }
+        let new_end = entry
+            .logical_start()
+            .checked_add(u64::from(extension.committed_pages()))
+            .ok_or_else(|| Error::new(Errno::EOVERFLOW))?;
+        if entries
+            .range((Bound::Excluded(entry.logical_start()), Bound::Unbounded))
+            .next()
+            .is_some_and(|(start, _)| *start < new_end)
+        {
+            return_errno_with_message!(Errno::EBUSY, "extended NV entry overlaps successor");
+        }
+        let added = usize::from(extension.committed_pages() - extension.expected_pages());
+        extension.commit();
+        if entry.migration_registered.load(Ordering::Acquire)
+            && let Some(workers) = self.migration_worker_set(entry.fs_id())
+        {
+            workers.extend_dirty(&inode_map, added);
+        }
+        drop(entries);
+        Ok(())
+    }
+
+    pub(crate) fn abort_entry_extension(&self, extension: NvExtentEntryExtension, requeue: bool) {
+        let entry = extension.entry().clone();
+        extension.abort();
+        if !requeue || !entry.migration_registered.load(Ordering::Acquire) {
+            return;
+        }
+        let Ok(Some(inode_map)) = self.inode_map(entry.fs_id(), entry.inode(), false) else {
+            return;
+        };
+        if let Some(workers) = self.migration_worker_set(entry.fs_id()) {
+            workers.ensure_dirty_ready(&inode_map);
+        }
+    }
+
     pub(crate) fn publish_entries(&self, new_entries: &[Arc<DirtyNvExtentEntry>]) -> Result<()> {
         self.prepare_entries(new_entries)?;
         self.activate_prepared_entries_atomically(new_entries)
@@ -792,6 +920,11 @@ impl RedirectDirectory {
         worker_id: usize,
     ) -> Option<MigrationWorkerLoadSnapshot> {
         self.migration_worker_set(fs_id)?.snapshot(worker_id)
+    }
+
+    pub(crate) fn migration_queued_dirty_pages(&self, fs_id: u64) -> Option<usize> {
+        self.migration_worker_set(fs_id)
+            .map(|workers| workers.queued_dirty_pages())
     }
 
     pub(crate) fn migration_worker_count(&self, fs_id: u64) -> Option<usize> {

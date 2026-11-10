@@ -27,6 +27,25 @@ Each result run needs exclusive ownership of its target device and QEMU instance
 
 Keep latency or tracing instrumentation off for absolute-throughput runs. Enable it only for a separately labeled diagnostic run, then do not compare its throughput with an uninstrumented result. Preserve the guest completion marker, configuration snapshot, and parser output for every candidate point. A timeout, silent guest exit, missing completion marker, invalid parser row, or changed configuration excludes that point from formal comparison.
 
+Unless an experiment explicitly states that SSD allocation metadata is part of
+the measured mechanism, prepare the target data before measurement as a
+low-fragmentation, logically and physically contiguous file. The default
+multi-job workload uses non-overlapping ranges of that one file. If the purpose
+requires one inode per job, create the files sequentially, never concurrently,
+and verify that their extent counts remain low and comparable. Concurrent file
+creation changes the extent-tree shape and is a separate workload variable.
+
+Record the prepared file size, data-extent count and extent-index-block count
+from a read-only `debugfs stat` (or an equivalent structured inspector) for
+every point. A point with an unexplained layout difference cannot be used for
+thread or block-size scaling conclusions. Prefer cloning one frozen prepared
+filesystem state across a sweep when the harness supports it.
+
+Only an experiment named and documented as `first-write`, `fresh-file`, or
+`allocation-included` may create holes/files and allocate SSD blocks, bitmaps,
+GDT state or extent nodes during the timed interval. Its results must not be
+mixed into the default overwrite curve.
+
 Device-backed harnesses reformat their selected test filesystem. Pass `--confirm-destroy` only after verifying the device mapping and that no needed data is present. Formatting is intentional and destructive.
 
 ## Acceptance

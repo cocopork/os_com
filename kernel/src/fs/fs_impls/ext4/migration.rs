@@ -37,7 +37,20 @@ use worker::DurableBatchResult;
 pub(super) use worker::RtioWorkerRuntime;
 
 const MIGRATION_BATCH_PAGES: usize = super::writeback::WRITEBACK_BATCH;
+
+fn should_run_background_migration(
+    worker_dirty_pages: usize,
+    total_dirty_pages: usize,
+    capacity_waiters: usize,
+    progress_waiters: usize,
+) -> bool {
+    worker_dirty_pages != 0
+        && (total_dirty_pages >= MIGRATION_BATCH_PAGES
+            || capacity_waiters != 0
+            || progress_waiters != 0)
+}
 const MAX_RTIO_WORKERS: usize = 16;
+const DEFAULT_RTIO_WORKERS: usize = 4;
 
 static RTIO_WORKERS_PARAM: Once<String> = Once::new();
 aster_cmdline::define_kv_param!("rtio_workers", RTIO_WORKERS_PARAM);
@@ -61,9 +74,7 @@ pub(super) fn rtio_worker_count(
             "rtio_workers exceeds available submission queues"
         );
     }
-    // The four-queue experiment regressed sequential writes; parallel workers
-    // remain opt-in until the performance acceptance gates pass.
-    Ok(override_value.unwrap_or(1))
+    Ok(override_value.unwrap_or_else(|| DEFAULT_RTIO_WORKERS.min(submission_queues)))
 }
 
 pub(super) fn configured_rtio_worker_count(
@@ -343,11 +354,30 @@ impl Ext4 {
                         if fs.is_shutdown() || fs.nv_migration_failed.load(Ordering::Acquire) {
                             break;
                         }
-                        if uses_shared_migration_rounds(fs.rnvpc_mode())
-                            || rnvpc::needs_flush_watermark()
-                            || fs.nv_capacity_waiters.load(Ordering::Acquire) != 0
-                            || fs.nv_migration_progress_waiters.load(Ordering::Acquire) != 0
-                        {
+                        let capacity_waiters = fs.nv_capacity_waiters.load(Ordering::Acquire);
+                        let progress_waiters =
+                            fs.nv_migration_progress_waiters.load(Ordering::Acquire);
+                        let run_migration = if uses_shared_migration_rounds(fs.rnvpc_mode()) {
+                            let pool = rnvpc::pool()
+                                .expect("rNVPCe migration worker requires an initialized pool");
+                            let total_dirty_pages = pool
+                                .migration_queued_dirty_pages(fs.rnvpc_fs_id())
+                                .unwrap_or(0);
+                            let worker_dirty_pages = pool
+                                .migration_worker_load_snapshot(fs.rnvpc_fs_id(), worker_id)
+                                .map_or(0, |load| load.queued_dirty_pages);
+                            should_run_background_migration(
+                                worker_dirty_pages,
+                                total_dirty_pages,
+                                capacity_waiters,
+                                progress_waiters,
+                            )
+                        } else {
+                            rnvpc::needs_flush_watermark()
+                                || capacity_waiters != 0
+                                || progress_waiters != 0
+                        };
+                        if run_migration {
                             let result = if uses_shared_migration_rounds(fs.rnvpc_mode()) {
                                 fs.migrate_nv_round_on_queue(MIGRATION_BATCH_PAGES, affinity)
                             } else {
@@ -364,7 +394,16 @@ impl Ext4 {
                                     break;
                                 }
                             }
-                            match fs.rtio_durability.try_advance_idle(&fs, Some(worker_id)) {
+                            let queued_dirty_pages = rnvpc::pool()
+                                .and_then(|pool| {
+                                    pool.migration_queued_dirty_pages(fs.rnvpc_fs_id())
+                                })
+                                .unwrap_or(0);
+                            match fs.rtio_durability.try_advance_idle(
+                                &fs,
+                                Some(worker_id),
+                                queued_dirty_pages,
+                            ) {
                                 Ok(processed) if processed != 0 => {
                                     if let Err(error) =
                                         fs.process_rtio_worker_completions(worker_id)
@@ -568,18 +607,22 @@ impl Ext4 {
         let Some(pool) = rnvpc::pool() else {
             return;
         };
-        let Some(worker_id) = pool.nv_entry_owner_worker(self.rnvpc_fs_id(), inode) else {
+        if pool
+            .nv_entry_owner_worker(self.rnvpc_fs_id(), inode)
+            .is_none()
+        {
             return;
-        };
-        let Some((epoch, trigger)) = self
-            .nv_migration_worker_epochs
-            .get(worker_id)
-            .zip(self.nv_migration_triggers.get(worker_id))
-        else {
+        }
+        let total_dirty_pages = pool
+            .migration_queued_dirty_pages(self.rnvpc_fs_id())
+            .unwrap_or(0);
+        if total_dirty_pages < MIGRATION_BATCH_PAGES
+            && self.nv_capacity_waiters.load(Ordering::Acquire) == 0
+            && self.nv_migration_progress_waiters.load(Ordering::Acquire) == 0
+        {
             return;
-        };
-        epoch.fetch_add(1, Ordering::Release);
-        trigger.wake_one();
+        }
+        self.request_nv_migration();
     }
 
     /// Sleeps outside inode/publication locks until a migration round completes.
@@ -1013,9 +1056,11 @@ impl Ext4 {
         }
         let group_started = pp::now();
         let cpu = CpuId::current_racy().as_usize();
-        let goal_group = goal
-            .map(|block| self.block_group_index_for_block(block))
-            .transpose()?;
+        // A locality hint is advisory. In particular, the exclusive end of an
+        // allocation at the end of the device equals `total_blocks`; treat it
+        // as absent instead of turning a later allocation into EINVAL.
+        let goal = goal.filter(|block| self.block_group_index_for_block(*block).is_ok());
+        let goal_group = goal.and_then(|block| self.block_group_index_for_block(block).ok());
         pp::NV_FOREGROUND_GROUP_RESERVE.record_since(group_started, count as usize);
         let mut ranges = Vec::new();
         let allocation_result = (|| {
@@ -1027,8 +1072,7 @@ impl Ext4 {
                 for group in self.allocation_group_selector.candidates(
                     cpu,
                     next_goal
-                        .map(|block| self.block_group_index_for_block(block))
-                        .transpose()?
+                        .and_then(|block| self.block_group_index_for_block(block).ok())
                         .or(goal_group),
                     1,
                 ) {
@@ -1767,13 +1811,15 @@ pub(super) mod tests {
     #[ktest]
     fn rtio_worker_policy_defaults_and_bounds() {
         for (cpus, queues, expected) in [
-            (64, 16, 1),
-            (16, 16, 1),
-            (4, 16, 1),
-            (0, 16, 1),
-            (64, 2, 1),
+            (64, 16, 4),
+            (16, 16, 4),
+            (4, 16, 4),
+            (0, 16, 4),
+            (64, 4, 4),
+            (64, 3, 3),
+            (64, 2, 2),
             (64, 1, 1),
-            (256, 16, 1),
+            (256, 16, 4),
         ] {
             assert_eq!(
                 rtio_worker_count(RnvpcMode::RnvpcExtend, cpus, queues, None).unwrap(),
@@ -1810,6 +1856,30 @@ pub(super) mod tests {
             assert_eq!(rtio_worker_count(mode, 64, 1, None).unwrap(), 1);
             assert_eq!(rtio_worker_count(mode, 64, 1, Some(4)).unwrap(), 1);
         }
+    }
+
+    #[ktest]
+    fn rnvpce_background_migration_waits_for_batch_or_waiter() {
+        assert!(!should_run_background_migration(
+            1,
+            MIGRATION_BATCH_PAGES - 1,
+            0,
+            0,
+        ));
+        assert!(should_run_background_migration(
+            1,
+            MIGRATION_BATCH_PAGES,
+            0,
+            0,
+        ));
+        assert!(!should_run_background_migration(
+            0,
+            MIGRATION_BATCH_PAGES,
+            1,
+            1,
+        ));
+        assert!(should_run_background_migration(1, 1, 1, 0));
+        assert!(should_run_background_migration(1, 1, 0, 1));
     }
 
     #[ktest]
@@ -2047,7 +2117,9 @@ pub(super) mod tests {
 
         let before = disk.disk.flush_count();
         assert_eq!(
-            fs.rtio_durability.try_advance_idle(&fs, Some(0)).unwrap(),
+            fs.rtio_durability
+                .try_advance_idle(&fs, Some(0), 0)
+                .unwrap(),
             1
         );
         assert_eq!(disk.disk.flush_count() - before, 1);

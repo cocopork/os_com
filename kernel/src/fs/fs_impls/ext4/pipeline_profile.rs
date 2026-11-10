@@ -83,6 +83,20 @@ pub(crate) static NV_FOREGROUND_BLOCK_ALLOCATE: Metric = Metric::new();
 pub(crate) static NV_FOREGROUND_ALLOCATION_METADATA: Metric = Metric::new();
 pub(crate) static NV_FOREGROUND_ALLOCATION_RECORD_PUBLISH: Metric = Metric::new();
 pub(crate) static NV_FOREGROUND_ALLOCATION_RECORD_RECLAIM: Metric = Metric::new();
+pub(crate) static NV_FOREGROUND_PRE_GUARD: Metric = Metric::new();
+pub(crate) static NV_FOREGROUND_PUBLICATION_ACQUIRE: Metric = Metric::new();
+pub(crate) static NV_FOREGROUND_GUARDED_AUTHORITY: Metric = Metric::new();
+pub(crate) static NV_FOREGROUND_PLAN: Metric = Metric::new();
+pub(crate) static NV_FOREGROUND_PLAN_INODE: Metric = Metric::new();
+pub(crate) static NV_FOREGROUND_PLAN_REDIRECT: Metric = Metric::new();
+pub(crate) static NV_FOREGROUND_PLAN_TREE: Metric = Metric::new();
+pub(crate) static NV_FOREGROUND_PLAN_TREE_READ: Metric = Metric::new();
+pub(crate) static NV_FOREGROUND_PLAN_BUILD: Metric = Metric::new();
+pub(crate) static NV_FOREGROUND_SPAN_PREPARE: Metric = Metric::new();
+pub(crate) static NV_FOREGROUND_DATA_RESERVE: Metric = Metric::new();
+pub(crate) static NV_FOREGROUND_ALLOCATION_GOAL: Metric = Metric::new();
+pub(crate) static NV_FOREGROUND_REQUEST_BUILD: Metric = Metric::new();
+pub(crate) static NV_FOREGROUND_POST_COMMIT: Metric = Metric::new();
 pub(crate) static NV_FOREGROUND_PERSIST: Metric = Metric::new();
 pub(crate) static NV_CAPACITY_WAIT: Metric = Metric::new();
 pub(crate) static NV_FLUSH_TOTAL: Metric = Metric::new();
@@ -526,6 +540,32 @@ pub(super) fn dump_snapshot(
             "nv_foreground_allocation_record_reclaim",
             &NV_FOREGROUND_ALLOCATION_RECORD_RECLAIM,
         ),
+        ("nv_foreground_pre_guard", &NV_FOREGROUND_PRE_GUARD),
+        (
+            "nv_foreground_publication_acquire",
+            &NV_FOREGROUND_PUBLICATION_ACQUIRE,
+        ),
+        (
+            "nv_foreground_guarded_authority",
+            &NV_FOREGROUND_GUARDED_AUTHORITY,
+        ),
+        ("nv_foreground_plan", &NV_FOREGROUND_PLAN),
+        ("nv_foreground_plan_inode", &NV_FOREGROUND_PLAN_INODE),
+        ("nv_foreground_plan_redirect", &NV_FOREGROUND_PLAN_REDIRECT),
+        ("nv_foreground_plan_tree", &NV_FOREGROUND_PLAN_TREE),
+        (
+            "nv_foreground_plan_tree_read",
+            &NV_FOREGROUND_PLAN_TREE_READ,
+        ),
+        ("nv_foreground_plan_build", &NV_FOREGROUND_PLAN_BUILD),
+        ("nv_foreground_span_prepare", &NV_FOREGROUND_SPAN_PREPARE),
+        ("nv_foreground_data_reserve", &NV_FOREGROUND_DATA_RESERVE),
+        (
+            "nv_foreground_allocation_goal",
+            &NV_FOREGROUND_ALLOCATION_GOAL,
+        ),
+        ("nv_foreground_request_build", &NV_FOREGROUND_REQUEST_BUILD),
+        ("nv_foreground_post_commit", &NV_FOREGROUND_POST_COMMIT),
         ("nv_foreground_persist", &NV_FOREGROUND_PERSIST),
         ("nv_capacity_wait", &NV_CAPACITY_WAIT),
         ("nv_flush_total", &NV_FLUSH_TOTAL),

@@ -43,8 +43,36 @@ one redirect entry, and one entry-level publication transaction.
 - The rNVPC WAL mode and persistent metadata-object descriptors do not change.
 - The virtio queue, rTIO worker count, and SSD block-group allocator are outside
   this change.
-- Adjacent dirty entries are not synchronously coalesced on the foreground hot
-  path. Coalescing is optional follow-on work.
+- Existing independent dirty entries are not synchronously rewritten into one
+  record. The follow-on open-entry path may extend the immediately preceding
+  entry when logical pages, NV slots, and SSD blocks remain contiguous.
+
+## 3.1 Open redirect extent follow-on
+
+The first write persists one recovery-authoritative `NvRedirectExtentRecord`.
+Its DRAM `DirtyNvExtentEntry` remains open while it is dirty and shorter than
+128 pages. A later adjacent overwrite may append to that same object when the
+logical page, exact next NV slot, and SSD block are all contiguous and no
+migration owns the entry.
+
+The append order is:
+
+1. reserve and initialize the exact adjacent NV slots;
+2. persist every appended data page and fence;
+3. atomically advance the selected persistent record copy's aligned 8-byte
+   header containing `page_count`, persist it, and fence;
+4. publish the larger page count to the DRAM entry and migration accounting.
+
+A crash before step 3 leaves an unreachable initialized tail that recovery
+reclaims as a leak. A crash after step 3 recovers the complete extended range.
+The runtime open-entry cursor, extension ownership, and cached route remain
+DRAM-only.
+
+For a pure overwrite, redirect visibility uses the current authoritative inode
+generation. If extent root, file size, and block count are unchanged, the
+transaction returns the existing inode reference rather than persisting an
+identical inode record. EOF growth and allocation still publish a new inode
+generation through F7.
 
 ## 4. Range model
 
@@ -349,3 +377,26 @@ entry-lock wait/hold, data fences, selector fences, capacity waits, rTIO
 candidate pages, BIO sizes, and durable bandwidth. The expected structural
 result is metadata work proportional to entries; a bandwidth increase is
 measured, not assumed.
+
+## 12. Open redirect extent implementation (2026-11-09)
+
+Adjacent overwrite system calls now extend an existing persistent redirect
+entry when logical pages, NV slots, and SSD blocks are all contiguous. The
+allocator must reserve the exact tail in the same allocation domain; numerical
+adjacency produced by an ordinary or cross-domain allocation is not sufficient.
+An explicit reservation marker carries this proof into the transaction commit.
+
+The persistent update first flushes the new data tail, then atomically updates
+and persists the selected record copy's aligned header containing `page_count`.
+The DRAM entry advances only after that commit boundary. `Extending` excludes
+migration while readers continue to use the old committed prefix. If exact
+reservation or extension ownership fails, the write publishes an independent
+entry through the existing path.
+
+Pure overwrites also reuse the authoritative inode record and generation when
+the extent root, file size, and block count are unchanged. Recovery tests cover
+both sides of the redirect header commit boundary. Five 1-job runs on the real
+NVMe device increased 4 KiB sequential overwrite from 183.69 MiB/s to a
+630.80 MiB/s mean, while random overwrite remained near baseline at
+189.22 MiB/s. Full evidence is recorded in
+`docs/experiments/reports/RNVPCE-OPEN-REDIRECT-EXTENTS-2026-11-09.md`.
