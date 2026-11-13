@@ -32,7 +32,8 @@ use super::{
         AuthoritySnapshot, RangeWriteBatch, RangeWritePage, SsdBaselineExtent, SsdMigrationPage,
         WriteAllocation, WriteExtent, allocation_record_count, authoritative_inode_state,
         bootstrap_inode_authority, commit_range_write, consume_ssd_capacity_locked,
-        current_page_mapping, mapped_nv_page_ref, plan_range_write, publish_ssd_baseline_batch,
+        current_page_mapping, mapped_nv_page_ref, plan_range_write, plan_range_write_from_inode,
+        plan_range_write_from_inode_with_ssd_route, publish_ssd_baseline_batch,
         publish_ssd_baseline_extent, publish_ssd_baseline_extents, range_write_new_pages,
         reserve_ssd_capacity, space_reservation, test_release_migration_credit_with,
         visit_ssd_extents,
@@ -1738,6 +1739,61 @@ fn rnvpce_initial_range_capacity_count_does_not_reread_extent_tree() {
 }
 
 #[ktest]
+fn rnvpce_cached_inode_authority_reads_record_once() {
+    const FS_ID: u64 = 0xa209;
+    const INODE: u64 = 48;
+    let pool = test_pool(32, 8, 24, None);
+    let snapshot = AuthoritySnapshot::new(1, &[], 0, 0, 0o100644, 0).unwrap();
+    let authority = bootstrap_inode_authority(pool.clone(), FS_ID, INODE, &snapshot, None).unwrap();
+    let reads = pool.authoritative_metadata_reads();
+    let notifications = pool.metadata_pin_notifications();
+
+    let loaded = pool
+        .read_fixed_inode(FS_ID, INODE, Some(authority.inode()))
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(loaded.reference(), authority.inode());
+    let record = loaded.record();
+    assert_eq!(record.header().fs_id(), FS_ID);
+    assert_eq!(record.header().inode(), INODE);
+    assert_eq!(
+        pool.authoritative_metadata_reads() - reads,
+        1,
+        "a stable fixed-inode reference must decode its record only once"
+    );
+    assert_eq!(
+        pool.metadata_pin_notifications() - notifications,
+        0,
+        "an uncontended metadata read must not broadcast a pin-state change"
+    );
+}
+
+#[ktest]
+fn rnvpce_range_plan_reuses_loaded_inode_authority() {
+    const FS_ID: u64 = 0xa20c;
+    const INODE: u64 = 51;
+    let pool = test_pool(32, 8, 24, None);
+    let snapshot = AuthoritySnapshot::new(1, &[], 0, 0, 0o100644, 0).unwrap();
+    let authority = bootstrap_inode_authority(pool.clone(), FS_ID, INODE, &snapshot, None).unwrap();
+    let loaded = pool
+        .read_fixed_inode(FS_ID, INODE, Some(authority.inode()))
+        .unwrap()
+        .unwrap();
+    let reads = pool.authoritative_metadata_reads();
+
+    let plan =
+        plan_range_write_from_inode(&pool, FS_ID, INODE, 0, PAGE_SIZE, 0, loaded.record()).unwrap();
+
+    assert_eq!(plan.inode_generation, 1);
+    assert_eq!(
+        pool.authoritative_metadata_reads() - reads,
+        1,
+        "a loaded inode authority must not be decoded again while planning"
+    );
+}
+
+#[ktest]
 fn rnvpce_initial_range_commit_does_not_revalidate_each_page() {
     const FS_ID: u64 = 0xa20b;
     const INODE: u64 = 50;
@@ -1835,7 +1891,7 @@ fn rnvpce_range_write_plan() {
     .unwrap();
     let tree_lookups = contiguous.extent_tree_range_lookups();
     let redirect_lookups = contiguous.redirect_overlap_lookups();
-    let plan = plan_range_write(
+    let mut plan = plan_range_write(
         &contiguous,
         FS_ID,
         INODE,
@@ -1851,6 +1907,34 @@ fn rnvpce_range_write_plan() {
     assert_eq!(plan.ssd_allocation_goal(Some(99_000)).unwrap(), None);
     assert_eq!(contiguous.extent_tree_range_lookups() - tree_lookups, 1);
     assert_eq!(contiguous.redirect_overlap_lookups() - redirect_lookups, 1);
+    let mut discovered = plan.take_discovered_ssd_routes().unwrap();
+    assert_eq!(discovered.len(), 1);
+    assert_eq!(discovered[0].logical_range(), &(0..32));
+    assert_eq!(discovered[0].ssd_start(), 40_000);
+    assert!(discovered[0].is_written());
+
+    let loaded = contiguous
+        .read_fixed_inode(FS_ID, INODE, None)
+        .unwrap()
+        .unwrap();
+    let cached_lookups = contiguous.extent_tree_range_lookups();
+    let cached_plan = plan_range_write_from_inode_with_ssd_route(
+        &contiguous,
+        FS_ID,
+        INODE,
+        4 * PAGE_SIZE as u64,
+        PAGE_SIZE,
+        32 * PAGE_SIZE as u64,
+        loaded.record(),
+        discovered.pop().unwrap(),
+    )
+    .unwrap();
+    assert_eq!(shape(&cached_plan), vec![(1, 4, 5, 40_004, true)]);
+    assert_eq!(
+        contiguous.extent_tree_range_lookups() - cached_lookups,
+        0,
+        "a complete EST route hit must not read the NVM extent tree"
+    );
 
     let discontinuous = test_pool(128, 32, 96, None);
     let discontinuous_extents = [
@@ -1971,6 +2055,25 @@ fn rnvpce_range_write_plan() {
         .collect::<Vec<_>>();
     let dirty_nv_start = staged[0].0.index() as u64;
     dirty.publish_redirect_batch(&staged, None).unwrap();
+    let redirect_only_lookups = dirty.extent_tree_range_lookups();
+    let redirect_only = plan_range_write(
+        &dirty,
+        FS_ID,
+        INODE + 2,
+        8 * PAGE_SIZE as u64,
+        4 * PAGE_SIZE,
+        16 * PAGE_SIZE as u64,
+    )
+    .unwrap();
+    assert_eq!(
+        shape(&redirect_only),
+        vec![(0, 8, 12, dirty_nv_start, true)]
+    );
+    assert_eq!(
+        dirty.extent_tree_range_lookups() - redirect_only_lookups,
+        0,
+        "a redirect-complete write must not read the NVM extent tree"
+    );
     let dirty_plan = plan_range_write(
         &dirty,
         FS_ID,

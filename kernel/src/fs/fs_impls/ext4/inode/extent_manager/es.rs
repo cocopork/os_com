@@ -74,6 +74,74 @@ struct EsInner {
     /// Authoritative delayed ownership; never evicted with mapping facts.
     delayed: BTreeMap<Iblock, Iblock>,
     delayed_count: u64,
+    rnvpce_generation: Option<u64>,
+    /// Sorted, pairwise-disjoint routes. Capacity is reserved before taking
+    /// `inner`, so route mutation never enters the allocator under this lock.
+    rnvpce_routes: Option<Vec<RnvpceSsdRoute>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(in crate::fs::fs_impls::ext4::inode) struct RnvpceSsdRoute {
+    logical_start: u64,
+    length: u32,
+    ssd_start: u64,
+    written: bool,
+}
+
+impl RnvpceSsdRoute {
+    pub(in crate::fs::fs_impls::ext4::inode) fn new(
+        logical_start: u64,
+        length: u32,
+        ssd_start: u64,
+        written: bool,
+    ) -> Result<Self> {
+        if length == 0
+            || logical_start.checked_add(u64::from(length)).is_none()
+            || ssd_start.checked_add(u64::from(length)).is_none()
+        {
+            return_errno_with_message!(Errno::EINVAL, "invalid rNVPCe SSD route");
+        }
+        Ok(Self {
+            logical_start,
+            length,
+            ssd_start,
+            written,
+        })
+    }
+
+    pub(in crate::fs::fs_impls::ext4::inode) const fn logical_start(&self) -> u64 {
+        self.logical_start
+    }
+
+    pub(in crate::fs::fs_impls::ext4::inode) const fn length(&self) -> u32 {
+        self.length
+    }
+
+    pub(in crate::fs::fs_impls::ext4::inode) const fn ssd_start(&self) -> u64 {
+        self.ssd_start
+    }
+
+    pub(in crate::fs::fs_impls::ext4::inode) const fn is_written(&self) -> bool {
+        self.written
+    }
+
+    fn logical_end(&self) -> u64 {
+        self.logical_start + u64::from(self.length)
+    }
+
+    fn clipped(&self, start: u64, end: u64) -> Result<Self> {
+        let clipped_start = self.logical_start.max(start);
+        let clipped_end = self.logical_end().min(end);
+        let offset = clipped_start - self.logical_start;
+        Self::new(
+            clipped_start,
+            u32::try_from(clipped_end - clipped_start).map_err(|_| Error::new(Errno::EOVERFLOW))?,
+            self.ssd_start
+                .checked_add(offset)
+                .ok_or_else(|| Error::new(Errno::EOVERFLOW))?,
+            self.written,
+        )
+    }
 }
 
 /// The answer of a range-coverage query: the STRONGEST statement about
@@ -206,8 +274,110 @@ impl EsCache {
                 map: BTreeMap::new(),
                 delayed: BTreeMap::new(),
                 delayed_count: 0,
+                rnvpce_generation: None,
+                rnvpce_routes: None,
             }),
         }
+    }
+
+    pub(super) fn record_rnvpce_routes(
+        &self,
+        generation: u64,
+        routes: &[RnvpceSsdRoute],
+    ) -> Result<()> {
+        let needs_storage = {
+            let mut inner = self.inner.lock();
+            inner.select_rnvpce_generation(generation);
+            inner.rnvpce_routes.is_none()
+        };
+        let mut reserved = if needs_storage {
+            let mut routes = Vec::new();
+            routes
+                .try_reserve_exact(Self::CAPACITY)
+                .map_err(|_| Error::new(Errno::ENOMEM))?;
+            Some(routes)
+        } else {
+            None
+        };
+        let mut inner = self.inner.lock();
+        inner.select_rnvpce_generation(generation);
+        if inner.rnvpce_routes.is_none() {
+            inner.rnvpce_routes = reserved.take();
+        }
+        let cached = inner
+            .rnvpce_routes
+            .as_mut()
+            .expect("rNVPCe route capacity was initialized");
+        for route in routes {
+            if cached.len() >= Self::CAPACITY {
+                cached.clear();
+            }
+            cached.retain(|existing| {
+                existing.logical_end() <= route.logical_start
+                    || existing.logical_start >= route.logical_end()
+            });
+            let position =
+                cached.partition_point(|existing| existing.logical_start < route.logical_start);
+            cached.insert(position, *route);
+        }
+        Ok(())
+    }
+
+    pub(super) fn rnvpce_route(
+        &self,
+        generation: u64,
+        range: Range<u64>,
+    ) -> Result<Option<RnvpceSsdRoute>> {
+        if range.start >= range.end {
+            return Ok(None);
+        }
+        let mut inner = self.inner.lock();
+        inner.select_rnvpce_generation(generation);
+        let routes = inner.rnvpce_route_slice();
+        let index = routes.partition_point(|route| route.logical_end() <= range.start);
+        let Some(route) = routes.get(index) else {
+            return Ok(None);
+        };
+        if route.logical_start > range.start || route.logical_end() < range.end {
+            return Ok(None);
+        }
+        Ok(Some(route.clipped(range.start, range.end)?))
+    }
+
+    pub(super) fn rnvpce_routes(
+        &self,
+        generation: u64,
+        range: Range<u64>,
+    ) -> Result<Option<Vec<RnvpceSsdRoute>>> {
+        if range.start >= range.end {
+            return Ok(None);
+        }
+        let count = {
+            let mut inner = self.inner.lock();
+            inner.select_rnvpce_generation(generation);
+            inner.rnvpce_route_count(range.clone())
+        };
+        let Some(count) = count else {
+            return Ok(None);
+        };
+        let mut routes = Vec::new();
+        routes
+            .try_reserve_exact(count)
+            .map_err(|_| Error::new(Errno::ENOMEM))?;
+        let inner = self.inner.lock();
+        if inner.rnvpce_generation != Some(generation)
+            || inner.rnvpce_route_count(range.clone()) != Some(count)
+        {
+            return Ok(None);
+        }
+        let scan_from = inner.rnvpce_scan_start(range.start);
+        for route in &inner.rnvpce_route_slice()[scan_from..] {
+            if route.logical_start >= range.end {
+                break;
+            }
+            routes.push(route.clipped(range.start, range.end)?);
+        }
+        Ok(Some(routes))
     }
 
     /// Records one fact a walk/edit just proved under the ③ lock. Every
@@ -308,6 +478,44 @@ impl EsCache {
 }
 
 impl EsInner {
+    fn select_rnvpce_generation(&mut self, generation: u64) {
+        if self.rnvpce_generation != Some(generation) {
+            if let Some(routes) = self.rnvpce_routes.as_mut() {
+                routes.clear();
+            }
+            self.rnvpce_generation = Some(generation);
+        }
+    }
+
+    fn rnvpce_route_slice(&self) -> &[RnvpceSsdRoute] {
+        self.rnvpce_routes.as_deref().unwrap_or(&[])
+    }
+
+    fn rnvpce_scan_start(&self, start: u64) -> usize {
+        self.rnvpce_route_slice()
+            .partition_point(|route| route.logical_end() <= start)
+    }
+
+    fn rnvpce_route_count(&self, range: Range<u64>) -> Option<usize> {
+        let scan_from = self.rnvpce_scan_start(range.start);
+        let mut cursor = range.start;
+        let mut count = 0usize;
+        for route in &self.rnvpce_route_slice()[scan_from..] {
+            if route.logical_start > cursor {
+                return None;
+            }
+            if route.logical_end() <= cursor {
+                continue;
+            }
+            cursor = route.logical_end();
+            count = count.checked_add(1)?;
+            if cursor >= range.end {
+                return Some(count);
+            }
+        }
+        None
+    }
+
     /// Returns the key of the entry that starts BELOW `boundary` but extends
     /// across it, if any — the straddler both `record` and `invalidate_range`
     /// must remove and `range_state` must scan from.
@@ -352,9 +560,76 @@ mod tests {
             straddler_across_span_start_is_invalidated_whole,
             record_on_full_cache_clears_then_seeds,
             record_removes_overlapping_facts_first,
+            rnvpce_routes_require_complete_current_generation_coverage,
             range_state_returns_strongest_true_tier,
             tail_span_invalidation_clears_tail_and_spares_head,
             clear_all_drops_every_fact,
+        );
+    }
+
+    fn rnvpce_routes_require_complete_current_generation_coverage() {
+        let es = EsCache::new();
+        es.record_rnvpce_routes(
+            7,
+            &[
+                RnvpceSsdRoute::new(0, 4, 100, true).unwrap(),
+                RnvpceSsdRoute::new(4, 4, 900, false).unwrap(),
+            ],
+        )
+        .unwrap();
+
+        let routes = es.rnvpce_routes(7, 1..7).unwrap().unwrap();
+        assert_eq!(routes.len(), 2);
+        assert_eq!(routes[0], RnvpceSsdRoute::new(1, 3, 101, true).unwrap());
+        assert_eq!(routes[1], RnvpceSsdRoute::new(4, 3, 900, false).unwrap());
+        assert_eq!(
+            es.rnvpce_route(7, 1..3).unwrap(),
+            Some(RnvpceSsdRoute::new(1, 2, 101, true).unwrap())
+        );
+        assert!(es.rnvpce_route(7, 3..5).unwrap().is_none());
+        assert!(es.rnvpce_routes(7, 0..9).unwrap().is_none());
+
+        es.record_rnvpce_routes(8, &[RnvpceSsdRoute::new(8, 2, 300, true).unwrap()])
+            .unwrap();
+        assert!(es.rnvpce_routes(8, 0..1).unwrap().is_none());
+        assert_eq!(
+            es.rnvpce_routes(8, 8..10).unwrap().unwrap(),
+            vec![RnvpceSsdRoute::new(8, 2, 300, true).unwrap()]
+        );
+        assert!(es.rnvpce_routes(7, 8..10).unwrap().is_none());
+        assert!(es.rnvpce_routes(8, 8..10).unwrap().is_none());
+
+        let overlap = EsCache::new();
+        overlap
+            .record_rnvpce_routes(1, &[RnvpceSsdRoute::new(0, 8, 100, true).unwrap()])
+            .unwrap();
+        overlap
+            .record_rnvpce_routes(1, &[RnvpceSsdRoute::new(2, 2, 900, false).unwrap()])
+            .unwrap();
+        assert!(overlap.rnvpce_routes(1, 0..8).unwrap().is_none());
+        assert_eq!(
+            overlap.rnvpce_routes(1, 2..4).unwrap().unwrap(),
+            vec![RnvpceSsdRoute::new(2, 2, 900, false).unwrap()]
+        );
+
+        let capacity = EsCache::new();
+        for index in 0..=EsCache::CAPACITY {
+            capacity
+                .record_rnvpce_routes(
+                    1,
+                    &[RnvpceSsdRoute::new(index as u64 * 2, 1, index as u64 + 1, true).unwrap()],
+                )
+                .unwrap();
+        }
+        assert!(capacity.rnvpce_routes(1, 0..1).unwrap().is_none());
+        assert!(
+            capacity
+                .rnvpce_routes(
+                    1,
+                    EsCache::CAPACITY as u64 * 2..EsCache::CAPACITY as u64 * 2 + 1,
+                )
+                .unwrap()
+                .is_some()
         );
     }
 

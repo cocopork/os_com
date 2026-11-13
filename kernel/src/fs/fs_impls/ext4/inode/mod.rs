@@ -37,6 +37,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 use aster_block::bio::BioDirection;
 use ostd::mm::io::util::HasVmReaderWriter;
+use spin::once::Once;
 
 use super::{
     checksum::{self, InodeCsumSeed},
@@ -54,7 +55,7 @@ mod extent_manager;
 mod symlink;
 
 use self::{
-    extent_manager::{ExtentManager, ExtentTree},
+    extent_manager::{ExtentManager, ExtentTree, RnvpceSsdRoute},
     symlink::FastSymlinkTarget,
 };
 use crate::fs::{
@@ -934,6 +935,10 @@ pub struct Inode {
     /// It is only a locality hint; stale values are revalidated by the group
     /// bitmap allocator and are therefore harmless.
     rnvpce_allocation_hint: AtomicU64,
+    /// Stable identity of this inode's fixed rNVPCe authority record.
+    rnvpce_authority_ref: Once<crate::fs::rnvpc::metadata::PersistentObjectRef>,
+    /// Inode-local publication coordinator, retained for the inode lifetime.
+    rnvpce_publication: Once<Arc<crate::fs::rnvpc::frame::InodePublication>>,
     /// The VFS extension slot (flock, POSIX locks, inotify); must exist from
     /// day one or the VFS layer panics on inodes that use these features.
     extension: Extension,
@@ -1015,6 +1020,8 @@ impl Inode {
             pipe,
             ra: SpinLock::new(RaState::cold()),
             rnvpce_allocation_hint: AtomicU64::new(inode_goal),
+            rnvpce_authority_ref: Once::new(),
+            rnvpce_publication: Once::new(),
             extension: Extension::new(),
         });
         if type_ == InodeType::File {
@@ -1827,56 +1834,138 @@ impl Inode {
             let mut inner = self.inner.write();
             LATENCY_STATS.rnvpce_write_inner_wait.record_since(t_lock);
             let old_size = inner.file_size();
-            if crate::fs::rnvpc::write_transaction::authoritative_inode_state(
-                &pool, fs_id, inode_id,
-            )?
-            .is_none()
-            {
-                let snapshot_extents = inner.extent_manager()?.snapshot_ssd_extents()?;
-                let snapshot = crate::fs::rnvpc::write_transaction::AuthoritySnapshot::new(
-                    1,
-                    &snapshot_extents,
-                    old_size as u64,
-                    inner.sector_count(),
-                    self.type_ as u32 | inner.desc.perm().bits() as u32,
-                    inner.desc.flags().bits(),
-                )?;
-                crate::fs::rnvpc::write_transaction::bootstrap_inode_authority(
-                    pool.clone(),
-                    fs_id,
-                    inode_id,
-                    &snapshot,
-                    None,
-                )?;
+            if self.rnvpce_authority_ref.get().is_none() {
+                let reference =
+                    if let Some(loaded) = pool.read_fixed_inode(fs_id, inode_id, None)? {
+                        loaded.reference()
+                    } else {
+                        let snapshot_extents = inner.extent_manager()?.snapshot_ssd_extents()?;
+                        let snapshot = crate::fs::rnvpc::write_transaction::AuthoritySnapshot::new(
+                            1,
+                            &snapshot_extents,
+                            old_size as u64,
+                            inner.sector_count(),
+                            self.type_ as u32 | inner.desc.perm().bits() as u32,
+                            inner.desc.flags().bits(),
+                        )?;
+                        crate::fs::rnvpc::write_transaction::bootstrap_inode_authority(
+                            pool.clone(),
+                            fs_id,
+                            inode_id,
+                            &snapshot,
+                            None,
+                        )?
+                        .inode()
+                    };
+                self.rnvpce_authority_ref.call_once(|| reference);
             }
             pp::NV_FOREGROUND_PRE_GUARD.record_since(pre_guard_started, write_len);
             let publication_started = pp::now();
-            let mutation = crate::fs::rnvpc::extent_mutation::ExtentMutation::new(
+            let publication = self
+                .rnvpce_publication
+                .call_once(|| pool.inode_publication(fs_id, inode_id));
+            let publication =
+                publication.begin(&pool, crate::fs::rnvpc::frame::PublicationRole::Foreground)?;
+            let mutation = crate::fs::rnvpc::extent_mutation::ExtentMutation::with_publication(
                 pool.clone(),
                 fs_id,
                 inode_id,
+                publication,
             )?;
             pp::NV_FOREGROUND_PUBLICATION_ACQUIRE.record_since(publication_started, write_len);
             let guarded_authority_started = pp::now();
-            let authority = crate::fs::rnvpc::write_transaction::authoritative_inode_state(
-                &pool, fs_id, inode_id,
-            )?
-            .ok_or_else(|| Error::new(Errno::EUCLEAN))?;
+            let cached_reference = *self
+                .rnvpce_authority_ref
+                .get()
+                .ok_or_else(|| Error::new(Errno::EUCLEAN))?;
+            let loaded_authority = pool
+                .read_fixed_inode(fs_id, inode_id, Some(cached_reference))?
+                .ok_or_else(|| Error::new(Errno::EUCLEAN))?;
+            let authority = loaded_authority.record();
             pp::NV_FOREGROUND_GUARDED_AUTHORITY.record_since(guarded_authority_started, write_len);
             let first_page = offset / PAGE_SIZE;
             let last_page = end.div_ceil(PAGE_SIZE);
             let page_count = last_page - first_page;
             let plan_started = pp::now();
-            let plan = crate::fs::rnvpc::write_transaction::plan_range_write(
-                &pool,
-                fs_id,
-                inode_id,
-                offset as u64,
-                write_len,
-                authority.file_size(),
-            )?;
+            let logical_range = first_page as u64..last_page as u64;
+            let extent_manager = inner.extent_manager()?;
+            let generation = authority.header().generation();
+            let cached_route =
+                extent_manager.rnvpce_ssd_route(generation, logical_range.clone())?;
+            let mut plan = if let Some(route) = cached_route {
+                crate::fs::rnvpc::write_transaction::plan_range_write_from_inode_with_ssd_route(
+                    &pool,
+                    fs_id,
+                    inode_id,
+                    offset as u64,
+                    write_len,
+                    authority.file_size(),
+                    &authority,
+                    crate::fs::rnvpc::write_transaction::SsdWriteExtent::new(
+                        route.logical_start()
+                            ..route
+                                .logical_start()
+                                .checked_add(u64::from(route.length()))
+                                .ok_or_else(|| Error::new(Errno::EOVERFLOW))?,
+                        route.ssd_start(),
+                        route.is_written(),
+                    )?,
+                )?
+            } else if let Some(routes) =
+                extent_manager.rnvpce_ssd_routes(generation, logical_range)?
+            {
+                let routes = routes
+                    .into_iter()
+                    .map(|route| {
+                        crate::fs::rnvpc::write_transaction::SsdWriteExtent::new(
+                            route.logical_start()
+                                ..route
+                                    .logical_start()
+                                    .checked_add(u64::from(route.length()))
+                                    .ok_or_else(|| Error::new(Errno::EOVERFLOW))?,
+                            route.ssd_start(),
+                            route.is_written(),
+                        )
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                crate::fs::rnvpc::write_transaction::plan_range_write_from_inode_with_ssd_routes(
+                    &pool,
+                    fs_id,
+                    inode_id,
+                    offset as u64,
+                    write_len,
+                    authority.file_size(),
+                    &authority,
+                    routes,
+                )?
+            } else {
+                crate::fs::rnvpc::write_transaction::plan_range_write_from_inode(
+                    &pool,
+                    fs_id,
+                    inode_id,
+                    offset as u64,
+                    write_len,
+                    authority.file_size(),
+                    &authority,
+                )?
+            };
+            if let Some(routes) = plan.take_discovered_ssd_routes() {
+                let routes = routes
+                    .into_iter()
+                    .map(|route| {
+                        RnvpceSsdRoute::new(
+                            route.logical_range().start,
+                            u32::try_from(route.logical_range().end - route.logical_range().start)
+                                .map_err(|_| Error::new(Errno::EOVERFLOW))?,
+                            route.ssd_start(),
+                            route.is_written(),
+                        )
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                extent_manager.record_rnvpce_ssd_routes(generation, &routes)?;
+            }
             pp::NV_FOREGROUND_PLAN.record_since(plan_started, write_len);
-            if plan.inode_generation != authority.generation() {
+            if plan.inode_generation != authority.header().generation() {
                 drop(mutation);
                 drop(inner);
                 continue;
@@ -2050,6 +2139,7 @@ impl Inode {
             let request_build_started = pp::now();
             let request = crate::fs::rnvpc::write_transaction::RangeWriteBatch::new(
                 authority
+                    .header()
                     .generation()
                     .checked_add(1)
                     .ok_or_else(|| Error::new(Errno::EOVERFLOW))?,
@@ -2082,6 +2172,7 @@ impl Inode {
                     Ok(())
                 },
                 None,
+                Some(loaded_authority),
                 mutation,
                 reservation,
             );
@@ -2116,11 +2207,7 @@ impl Inode {
                         }
                     }
                     inner.set_file_size(old_size.max(offset + committed.copied()));
-                    let state = crate::fs::rnvpc::write_transaction::authoritative_inode_state(
-                        &pool, fs_id, inode_id,
-                    )?
-                    .ok_or_else(|| Error::new(Errno::EUCLEAN))?;
-                    inner.desc.set_sector_count(state.block_count());
+                    inner.desc.set_sector_count(committed.block_count());
                     fs.request_nv_migration_for_inode(inode_id);
                     pp::NV_FOREGROUND_POST_COMMIT.record_since(post_commit_started, write_len);
                     Ok(committed.copied())

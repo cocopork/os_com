@@ -248,6 +248,7 @@ pub struct Ext4 {
     pub(super) rtio_profile: super::pipeline_profile::RtioQueueProfile,
     pub(super) nv_migration_triggers: Box<[Arc<ostd::sync::WaitQueue>]>,
     pub(super) nv_migration_worker_epochs: Box<[AtomicUsize]>,
+    pub(super) nv_migration_wake_pending: Box<[AtomicBool]>,
     pub(super) rtio_worker_runtimes: Box<[Arc<super::migration::RtioWorkerRuntime>]>,
     pub(super) rtio_durability: Arc<super::migration::DurabilityArbiter>,
     pub(super) nv_capacity_waiters: AtomicUsize,
@@ -416,6 +417,10 @@ impl Ext4 {
             .map(|_| AtomicUsize::new(0))
             .collect::<Vec<_>>()
             .into_boxed_slice();
+        let nv_migration_wake_pending = (0..migration_worker_slots)
+            .map(|_| AtomicBool::new(false))
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
         let rtio_worker_runtimes = nv_migration_triggers
             .iter()
             .enumerate()
@@ -481,6 +486,7 @@ impl Ext4 {
             rtio_profile,
             nv_migration_triggers,
             nv_migration_worker_epochs,
+            nv_migration_wake_pending,
             rtio_worker_runtimes,
             rtio_durability: Arc::new(super::migration::DurabilityArbiter::new()),
             nv_capacity_waiters: AtomicUsize::new(0),

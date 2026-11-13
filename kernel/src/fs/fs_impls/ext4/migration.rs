@@ -329,7 +329,7 @@ impl Ext4 {
                         let Some(fs) = weak.upgrade() else {
                             break;
                         };
-                        observed = fs.nv_migration_worker_epochs[worker_id].load(Ordering::Acquire);
+                        observed = fs.begin_nv_migration_worker_round(worker_id);
                         durability_generation = fs.rtio_durability.generation();
                         if uses_shared_migration_rounds(fs.rnvpc_mode()) {
                             if let Err(error) = fs.process_rtio_worker_completions(worker_id) {
@@ -593,14 +593,35 @@ impl Ext4 {
     }
 
     pub(super) fn request_nv_migration(&self) {
-        for (epoch, trigger) in self
-            .nv_migration_worker_epochs
-            .iter()
-            .zip(self.nv_migration_triggers.iter())
+        for worker_id in 0..self.nv_migration_triggers.len() {
+            self.request_nv_migration_worker(worker_id);
+        }
+    }
+
+    pub(super) fn request_nv_migration_worker(&self, worker_id: usize) {
+        let (Some(pending), Some(epoch), Some(trigger)) = (
+            self.nv_migration_wake_pending.get(worker_id),
+            self.nv_migration_worker_epochs.get(worker_id),
+            self.nv_migration_triggers.get(worker_id),
+        ) else {
+            return;
+        };
+        if pending
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
         {
             epoch.fetch_add(1, Ordering::Release);
             trigger.wake_one();
         }
+    }
+
+    pub(super) fn begin_nv_migration_worker_round(&self, worker_id: usize) -> usize {
+        let Some(pending) = self.nv_migration_wake_pending.get(worker_id) else {
+            return 0;
+        };
+        let observed = self.nv_migration_worker_epochs[worker_id].load(Ordering::Acquire);
+        pending.store(false, Ordering::Release);
+        observed
     }
 
     pub(super) fn request_nv_migration_for_inode(&self, inode: u64) {

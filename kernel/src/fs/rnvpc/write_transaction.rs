@@ -803,6 +803,7 @@ pub(crate) struct RangeWritePlan {
     pub(crate) last_page_end: usize,
     pub(crate) extents: Vec<WriteExtent>,
     ssd_allocation_predecessor: Option<u64>,
+    discovered_ssd_routes: Option<Vec<SsdWriteExtent>>,
 }
 
 impl RangeWritePlan {
@@ -839,6 +840,10 @@ impl RangeWritePlan {
         }
         Ok(self.ssd_allocation_predecessor.or(inode_hint))
     }
+
+    pub(crate) fn take_discovered_ssd_routes(&mut self) -> Option<Vec<SsdWriteExtent>> {
+        self.discovered_ssd_routes.take()
+    }
 }
 
 pub(crate) enum WriteExtent {
@@ -867,10 +872,39 @@ impl WriteExtent {
 }
 
 #[derive(Clone, Debug)]
-struct SsdWriteExtent {
+pub(crate) struct SsdWriteExtent {
     logical_range: Range<u64>,
     ssd_start: u64,
     written: bool,
+}
+
+impl SsdWriteExtent {
+    pub(crate) fn new(logical_range: Range<u64>, ssd_start: u64, written: bool) -> Result<Self> {
+        if logical_range.start >= logical_range.end
+            || ssd_start
+                .checked_add(logical_range.end - logical_range.start)
+                .is_none()
+        {
+            return_errno_with_message!(Errno::EINVAL, "invalid SSD write extent");
+        }
+        Ok(Self {
+            logical_range,
+            ssd_start,
+            written,
+        })
+    }
+
+    pub(crate) fn logical_range(&self) -> &Range<u64> {
+        &self.logical_range
+    }
+
+    pub(crate) const fn ssd_start(&self) -> u64 {
+        self.ssd_start
+    }
+
+    pub(crate) const fn is_written(&self) -> bool {
+        self.written
+    }
 }
 
 pub(crate) fn plan_range_write(
@@ -880,6 +914,119 @@ pub(crate) fn plan_range_write(
     file_offset: u64,
     write_len: usize,
     old_file_size: u64,
+) -> Result<RangeWritePlan> {
+    let plan_inode_started = pp::now();
+    let loaded_inode = pool
+        .read_fixed_inode(fs_id, inode, None)?
+        .ok_or_else(|| Error::new(Errno::ENOENT))?;
+    pp::NV_FOREGROUND_PLAN_INODE.record_since(plan_inode_started, 1);
+    plan_range_write_from_inode(
+        pool,
+        fs_id,
+        inode,
+        file_offset,
+        write_len,
+        old_file_size,
+        loaded_inode.record(),
+    )
+}
+
+pub(crate) fn plan_range_write_from_inode(
+    pool: &Arc<Rnvpc>,
+    fs_id: u64,
+    inode: u64,
+    file_offset: u64,
+    write_len: usize,
+    old_file_size: u64,
+    inode_record: &InodeRecord,
+) -> Result<RangeWritePlan> {
+    plan_range_write_from_inode_with_optional_ssd_routes(
+        pool,
+        fs_id,
+        inode,
+        file_offset,
+        write_len,
+        old_file_size,
+        inode_record,
+        None,
+    )
+}
+
+pub(crate) fn plan_range_write_from_inode_with_ssd_routes(
+    pool: &Arc<Rnvpc>,
+    fs_id: u64,
+    inode: u64,
+    file_offset: u64,
+    write_len: usize,
+    old_file_size: u64,
+    inode_record: &InodeRecord,
+    ssd_routes: Vec<SsdWriteExtent>,
+) -> Result<RangeWritePlan> {
+    plan_range_write_from_inode_with_optional_ssd_routes(
+        pool,
+        fs_id,
+        inode,
+        file_offset,
+        write_len,
+        old_file_size,
+        inode_record,
+        Some(CachedSsdRoutes::Many(ssd_routes)),
+    )
+}
+
+pub(crate) fn plan_range_write_from_inode_with_ssd_route(
+    pool: &Arc<Rnvpc>,
+    fs_id: u64,
+    inode: u64,
+    file_offset: u64,
+    write_len: usize,
+    old_file_size: u64,
+    inode_record: &InodeRecord,
+    ssd_route: SsdWriteExtent,
+) -> Result<RangeWritePlan> {
+    plan_range_write_from_inode_with_optional_ssd_routes(
+        pool,
+        fs_id,
+        inode,
+        file_offset,
+        write_len,
+        old_file_size,
+        inode_record,
+        Some(CachedSsdRoutes::One(ssd_route)),
+    )
+}
+
+enum CachedSsdRoutes {
+    One(SsdWriteExtent),
+    Many(Vec<SsdWriteExtent>),
+}
+
+impl CachedSsdRoutes {
+    fn as_slice(&self) -> &[SsdWriteExtent] {
+        match self {
+            Self::One(route) => core::slice::from_ref(route),
+            Self::Many(routes) => routes,
+        }
+    }
+
+    fn into_vec(self) -> Vec<SsdWriteExtent> {
+        match self {
+            Self::One(route) => vec![route],
+            Self::Many(routes) => routes,
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn plan_range_write_from_inode_with_optional_ssd_routes(
+    pool: &Arc<Rnvpc>,
+    fs_id: u64,
+    inode: u64,
+    file_offset: u64,
+    write_len: usize,
+    old_file_size: u64,
+    inode_record: &InodeRecord,
+    cached_ssd_routes: Option<CachedSsdRoutes>,
 ) -> Result<RangeWritePlan> {
     if write_len == 0 {
         return_errno_with_message!(Errno::EINVAL, "empty range write");
@@ -893,22 +1040,26 @@ pub(crate) fn plan_range_write(
         .ok_or_else(|| Error::new(Errno::EOVERFLOW))?
         / PAGE_SIZE as u64;
     let logical_range = first_page..page_end;
-    let plan_inode_started = pp::now();
-    let inode_ref =
-        authoritative_inode_ref(pool, fs_id, inode)?.ok_or_else(|| Error::new(Errno::ENOENT))?;
-    let inode_record = pool.read_authoritative_metadata::<InodeRecord>(inode_ref)?;
-    pp::NV_FOREGROUND_PLAN_INODE.record_since(plan_inode_started, 1);
     let plan_redirect_started = pp::now();
     let redirects = pool.lookup_dirty_nv_overlaps(fs_id, inode, logical_range.clone())?;
     pp::NV_FOREGROUND_PLAN_REDIRECT.record_since(plan_redirect_started, redirects.len());
     let plan_tree_started = pp::now();
-    let (ssd_extents, tree_predecessor) = lookup_tree_extent_ranges(
-        pool,
-        fs_id,
-        inode,
-        inode_record.extent_root(),
-        logical_range.clone(),
-    )?;
+    let redirects_cover_range = redirects_cover_range(&redirects, logical_range.clone());
+    let (ssd_routes, tree_predecessor, discovered_ssd_routes) = if redirects_cover_range {
+        (CachedSsdRoutes::Many(Vec::new()), None, false)
+    } else if let Some(routes) = cached_ssd_routes {
+        (routes, None, false)
+    } else {
+        let (routes, predecessor) = lookup_tree_extent_ranges(
+            pool,
+            fs_id,
+            inode,
+            inode_record.extent_root(),
+            logical_range.clone(),
+        )?;
+        (CachedSsdRoutes::Many(routes), predecessor, true)
+    };
+    let ssd_extents = ssd_routes.as_slice();
     pp::NV_FOREGROUND_PLAN_TREE.record_since(plan_tree_started, ssd_extents.len());
     let plan_build_started = pp::now();
     let old_eof_page = (old_file_size % PAGE_SIZE as u64 == 0)
@@ -1020,9 +1171,27 @@ pub(crate) fn plan_range_write(
         },
         extents,
         ssd_allocation_predecessor,
+        discovered_ssd_routes: discovered_ssd_routes.then(|| ssd_routes.into_vec()),
     };
     pp::NV_FOREGROUND_PLAN_BUILD.record_since(plan_build_started, result.extents.len());
     Ok(result)
+}
+
+fn redirects_cover_range(
+    redirects: &[Arc<super::redirect_index::DirtyNvExtentEntry>],
+    logical_range: Range<u64>,
+) -> bool {
+    let mut cursor = logical_range.start;
+    for entry in redirects {
+        if entry.logical_start() > cursor {
+            return false;
+        }
+        cursor = cursor.max(entry.logical_range().end);
+        if cursor >= logical_range.end {
+            return true;
+        }
+    }
+    false
 }
 
 impl RangeWritePage {
@@ -1169,6 +1338,7 @@ impl<'a> RangeWriteBatch<'a> {
 pub(crate) struct CommittedRangeWrite {
     copied: usize,
     inode: PersistentObjectRef,
+    block_count: u64,
     reserved_blocks: u64,
     unused_allocations: Vec<WriteAllocation>,
     allocation_records: Vec<PersistentObjectRef>,
@@ -1181,6 +1351,10 @@ impl CommittedRangeWrite {
 
     pub(crate) const fn inode(&self) -> PersistentObjectRef {
         self.inode
+    }
+
+    pub(crate) const fn block_count(&self) -> u64 {
+        self.block_count
     }
 
     pub(crate) const fn reserved_blocks(&self) -> u64 {
@@ -1231,6 +1405,7 @@ where
         reader,
         load_ssd_page,
         inode_fault,
+        None,
         mutation,
         reservation,
     )
@@ -1300,6 +1475,7 @@ pub(crate) fn commit_range_write_with_mutation<F>(
     reader: &mut VmReader,
     mut load_ssd_page: F,
     inode_fault: Option<FaultPoint>,
+    loaded_inode: Option<super::frame::LoadedFixedInode>,
     mutation: ExtentMutation,
     mut reservation: super::frame::CapacityReservation,
 ) -> Result<CommittedRangeWrite>
@@ -1310,9 +1486,22 @@ where
     let body_started = read_ns();
     let extension_reservation = pool.reservation_supports_redirect_extension(&reservation);
     let started = read_ns();
-    let current_inode_ref =
-        authoritative_inode_ref(&pool, fs_id, inode)?.ok_or_else(|| Error::new(Errno::ENOENT))?;
-    let current_inode = pool.read_authoritative_metadata::<InodeRecord>(current_inode_ref)?;
+    let (current_inode_ref, current_inode) = match loaded_inode {
+        Some(loaded) => {
+            let (reference, record) = loaded.into_parts();
+            if record.header().fs_id() != fs_id || record.header().inode() != inode {
+                return_errno_with_message!(
+                    Errno::EUCLEAN,
+                    "loaded inode authority has wrong owner"
+                );
+            }
+            (reference, record)
+        }
+        None => pool
+            .read_fixed_inode(fs_id, inode, None)?
+            .ok_or_else(|| Error::new(Errno::ENOENT))?
+            .into_parts(),
+    };
     if request.generation != current_inode.header().generation().saturating_add(1) {
         return_errno_with_message!(Errno::ESTALE, "write generation is not newer than inode");
     }
@@ -1690,6 +1879,7 @@ where
     Ok(CommittedRangeWrite {
         copied,
         inode: inode_ref,
+        block_count,
         reserved_blocks: newly_mapped,
         unused_allocations,
         allocation_records: allocation_refs,
@@ -1746,9 +1936,7 @@ where
             return Ok(None);
         }
     }
-
     let nv_mutations = begin_plan_nv_mutations(pool, plan)?;
-
     let mut pending = Vec::new();
     pending
         .try_reserve_exact(request.pages.len())
@@ -1891,6 +2079,7 @@ where
     Ok(Some(CommittedRangeWrite {
         copied,
         inode: inode_ref,
+        block_count: current_inode.block_count(),
         reserved_blocks: 0,
         unused_allocations: Vec::new(),
         allocation_records: Vec::new(),
@@ -1914,9 +2103,11 @@ fn try_extend_preceding_redirect(
     )) else {
         return Ok(false);
     };
-    if entry.state() != super::redirect_index::NvExtentEntryState::Dirty
-        || usize::from(entry.page_count()).saturating_add(pending.len())
-            > super::redirect_index::MAX_DIRTY_MIGRATION_EXTENT_PAGES
+    if entry.state() != super::redirect_index::NvExtentEntryState::Dirty {
+        return Ok(false);
+    }
+    if usize::from(entry.page_count()).saturating_add(pending.len())
+        > super::redirect_index::MAX_DIRTY_MIGRATION_EXTENT_PAGES
     {
         return Ok(false);
     }
@@ -2618,10 +2809,10 @@ pub(crate) fn authoritative_inode_state(
     fs_id: u64,
     inode: u64,
 ) -> Result<Option<AuthoritativeInodeState>> {
-    let Some(reference) = authoritative_inode_ref(pool, fs_id, inode)? else {
+    let Some(loaded) = pool.read_fixed_inode(fs_id, inode, None)? else {
         return Ok(None);
     };
-    let record = pool.read_authoritative_metadata::<InodeRecord>(reference)?;
+    let record = loaded.record();
     Ok(Some(AuthoritativeInodeState {
         generation: record.header().generation(),
         file_size: record.file_size(),
@@ -3394,9 +3585,9 @@ fn lookup_tree_extent_ranges(
                                 .ok_or_else(|| Error::new(Errno::EOVERFLOW))?,
                         );
                     }
-                    let start = entry.logical_block().max(logical_range.start);
-                    let end = entry_end.min(logical_range.end);
-                    if start >= end {
+                    let overlap_start = entry.logical_block().max(logical_range.start);
+                    let overlap_end = entry_end.min(logical_range.end);
+                    if overlap_start >= overlap_end {
                         continue;
                     }
                     let ExtentDataRef::Ssd(ssd_base) = entry.data_ref()? else {
@@ -3408,9 +3599,12 @@ fn lookup_tree_extent_ranges(
                     if ssd_base == 0 {
                         continue;
                     }
-                    let ssd_start = ssd_base
-                        .checked_add(start - entry.logical_block())
-                        .ok_or_else(|| Error::new(Errno::EOVERFLOW))?;
+                    // Keep the complete validated route.  The planner clips it to the
+                    // current request, while EST can reuse the surrounding mapping on
+                    // later writes instead of caching one 4 KiB fragment at a time.
+                    let start = entry.logical_block();
+                    let end = entry_end;
+                    let ssd_start = ssd_base;
                     let written = !entry.is_unwritten();
                     let can_merge = ranges.last().is_some_and(|previous: &SsdWriteExtent| {
                         previous.logical_range.end == start

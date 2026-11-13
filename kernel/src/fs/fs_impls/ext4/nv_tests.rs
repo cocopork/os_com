@@ -235,6 +235,30 @@ fn rnvpce_foreground_publication_keeps_owner_and_wakes_only_its_worker() {
 }
 
 #[ktest]
+fn rnvpce_migration_worker_notification_is_edge_triggered() {
+    let (fs, _) = cross_queue_fixture(0xed);
+    let before = fs
+        .nv_migration_worker_epochs
+        .iter()
+        .map(|epoch| epoch.load(Ordering::Acquire))
+        .collect::<Vec<_>>();
+
+    fs.request_nv_migration_worker(2);
+    fs.request_nv_migration_worker(2);
+    for (worker, epoch) in fs.nv_migration_worker_epochs.iter().enumerate() {
+        let expected = before[worker] + usize::from(worker == 2);
+        assert_eq!(epoch.load(Ordering::Acquire), expected, "worker {worker}");
+    }
+
+    fs.begin_nv_migration_worker_round(2);
+    fs.request_nv_migration_worker(2);
+    assert_eq!(
+        fs.nv_migration_worker_epochs[2].load(Ordering::Acquire),
+        before[2] + 2
+    );
+}
+
+#[ktest]
 fn rnvpce_owner_wake_migrates_below_global_watermark() {
     crate::fs::rnvpc::init_for_ext4_tests();
     crate::time::clocks::init_for_ktest();

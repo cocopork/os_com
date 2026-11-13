@@ -635,6 +635,11 @@ struct InodeRedirectMap {
     fs_id: u64,
     entries: SpinLock<BTreeMap<u64, Arc<DirtyNvExtentEntry>>>,
     migration: SpinLock<InodeMigrationState>,
+    migration_owner: AtomicUsize,
+    queued_dirty_pages: AtomicUsize,
+    ready_queued: AtomicBool,
+    #[cfg(ktest)]
+    migration_lock_acquisitions: AtomicUsize,
 }
 
 impl InodeRedirectMap {
@@ -643,6 +648,11 @@ impl InodeRedirectMap {
             fs_id,
             entries: SpinLock::new(BTreeMap::new()),
             migration: SpinLock::new(InodeMigrationState::default()),
+            migration_owner: AtomicUsize::new(usize::MAX),
+            queued_dirty_pages: AtomicUsize::new(0),
+            ready_queued: AtomicBool::new(false),
+            #[cfg(ktest)]
+            migration_lock_acquisitions: AtomicUsize::new(0),
         }
     }
 }
@@ -930,6 +940,16 @@ impl RedirectDirectory {
     pub(crate) fn migration_worker_count(&self, fs_id: u64) -> Option<usize> {
         self.migration_worker_set(fs_id)
             .map(|workers| workers.worker_count())
+    }
+
+    #[cfg(ktest)]
+    fn migration_lock_acquisitions_for_test(&self, fs_id: u64, inode: u64) -> usize {
+        self.inode_map(fs_id, inode, false)
+            .ok()
+            .flatten()
+            .map_or(0, |map| {
+                map.migration_lock_acquisitions.load(Ordering::Acquire)
+            })
     }
 
     pub(crate) fn lookup_dirty_entry(&self, key: PageKey) -> Option<Arc<DirtyNvExtentEntry>> {
@@ -2122,6 +2142,59 @@ mod tests {
         assert_eq!(first_load.queued_dirty_pages, 0);
         assert_eq!(first_load.in_flight_pages, 8);
         assert_eq!(first_load.owned_inodes, 1);
+    }
+
+    #[ktest]
+    fn rnvpce_extension_accounting_stays_on_atomic_fast_path() {
+        let fs_id = 0xa6;
+        let inode = 60;
+        let directory = RedirectDirectory::new().unwrap();
+        directory.configure_migration_workers(fs_id, 1).unwrap();
+
+        let entry = dirty_entry(fs_id, inode, 0, 1, 600, 6000);
+        directory.publish_dirty_entry(entry.clone()).unwrap();
+        let lock_acquisitions_before = directory.migration_lock_acquisitions_for_test(fs_id, inode);
+        for committed_pages in 2..=4 {
+            let extension = entry
+                .begin_extension(committed_pages - 1, committed_pages)
+                .unwrap();
+            directory.finish_entry_extension(extension).unwrap();
+        }
+
+        assert_eq!(
+            directory.migration_lock_acquisitions_for_test(fs_id, inode),
+            lock_acquisitions_before,
+            "registered entry extensions must not acquire the inode migration lock"
+        );
+        let claims = directory
+            .claim_ready_entries_for_worker(fs_id, 0, 4)
+            .unwrap();
+        assert_eq!(claims.len(), 1);
+        assert_eq!(claims[0].entry().page_count(), 4);
+        let load = directory.migration_worker_load_snapshot(fs_id, 0).unwrap();
+        assert_eq!(load.queued_dirty_pages, 0);
+        assert_eq!(load.in_flight_pages, 4);
+        assert_eq!(load.ready_inode_dequeues, 1);
+    }
+
+    #[ktest]
+    fn rnvpce_abort_requeue_serializes_with_owner_turnover() {
+        let fs_id = 0xa7;
+        let inode = 61;
+        let directory = RedirectDirectory::new().unwrap();
+        directory.configure_migration_workers(fs_id, 2).unwrap();
+
+        let entry = dirty_entry(fs_id, inode, 0, 1, 700, 7000);
+        directory.publish_dirty_entry(entry.clone()).unwrap();
+        let lock_acquisitions_before = directory.migration_lock_acquisitions_for_test(fs_id, inode);
+        let extension = entry.begin_extension(1, 2).unwrap();
+        directory.abort_entry_extension(extension, true);
+
+        assert_eq!(
+            directory.migration_lock_acquisitions_for_test(fs_id, inode),
+            lock_acquisitions_before + 1,
+            "abort requeue must serialize ready state with owner release and reassignment"
+        );
     }
 
     #[ktest]

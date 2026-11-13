@@ -40,7 +40,7 @@ mod path;
 mod tree;
 
 use self::es::EsCoverage;
-pub(super) use self::tree::ExtentTree;
+pub(super) use self::{es::RnvpceSsdRoute, tree::ExtentTree};
 
 /// State of a mapped logical block — the three-way view tests assert against
 /// (production code pattern-matches [`Mapping`] directly).
@@ -553,6 +553,36 @@ impl ExtentManager {
 
     pub(super) fn range_known_written(&self, start: Iblock, end: Iblock) -> bool {
         self.state.read().es_cache().range_state(start, end) == EsCoverage::AllWritten
+    }
+
+    pub(super) fn rnvpce_ssd_routes(
+        &self,
+        generation: u64,
+        range: Range<u64>,
+    ) -> Result<Option<Vec<RnvpceSsdRoute>>> {
+        self.state
+            .read()
+            .es_cache()
+            .rnvpce_routes(generation, range)
+    }
+
+    pub(super) fn rnvpce_ssd_route(
+        &self,
+        generation: u64,
+        range: Range<u64>,
+    ) -> Result<Option<RnvpceSsdRoute>> {
+        self.state.read().es_cache().rnvpce_route(generation, range)
+    }
+
+    pub(super) fn record_rnvpce_ssd_routes(
+        &self,
+        generation: u64,
+        routes: &[RnvpceSsdRoute],
+    ) -> Result<()> {
+        self.state
+            .read()
+            .es_cache()
+            .record_rnvpce_routes(generation, routes)
     }
 
     /// Debug-only cross-check for the overwrite fast path: walks `[start, end)`

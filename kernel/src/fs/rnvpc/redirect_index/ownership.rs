@@ -21,11 +21,9 @@ pub(super) struct InodeMigrationState {
     pub(super) owner: Option<usize>,
     pub(super) generation: u64,
     pub(super) active_entries: usize,
-    pub(super) queued_dirty_pages: usize,
     pub(super) in_flight_pages: usize,
     pub(super) completion_pending_pages: usize,
     pub(super) reclaim_pending_pages: usize,
-    pub(super) ready_queued: bool,
 }
 
 struct MigrationWorkerState {
@@ -72,6 +70,16 @@ pub(super) struct MigrationWorkerSet {
 }
 
 impl MigrationWorkerSet {
+    const NO_OWNER: usize = usize::MAX;
+
+    #[inline]
+    fn record_migration_lock(inode_map: &InodeRedirectMap) {
+        #[cfg(ktest)]
+        inode_map
+            .migration_lock_acquisitions
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     pub(super) fn new(worker_count: usize) -> Result<Self> {
         if worker_count == 0 {
             return_errno_with_message!(Errno::EINVAL, "migration worker count is zero");
@@ -126,7 +134,8 @@ impl MigrationWorkerSet {
     }
 
     pub(super) fn publish_dirty(self: &Arc<Self>, inode_map: &Arc<InodeRedirectMap>, pages: usize) {
-        let (owner, enqueue) = {
+        let owner = {
+            Self::record_migration_lock(inode_map);
             let mut migration = inode_map.migration.lock();
             let owner = match migration.owner {
                 Some(owner) => owner,
@@ -137,19 +146,20 @@ impl MigrationWorkerSet {
                     self.workers[owner]
                         .owned_inodes
                         .fetch_add(1, Ordering::AcqRel);
+                    inode_map.migration_owner.store(owner, Ordering::Release);
                     owner
                 }
             };
             migration.active_entries = migration.active_entries.saturating_add(1);
-            migration.queued_dirty_pages = migration.queued_dirty_pages.saturating_add(pages);
-            let enqueue = !migration.ready_queued;
-            migration.ready_queued = true;
-            (owner, enqueue)
+            owner
         };
+        inode_map
+            .queued_dirty_pages
+            .fetch_add(pages, Ordering::AcqRel);
         self.workers[owner]
             .queued_dirty_pages
             .fetch_add(pages, Ordering::AcqRel);
-        if enqueue {
+        if !inode_map.ready_queued.swap(true, Ordering::AcqRel) {
             self.workers[owner]
                 .ready_inodes
                 .lock()
@@ -158,20 +168,16 @@ impl MigrationWorkerSet {
     }
 
     pub(super) fn extend_dirty(&self, inode_map: &Arc<InodeRedirectMap>, pages: usize) {
-        let (owner, enqueue) = {
-            let mut migration = inode_map.migration.lock();
-            let owner = migration
-                .owner
-                .expect("a registered dirty entry has a migration owner");
-            migration.queued_dirty_pages = migration.queued_dirty_pages.saturating_add(pages);
-            let enqueue = !migration.ready_queued;
-            migration.ready_queued = true;
-            (owner, enqueue)
-        };
+        let owner = inode_map.migration_owner.load(Ordering::Acquire);
+        debug_assert_ne!(owner, Self::NO_OWNER);
+        debug_assert!(owner < self.workers.len());
+        inode_map
+            .queued_dirty_pages
+            .fetch_add(pages, Ordering::AcqRel);
         self.workers[owner]
             .queued_dirty_pages
             .fetch_add(pages, Ordering::AcqRel);
-        if enqueue {
+        if !inode_map.ready_queued.swap(true, Ordering::AcqRel) {
             self.workers[owner]
                 .ready_inodes
                 .lock()
@@ -181,12 +187,12 @@ impl MigrationWorkerSet {
 
     pub(super) fn ensure_dirty_ready(&self, inode_map: &Arc<InodeRedirectMap>) {
         let (owner, enqueue) = {
-            let mut migration = inode_map.migration.lock();
+            Self::record_migration_lock(inode_map);
+            let migration = inode_map.migration.lock();
             let Some(owner) = migration.owner else {
                 return;
             };
-            let enqueue = !migration.ready_queued;
-            migration.ready_queued = true;
+            let enqueue = !inode_map.ready_queued.swap(true, Ordering::AcqRel);
             (owner, enqueue)
         };
         if enqueue {
@@ -198,7 +204,8 @@ impl MigrationWorkerSet {
     }
 
     pub(super) fn owner(&self, inode_map: &InodeRedirectMap) -> Option<usize> {
-        inode_map.migration.lock().owner
+        let owner = inode_map.migration_owner.load(Ordering::Acquire);
+        (owner != Self::NO_OWNER).then_some(owner)
     }
 
     pub(super) fn pop_ready_inode(
@@ -213,9 +220,8 @@ impl MigrationWorkerSet {
             return Ok(None);
         };
         worker.ready_inode_dequeues.fetch_add(1, Ordering::Relaxed);
-        let mut migration = inode_map.migration.lock();
-        if migration.owner == Some(worker_id) {
-            migration.ready_queued = false;
+        if inode_map.migration_owner.load(Ordering::Acquire) == worker_id {
+            inode_map.ready_queued.store(false, Ordering::Release);
             Ok(Some(inode_map.clone()))
         } else {
             Ok(None)
@@ -231,16 +237,9 @@ impl MigrationWorkerSet {
         if !has_dirty {
             return;
         }
-        let enqueue = {
-            let mut migration = inode_map.migration.lock();
-            if migration.owner != Some(worker_id) || migration.ready_queued {
-                false
-            } else {
-                migration.ready_queued = true;
-                true
-            }
-        };
-        if enqueue {
+        if inode_map.migration_owner.load(Ordering::Acquire) == worker_id
+            && !inode_map.ready_queued.swap(true, Ordering::AcqRel)
+        {
             self.workers[worker_id]
                 .ready_inodes
                 .lock()
@@ -254,11 +253,18 @@ impl MigrationWorkerSet {
         worker_id: usize,
         pages: usize,
     ) -> Result<()> {
+        Self::record_migration_lock(inode_map);
         let mut migration = inode_map.migration.lock();
-        if migration.owner != Some(worker_id) || migration.queued_dirty_pages < pages {
+        if migration.owner != Some(worker_id)
+            || inode_map
+                .queued_dirty_pages
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |queued| {
+                    queued.checked_sub(pages)
+                })
+                .is_err()
+        {
             return_errno_with_message!(Errno::ESTALE, "migration inode owner changed");
         }
-        migration.queued_dirty_pages -= pages;
         migration.in_flight_pages = migration.in_flight_pages.saturating_add(pages);
         self.workers[worker_id]
             .queued_dirty_pages
@@ -276,15 +282,16 @@ impl MigrationWorkerSet {
         pages: usize,
     ) {
         let enqueue = {
+            Self::record_migration_lock(inode_map);
             let mut migration = inode_map.migration.lock();
             if migration.owner != Some(worker_id) || migration.in_flight_pages < pages {
                 return;
             }
             migration.in_flight_pages -= pages;
-            migration.queued_dirty_pages = migration.queued_dirty_pages.saturating_add(pages);
-            let enqueue = !migration.ready_queued;
-            migration.ready_queued = true;
-            enqueue
+            inode_map
+                .queued_dirty_pages
+                .fetch_add(pages, Ordering::AcqRel);
+            !inode_map.ready_queued.swap(true, Ordering::AcqRel)
         };
         self.workers[worker_id]
             .in_flight_pages
@@ -306,6 +313,7 @@ impl MigrationWorkerSet {
         worker_id: usize,
         pages: usize,
     ) -> Result<()> {
+        Self::record_migration_lock(inode_map);
         let mut migration = inode_map.migration.lock();
         if migration.owner != Some(worker_id) || migration.in_flight_pages < pages {
             return_errno_with_message!(Errno::ESTALE, "migration completion owner changed");
@@ -327,6 +335,7 @@ impl MigrationWorkerSet {
         inode_map: &InodeRedirectMap,
         pages: usize,
     ) -> Result<()> {
+        Self::record_migration_lock(inode_map);
         let mut migration = inode_map.migration.lock();
         let owner = migration.owner.ok_or_else(|| Error::new(Errno::ESTALE))?;
         if migration.active_entries == 0 || migration.completion_pending_pages < pages {
@@ -338,12 +347,15 @@ impl MigrationWorkerSet {
             .completion_pending_pages
             .fetch_sub(pages, Ordering::AcqRel);
         if migration.active_entries == 0 {
-            debug_assert_eq!(migration.queued_dirty_pages, 0);
+            debug_assert_eq!(inode_map.queued_dirty_pages.load(Ordering::Acquire), 0);
             debug_assert_eq!(migration.in_flight_pages, 0);
             debug_assert_eq!(migration.completion_pending_pages, 0);
             debug_assert_eq!(migration.reclaim_pending_pages, 0);
             migration.owner = None;
-            migration.ready_queued = false;
+            inode_map
+                .migration_owner
+                .store(Self::NO_OWNER, Ordering::Release);
+            inode_map.ready_queued.store(false, Ordering::Release);
             self.workers[owner]
                 .owned_inodes
                 .fetch_sub(1, Ordering::AcqRel);

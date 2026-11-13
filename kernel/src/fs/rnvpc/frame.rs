@@ -59,6 +59,28 @@ static DATA_PAGE_LEASE_WAITERS: WaitQueue = WaitQueue::new();
 static DATA_CAPACITY_WAITERS: WaitQueue = WaitQueue::new();
 static METADATA_PIN_EPOCH: AtomicU64 = AtomicU64::new(0);
 static METADATA_PIN_WAITERS: WaitQueue = WaitQueue::new();
+static METADATA_PIN_WAITER_COUNT: AtomicUsize = AtomicUsize::new(0);
+#[cfg(ktest)]
+static METADATA_PIN_NOTIFICATIONS: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) struct LoadedFixedInode {
+    reference: PersistentObjectRef,
+    record: InodeRecord,
+}
+
+impl LoadedFixedInode {
+    pub(crate) const fn reference(&self) -> PersistentObjectRef {
+        self.reference
+    }
+
+    pub(crate) const fn record(&self) -> &InodeRecord {
+        &self.record
+    }
+
+    pub(crate) fn into_parts(self) -> (PersistentObjectRef, InodeRecord) {
+        (self.reference, self.record)
+    }
+}
 
 mod pcache;
 pub(crate) use pcache::{PersistentDataRef, PersistentFrameUpdate};
@@ -826,6 +848,11 @@ impl Rnvpc {
     }
 
     #[cfg(ktest)]
+    pub(crate) fn metadata_pin_notifications(&self) -> u64 {
+        METADATA_PIN_NOTIFICATIONS.load(Ordering::Relaxed)
+    }
+
+    #[cfg(ktest)]
     pub(crate) fn extent_tree_lookups(&self) -> u64 {
         self.extent_tree_lookups.load(Ordering::Acquire)
     }
@@ -1200,6 +1227,12 @@ impl Rnvpc {
                         id,
                     });
                 }
+            }
+            let _waiter = MetadataPinWaiter::register();
+            if METADATA_PIN_EPOCH.load(Ordering::Acquire) != observed
+                || !self.objects.lock_checked(id.index())?.records[id.index()].persisting
+            {
+                continue;
             }
             let _ = METADATA_PIN_WAITERS.wait_until(|| {
                 (METADATA_PIN_EPOCH.load(Ordering::Acquire) != observed).then_some(())
@@ -2728,6 +2761,12 @@ impl Rnvpc {
                     });
                 }
             }
+            let _waiter = MetadataPinWaiter::register();
+            if METADATA_PIN_EPOCH.load(Ordering::Acquire) != observed
+                || !self.objects.lock_checked(slot)?.records[slot].persisting
+            {
+                continue;
+            }
             METADATA_PIN_WAITERS.wait_until(|| {
                 (METADATA_PIN_EPOCH.load(Ordering::Acquire) != observed).then_some(())
             });
@@ -3416,23 +3455,45 @@ impl Rnvpc {
         fs_id: u64,
         inode: u64,
     ) -> Result<Option<PersistentObjectRef>> {
+        Ok(self
+            .read_fixed_inode(fs_id, inode, None)?
+            .map(|loaded| loaded.reference()))
+    }
+
+    fn lookup_fixed_inode_ref(
+        &self,
+        fs_id: u64,
+        inode: u64,
+    ) -> Result<Option<PersistentObjectRef>> {
         let key = PageKey::new(fs_id, inode, FIXED_INODE_LOGICAL_INDEX);
-        let found = {
-            let state = self.state.lock();
-            state
-                .metadata_index
-                .get(&key)
-                .copied()
-                .map(|index| {
-                    let record = self
-                        .objects
-                        .get(index)
-                        .ok_or_else(|| Error::new(Errno::EUCLEAN))?;
-                    PersistentObjectRef::new(index as u64, record.alloc_seq)
-                })
-                .transpose()?
+        let state = self.state.lock();
+        state
+            .metadata_index
+            .get(&key)
+            .copied()
+            .map(|index| {
+                let record = self
+                    .objects
+                    .get(index)
+                    .ok_or_else(|| Error::new(Errno::EUCLEAN))?;
+                PersistentObjectRef::new(index as u64, record.alloc_seq)
+            })
+            .transpose()
+    }
+
+    /// Reads the fixed inode record, optionally using its stable NV identity.
+    pub(crate) fn read_fixed_inode(
+        self: &Arc<Self>,
+        fs_id: u64,
+        inode: u64,
+        cached: Option<PersistentObjectRef>,
+    ) -> Result<Option<LoadedFixedInode>> {
+        let reference = if let Some(reference) = cached {
+            Some(reference)
+        } else {
+            self.lookup_fixed_inode_ref(fs_id, inode)?
         };
-        let Some(reference) = found else {
+        let Some(reference) = reference else {
             return Ok(None);
         };
         let record = self
@@ -3441,7 +3502,7 @@ impl Rnvpc {
         if record.header().fs_id() != fs_id || record.header().inode() != inode {
             return_errno_with_message!(Errno::EUCLEAN, "fixed inode root identity mismatch");
         }
-        Ok(Some(reference))
+        Ok(Some(LoadedFixedInode { reference, record }))
     }
 
     /// Creates the only persistent inode root for `(fs_id, inode)`.
@@ -5559,6 +5620,12 @@ impl Rnvpc {
                     return Ok(());
                 }
             }
+            let _waiter = MetadataPinWaiter::register();
+            if METADATA_PIN_EPOCH.load(Ordering::Acquire) != observed
+                || self.objects.lock(frame.index()).records[frame.index()].pins == 0
+            {
+                continue;
+            }
             let _ = METADATA_PIN_WAITERS.wait_until(|| {
                 (METADATA_PIN_EPOCH.load(Ordering::Acquire) != observed).then_some(())
             });
@@ -5735,8 +5802,28 @@ fn note_data_page_lease_change() {
 }
 
 fn note_metadata_pin_change() {
+    if METADATA_PIN_WAITER_COUNT.load(Ordering::Acquire) == 0 {
+        return;
+    }
     METADATA_PIN_EPOCH.fetch_add(1, Ordering::AcqRel);
+    #[cfg(ktest)]
+    METADATA_PIN_NOTIFICATIONS.fetch_add(1, Ordering::Relaxed);
     METADATA_PIN_WAITERS.wake_all();
+}
+
+struct MetadataPinWaiter;
+
+impl MetadataPinWaiter {
+    fn register() -> Self {
+        METADATA_PIN_WAITER_COUNT.fetch_add(1, Ordering::AcqRel);
+        Self
+    }
+}
+
+impl Drop for MetadataPinWaiter {
+    fn drop(&mut self) {
+        METADATA_PIN_WAITER_COUNT.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 pub(crate) struct PinnedFrame {
