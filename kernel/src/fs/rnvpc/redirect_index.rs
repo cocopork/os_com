@@ -978,11 +978,7 @@ impl RedirectDirectory {
         self.migration_worker_set(fs_id)?.snapshot(worker_id)
     }
 
-    pub(crate) fn rebalance_migration_inode(
-        &self,
-        fs_id: u64,
-        helper_id: usize,
-    ) -> Result<bool> {
+    pub(crate) fn rebalance_migration_inode(&self, fs_id: u64, helper_id: usize) -> Result<bool> {
         self.migration_worker_set(fs_id)
             .ok_or_else(|| Error::new(Errno::EINVAL))?
             .rebalance_queued_inode(helper_id)
@@ -2356,9 +2352,7 @@ mod tests {
         let old_owner = directory.owner_worker(fs_id, inode).unwrap();
         let helper = (old_owner + 1) % 2;
 
-        assert!(directory
-            .rebalance_migration_inode(fs_id, helper)
-            .unwrap());
+        assert!(directory.rebalance_migration_inode(fs_id, helper).unwrap());
         assert_eq!(directory.owner_worker(fs_id, inode), Some(helper));
         assert_eq!(
             directory
@@ -2372,10 +2366,12 @@ mod tests {
             .unwrap();
         assert_eq!(helper_load.queued_dirty_pages, 8);
         assert_eq!(helper_load.owned_inodes, 1);
-        assert!(directory
-            .claim_ready_entries_for_worker(fs_id, old_owner, 8)
-            .unwrap()
-            .is_empty());
+        assert!(
+            directory
+                .claim_ready_entries_for_worker(fs_id, old_owner, 8)
+                .unwrap()
+                .is_empty()
+        );
         assert_eq!(
             directory
                 .claim_ready_entries_for_worker(fs_id, helper, 8)
@@ -2400,9 +2396,7 @@ mod tests {
         let helper = (owner + 1) % 2;
         assert!(workers.pop_ready_inode(owner).unwrap().is_some());
 
-        assert!(!directory
-            .rebalance_migration_inode(fs_id, helper)
-            .unwrap());
+        assert!(!directory.rebalance_migration_inode(fs_id, helper).unwrap());
         assert_eq!(directory.owner_worker(fs_id, inode), Some(owner));
     }
 
@@ -2425,9 +2419,7 @@ mod tests {
             .unwrap();
         assert_eq!(leases.len(), 1);
 
-        assert!(!directory
-            .rebalance_migration_inode(fs_id, helper)
-            .unwrap());
+        assert!(!directory.rebalance_migration_inode(fs_id, helper).unwrap());
         assert_eq!(directory.owner_worker(fs_id, inode), Some(owner));
         drop(leases);
     }
@@ -2446,9 +2438,7 @@ mod tests {
         let inode_map = directory.inode_map(fs_id, inode, false).unwrap().unwrap();
 
         inode_map.migration.lock().completion_pending_pages = 1;
-        assert!(!directory
-            .rebalance_migration_inode(fs_id, helper)
-            .unwrap());
+        assert!(!directory.rebalance_migration_inode(fs_id, helper).unwrap());
         assert_eq!(directory.owner_worker(fs_id, inode), Some(owner));
 
         {
@@ -2456,9 +2446,7 @@ mod tests {
             migration.completion_pending_pages = 0;
             migration.reclaim_pending_pages = 1;
         }
-        assert!(!directory
-            .rebalance_migration_inode(fs_id, helper)
-            .unwrap());
+        assert!(!directory.rebalance_migration_inode(fs_id, helper).unwrap());
         assert_eq!(directory.owner_worker(fs_id, inode), Some(owner));
     }
 

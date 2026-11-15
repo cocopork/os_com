@@ -292,3 +292,35 @@ fio、sync、umount 和只读 `e2fsck -fn`。四 worker 相对单 worker 的含 
 在四 worker 下产生 70,790 个 epoch，而单 worker 只有 520 个。后续应聚合短时间内到达
 的 ready batch，减少设备 FLUSH 次数；不应为此放宽单 inode owner 约束。完整数据和
 镜像指纹见[实验报告](../../../experiments/reports/RTIO-INODE-OWNED-FLUSHERS-2026-11-03.md)。
+
+## 12. 2026-11-15 worker 本地批处理实验
+
+本轮实现了以下策略：
+
+- 普通负载按 owner worker 自己的 `queued_dirty_pages >= 1024` 激活，只唤醒 owner；
+- 容量或显式进度压力仍唤醒全部 worker，空闲 worker 只可整体接管处于 `QUEUED`
+  且无 in-flight、completion-pending、reclaim-pending 状态的 inode；
+- durability worker 只消费 generation 变化边，不再因一个不足 1024 页的 ready batch
+  永久保持可运行；全局无 queued/pending 工作时仍会提交尾批次。
+
+正确性测试覆盖了本地水位、压力覆盖、owner 转移、旧队列节点、阻止运行中或完成中
+inode 转移，以及 durability 边沿和尾批次。真实 NVMe 的 15 个正式点全部完成 sync、
+卸载和 e2fsck。
+
+但五轮 4 KiB 随机覆盖写没有得到性能提升。相对修改前精确 dirty-entry 索引基线，
+4/16/32 线程均值分别从 `588.80/382.42/222.35 MiB/s` 变为
+`584.67/375.47/213.97 MiB/s`。因此该策略不能标记为性能验收通过。
+
+诊断插桩显示，4/16 线程约有 `997/967` 页每 completion batch，32 线程却只有
+约 `19.3` 页。根因是当前 `queued_dirty_pages` 包含正在被前台扩展、暂时不能从
+`Dirty` 转为 `Migrating` 的 entry；总 dirty 水位超过 1024 并不表示本 worker
+已有 1024 页可 claim。后续若继续优化，应单独设计和验证 per-worker
+`claimable_ready_pages` 计数，并覆盖 extension commit/abort、claim rollback、owner
+转移和候选去重的所有状态边。不能继续只调整 total-dirty 阈值。
+
+曾验证“在一次 `pop_ready_inode()` 中连续丢弃 stale 节点”。该实现使最终五轮均值
+进一步降到 `515.48/370.75/194.91 MiB/s`，已撤销。stale 节点不是 32 线程小批次的
+主要来源，集中清理反而放大 candidate-select CPU 开销。
+
+完整数据和边界见
+[`RNVPCE-WORKER-LOCAL-BATCHING-2026-11-15.md`](../../../experiments/reports/RNVPCE-WORKER-LOCAL-BATCHING-2026-11-15.md)。

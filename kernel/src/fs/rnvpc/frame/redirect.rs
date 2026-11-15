@@ -271,13 +271,8 @@ impl Rnvpc {
             .migration_worker_load_snapshot(fs_id, worker_id)
     }
 
-    pub(crate) fn rebalance_migration_inode(
-        &self,
-        fs_id: u64,
-        helper_id: usize,
-    ) -> Result<bool> {
-        self.redirects
-            .rebalance_migration_inode(fs_id, helper_id)
+    pub(crate) fn rebalance_migration_inode(&self, fs_id: u64, helper_id: usize) -> Result<bool> {
+        self.redirects.rebalance_migration_inode(fs_id, helper_id)
     }
 
     pub(crate) fn migration_queued_dirty_pages(&self, fs_id: u64) -> Option<usize> {

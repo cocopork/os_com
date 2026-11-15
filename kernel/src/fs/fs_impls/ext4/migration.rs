@@ -365,10 +365,7 @@ impl Ext4 {
                             if worker_dirty_pages == 0
                                 && (capacity_waiters != 0 || progress_waiters != 0)
                             {
-                                match pool.rebalance_migration_inode(
-                                    fs.rnvpc_fs_id(),
-                                    worker_id,
-                                ) {
+                                match pool.rebalance_migration_inode(fs.rnvpc_fs_id(), worker_id) {
                                     Ok(true) => {
                                         worker_dirty_pages = pool
                                             .migration_worker_load_snapshot(
@@ -413,9 +410,7 @@ impl Ext4 {
                             }
                         }
                         let queued_dirty_pages = rnvpc::pool()
-                            .and_then(|pool| {
-                                pool.migration_queued_dirty_pages(fs.rnvpc_fs_id())
-                            })
+                            .and_then(|pool| pool.migration_queued_dirty_pages(fs.rnvpc_fs_id()))
                             .unwrap_or(0);
                         match fs.rtio_durability.try_advance_idle(
                             &fs,
@@ -423,9 +418,7 @@ impl Ext4 {
                             queued_dirty_pages,
                         ) {
                             Ok(processed) if processed != 0 => {
-                                if let Err(error) =
-                                    fs.process_rtio_worker_completions(worker_id)
-                                {
+                                if let Err(error) = fs.process_rtio_worker_completions(worker_id) {
                                     error!("rTIO owner completion failed: {error:?}");
                                     fs.fail_nv_migration();
                                 }
@@ -1902,11 +1895,7 @@ pub(super) mod tests {
             0,
             0,
         ));
-        assert!(should_run_background_migration(
-            MIGRATION_BATCH_PAGES,
-            0,
-            0,
-        ));
+        assert!(should_run_background_migration(MIGRATION_BATCH_PAGES, 0, 0,));
         assert!(!should_run_background_migration(0, 1, 1));
         assert!(should_run_background_migration(1, 1, 0));
         assert!(should_run_background_migration(1, 0, 1));

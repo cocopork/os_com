@@ -126,19 +126,19 @@
 - Consumes: completed Tasks 1-3 and the existing overwrite sweep harness.
 - Produces: correctness evidence and repeatable 4/16/32-thread performance data.
 
-- [ ] **Step 1: Run formatting, normal compile, ktest compile, and focused ktests**
+- [x] **Step 1: Run formatting, normal compile, ktest compile, and focused ktests**
 
   Require zero new compiler errors and all targeted tests to pass; record any unrelated full-suite limitation separately.
 
-- [ ] **Step 2: Build one release image and run a smoke test**
+- [x] **Step 2: Build one release image and run a smoke test**
 
   Use `/dev/nvme1n1p2`, 2 GiB low-fragmentation files, a 128 MiB NV pool, 4 KiB random overwrite, four rTIO workers, and four virtqueues. Require sync, unmount, e2fsck, and hctx validation.
 
-- [ ] **Step 3: Run five complete 4/16/32-thread rounds with alternating point order**
+- [x] **Step 3: Run five complete 4/16/32-thread rounds with alternating point order**
 
   Compare mean, median, standard deviation, pages per completion batch, worker page balance, ready-inode dequeues, durability leader attempts/wins, and capacity-wait latency against the current exact-index baseline.
 
-- [ ] **Step 4: Record the design and measured outcome**
+- [x] **Step 4: Record the design and measured outcome**
 
   Document both successful and rejected behavior. Do not claim improvement unless repeated 32-thread throughput improves beyond baseline variation without regressing 4/16-thread means or correctness.
 
