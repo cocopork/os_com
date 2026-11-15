@@ -68,23 +68,23 @@
 - Consumes: worker ready-inode queues, `InodeMigrationState`, and the `IDLE/QUEUED/RUNNING/RERUN` work-state machine.
 - Produces: `MigrationWorkerSet::rebalance_queued_inode(helper_id: usize) -> Result<bool>` and `Rnvpc::rebalance_migration_inode(fs_id: u64, helper_id: usize) -> Result<bool>`.
 
-- [ ] **Step 1: Add failing ownership-transfer tests**
+- [x] **Step 1: Add failing ownership-transfer tests**
 
   Test a successful queued-inode transfer, refusal for `RUNNING`, refusal with any in-flight/completion/reclaim pages, correct per-worker dirty/owned counters, and harmless discard of the old worker's stale queue node.
 
-- [ ] **Step 2: Run the ownership tests and verify the rebalancing interface is absent**
+- [x] **Step 2: Run the ownership tests and verify the rebalancing interface is absent**
 
   Run the focused redirect-index ktests; expect compile failure or missing-method failure before implementation.
 
-- [ ] **Step 3: Implement atomic whole-inode transfer**
+- [x] **Step 3: Implement atomic whole-inode transfer**
 
   Select the most-loaded victim, remove one queued inode, validate the safety predicates under its migration lock, update owner generation and worker counters, then enqueue it once on the helper. On validation failure, restore the victim queue without changing ownership.
 
-- [ ] **Step 4: Invoke rebalancing only under capacity/progress pressure**
+- [x] **Step 4: Invoke rebalancing only under capacity/progress pressure**
 
   An idle pressured worker attempts one safe transfer before concluding it has no local work. Normal watermark operation never steals and never inspects another worker's ready queue.
 
-- [ ] **Step 5: Run focused ownership, migration, and compile checks**
+- [x] **Step 5: Run focused ownership, migration, and compile checks**
 
   Expect all new race/counter tests and `cargo osdk check --ktests --package aster-kernel` to pass.
 

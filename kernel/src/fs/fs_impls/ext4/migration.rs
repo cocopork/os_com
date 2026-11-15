@@ -359,9 +359,31 @@ impl Ext4 {
                         let run_migration = if uses_shared_migration_rounds(fs.rnvpc_mode()) {
                             let pool = rnvpc::pool()
                                 .expect("rNVPCe migration worker requires an initialized pool");
-                            let worker_dirty_pages = pool
+                            let mut worker_dirty_pages = pool
                                 .migration_worker_load_snapshot(fs.rnvpc_fs_id(), worker_id)
                                 .map_or(0, |load| load.queued_dirty_pages);
+                            if worker_dirty_pages == 0
+                                && (capacity_waiters != 0 || progress_waiters != 0)
+                            {
+                                match pool.rebalance_migration_inode(
+                                    fs.rnvpc_fs_id(),
+                                    worker_id,
+                                ) {
+                                    Ok(true) => {
+                                        worker_dirty_pages = pool
+                                            .migration_worker_load_snapshot(
+                                                fs.rnvpc_fs_id(),
+                                                worker_id,
+                                            )
+                                            .map_or(0, |load| load.queued_dirty_pages);
+                                    }
+                                    Ok(false) => {}
+                                    Err(error) => {
+                                        error!("rTIO pressure rebalance failed: {error:?}");
+                                        fs.fail_nv_migration();
+                                    }
+                                }
+                            }
                             should_run_background_migration(
                                 worker_dirty_pages,
                                 capacity_waiters,

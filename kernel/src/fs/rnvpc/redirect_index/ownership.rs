@@ -202,28 +202,91 @@ impl MigrationWorkerSet {
                 }
             };
             migration.active_entries = migration.active_entries.saturating_add(1);
+            inode_map
+                .queued_dirty_pages
+                .fetch_add(pages, Ordering::AcqRel);
+            self.workers[owner]
+                .queued_dirty_pages
+                .fetch_add(pages, Ordering::AcqRel);
             owner
         };
-        inode_map
-            .queued_dirty_pages
-            .fetch_add(pages, Ordering::AcqRel);
-        self.workers[owner]
-            .queued_dirty_pages
-            .fetch_add(pages, Ordering::AcqRel);
         inode_map.enqueue_dirty_entry(entry);
         self.schedule_inode(inode_map, owner);
     }
 
     pub(super) fn account_dirty_extension(&self, inode_map: &InodeRedirectMap, pages: usize) {
-        let owner = inode_map.migration_owner.load(Ordering::Acquire);
-        debug_assert_ne!(owner, Self::NO_OWNER);
-        debug_assert!(owner < self.workers.len());
+        Self::record_migration_lock(inode_map);
+        let migration = inode_map.migration.lock();
+        let owner = migration
+            .owner
+            .expect("a registered dirty extent has a migration owner");
         inode_map
             .queued_dirty_pages
             .fetch_add(pages, Ordering::AcqRel);
         self.workers[owner]
             .queued_dirty_pages
             .fetch_add(pages, Ordering::AcqRel);
+    }
+
+    pub(super) fn rebalance_queued_inode(&self, helper_id: usize) -> Result<bool> {
+        if helper_id >= self.workers.len() {
+            return_errno_with_message!(Errno::EINVAL, "invalid migration helper worker");
+        }
+        let Some((victim_id, victim)) = self
+            .workers
+            .iter()
+            .enumerate()
+            .filter(|(worker_id, _)| *worker_id != helper_id)
+            .max_by_key(|(_, worker)| worker.queued_dirty_pages.load(Ordering::Acquire))
+        else {
+            return Ok(false);
+        };
+        if victim.queued_dirty_pages.load(Ordering::Acquire) == 0 {
+            return Ok(false);
+        }
+        let Some(inode_map) = victim.ready_inodes.lock().pop_front() else {
+            return Ok(false);
+        };
+
+        Self::record_migration_lock(&inode_map);
+        let mut migration = inode_map.migration.lock();
+        if migration.owner != Some(victim_id) {
+            return Ok(false);
+        }
+        let queued_pages = inode_map.queued_dirty_pages.load(Ordering::Acquire);
+        if inode_map.work_state.load(Ordering::Acquire) != INODE_WORK_QUEUED
+            || queued_pages == 0
+            || migration.in_flight_pages != 0
+            || migration.completion_pending_pages != 0
+            || migration.reclaim_pending_pages != 0
+        {
+            if inode_map.work_state.load(Ordering::Acquire) == INODE_WORK_QUEUED {
+                victim.ready_inodes.lock().push_back(inode_map.clone());
+            }
+            return Ok(false);
+        }
+
+        migration.owner = Some(helper_id);
+        migration.generation = migration.generation.wrapping_add(1);
+        inode_map
+            .migration_owner
+            .store(helper_id, Ordering::Release);
+        victim
+            .queued_dirty_pages
+            .fetch_sub(queued_pages, Ordering::AcqRel);
+        self.workers[helper_id]
+            .queued_dirty_pages
+            .fetch_add(queued_pages, Ordering::AcqRel);
+        victim.owned_inodes.fetch_sub(1, Ordering::AcqRel);
+        self.workers[helper_id]
+            .owned_inodes
+            .fetch_add(1, Ordering::AcqRel);
+        drop(migration);
+        self.workers[helper_id]
+            .ready_inodes
+            .lock()
+            .push_back(inode_map);
+        Ok(true)
     }
 
     pub(super) fn ensure_dirty_ready(&self, inode_map: &Arc<InodeRedirectMap>) {

@@ -978,6 +978,16 @@ impl RedirectDirectory {
         self.migration_worker_set(fs_id)?.snapshot(worker_id)
     }
 
+    pub(crate) fn rebalance_migration_inode(
+        &self,
+        fs_id: u64,
+        helper_id: usize,
+    ) -> Result<bool> {
+        self.migration_worker_set(fs_id)
+            .ok_or_else(|| Error::new(Errno::EINVAL))?
+            .rebalance_queued_inode(helper_id)
+    }
+
     pub(crate) fn migration_queued_dirty_pages(&self, fs_id: u64) -> Option<usize> {
         self.migration_worker_set(fs_id)
             .map(|workers| workers.queued_dirty_pages())
@@ -2331,6 +2341,125 @@ mod tests {
             "a stale worker turn must yield instead of failing the filesystem"
         );
         assert_eq!(inode_map.queued_dirty_pages.load(Ordering::Acquire), 1);
+    }
+
+    #[ktest]
+    fn rnvpce_pressure_rebalances_one_whole_queued_inode() {
+        let fs_id = 0xae;
+        let inode = 66;
+        let directory = RedirectDirectory::new().unwrap();
+        directory.configure_migration_workers(fs_id, 2).unwrap();
+
+        directory
+            .publish_dirty_entry(dirty_entry(fs_id, inode, 0, 8, 1200, 12000))
+            .unwrap();
+        let old_owner = directory.owner_worker(fs_id, inode).unwrap();
+        let helper = (old_owner + 1) % 2;
+
+        assert!(directory
+            .rebalance_migration_inode(fs_id, helper)
+            .unwrap());
+        assert_eq!(directory.owner_worker(fs_id, inode), Some(helper));
+        assert_eq!(
+            directory
+                .migration_worker_load_snapshot(fs_id, old_owner)
+                .unwrap()
+                .queued_dirty_pages,
+            0
+        );
+        let helper_load = directory
+            .migration_worker_load_snapshot(fs_id, helper)
+            .unwrap();
+        assert_eq!(helper_load.queued_dirty_pages, 8);
+        assert_eq!(helper_load.owned_inodes, 1);
+        assert!(directory
+            .claim_ready_entries_for_worker(fs_id, old_owner, 8)
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            directory
+                .claim_ready_entries_for_worker(fs_id, helper, 8)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[ktest]
+    fn rnvpce_pressure_rebalance_refuses_running_inode() {
+        let fs_id = 0xaf;
+        let inode = 67;
+        let directory = RedirectDirectory::new().unwrap();
+        directory.configure_migration_workers(fs_id, 2).unwrap();
+        directory
+            .publish_dirty_entry(dirty_entry(fs_id, inode, 0, 1, 1300, 13000))
+            .unwrap();
+        let inode_map = directory.inode_map(fs_id, inode, false).unwrap().unwrap();
+        let workers = directory.migration_worker_set(fs_id).unwrap();
+        let owner = workers.owner(&inode_map).unwrap();
+        let helper = (owner + 1) % 2;
+        assert!(workers.pop_ready_inode(owner).unwrap().is_some());
+
+        assert!(!directory
+            .rebalance_migration_inode(fs_id, helper)
+            .unwrap());
+        assert_eq!(directory.owner_worker(fs_id, inode), Some(owner));
+    }
+
+    #[ktest]
+    fn rnvpce_pressure_rebalance_refuses_in_flight_inode() {
+        let fs_id = 0xb0;
+        let inode = 68;
+        let directory = RedirectDirectory::new().unwrap();
+        directory.configure_migration_workers(fs_id, 2).unwrap();
+        directory
+            .publish_dirty_entry(dirty_entry(fs_id, inode, 0, 1, 1400, 14000))
+            .unwrap();
+        directory
+            .publish_dirty_entry(dirty_entry(fs_id, inode, 2, 1, 1402, 14002))
+            .unwrap();
+        let owner = directory.owner_worker(fs_id, inode).unwrap();
+        let helper = (owner + 1) % 2;
+        let leases = directory
+            .claim_ready_entries_for_worker(fs_id, owner, 1)
+            .unwrap();
+        assert_eq!(leases.len(), 1);
+
+        assert!(!directory
+            .rebalance_migration_inode(fs_id, helper)
+            .unwrap());
+        assert_eq!(directory.owner_worker(fs_id, inode), Some(owner));
+        drop(leases);
+    }
+
+    #[ktest]
+    fn rnvpce_pressure_rebalance_refuses_completion_or_reclaim_pending_inode() {
+        let fs_id = 0xb1;
+        let inode = 69;
+        let directory = RedirectDirectory::new().unwrap();
+        directory.configure_migration_workers(fs_id, 2).unwrap();
+        directory
+            .publish_dirty_entry(dirty_entry(fs_id, inode, 0, 1, 1500, 15000))
+            .unwrap();
+        let owner = directory.owner_worker(fs_id, inode).unwrap();
+        let helper = (owner + 1) % 2;
+        let inode_map = directory.inode_map(fs_id, inode, false).unwrap().unwrap();
+
+        inode_map.migration.lock().completion_pending_pages = 1;
+        assert!(!directory
+            .rebalance_migration_inode(fs_id, helper)
+            .unwrap());
+        assert_eq!(directory.owner_worker(fs_id, inode), Some(owner));
+
+        {
+            let mut migration = inode_map.migration.lock();
+            migration.completion_pending_pages = 0;
+            migration.reclaim_pending_pages = 1;
+        }
+        assert!(!directory
+            .rebalance_migration_inode(fs_id, helper)
+            .unwrap());
+        assert_eq!(directory.owner_worker(fs_id, inode), Some(owner));
     }
 
     #[ktest]
