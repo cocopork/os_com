@@ -40,12 +40,11 @@ const MIGRATION_BATCH_PAGES: usize = super::writeback::WRITEBACK_BATCH;
 
 fn should_run_background_migration(
     worker_dirty_pages: usize,
-    total_dirty_pages: usize,
     capacity_waiters: usize,
     progress_waiters: usize,
 ) -> bool {
     worker_dirty_pages != 0
-        && (total_dirty_pages >= MIGRATION_BATCH_PAGES
+        && (worker_dirty_pages >= MIGRATION_BATCH_PAGES
             || capacity_waiters != 0
             || progress_waiters != 0)
 }
@@ -360,15 +359,11 @@ impl Ext4 {
                         let run_migration = if uses_shared_migration_rounds(fs.rnvpc_mode()) {
                             let pool = rnvpc::pool()
                                 .expect("rNVPCe migration worker requires an initialized pool");
-                            let total_dirty_pages = pool
-                                .migration_queued_dirty_pages(fs.rnvpc_fs_id())
-                                .unwrap_or(0);
                             let worker_dirty_pages = pool
                                 .migration_worker_load_snapshot(fs.rnvpc_fs_id(), worker_id)
                                 .map_or(0, |load| load.queued_dirty_pages);
                             should_run_background_migration(
                                 worker_dirty_pages,
-                                total_dirty_pages,
                                 capacity_waiters,
                                 progress_waiters,
                             )
@@ -628,22 +623,21 @@ impl Ext4 {
         let Some(pool) = rnvpc::pool() else {
             return;
         };
-        if pool
-            .nv_entry_owner_worker(self.rnvpc_fs_id(), inode)
-            .is_none()
-        {
+        let Some(owner) = pool.nv_entry_owner_worker(self.rnvpc_fs_id(), inode) else {
+            return;
+        };
+        let capacity_waiters = self.nv_capacity_waiters.load(Ordering::Acquire);
+        let progress_waiters = self.nv_migration_progress_waiters.load(Ordering::Acquire);
+        if capacity_waiters != 0 || progress_waiters != 0 {
+            self.request_nv_migration();
             return;
         }
-        let total_dirty_pages = pool
-            .migration_queued_dirty_pages(self.rnvpc_fs_id())
-            .unwrap_or(0);
-        if total_dirty_pages < MIGRATION_BATCH_PAGES
-            && self.nv_capacity_waiters.load(Ordering::Acquire) == 0
-            && self.nv_migration_progress_waiters.load(Ordering::Acquire) == 0
-        {
-            return;
+        let worker_dirty_pages = pool
+            .migration_worker_load_snapshot(self.rnvpc_fs_id(), owner)
+            .map_or(0, |load| load.queued_dirty_pages);
+        if worker_dirty_pages >= MIGRATION_BATCH_PAGES {
+            self.request_nv_migration_worker(owner);
         }
-        self.request_nv_migration();
     }
 
     /// Sleeps outside inode/publication locks until a migration round completes.
@@ -1882,25 +1876,18 @@ pub(super) mod tests {
     #[ktest]
     fn rnvpce_background_migration_waits_for_batch_or_waiter() {
         assert!(!should_run_background_migration(
-            1,
             MIGRATION_BATCH_PAGES - 1,
             0,
             0,
         ));
         assert!(should_run_background_migration(
-            1,
             MIGRATION_BATCH_PAGES,
             0,
             0,
         ));
-        assert!(!should_run_background_migration(
-            0,
-            MIGRATION_BATCH_PAGES,
-            1,
-            1,
-        ));
-        assert!(should_run_background_migration(1, 1, 1, 0));
-        assert!(should_run_background_migration(1, 1, 0, 1));
+        assert!(!should_run_background_migration(0, 1, 1));
+        assert!(should_run_background_migration(1, 1, 0));
+        assert!(should_run_background_migration(1, 0, 1));
     }
 
     #[ktest]

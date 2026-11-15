@@ -259,7 +259,7 @@ fn rnvpce_migration_worker_notification_is_edge_triggered() {
 }
 
 #[ktest]
-fn rnvpce_owner_wake_migrates_below_global_watermark() {
+fn rnvpce_owner_wake_waits_for_local_watermark() {
     crate::fs::rnvpc::init_for_ext4_tests();
     crate::time::clocks::init_for_ktest();
     let fixture = Ext4FixtureBuilder::new(2048, 256, 2048)
@@ -281,15 +281,12 @@ fn rnvpce_owner_wake_migrates_below_global_watermark() {
         .unwrap();
 
     let pool = crate::fs::rnvpc::pool().unwrap();
-    let deadline = ostd::timer::Jiffies::elapsed().as_duration() + Duration::from_secs(2);
-    while has_native_redirect(pool, fixture.ext4.rnvpc_fs_id(), 11, 0)
-        && ostd::timer::Jiffies::elapsed().as_duration() < deadline
-    {
+    for _ in 0..256 {
         crate::thread::Thread::yield_now();
     }
     assert!(
-        !has_native_redirect(pool, fixture.ext4.rnvpc_fs_id(), 11, 0),
-        "owner notification must drive ordinary dirty work below the global watermark"
+        has_native_redirect(pool, fixture.ext4.rnvpc_fs_id(), 11, 0),
+        "ordinary publication must stay resident below the owner worker watermark"
     );
 }
 

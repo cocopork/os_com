@@ -39,19 +39,19 @@
 - Consumes: `Rnvpc::migration_worker_load_snapshot(fs_id, worker_id)` and `Rnvpc::nv_entry_owner_worker(fs_id, inode)`.
 - Produces: `should_run_background_migration(worker_dirty_pages, capacity_waiters, progress_waiters) -> bool` and owner-local foreground wakeup behavior.
 
-- [ ] **Step 1: Add failing activation-policy tests**
+- [x] **Step 1: Add failing activation-policy tests**
 
   Pin that 1023 local pages remain parked without pressure, 1024 local pages run, and either waiter count overrides the watermark. Update the below-global-watermark foreground test so ordinary publication remains resident until an explicit drain/pressure event.
 
-- [ ] **Step 2: Run the focused tests and verify the old global-total policy fails them**
+- [x] **Step 2: Run the focused tests and verify the old global-total policy fails them**
 
   Run the relevant `migration` and `nv_tests` ktests through the existing OSDK ktest runner; expect the local-watermark assertion to fail before implementation.
 
-- [ ] **Step 3: Implement worker-local activation and owner-only ordinary wakeup**
+- [x] **Step 3: Implement worker-local activation and owner-only ordinary wakeup**
 
   Remove `total_dirty_pages` from normal activation. `request_nv_migration_for_inode()` reads the inode owner and that worker's queued pages, waking only the owner at 1024 pages; capacity/progress, sync, shutdown, and failure continue to use the global wake path.
 
-- [ ] **Step 4: Run focused ktests and ktest compile checks**
+- [x] **Step 4: Run focused ktests and ktest compile checks**
 
   Run the activation/wakeup tests and `cargo osdk check --ktests --package aster-kernel`; expect success.
 
