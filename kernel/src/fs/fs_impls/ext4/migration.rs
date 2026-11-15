@@ -411,31 +411,31 @@ impl Ext4 {
                                     break;
                                 }
                             }
-                            let queued_dirty_pages = rnvpc::pool()
-                                .and_then(|pool| {
-                                    pool.migration_queued_dirty_pages(fs.rnvpc_fs_id())
-                                })
-                                .unwrap_or(0);
-                            match fs.rtio_durability.try_advance_idle(
-                                &fs,
-                                Some(worker_id),
-                                queued_dirty_pages,
-                            ) {
-                                Ok(processed) if processed != 0 => {
-                                    if let Err(error) =
-                                        fs.process_rtio_worker_completions(worker_id)
-                                    {
-                                        error!("rTIO owner completion failed: {error:?}");
-                                        fs.fail_nv_migration();
-                                    }
-                                    continue;
-                                }
-                                Ok(_) => {}
-                                Err(error) => {
-                                    error!("rTIO durability failed: {error:?}");
+                        }
+                        let queued_dirty_pages = rnvpc::pool()
+                            .and_then(|pool| {
+                                pool.migration_queued_dirty_pages(fs.rnvpc_fs_id())
+                            })
+                            .unwrap_or(0);
+                        match fs.rtio_durability.try_advance_idle(
+                            &fs,
+                            Some(worker_id),
+                            queued_dirty_pages,
+                        ) {
+                            Ok(processed) if processed != 0 => {
+                                if let Err(error) =
+                                    fs.process_rtio_worker_completions(worker_id)
+                                {
+                                    error!("rTIO owner completion failed: {error:?}");
                                     fs.fail_nv_migration();
-                                    break;
                                 }
+                                continue;
+                            }
+                            Ok(_) => {}
+                            Err(error) => {
+                                error!("rTIO durability failed: {error:?}");
+                                fs.fail_nv_migration();
+                                break;
                             }
                         }
                     }
@@ -450,9 +450,9 @@ impl Ext4 {
                                             .load(Ordering::Acquire)
                                             != observed
                                         || (uses_shared_migration_rounds(fs.rnvpc_mode())
-                                            && (fs.rtio_durability.generation()
-                                                != durability_generation
-                                                || fs.rtio_durability.ready_batch_count() != 0))
+                                            && fs
+                                                .rtio_durability
+                                                .completion_edge_since(durability_generation))
                                 })
                                 .then_some(())
                         },

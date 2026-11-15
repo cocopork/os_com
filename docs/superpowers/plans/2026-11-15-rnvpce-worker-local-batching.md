@@ -100,19 +100,19 @@
 - Consumes: global `ready_pages`, `pending_data_pages`, durability generation, and worker triggers.
 - Produces: a wait predicate that wakes for a new completion edge, a full 1024-page epoch, an idle tail, or an explicit drain, but does not remain permanently true merely because one sub-threshold batch exists.
 
-- [ ] **Step 1: Add failing durability wake tests**
+- [x] **Step 1: Add failing durability wake tests**
 
   Pin that a ready tail below 1024 does not keep a worker runnable after its completion edge is consumed, that crossing 1024 advances once, and that queued/pending work prevents premature idle-tail flush.
 
-- [ ] **Step 2: Run the focused durability tests and observe the sticky-ready behavior**
+- [x] **Step 2: Run the focused durability tests and observe the sticky-ready behavior**
 
   Expect the sub-threshold non-spinning assertion to fail before implementation.
 
-- [ ] **Step 3: Remove sticky `ready_batch_count != 0` wake behavior**
+- [x] **Step 3: Remove sticky `ready_batch_count != 0` wake behavior**
 
   Use generation changes and explicit threshold/idle conditions as edges. Keep exactly one global durability leader and route durable results to the submitting batch owner.
 
-- [ ] **Step 4: Run focused durability and migration tests**
+- [x] **Step 4: Run focused durability and migration tests**
 
   Expect the new wake tests, existing durability accounting tests, and ktest compile check to pass.
 

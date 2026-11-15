@@ -67,6 +67,14 @@ impl DurabilityArbiter {
         self.generation.load(Ordering::Acquire)
     }
 
+    pub(super) fn completion_edge_since(&self, observed_generation: usize) -> bool {
+        self.generation() != observed_generation
+    }
+
+    fn background_epoch_ready(&self) -> bool {
+        self.ready_page_count() >= super::MIGRATION_BATCH_PAGES
+    }
+
     fn idle_tail_ready(&self, queued_dirty_pages: usize) -> bool {
         queued_dirty_pages == 0 && self.pending_data_page_count() == 0
     }
@@ -76,7 +84,7 @@ impl DurabilityArbiter {
         fs: &Ext4,
         contender: Option<usize>,
     ) -> Result<usize> {
-        if self.ready_page_count() < super::MIGRATION_BATCH_PAGES {
+        if !self.background_epoch_ready() {
             return Ok(0);
         }
         self.try_advance(fs, contender)
@@ -230,5 +238,31 @@ mod tests {
 
         assert!(!arbiter.idle_tail_ready(1));
         assert!(arbiter.idle_tail_ready(0));
+    }
+
+    #[ktest]
+    fn ready_completion_edge_is_consumed_once() {
+        let arbiter = DurabilityArbiter::new();
+        let before = arbiter.generation();
+
+        arbiter.note_submitted_pages(1);
+        arbiter.note_ready_batch(1);
+        assert!(arbiter.completion_edge_since(before));
+        let consumed = arbiter.generation();
+        assert!(!arbiter.completion_edge_since(consumed));
+        assert_eq!(arbiter.ready_batch_count(), 1);
+    }
+
+    #[ktest]
+    fn background_epoch_starts_only_at_page_watermark() {
+        let arbiter = DurabilityArbiter::new();
+        let below = super::super::MIGRATION_BATCH_PAGES - 1;
+        arbiter.note_submitted_pages(below);
+        arbiter.note_ready_batch(below);
+        assert!(!arbiter.background_epoch_ready());
+
+        arbiter.note_submitted_pages(1);
+        arbiter.note_ready_batch(1);
+        assert!(arbiter.background_epoch_ready());
     }
 }
