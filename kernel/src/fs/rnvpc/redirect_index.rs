@@ -19,7 +19,7 @@ use crate::prelude::*;
 mod ownership;
 
 pub(crate) use ownership::MigrationWorkerLoadSnapshot;
-use ownership::{InodeMigrationState, MigrationWorkerSet};
+use ownership::{INODE_WORK_IDLE, InodeMigrationState, MigrationWorkerSet};
 
 const REDIRECT_PARTITION_COUNT: usize = 64;
 const REDIRECT_PARTITION_PAGES: u64 = 256;
@@ -68,6 +68,7 @@ pub(crate) struct DirtyNvExtentEntry {
     readers: AtomicUsize,
     writers: AtomicUsize,
     migration_registered: AtomicBool,
+    candidate_queued: AtomicBool,
     waiters: WaitQueue,
 }
 
@@ -92,6 +93,7 @@ impl DirtyNvExtentEntry {
             readers: AtomicUsize::new(0),
             writers: AtomicUsize::new(0),
             migration_registered: AtomicBool::new(false),
+            candidate_queued: AtomicBool::new(false),
             waiters: WaitQueue::new(),
         })
     }
@@ -275,10 +277,14 @@ impl NvExtentEntryExtension {
         self.committed_pages
     }
 
-    fn commit(mut self) {
+    fn publish_page_count(&self) {
         self.entry
             .committed_pages
             .store(self.committed_pages, Ordering::Release);
+    }
+
+    fn commit(mut self) {
+        self.publish_page_count();
         self.entry
             .transition(NvExtentEntryState::Extending, NvExtentEntryState::Dirty)
             .expect("exclusive NV extent extension state changed");
@@ -408,6 +414,7 @@ impl Drop for NvExtentEntryLease {
         {
             ownership.workers.return_claim(
                 &ownership.inode_map,
+                &self.entry,
                 ownership.worker_id,
                 ownership.pages,
             );
@@ -634,12 +641,15 @@ struct RedirectPartition {
 struct InodeRedirectMap {
     fs_id: u64,
     entries: SpinLock<BTreeMap<u64, Arc<DirtyNvExtentEntry>>>,
+    dirty_entries: SpinLock<BTreeMap<u64, Arc<DirtyNvExtentEntry>>>,
     migration: SpinLock<InodeMigrationState>,
     migration_owner: AtomicUsize,
     queued_dirty_pages: AtomicUsize,
-    ready_queued: AtomicBool,
+    work_state: AtomicU8,
     #[cfg(ktest)]
     migration_lock_acquisitions: AtomicUsize,
+    #[cfg(ktest)]
+    candidate_entry_visits: AtomicUsize,
 }
 
 impl InodeRedirectMap {
@@ -647,13 +657,39 @@ impl InodeRedirectMap {
         Self {
             fs_id,
             entries: SpinLock::new(BTreeMap::new()),
+            dirty_entries: SpinLock::new(BTreeMap::new()),
             migration: SpinLock::new(InodeMigrationState::default()),
             migration_owner: AtomicUsize::new(usize::MAX),
             queued_dirty_pages: AtomicUsize::new(0),
-            ready_queued: AtomicBool::new(false),
+            work_state: AtomicU8::new(INODE_WORK_IDLE),
             #[cfg(ktest)]
             migration_lock_acquisitions: AtomicUsize::new(0),
+            #[cfg(ktest)]
+            candidate_entry_visits: AtomicUsize::new(0),
         }
+    }
+
+    fn enqueue_dirty_entry(&self, entry: &Arc<DirtyNvExtentEntry>) {
+        if entry
+            .candidate_queued
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            self.dirty_entries
+                .lock()
+                .insert(entry.logical_start(), entry.clone());
+        }
+    }
+
+    fn pop_dirty_entry(&self) -> Option<Arc<DirtyNvExtentEntry>> {
+        let mut dirty_entries = self.dirty_entries.lock();
+        let (_, entry) = dirty_entries.pop_first()?;
+        entry.candidate_queued.store(false, Ordering::Release);
+        Some(entry)
+    }
+
+    fn has_dirty_entries(&self) -> bool {
+        !self.dirty_entries.lock().is_empty()
     }
 }
 
@@ -734,11 +770,19 @@ impl RedirectDirectory {
             return_errno_with_message!(Errno::EBUSY, "extended NV entry overlaps successor");
         }
         let added = usize::from(extension.committed_pages() - extension.expected_pages());
+        extension.publish_page_count();
+        let workers = entry
+            .migration_registered
+            .load(Ordering::Acquire)
+            .then(|| self.migration_worker_set(entry.fs_id()))
+            .flatten();
+        if let Some(workers) = &workers {
+            workers.account_dirty_extension(&inode_map, added);
+        }
         extension.commit();
-        if entry.migration_registered.load(Ordering::Acquire)
-            && let Some(workers) = self.migration_worker_set(entry.fs_id())
-        {
-            workers.extend_dirty(&inode_map, added);
+        if let Some(workers) = workers {
+            inode_map.enqueue_dirty_entry(&entry);
+            workers.ensure_dirty_ready(&inode_map);
         }
         drop(entries);
         Ok(())
@@ -754,6 +798,7 @@ impl RedirectDirectory {
             return;
         };
         if let Some(workers) = self.migration_worker_set(entry.fs_id()) {
+            inode_map.enqueue_dirty_entry(&entry);
             workers.ensure_dirty_ready(&inode_map);
         }
     }
@@ -865,7 +910,7 @@ impl RedirectDirectory {
         {
             return;
         }
-        workers.publish_dirty(inode_map, usize::from(entry.page_count()));
+        workers.publish_dirty(inode_map, entry, usize::from(entry.page_count()));
     }
 
     pub(crate) fn configure_migration_workers(&self, fs_id: u64, workers: usize) -> Result<()> {
@@ -908,7 +953,7 @@ impl RedirectDirectory {
                         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
                         .is_ok()
                 {
-                    workers.publish_dirty(&inode_map, usize::from(entry.page_count()));
+                    workers.publish_dirty(&inode_map, &entry, usize::from(entry.page_count()));
                 }
             }
         }
@@ -921,7 +966,8 @@ impl RedirectDirectory {
 
     pub(crate) fn owner_worker(&self, fs_id: u64, inode: u64) -> Option<usize> {
         let inode_map = self.inode_map(fs_id, inode, false).ok().flatten()?;
-        inode_map.migration.lock().owner
+        let owner = inode_map.migration_owner.load(Ordering::Acquire);
+        (owner != usize::MAX).then_some(owner)
     }
 
     pub(crate) fn migration_worker_load_snapshot(
@@ -950,6 +996,14 @@ impl RedirectDirectory {
             .map_or(0, |map| {
                 map.migration_lock_acquisitions.load(Ordering::Acquire)
             })
+    }
+
+    #[cfg(ktest)]
+    fn candidate_entry_visits_for_test(&self, fs_id: u64, inode: u64) -> usize {
+        self.inode_map(fs_id, inode, false)
+            .ok()
+            .flatten()
+            .map_or(0, |map| map.candidate_entry_visits.load(Ordering::Acquire))
     }
 
     pub(crate) fn lookup_dirty_entry(&self, key: PageKey) -> Option<Arc<DirtyNvExtentEntry>> {
@@ -1098,8 +1152,14 @@ impl RedirectDirectory {
             };
             debug_assert_eq!(inode_map.fs_id, fs_id);
             debug_assert_eq!(workers.owner(&inode_map), Some(worker_id));
-            let entries = inode_map.entries.lock();
-            for entry in entries.values() {
+            while claimed_pages < page_budget {
+                let Some(entry) = inode_map.pop_dirty_entry() else {
+                    break;
+                };
+                #[cfg(ktest)]
+                inode_map
+                    .candidate_entry_visits
+                    .fetch_add(1, Ordering::Relaxed);
                 if entry
                     .transition(NvExtentEntryState::Dirty, NvExtentEntryState::Migrating)
                     .is_err()
@@ -1107,10 +1167,21 @@ impl RedirectDirectory {
                     continue;
                 }
                 let pages = usize::from(entry.page_count());
-                if let Err(error) = workers.claim_pages(&inode_map, worker_id, pages) {
-                    let _ =
-                        entry.transition(NvExtentEntryState::Migrating, NvExtentEntryState::Dirty);
-                    return Err(error);
+                match workers.claim_pages(&inode_map, worker_id, pages) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        let _ = entry
+                            .transition(NvExtentEntryState::Migrating, NvExtentEntryState::Dirty);
+                        inode_map.enqueue_dirty_entry(&entry);
+                        break;
+                    }
+                    Err(error) => {
+                        let _ = entry
+                            .transition(NvExtentEntryState::Migrating, NvExtentEntryState::Dirty);
+                        inode_map.enqueue_dirty_entry(&entry);
+                        workers.finish_inode_turn(&inode_map, worker_id, true);
+                        return Err(error);
+                    }
                 }
                 claimed_pages = claimed_pages.saturating_add(pages);
                 leases.push(NvExtentEntryLease {
@@ -1123,15 +1194,9 @@ impl RedirectDirectory {
                         phase: AtomicU8::new(OWNERSHIP_CLAIMED),
                     })),
                 });
-                if claimed_pages >= page_budget {
-                    break;
-                }
             }
-            let has_dirty = entries
-                .values()
-                .any(|entry| entry.state() == NvExtentEntryState::Dirty);
-            drop(entries);
-            workers.requeue_if_dirty(&inode_map, worker_id, has_dirty);
+            let has_dirty = inode_map.has_dirty_entries();
+            workers.finish_inode_turn(&inode_map, worker_id, has_dirty);
         }
         Ok(leases)
     }
@@ -2175,6 +2240,128 @@ mod tests {
         assert_eq!(load.queued_dirty_pages, 0);
         assert_eq!(load.in_flight_pages, 4);
         assert_eq!(load.ready_inode_dequeues, 1);
+    }
+
+    #[ktest]
+    fn rnvpce_running_inode_records_rerun_without_duplicate_queue_entry() {
+        let fs_id = 0xaa;
+        let inode = 62;
+        let directory = RedirectDirectory::new().unwrap();
+        directory.configure_migration_workers(fs_id, 1).unwrap();
+
+        let entry = dirty_entry(fs_id, inode, 0, 1, 800, 8000);
+        directory.publish_dirty_entry(entry.clone()).unwrap();
+        let inode_map = directory.inode_map(fs_id, inode, false).unwrap().unwrap();
+        let workers = directory.migration_worker_set(fs_id).unwrap();
+
+        assert!(workers.pop_ready_inode(0).unwrap().is_some());
+        workers.ensure_dirty_ready(&inode_map);
+        assert!(
+            workers.pop_ready_inode(0).unwrap().is_none(),
+            "foreground publication must mark a running inode for rerun instead of queueing it twice"
+        );
+        workers.finish_inode_turn(&inode_map, 0, false);
+        assert!(workers.pop_ready_inode(0).unwrap().is_some());
+        workers.finish_inode_turn(&inode_map, 0, false);
+        assert!(workers.pop_ready_inode(0).unwrap().is_none());
+    }
+
+    #[ktest]
+    fn rnvpce_worker_claim_visits_only_ready_entries() {
+        let fs_id = 0xab;
+        let inode = 63;
+        let directory = RedirectDirectory::new().unwrap();
+        directory.configure_migration_workers(fs_id, 1).unwrap();
+
+        for logical_start in 0..32 {
+            directory
+                .publish_dirty_entry(dirty_entry(
+                    fs_id,
+                    inode,
+                    logical_start,
+                    1,
+                    900 + logical_start,
+                    9000 + logical_start,
+                ))
+                .unwrap();
+        }
+        let active = directory
+            .claim_ready_entries_for_worker(fs_id, 0, 32)
+            .unwrap();
+        assert_eq!(active.len(), 32);
+
+        directory
+            .publish_dirty_entry(dirty_entry(fs_id, inode, 32, 1, 932, 9032))
+            .unwrap();
+        let visits_before = directory.candidate_entry_visits_for_test(fs_id, inode);
+        let next = directory
+            .claim_ready_entries_for_worker(fs_id, 0, 1)
+            .unwrap();
+        assert_eq!(next.len(), 1);
+        assert_eq!(next[0].entry().logical_start(), 32);
+        assert_eq!(
+            directory.candidate_entry_visits_for_test(fs_id, inode) - visits_before,
+            1,
+            "the worker must pop the exact ready entry instead of rescanning active entries"
+        );
+        drop(active);
+    }
+
+    #[ktest]
+    fn rnvpce_stale_worker_yields_after_inode_owner_turnover() {
+        let fs_id = 0xac;
+        let inode = 64;
+        let directory = RedirectDirectory::new().unwrap();
+        directory.configure_migration_workers(fs_id, 2).unwrap();
+
+        let entry = dirty_entry(fs_id, inode, 0, 1, 1000, 10000);
+        directory.publish_dirty_entry(entry).unwrap();
+        let inode_map = directory.inode_map(fs_id, inode, false).unwrap().unwrap();
+        let workers = directory.migration_worker_set(fs_id).unwrap();
+        let old_owner = workers.owner(&inode_map).unwrap();
+        let new_owner = (old_owner + 1) % workers.worker_count();
+        inode_map.migration.lock().owner = Some(new_owner);
+        inode_map
+            .migration_owner
+            .store(new_owner, Ordering::Release);
+
+        assert_eq!(
+            workers.claim_pages(&inode_map, old_owner, 1).unwrap(),
+            false,
+            "a stale worker turn must yield instead of failing the filesystem"
+        );
+        assert_eq!(inode_map.queued_dirty_pages.load(Ordering::Acquire), 1);
+    }
+
+    #[ktest]
+    fn rnvpce_dirty_index_claims_entries_in_logical_order() {
+        let fs_id = 0xad;
+        let inode = 65;
+        let directory = RedirectDirectory::new().unwrap();
+        directory.configure_migration_workers(fs_id, 1).unwrap();
+
+        for logical_start in [4, 0, 2] {
+            directory
+                .publish_dirty_entry(dirty_entry(
+                    fs_id,
+                    inode,
+                    logical_start,
+                    1,
+                    1100 + logical_start,
+                    11000 + logical_start,
+                ))
+                .unwrap();
+        }
+        let claims = directory
+            .claim_ready_entries_for_worker(fs_id, 0, 3)
+            .unwrap();
+        assert_eq!(
+            claims
+                .iter()
+                .map(|lease| lease.entry().logical_start())
+                .collect::<Vec<_>>(),
+            vec![0, 2, 4]
+        );
     }
 
     #[ktest]

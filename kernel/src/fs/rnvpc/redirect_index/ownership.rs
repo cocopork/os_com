@@ -4,8 +4,13 @@
 
 use core::sync::atomic::{AtomicUsize, Ordering};
 
-use super::InodeRedirectMap;
+use super::{DirtyNvExtentEntry, InodeRedirectMap};
 use crate::prelude::*;
+
+pub(super) const INODE_WORK_IDLE: u8 = 0;
+const INODE_WORK_QUEUED: u8 = 1;
+const INODE_WORK_RUNNING: u8 = 2;
+const INODE_WORK_RERUN: u8 = 3;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct MigrationWorkerLoadSnapshot {
@@ -133,7 +138,53 @@ impl MigrationWorkerSet {
         selected
     }
 
-    pub(super) fn publish_dirty(self: &Arc<Self>, inode_map: &Arc<InodeRedirectMap>, pages: usize) {
+    fn schedule_inode(&self, inode_map: &Arc<InodeRedirectMap>, owner: usize) {
+        loop {
+            match inode_map.work_state.load(Ordering::Acquire) {
+                INODE_WORK_IDLE => {
+                    if inode_map
+                        .work_state
+                        .compare_exchange(
+                            INODE_WORK_IDLE,
+                            INODE_WORK_QUEUED,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        )
+                        .is_ok()
+                    {
+                        self.workers[owner]
+                            .ready_inodes
+                            .lock()
+                            .push_back(inode_map.clone());
+                        return;
+                    }
+                }
+                INODE_WORK_QUEUED | INODE_WORK_RERUN => return,
+                INODE_WORK_RUNNING => {
+                    if inode_map
+                        .work_state
+                        .compare_exchange(
+                            INODE_WORK_RUNNING,
+                            INODE_WORK_RERUN,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        )
+                        .is_ok()
+                    {
+                        return;
+                    }
+                }
+                _ => unreachable!("invalid inode migration work state"),
+            }
+        }
+    }
+
+    pub(super) fn publish_dirty(
+        self: &Arc<Self>,
+        inode_map: &Arc<InodeRedirectMap>,
+        entry: &Arc<DirtyNvExtentEntry>,
+        pages: usize,
+    ) {
         let owner = {
             Self::record_migration_lock(inode_map);
             let mut migration = inode_map.migration.lock();
@@ -159,15 +210,11 @@ impl MigrationWorkerSet {
         self.workers[owner]
             .queued_dirty_pages
             .fetch_add(pages, Ordering::AcqRel);
-        if !inode_map.ready_queued.swap(true, Ordering::AcqRel) {
-            self.workers[owner]
-                .ready_inodes
-                .lock()
-                .push_back(inode_map.clone());
-        }
+        inode_map.enqueue_dirty_entry(entry);
+        self.schedule_inode(inode_map, owner);
     }
 
-    pub(super) fn extend_dirty(&self, inode_map: &Arc<InodeRedirectMap>, pages: usize) {
+    pub(super) fn account_dirty_extension(&self, inode_map: &InodeRedirectMap, pages: usize) {
         let owner = inode_map.migration_owner.load(Ordering::Acquire);
         debug_assert_ne!(owner, Self::NO_OWNER);
         debug_assert!(owner < self.workers.len());
@@ -177,30 +224,18 @@ impl MigrationWorkerSet {
         self.workers[owner]
             .queued_dirty_pages
             .fetch_add(pages, Ordering::AcqRel);
-        if !inode_map.ready_queued.swap(true, Ordering::AcqRel) {
-            self.workers[owner]
-                .ready_inodes
-                .lock()
-                .push_back(inode_map.clone());
-        }
     }
 
     pub(super) fn ensure_dirty_ready(&self, inode_map: &Arc<InodeRedirectMap>) {
-        let (owner, enqueue) = {
+        let owner = {
             Self::record_migration_lock(inode_map);
             let migration = inode_map.migration.lock();
             let Some(owner) = migration.owner else {
                 return;
             };
-            let enqueue = !inode_map.ready_queued.swap(true, Ordering::AcqRel);
-            (owner, enqueue)
+            owner
         };
-        if enqueue {
-            self.workers[owner]
-                .ready_inodes
-                .lock()
-                .push_back(inode_map.clone());
-        }
+        self.schedule_inode(inode_map, owner);
     }
 
     pub(super) fn owner(&self, inode_map: &InodeRedirectMap) -> Option<usize> {
@@ -220,30 +255,53 @@ impl MigrationWorkerSet {
             return Ok(None);
         };
         worker.ready_inode_dequeues.fetch_add(1, Ordering::Relaxed);
-        if inode_map.migration_owner.load(Ordering::Acquire) == worker_id {
-            inode_map.ready_queued.store(false, Ordering::Release);
-            Ok(Some(inode_map.clone()))
-        } else {
-            Ok(None)
+        if inode_map.migration_owner.load(Ordering::Acquire) != worker_id
+            || inode_map
+                .work_state
+                .compare_exchange(
+                    INODE_WORK_QUEUED,
+                    INODE_WORK_RUNNING,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_err()
+        {
+            return Ok(None);
         }
+        Ok(Some(inode_map))
     }
 
-    pub(super) fn requeue_if_dirty(
+    pub(super) fn finish_inode_turn(
         &self,
         inode_map: &Arc<InodeRedirectMap>,
         worker_id: usize,
         has_dirty: bool,
     ) {
-        if !has_dirty {
+        if inode_map.migration_owner.load(Ordering::Acquire) != worker_id {
             return;
         }
-        if inode_map.migration_owner.load(Ordering::Acquire) == worker_id
-            && !inode_map.ready_queued.swap(true, Ordering::AcqRel)
-        {
-            self.workers[worker_id]
-                .ready_inodes
-                .lock()
-                .push_back(inode_map.clone());
+        loop {
+            let state = inode_map.work_state.load(Ordering::Acquire);
+            let next = match state {
+                INODE_WORK_RUNNING if !has_dirty => INODE_WORK_IDLE,
+                INODE_WORK_RUNNING | INODE_WORK_RERUN => INODE_WORK_QUEUED,
+                INODE_WORK_IDLE | INODE_WORK_QUEUED => return,
+                _ => unreachable!("invalid inode migration work state"),
+            };
+            if inode_map
+                .work_state
+                .compare_exchange(state, next, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+            {
+                continue;
+            }
+            if next == INODE_WORK_QUEUED {
+                self.workers[worker_id]
+                    .ready_inodes
+                    .lock()
+                    .push_back(inode_map.clone());
+            }
+            return;
         }
     }
 
@@ -252,18 +310,20 @@ impl MigrationWorkerSet {
         inode_map: &InodeRedirectMap,
         worker_id: usize,
         pages: usize,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         Self::record_migration_lock(inode_map);
         let mut migration = inode_map.migration.lock();
-        if migration.owner != Some(worker_id)
-            || inode_map
-                .queued_dirty_pages
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |queued| {
-                    queued.checked_sub(pages)
-                })
-                .is_err()
+        if migration.owner != Some(worker_id) {
+            return Ok(false);
+        }
+        if inode_map
+            .queued_dirty_pages
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |queued| {
+                queued.checked_sub(pages)
+            })
+            .is_err()
         {
-            return_errno_with_message!(Errno::ESTALE, "migration inode owner changed");
+            return_errno_with_message!(Errno::ESTALE, "migration dirty page accounting changed");
         }
         migration.in_flight_pages = migration.in_flight_pages.saturating_add(pages);
         self.workers[worker_id]
@@ -272,16 +332,17 @@ impl MigrationWorkerSet {
         self.workers[worker_id]
             .in_flight_pages
             .fetch_add(pages, Ordering::AcqRel);
-        Ok(())
+        Ok(true)
     }
 
     pub(super) fn return_claim(
         &self,
         inode_map: &Arc<InodeRedirectMap>,
+        entry: &Arc<DirtyNvExtentEntry>,
         worker_id: usize,
         pages: usize,
     ) {
-        let enqueue = {
+        {
             Self::record_migration_lock(inode_map);
             let mut migration = inode_map.migration.lock();
             if migration.owner != Some(worker_id) || migration.in_flight_pages < pages {
@@ -291,20 +352,15 @@ impl MigrationWorkerSet {
             inode_map
                 .queued_dirty_pages
                 .fetch_add(pages, Ordering::AcqRel);
-            !inode_map.ready_queued.swap(true, Ordering::AcqRel)
-        };
+        }
         self.workers[worker_id]
             .in_flight_pages
             .fetch_sub(pages, Ordering::AcqRel);
         self.workers[worker_id]
             .queued_dirty_pages
             .fetch_add(pages, Ordering::AcqRel);
-        if enqueue {
-            self.workers[worker_id]
-                .ready_inodes
-                .lock()
-                .push_back(inode_map.clone());
-        }
+        inode_map.enqueue_dirty_entry(entry);
+        self.schedule_inode(inode_map, worker_id);
     }
 
     pub(super) fn complete_claim(
@@ -355,7 +411,9 @@ impl MigrationWorkerSet {
             inode_map
                 .migration_owner
                 .store(Self::NO_OWNER, Ordering::Release);
-            inode_map.ready_queued.store(false, Ordering::Release);
+            inode_map
+                .work_state
+                .store(INODE_WORK_IDLE, Ordering::Release);
             self.workers[owner]
                 .owned_inodes
                 .fetch_sub(1, Ordering::AcqRel);
