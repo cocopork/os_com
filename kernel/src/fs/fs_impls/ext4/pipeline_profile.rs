@@ -138,6 +138,13 @@ struct RtioMultiWorkerMetrics {
     submitted_pages: AtomicU64,
     submitted_bios: AtomicU64,
     max_in_flight_pages: AtomicU64,
+    candidate_rounds: AtomicU64,
+    candidate_pages: AtomicU64,
+    candidate_queued_pages_sampled: AtomicU64,
+    candidate_in_flight_pages_sampled: AtomicU64,
+    candidate_completion_pages_sampled: AtomicU64,
+    candidate_reclaim_pages_sampled: AtomicU64,
+    candidate_pressure_rounds: AtomicU64,
 }
 
 impl RtioMultiWorkerMetrics {
@@ -153,6 +160,13 @@ impl RtioMultiWorkerMetrics {
             submitted_pages: AtomicU64::new(0),
             submitted_bios: AtomicU64::new(0),
             max_in_flight_pages: AtomicU64::new(0),
+            candidate_rounds: AtomicU64::new(0),
+            candidate_pages: AtomicU64::new(0),
+            candidate_queued_pages_sampled: AtomicU64::new(0),
+            candidate_in_flight_pages_sampled: AtomicU64::new(0),
+            candidate_completion_pages_sampled: AtomicU64::new(0),
+            candidate_reclaim_pages_sampled: AtomicU64::new(0),
+            candidate_pressure_rounds: AtomicU64::new(0),
         }
     }
 }
@@ -171,6 +185,13 @@ pub(crate) struct RtioMultiWorkerSnapshot {
     pub(crate) submitted_pages: u64,
     pub(crate) submitted_bios: u64,
     pub(crate) max_in_flight_pages: u64,
+    pub(crate) candidate_rounds: u64,
+    pub(crate) candidate_pages: u64,
+    pub(crate) candidate_queued_pages_sampled: u64,
+    pub(crate) candidate_in_flight_pages_sampled: u64,
+    pub(crate) candidate_completion_pages_sampled: u64,
+    pub(crate) candidate_reclaim_pages_sampled: u64,
+    pub(crate) candidate_pressure_rounds: u64,
 }
 
 const fn rtio_metrics_enabled() -> bool {
@@ -228,6 +249,42 @@ pub(crate) fn record_rtio_submission(pages: usize, bios: usize, in_flight_pages:
         .fetch_max(in_flight_pages as u64, Ordering::Relaxed);
 }
 
+pub(crate) fn record_rtio_candidate_round(
+    pages: usize,
+    queued_pages: usize,
+    in_flight_pages: usize,
+    completion_pages: usize,
+    reclaim_pending_pages: usize,
+    pressure: bool,
+) {
+    if !rtio_metrics_enabled() {
+        return;
+    }
+    RTIO_MULTI_WORKER
+        .candidate_rounds
+        .fetch_add(1, Ordering::Relaxed);
+    RTIO_MULTI_WORKER
+        .candidate_pages
+        .fetch_add(pages as u64, Ordering::Relaxed);
+    RTIO_MULTI_WORKER
+        .candidate_queued_pages_sampled
+        .fetch_add(queued_pages as u64, Ordering::Relaxed);
+    RTIO_MULTI_WORKER
+        .candidate_in_flight_pages_sampled
+        .fetch_add(in_flight_pages as u64, Ordering::Relaxed);
+    RTIO_MULTI_WORKER
+        .candidate_completion_pages_sampled
+        .fetch_add(completion_pages as u64, Ordering::Relaxed);
+    RTIO_MULTI_WORKER
+        .candidate_reclaim_pages_sampled
+        .fetch_add(reclaim_pending_pages as u64, Ordering::Relaxed);
+    if pressure {
+        RTIO_MULTI_WORKER
+            .candidate_pressure_rounds
+            .fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 pub(crate) fn record_rtio_epoch(batches: usize, pages: usize, device_flush: bool) {
     if !rtio_metrics_enabled() {
         return;
@@ -260,6 +317,23 @@ pub(crate) fn rtio_multi_worker_snapshot() -> RtioMultiWorkerSnapshot {
         max_in_flight_pages: RTIO_MULTI_WORKER
             .max_in_flight_pages
             .load(Ordering::Relaxed),
+        candidate_rounds: RTIO_MULTI_WORKER.candidate_rounds.load(Ordering::Relaxed),
+        candidate_pages: RTIO_MULTI_WORKER.candidate_pages.load(Ordering::Relaxed),
+        candidate_queued_pages_sampled: RTIO_MULTI_WORKER
+            .candidate_queued_pages_sampled
+            .load(Ordering::Relaxed),
+        candidate_in_flight_pages_sampled: RTIO_MULTI_WORKER
+            .candidate_in_flight_pages_sampled
+            .load(Ordering::Relaxed),
+        candidate_completion_pages_sampled: RTIO_MULTI_WORKER
+            .candidate_completion_pages_sampled
+            .load(Ordering::Relaxed),
+        candidate_reclaim_pages_sampled: RTIO_MULTI_WORKER
+            .candidate_reclaim_pages_sampled
+            .load(Ordering::Relaxed),
+        candidate_pressure_rounds: RTIO_MULTI_WORKER
+            .candidate_pressure_rounds
+            .load(Ordering::Relaxed),
     }
 }
 
@@ -276,6 +350,13 @@ fn reset_rtio_multi_worker_for_test() {
         &RTIO_MULTI_WORKER.submitted_pages,
         &RTIO_MULTI_WORKER.submitted_bios,
         &RTIO_MULTI_WORKER.max_in_flight_pages,
+        &RTIO_MULTI_WORKER.candidate_rounds,
+        &RTIO_MULTI_WORKER.candidate_pages,
+        &RTIO_MULTI_WORKER.candidate_queued_pages_sampled,
+        &RTIO_MULTI_WORKER.candidate_in_flight_pages_sampled,
+        &RTIO_MULTI_WORKER.candidate_completion_pages_sampled,
+        &RTIO_MULTI_WORKER.candidate_reclaim_pages_sampled,
+        &RTIO_MULTI_WORKER.candidate_pressure_rounds,
     ] {
         counter.store(0, Ordering::Relaxed);
     }
@@ -444,7 +525,7 @@ impl RtioQueueProfile {
                 })
                 .unwrap_or_default();
             ostd::error!(
-                "[PIPELINE] name=rtio_worker device={} worker={} queue={} submitted_pages={} submitted_bios={} leader_attempts={} leader_wins={} completion_batches={} completion_pages={} max_data_complete_depth={} max_durable_result_depth={} data_complete_depth={} durable_result_depth={} owned_inodes={} queued_dirty_pages={} in_flight_pages={} completion_pending_pages={} ready_inode_dequeues={}",
+                "[PIPELINE] name=rtio_worker device={} worker={} queue={} submitted_pages={} submitted_bios={} leader_attempts={} leader_wins={} completion_batches={} completion_pages={} max_data_complete_depth={} max_durable_result_depth={} data_complete_depth={} durable_result_depth={} owned_inodes={} queued_dirty_pages={} in_flight_pages={} completion_pending_pages={} ready_inode_dequeues={} ready_inode_empty={} ready_inode_invalid={} entry_state_conflicts={}",
                 device.name(),
                 worker_id,
                 worker_id,
@@ -463,6 +544,9 @@ impl RtioQueueProfile {
                 load.in_flight_pages,
                 load.completion_pending_pages,
                 load.ready_inode_dequeues,
+                load.ready_inode_empty,
+                load.ready_inode_invalid,
+                load.entry_state_conflicts,
             );
         }
         // Queue snapshots are taken only at the existing report boundary.
@@ -617,7 +701,7 @@ pub(super) fn dump_snapshot(
     }
     let rtio = rtio_multi_worker_snapshot();
     ostd::error!(
-        "[PIPELINE] name=rtio_multi_worker configured={} active={} peak={} epochs={} epoch_batches={} epoch_pages={} device_flushes={} submitted_pages={} submitted_bios={} max_in_flight_pages={}",
+        "[PIPELINE] name=rtio_multi_worker configured={} active={} peak={} epochs={} epoch_batches={} epoch_pages={} device_flushes={} submitted_pages={} submitted_bios={} max_in_flight_pages={} candidate_rounds={} candidate_pages={} candidate_queued_pages_sampled={} candidate_in_flight_pages_sampled={} candidate_completion_pages_sampled={} candidate_reclaim_pages_sampled={} candidate_pressure_rounds={}",
         rtio.configured_workers,
         rtio.active_workers,
         rtio.peak_workers,
@@ -628,6 +712,13 @@ pub(super) fn dump_snapshot(
         rtio.submitted_pages,
         rtio.submitted_bios,
         rtio.max_in_flight_pages,
+        rtio.candidate_rounds,
+        rtio.candidate_pages,
+        rtio.candidate_queued_pages_sampled,
+        rtio.candidate_in_flight_pages_sampled,
+        rtio.candidate_completion_pages_sampled,
+        rtio.candidate_reclaim_pages_sampled,
+        rtio.candidate_pressure_rounds,
     );
 }
 
@@ -683,6 +774,8 @@ mod tests {
         let second = enter_rtio_worker_round();
         record_rtio_submission(32, 1, 32);
         record_rtio_submission(64, 2, 96);
+        record_rtio_candidate_round(12, 20, 3, 0, 4, true);
+        record_rtio_candidate_round(1024, 18, 7, 0, 2, false);
         record_rtio_epoch(2, 96, true);
         drop(second);
         drop(first);
@@ -698,6 +791,13 @@ mod tests {
         assert_eq!(snapshot.submitted_pages, 96);
         assert_eq!(snapshot.submitted_bios, 3);
         assert_eq!(snapshot.max_in_flight_pages, 96);
+        assert_eq!(snapshot.candidate_rounds, 2);
+        assert_eq!(snapshot.candidate_pages, 1036);
+        assert_eq!(snapshot.candidate_queued_pages_sampled, 38);
+        assert_eq!(snapshot.candidate_in_flight_pages_sampled, 10);
+        assert_eq!(snapshot.candidate_completion_pages_sampled, 0);
+        assert_eq!(snapshot.candidate_reclaim_pages_sampled, 6);
+        assert_eq!(snapshot.candidate_pressure_rounds, 1);
     }
 
     #[ktest]

@@ -83,6 +83,13 @@ impl Rnvpc {
         Ok(NvPageId::try_from(slots.start)?..NvPageId::try_from(slots.end)?)
     }
 
+    fn remove_data_range_owners(
+        &self,
+        entries: &[Arc<DirtyNvExtentEntry>],
+    ) -> Result<Vec<Range<usize>>> {
+        self.objects.remove_data_range_owners(entries)
+    }
+
     pub(crate) fn begin_nv_entry_extension(
         &self,
         entry: &Arc<DirtyNvExtentEntry>,
@@ -271,6 +278,12 @@ impl Rnvpc {
             .migration_worker_load_snapshot(fs_id, worker_id)
     }
 
+    #[cfg(ktest)]
+    pub(crate) fn migration_lock_acquisitions_for_test(&self, fs_id: u64, inode: u64) -> usize {
+        self.redirects
+            .migration_lock_acquisitions_for_test(fs_id, inode)
+    }
+
     pub(crate) fn rebalance_migration_inode(&self, fs_id: u64, helper_id: usize) -> Result<bool> {
         self.redirects.rebalance_migration_inode(fs_id, helper_id)
     }
@@ -428,6 +441,69 @@ impl Rnvpc {
         }
         self.free_native_data_range(head_slot..head_slot + reclaimed)?;
         lease.finish_reclaim()?;
+        Ok(reclaimed)
+    }
+
+    pub(crate) fn reclaim_nv_entries(&self, leases: &[NvExtentEntryLease]) -> Result<usize> {
+        if leases.is_empty() {
+            return Ok(0);
+        }
+        if leases.len() == 1
+            || leases.iter().any(|lease| {
+                lease
+                    .entry()
+                    .record_snapshot()
+                    .is_ok_and(|record| record.visibility_generation() == 0)
+            })
+        {
+            let mut reclaimed = 0usize;
+            for lease in leases {
+                reclaimed = reclaimed.saturating_add(self.reclaim_nv_entry(lease)?);
+            }
+            return Ok(reclaimed);
+        }
+
+        self.ensure_publication_certain()?;
+        let mut pending = Vec::with_capacity(leases.len());
+        let mut heads = Vec::with_capacity(leases.len());
+        for lease in leases {
+            lease.begin_reclaim_and_wait_for_readers()?;
+            let entry = lease.entry();
+            let record = entry
+                .record_snapshot()?
+                .with_authority(NvRedirectAuthority::SsdAuthoritativePendingFree)?;
+            heads.push(
+                usize::try_from(entry.nv_slot_range().start)
+                    .map_err(|_| Error::new(Errno::EOVERFLOW))?,
+            );
+            pending.push(record);
+        }
+        self.persist.publish_redirect_extents(&pending, None)?;
+        self.persist.clear_frames(&heads, None)?;
+
+        let entries = leases
+            .iter()
+            .map(|lease| lease.entry().clone())
+            .collect::<Vec<_>>();
+        self.redirects.remove_reclaimed_entries(leases)?;
+        let owned_ranges = self.remove_data_range_owners(&entries)?;
+        let mut free_ranges = Vec::with_capacity(leases.len());
+        let mut reclaimed = 0usize;
+        for (lease, owned_pages) in leases.iter().zip(&owned_ranges) {
+            let entry = lease.entry();
+            let pages = usize::from(entry.page_count());
+            let head = usize::try_from(entry.nv_slot_range().start)
+                .map_err(|_| Error::new(Errno::EOVERFLOW))?;
+            if owned_pages.start != head || owned_pages.end != head + pages {
+                return_errno_with_message!(Errno::ESTALE, "NV extent entry range owner changed");
+            }
+            free_ranges.push(head..head + pages);
+            reclaimed = reclaimed.saturating_add(pages);
+        }
+        self.free_native_data_ranges(&free_ranges)?;
+        for lease in leases {
+            lease.finish_reclaim()?;
+        }
         Ok(reclaimed)
     }
 

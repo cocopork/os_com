@@ -96,10 +96,13 @@ release ISO SHA256：
 `11,696/6,454/6,556/2,426`，提交页数也从 100,567 到 161,199 不等。设备侧四个
 主要 hctx 均有流量，因此主要差异仍发生在文件系统候选变为可 claim 的软件路径。
 
-当前 worker 水位使用 `queued_dirty_pages`，它同时包含可迁移 `Dirty` entry 和正在由
-前台扩展、暂时不能执行 `Dirty -> Migrating` 的 entry。32 线程并发使后者显著增加：
-total dirty 已超过 1024，但一个 claim round 实际只能取得少量 ready entry，随后
-extension 完成又触发下一轮，形成大量约 19 页的小批次。
+当时根据现有计数推测 `queued_dirty_pages` 中存在大量正在由前台扩展、暂时不能执行
+`Dirty -> Migrating` 的 entry。2026-11-16 的分状态诊断否定了这个推测：32 线程下
+entry 状态冲突仅 130 次、失效 ready 节点为零；相反，候选轮次采样时 mount 全局
+reclaim-pending 平均达到 15,725 页，接近 64 MiB 数据池的 16,384 页容量，而当前
+worker queued 平均只有 17.8 页。小批次的直接原因是容量压力在页面大量等待前台回收
+时反复唤醒候选 worker。详见
+[`RNVPCE-CANDIDATE-STATE-TREND-2026-11-16.md`](RNVPCE-CANDIDATE-STATE-TREND-2026-11-16.md)。
 
 ## 被否决的 stale 队列连续清理
 

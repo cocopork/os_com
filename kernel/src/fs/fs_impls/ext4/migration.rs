@@ -32,11 +32,12 @@ pub(crate) mod worker;
 
 use batch::MigrationBatch;
 pub(super) use durability::DurabilityArbiter;
-use reclaim::ReclaimReadyQueue;
+use reclaim::ReclaimQueueSet;
 use worker::DurableBatchResult;
 pub(super) use worker::RtioWorkerRuntime;
 
 const MIGRATION_BATCH_PAGES: usize = super::writeback::WRITEBACK_BATCH;
+const RECLAIM_BATCH_ENTRIES: usize = 128;
 
 fn should_run_background_migration(
     worker_dirty_pages: usize,
@@ -188,10 +189,10 @@ pub(super) struct CompletionJob {
     status: BioStatus,
     pages: Vec<PendingPage>,
 }
-pub(super) type ReclaimQueue = Arc<ReclaimReadyQueue<ReclaimWorkItem>>;
+pub(super) type ReclaimQueue = Arc<ReclaimQueueSet<ReclaimWorkItem>>;
 
-pub(super) fn reclaim_queue() -> ReclaimQueue {
-    Arc::new(ReclaimReadyQueue::new())
+pub(super) fn reclaim_queue(worker_count: usize) -> Result<ReclaimQueue> {
+    Ok(Arc::new(ReclaimQueueSet::new(worker_count)?))
 }
 
 #[cfg(ktest)]
@@ -350,6 +351,15 @@ impl Ext4 {
                                 fs.fail_nv_migration();
                             }
                         }
+                        match fs.help_nv_reclaim(worker_id, MIGRATION_BATCH_PAGES) {
+                            Ok(reclaimed) if reclaimed != 0 => continue,
+                            Ok(_) => {}
+                            Err(error) => {
+                                error!("NV worker-local reclaim failed: {error:?}");
+                                fs.fail_nv_migration();
+                                break;
+                            }
+                        }
                         if fs.is_shutdown() || fs.nv_migration_failed.load(Ordering::Acquire) {
                             break;
                         }
@@ -455,41 +465,6 @@ impl Ext4 {
             })
             .spawn();
         }
-        let weak = Arc::downgrade(self);
-        let trigger = self.nv_reclaim_trigger.clone();
-        crate::thread::kernel_thread::ThreadOptions::new(move || {
-            loop {
-                let Some(fs) = weak.upgrade() else {
-                    break;
-                };
-                if fs.nv_reclaim_queue.ready_units() != 0
-                    && fs.nv_capacity_waiters.load(Ordering::Acquire) <= 1
-                {
-                    if let Err(error) = fs.help_nv_reclaim(MIGRATION_BATCH_PAGES) {
-                        error!("NV parallel reclaim failed: {error:?}");
-                    }
-                    continue;
-                }
-                if (fs.is_shutdown() || fs.nv_migration_failed.load(Ordering::Acquire))
-                    && fs.nv_reclaim_pending.load(Ordering::Acquire) == 0
-                {
-                    break;
-                }
-                drop(fs);
-                let _ = trigger.wait_until(|| {
-                    weak.upgrade()
-                        .is_none_or(|fs| {
-                            (fs.nv_reclaim_queue.ready_units() != 0
-                                && fs.nv_capacity_waiters.load(Ordering::Acquire) <= 1)
-                                || ((fs.is_shutdown()
-                                    || fs.nv_migration_failed.load(Ordering::Acquire))
-                                    && fs.nv_reclaim_pending.load(Ordering::Acquire) == 0)
-                        })
-                        .then_some(())
-                });
-            }
-        })
-        .spawn();
         if !self.rnvpc_extend_enabled() {
             let weak = Arc::downgrade(self);
             let trigger = self.nv_completion_trigger.clone();
@@ -593,7 +568,6 @@ impl Ext4 {
             pool.wake_data_capacity_waiters();
         }
         self.nv_completion_trigger.wake_all();
-        self.nv_reclaim_trigger.wake_all();
     }
 
     fn fail_nv_migration(&self) {
@@ -669,16 +643,11 @@ impl Ext4 {
                 if pool.can_reserve_data_pages(pages) {
                     break;
                 }
-                if self.nv_capacity_waiters.load(Ordering::Acquire) > 1
-                    && self.help_nv_reclaim(pages.max(1))? != 0
-                {
-                    continue;
-                }
                 self.request_nv_migration();
                 pool.wait_for_data_capacity_or(
                     pages,
                     || self.is_shutdown() || self.nv_migration_failed.load(Ordering::Acquire),
-                    || self.nv_reclaim_queue.ready_units() != 0,
+                    || false,
                 );
                 if self.is_shutdown() || self.nv_migration_failed.load(Ordering::Acquire) {
                     break;
@@ -688,9 +657,7 @@ impl Ext4 {
         })();
         pp::NV_CAPACITY_WAIT.record_since(wait_started, pages);
         self.nv_capacity_waiters.fetch_sub(1, Ordering::AcqRel);
-        if self.nv_reclaim_queue.ready_units() != 0 {
-            self.nv_reclaim_trigger.wake_one();
-        }
+        self.request_nv_migration();
         result?;
         if self.is_shutdown() || self.nv_migration_failed.load(Ordering::Acquire) {
             return_errno_with_message!(Errno::EIO, "NV migration cannot reclaim capacity");
@@ -808,6 +775,9 @@ impl Ext4 {
                 MigrationSubmitter::Quiesced(queue_id) => usize::from(queue_id),
                 MigrationSubmitter::Legacy => 0,
             };
+            let load_before = pool
+                .migration_worker_load_snapshot(self.rnvpc_fs_id(), worker_id)
+                .unwrap_or_default();
             nv_entries =
                 pool.claim_ready_nv_entries_for_worker(self.rnvpc_fs_id(), worker_id, budget)?;
             for lease in &nv_entries {
@@ -817,6 +787,19 @@ impl Ext4 {
                     usize::from(lease.entry().page_count()),
                 );
             }
+            let selected_pages = nv_entries
+                .iter()
+                .map(|lease| usize::from(lease.entry().page_count()))
+                .sum();
+            pp::record_rtio_candidate_round(
+                selected_pages,
+                load_before.queued_dirty_pages,
+                load_before.in_flight_pages,
+                load_before.completion_pending_pages,
+                self.nv_reclaim_pending.load(Ordering::Acquire),
+                self.nv_capacity_waiters.load(Ordering::Acquire) != 0
+                    || self.nv_migration_progress_waiters.load(Ordering::Acquire) != 0,
+            );
         } else {
             for (inode, index, page, target, generation, seq) in
                 rnvpc::flush_candidates(self.rnvpc_fs_id(), budget)
@@ -1386,17 +1369,15 @@ impl Ext4 {
             self.nv_reclaim_pending
                 .fetch_add(entry_pages, Ordering::AcqRel);
             self.nv_reclaim_queue.publish(
+                worker_id,
                 ReclaimWorkItem {
                     entry,
                     batch: reclaim_batch.clone(),
                     ready_at_ns: pp::now(),
                 },
                 entry_pages,
-            );
-            if self.nv_capacity_waiters.load(Ordering::Acquire) <= 1 {
-                self.nv_reclaim_trigger.wake_one();
-            }
-            pool.wake_one_data_capacity_waiter();
+            )?;
+            self.request_nv_migration_worker(worker_id);
         }
         pp::NV_COMPLETION_TOTAL.record_since(completion_started, result.batch.page_count());
         Ok(())
@@ -1474,11 +1455,12 @@ impl Ext4 {
         Ok(())
     }
 
-    pub(super) fn help_nv_reclaim(&self, budget: usize) -> Result<usize> {
-        let mut work_items = Vec::new();
+    pub(super) fn help_nv_reclaim(&self, worker_id: usize, budget: usize) -> Result<usize> {
+        let mut entries = Vec::new();
+        let mut completions = Vec::new();
         let mut page_total = 0usize;
-        while page_total < budget {
-            let Some((work_item, pages_count)) = self.nv_reclaim_queue.claim() else {
+        while page_total < budget && entries.len() < RECLAIM_BATCH_ENTRIES {
+            let Some((work_item, pages_count)) = self.nv_reclaim_queue.claim(worker_id)? else {
                 break;
             };
             let ReclaimWorkItem {
@@ -1488,24 +1470,19 @@ impl Ext4 {
             } = work_item;
             pp::NV_RECLAIM_READY_WAIT.record_since(ready_at_ns, pages_count);
             page_total = page_total.saturating_add(pages_count);
-            work_items.push((entry, batch, pages_count));
+            entries.push(entry);
+            completions.push((batch, pages_count));
         }
-        if work_items.is_empty() {
+        if entries.is_empty() {
             return Ok(0);
         }
         let publish_started = pp::now();
         let pool = rnvpc::pool().ok_or_else(|| Error::new(Errno::EINVAL))?;
-        let mut result = Ok(());
-        for (entry, _, _) in &work_items {
-            if let Err(error) = pool.reclaim_nv_entry(entry) {
-                result = Err(error);
-                break;
-            }
-        }
+        let result = pool.reclaim_nv_entries(&entries).map(|_| ());
         pp::NV_EXTENT_PUBLISH.record_since(publish_started, page_total);
         pp::NV_RECLAIM_HELP.record_since(publish_started, page_total);
-        let reclaimed_ranges = work_items.len();
-        for (_, batch, pages_count) in work_items {
+        let reclaimed_ranges = entries.len();
+        for (batch, pages_count) in completions {
             self.nv_reclaim_pending
                 .fetch_sub(pages_count, Ordering::AcqRel);
             batch.complete_work_item(self);
@@ -1516,7 +1493,6 @@ impl Ext4 {
         }
         batch_metrics::count(Event::ReclaimedPages, page_total);
         batch_metrics::count(Event::ReclaimedSlotRanges, reclaimed_ranges);
-        self.nv_reclaim_trigger.wake_all();
         Ok(page_total)
     }
 
@@ -1552,8 +1528,10 @@ impl Ext4 {
             if let Err(error) = self.process_nv_completions() {
                 failure = Some(error);
             }
-            if let Err(error) = self.help_nv_reclaim(MIGRATION_BATCH_PAGES) {
-                failure = Some(error);
+            for worker_id in 0..self.nv_reclaim_queue.worker_count() {
+                if let Err(error) = self.help_nv_reclaim(worker_id, MIGRATION_BATCH_PAGES) {
+                    failure = Some(error);
+                }
             }
             if self.rnvpc_extend_enabled() {
                 crate::thread::Thread::yield_now();
@@ -1564,7 +1542,7 @@ impl Ext4 {
                     ((self.nv_in_flight.load(Ordering::Acquire) == 0
                         && self.nv_reclaim_pending.load(Ordering::Acquire) == 0)
                         || !self.nv_completion_queue.lock().is_empty()
-                        || self.nv_reclaim_queue.ready_units() != 0)
+                        || self.nv_reclaim_queue.total_ready_units() != 0)
                         .then_some(())
                 },
                 &Duration::from_millis(10),
@@ -1990,7 +1968,7 @@ pub(super) mod tests {
         let before = disk.disk.flush_count();
         assert_eq!(fs.process_nv_completions().unwrap(), 8);
         assert_eq!(disk.disk.flush_count() - before, 1);
-        assert_eq!(fs.help_nv_reclaim(8).unwrap(), 8);
+        assert_eq!(fs.help_nv_reclaim(0, 8).unwrap(), 8);
 
         fs.read_inode(19)
             .unwrap()
@@ -2010,7 +1988,7 @@ pub(super) mod tests {
             "quiesced sync submissions are not worker activity"
         );
         assert_eq!(fs.process_nv_completions().unwrap(), 1);
-        assert_eq!(fs.help_nv_reclaim(1).unwrap(), 1);
+        assert_eq!(fs.help_nv_reclaim(0, 1).unwrap(), 1);
         disk.writes.lock().clear();
         fs.write_segments_async(
             200,
@@ -2254,7 +2232,7 @@ pub(super) mod tests {
         // and is draining all three pages through the common durability gate.
         assert_eq!(fs.nv_in_flight.load(Ordering::Acquire), 3);
         assert_eq!(fs.nv_reclaim_pending.load(Ordering::Acquire), 0);
-        assert_eq!(fs.nv_reclaim_queue.ready_units(), 0);
+        assert_eq!(fs.nv_reclaim_queue.total_ready_units(), 0);
         assert!(!sync_done.load(Ordering::Acquire));
         assert_eq!(late_state.load(Ordering::Acquire), 1);
         assert!(fs.nv_migration_gate.is_quiescing_for_test());
@@ -2309,12 +2287,14 @@ pub(super) mod tests {
             assert_eq!(runtime.data_complete_depth(), 0);
             assert_eq!(runtime.durable_result_depth(), 0);
         }
-        assert_eq!(fs.nv_reclaim_queue.ready_units(), 0);
+        assert_eq!(fs.nv_reclaim_queue.total_ready_units(), 0);
         for ino in 11..14 {
             assert_cross_queue_ssd_page(&fs, &disk, ino);
         }
         assert_eq!(fs.process_nv_completions().unwrap(), 0);
-        assert_eq!(fs.help_nv_reclaim(3).unwrap(), 0);
+        for worker_id in 0..fs.nv_reclaim_queue.worker_count() {
+            assert_eq!(fs.help_nv_reclaim(worker_id, 3).unwrap(), 0);
+        }
     }
 
     #[ktest]

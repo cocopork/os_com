@@ -252,34 +252,25 @@ impl FreeRangeIndex {
 
 impl NvSlotAllocator {
     pub(super) fn new(total_pages: usize) -> Result<Self> {
-        if total_pages == 0 {
-            return_errno!(Errno::EINVAL);
-        }
-        let candidate_domains = (total_pages / MIN_DOMAIN_PAGES).max(1);
-        let domain_limit = num_cpus().min(candidate_domains);
-        let domain_count = floor_power_of_two(domain_limit.max(1));
-        let base_len = total_pages / domain_count;
-        let remainder = total_pages % domain_count;
+        let domain_ranges = allocation_domain_ranges(total_pages)?;
         let mut domains = Vec::new();
         domains
-            .try_reserve_exact(domain_count)
+            .try_reserve_exact(domain_ranges.len())
             .map_err(|_| Error::new(Errno::ENOMEM))?;
-        let mut start = 0;
-        for index in 0..domain_count {
-            let len = base_len + usize::from(index < remainder);
+        for range in domain_ranges {
+            let len = range.end - range.start;
             let state = NvDomainState {
                 free_ranges: FreeRangeIndex::new(len)?,
                 cursor: 0,
             };
             domains.push(NvAllocationDomain {
-                start,
-                end: start + len,
+                start: range.start,
+                end: range.end,
                 state: SpinLock::new(state),
                 free_pages: AtomicUsize::new(len),
                 longest_free_range: AtomicUsize::new(len),
                 generation: AtomicU64::new(0),
             });
-            start += len;
         }
         Ok(Self {
             domains: domains.into_boxed_slice(),
@@ -353,6 +344,34 @@ impl NvSlotAllocator {
         let mut state = domain.state.lock();
         state.free_ranges.free(local)?;
         Self::publish_domain_state(domain, &state);
+        Ok(())
+    }
+
+    pub(super) fn free_ranges(&self, ranges: &[Range<usize>]) -> Result<()> {
+        if ranges.is_empty() {
+            return Ok(());
+        }
+        let mut sorted = ranges.to_vec();
+        sorted.sort_unstable_by_key(|range| range.start);
+        if sorted.windows(2).any(|pair| pair[0].end > pair[1].start) {
+            return_errno!(Errno::EINVAL);
+        }
+        let mut offset = 0;
+        while offset < sorted.len() {
+            let (domain, _) = self.resolve_range(sorted[offset].clone())?;
+            let end = sorted[offset..]
+                .iter()
+                .position(|range| range.start < domain.start || range.end > domain.end)
+                .map_or(sorted.len(), |next| offset + next);
+            let mut state = domain.state.lock();
+            for range in &sorted[offset..end] {
+                state
+                    .free_ranges
+                    .free(range.start - domain.start..range.end - domain.start)?;
+            }
+            Self::publish_domain_state(domain, &state);
+            offset = end;
+        }
         Ok(())
     }
 
@@ -480,6 +499,28 @@ impl NvSlotAllocator {
             .map(|domain| domain.generation.load(Ordering::Acquire))
             .collect()
     }
+}
+
+pub(super) fn allocation_domain_ranges(total_pages: usize) -> Result<Box<[Range<usize>]>> {
+    if total_pages == 0 {
+        return_errno!(Errno::EINVAL);
+    }
+    let candidate_domains = (total_pages / MIN_DOMAIN_PAGES).max(1);
+    let domain_limit = num_cpus().min(candidate_domains);
+    let domain_count = floor_power_of_two(domain_limit.max(1));
+    let base_len = total_pages / domain_count;
+    let remainder = total_pages % domain_count;
+    let mut ranges = Vec::new();
+    ranges
+        .try_reserve_exact(domain_count)
+        .map_err(|_| Error::new(Errno::ENOMEM))?;
+    let mut start = 0;
+    for index in 0..domain_count {
+        let len = base_len + usize::from(index < remainder);
+        ranges.push(start..start + len);
+        start += len;
+    }
+    Ok(ranges.into_boxed_slice())
 }
 
 fn floor_power_of_two(value: usize) -> usize {

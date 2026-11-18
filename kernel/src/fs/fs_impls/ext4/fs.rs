@@ -257,7 +257,6 @@ pub struct Ext4 {
     pub(super) nv_completion_queue: super::migration::CompletionQueue,
     pub(super) nv_completion_trigger: Arc<ostd::sync::WaitQueue>,
     pub(super) nv_reclaim_queue: super::migration::ReclaimQueue,
-    pub(super) nv_reclaim_trigger: Arc<ostd::sync::WaitQueue>,
     pub(super) nv_reclaim_pending: AtomicUsize,
     pub(super) nv_allocation_pager_trigger: Arc<ostd::sync::WaitQueue>,
     pub(super) nv_allocation_pager_epoch: AtomicUsize,
@@ -429,6 +428,7 @@ impl Ext4 {
             })
             .collect::<Vec<_>>()
             .into_boxed_slice();
+        let nv_reclaim_queue = super::migration::reclaim_queue(rtio_workers.max(1))?;
         if rnvpc_mode.mode() != RnvpcMode::Native && crate::fs::rnvpc::pool().is_none() {
             return_errno_with_message!(Errno::EINVAL, "rNVPC mount requires a configured pool");
         }
@@ -494,8 +494,7 @@ impl Ext4 {
             nv_completion_lock: Mutex::new(()),
             nv_completion_queue: Arc::new(SpinLock::new(VecDeque::new())),
             nv_completion_trigger: Arc::new(ostd::sync::WaitQueue::new()),
-            nv_reclaim_queue: super::migration::reclaim_queue(),
-            nv_reclaim_trigger: Arc::new(ostd::sync::WaitQueue::new()),
+            nv_reclaim_queue,
             nv_reclaim_pending: AtomicUsize::new(0),
             nv_allocation_pager_trigger: Arc::new(ostd::sync::WaitQueue::new()),
             nv_allocation_pager_epoch: AtomicUsize::new(0),

@@ -312,11 +312,14 @@ inode 转移，以及 durability 边沿和尾批次。真实 NVMe 的 15 个正�
 `584.67/375.47/213.97 MiB/s`。因此该策略不能标记为性能验收通过。
 
 诊断插桩显示，4/16 线程约有 `997/967` 页每 completion batch，32 线程却只有
-约 `19.3` 页。根因是当前 `queued_dirty_pages` 包含正在被前台扩展、暂时不能从
-`Dirty` 转为 `Migrating` 的 entry；总 dirty 水位超过 1024 并不表示本 worker
-已有 1024 页可 claim。后续若继续优化，应单独设计和验证 per-worker
-`claimable_ready_pages` 计数，并覆盖 extension commit/abort、claim rollback、owner
-转移和候选去重的所有状态边。不能继续只调整 total-dirty 阈值。
+约 `19.3` 页。当时推测 `queued_dirty_pages` 中的大量 Extending entry 是主因；
+2026-11-16 的分状态实验否定了该推测。32 线程下失效 ready 节点为零，entry 状态冲突
+仅 130 次；每轮当前 worker queued 平均只有 17.8 页，而 mount 全局
+reclaim-pending 平均达到 15,725 页，接近 64 MiB 数据池容量。根因是容量压力在大量
+页面等待前台回收时反复唤醒候选 worker，而不是 worker 持有大量不可 claim 的
+Extending entry。因此后续应优先批量化/分散化回收发布，并让容量压力根据 queued 与
+reclaim-pending 状态选择唤醒回收者或候选 worker，而非只调整 dirty 阈值。完整证据见
+[`RNVPCE-CANDIDATE-STATE-TREND-2026-11-16.md`](../../../experiments/reports/RNVPCE-CANDIDATE-STATE-TREND-2026-11-16.md)。
 
 曾验证“在一次 `pop_ready_inode()` 中连续丢弃 stale 节点”。该实现使最终五轮均值
 进一步降到 `515.48/370.75/194.91 MiB/s`，已撤销。stale 节点不是 32 线程小批次的

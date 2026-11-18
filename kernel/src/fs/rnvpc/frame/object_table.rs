@@ -11,12 +11,15 @@ use ostd::sync::{PreemptDisabled, WaitQueue};
 use super::ObjectRecord;
 #[cfg(ktest)]
 use super::ReverseExtentRef;
-use crate::{fs::rnvpc::redirect_index::DirtyNvExtentEntry, prelude::*};
+use crate::{
+    fs::rnvpc::{redirect_index::DirtyNvExtentEntry, slot_allocator::allocation_domain_ranges},
+    prelude::*,
+};
 
 pub(super) struct ObjectTable {
     slots: Vec<SlotEntry>,
     migration_ranges: SpinLock<MigrationRangeState>,
-    data_ranges: SpinLock<BTreeMap<usize, DataRangeOwner>>,
+    data_range_domains: Box<[DataRangeDomain]>,
     #[cfg(ktest)]
     data_range_lock_acquisitions: AtomicUsize,
 }
@@ -24,6 +27,12 @@ pub(super) struct ObjectTable {
 struct DataRangeOwner {
     end: usize,
     owner: Weak<DirtyNvExtentEntry>,
+}
+
+struct DataRangeDomain {
+    start: usize,
+    end: usize,
+    owners: SpinLock<BTreeMap<usize, DataRangeOwner>>,
 }
 
 #[derive(Default)]
@@ -86,10 +95,18 @@ impl ObjectTable {
                 metadata_mutation_waiters: WaitQueue::new(),
             });
         }
+        let mut data_range_domains = Vec::new();
+        for range in allocation_domain_ranges(pages)? {
+            data_range_domains.push(DataRangeDomain {
+                start: range.start,
+                end: range.end,
+                owners: SpinLock::new(BTreeMap::new()),
+            });
+        }
         Ok(Self {
             slots,
             migration_ranges: SpinLock::new(MigrationRangeState::default()),
-            data_ranges: SpinLock::new(BTreeMap::new()),
+            data_range_domains: data_range_domains.into_boxed_slice(),
             #[cfg(ktest)]
             data_range_lock_acquisitions: AtomicUsize::new(0),
         })
@@ -108,7 +125,7 @@ impl ObjectTable {
         {
             return_errno_with_message!(Errno::EINVAL, "invalid NV data range owner");
         }
-        let mut ranges = self.lock_data_ranges();
+        let mut ranges = self.lock_data_ranges(slots.clone())?;
         if ranges
             .range(..slots.end)
             .next_back()
@@ -130,22 +147,58 @@ impl ObjectTable {
         &self,
         entry: &Arc<DirtyNvExtentEntry>,
     ) -> Result<Range<usize>> {
-        let start = usize::try_from(entry.nv_slot_range().start)
-            .map_err(|_| Error::new(Errno::EOVERFLOW))?;
-        let mut ranges = self.lock_data_ranges();
-        let owner = ranges
-            .get(&start)
-            .ok_or_else(|| Error::new(Errno::ESTALE))?;
-        if !owner
-            .owner
-            .upgrade()
-            .is_some_and(|candidate| Arc::ptr_eq(&candidate, entry))
-        {
-            return_errno_with_message!(Errno::ESTALE, "NV data range owner changed");
+        Ok(self
+            .remove_data_range_owners(core::slice::from_ref(entry))?
+            .pop()
+            .unwrap())
+    }
+
+    pub(super) fn remove_data_range_owners(
+        &self,
+        entries: &[Arc<DirtyNvExtentEntry>],
+    ) -> Result<Vec<Range<usize>>> {
+        let mut pending = Vec::with_capacity(entries.len());
+        for (position, entry) in entries.iter().enumerate() {
+            let start = usize::try_from(entry.nv_slot_range().start)
+                .map_err(|_| Error::new(Errno::EOVERFLOW))?;
+            let range = start..start + usize::from(entry.page_count());
+            let domain_index = self
+                .data_range_domains
+                .iter()
+                .position(|domain| range.start >= domain.start && range.end <= domain.end)
+                .ok_or_else(|| Error::new(Errno::EINVAL))?;
+            pending.push((domain_index, position, start, entry));
         }
-        let end = owner.end;
-        ranges.remove(&start);
-        Ok(start..end)
+        pending.sort_unstable_by_key(|(domain, _, start, _)| (*domain, *start));
+        let mut removed = (0..entries.len()).map(|_| None).collect::<Vec<_>>();
+        let mut offset = 0;
+        while offset < pending.len() {
+            let domain_index = pending[offset].0;
+            let end = pending[offset..]
+                .iter()
+                .position(|(domain, _, _, _)| *domain != domain_index)
+                .map_or(pending.len(), |next| offset + next);
+            #[cfg(ktest)]
+            self.data_range_lock_acquisitions
+                .fetch_add(1, Ordering::Relaxed);
+            let mut ranges = self.data_range_domains[domain_index].owners.lock();
+            for (_, _, start, entry) in &pending[offset..end] {
+                let owner = ranges.get(start).ok_or_else(|| Error::new(Errno::ESTALE))?;
+                if !owner
+                    .owner
+                    .upgrade()
+                    .is_some_and(|candidate| Arc::ptr_eq(&candidate, entry))
+                {
+                    return_errno_with_message!(Errno::ESTALE, "NV data range owner changed");
+                }
+            }
+            for (_, position, start, _) in &pending[offset..end] {
+                let owner = ranges.remove(start).unwrap();
+                removed[*position] = Some(*start..owner.end);
+            }
+            offset = end;
+        }
+        Ok(removed.into_iter().map(Option::unwrap).collect())
     }
 
     pub(super) fn extend_data_range_owner(
@@ -163,7 +216,7 @@ impl ObjectTable {
             .checked_add(usize::from(committed_pages))
             .filter(|end| *end <= self.slots.len())
             .ok_or_else(|| Error::new(Errno::EINVAL))?;
-        let mut ranges = self.lock_data_ranges();
+        let mut ranges = self.lock_data_ranges(start..committed_end)?;
         let owner = ranges
             .get(&start)
             .ok_or_else(|| Error::new(Errno::ESTALE))?;
@@ -201,7 +254,9 @@ impl ObjectTable {
         let Some(expected_end) = start.checked_add(usize::from(expected_pages)) else {
             return;
         };
-        let mut ranges = self.lock_data_ranges();
+        let Ok(mut ranges) = self.lock_data_ranges(start..committed_end) else {
+            return;
+        };
         if let Some(owner) = ranges.get_mut(&start)
             && owner.end == committed_end
             && owner
@@ -216,7 +271,7 @@ impl ObjectTable {
     pub(super) fn data_range_owner(&self, entry: &Arc<DirtyNvExtentEntry>) -> Result<Range<usize>> {
         let start = usize::try_from(entry.nv_slot_range().start)
             .map_err(|_| Error::new(Errno::EOVERFLOW))?;
-        let ranges = self.lock_data_ranges();
+        let ranges = self.lock_data_ranges(start..start + usize::from(entry.page_count()))?;
         let owner = ranges
             .get(&start)
             .ok_or_else(|| Error::new(Errno::ESTALE))?;
@@ -237,13 +292,56 @@ impl ObjectTable {
         self.data_range_owner(entry)
     }
 
+    fn data_range_domain(&self, range: Range<usize>) -> Result<&DataRangeDomain> {
+        if range.start >= range.end || range.end > self.slots.len() {
+            return_errno!(Errno::EINVAL);
+        }
+        let domain = self
+            .data_range_domains
+            .iter()
+            .find(|domain| range.start >= domain.start && range.start < domain.end)
+            .ok_or_else(|| Error::new(Errno::EINVAL))?;
+        if range.end > domain.end {
+            return_errno_with_message!(Errno::EINVAL, "NV data range crosses allocation domains");
+        }
+        Ok(domain)
+    }
+
     fn lock_data_ranges(
         &self,
-    ) -> SpinLockGuard<'_, BTreeMap<usize, DataRangeOwner>, PreemptDisabled> {
+        range: Range<usize>,
+    ) -> Result<SpinLockGuard<'_, BTreeMap<usize, DataRangeOwner>, PreemptDisabled>> {
+        let domain = self.data_range_domain(range)?;
         #[cfg(ktest)]
         self.data_range_lock_acquisitions
             .fetch_add(1, Ordering::Relaxed);
-        self.data_ranges.lock()
+        Ok(domain.owners.lock())
+    }
+
+    #[cfg(ktest)]
+    fn data_range_domain_count_for_test(&self) -> usize {
+        self.data_range_domains.len()
+    }
+
+    #[cfg(ktest)]
+    fn lock_data_range_domain_for_test(
+        &self,
+        slot: usize,
+    ) -> Result<SpinLockGuard<'_, BTreeMap<usize, DataRangeOwner>, PreemptDisabled>> {
+        self.lock_data_ranges(slot..slot + 1)
+    }
+
+    #[cfg(ktest)]
+    fn try_lock_data_range_domain_for_test(&self, slot: usize) -> bool {
+        self.data_range_domain(slot..slot + 1)
+            .ok()
+            .and_then(|domain| domain.owners.try_lock())
+            .is_some()
+    }
+
+    #[cfg(ktest)]
+    fn validate_data_range_domain_for_test(&self, range: Range<usize>) -> Result<()> {
+        self.data_range_domain(range).map(|_| ())
     }
 
     #[cfg(ktest)]
@@ -462,5 +560,23 @@ mod tests {
         table.release_migration_range(disjoint).unwrap();
         table.release_migration_range(first).unwrap();
         assert!(!table.migration_range_contains(100));
+    }
+
+    #[ostd::prelude::ktest]
+    fn data_range_owner_locks_are_partitioned_by_allocation_domain() {
+        let table = ObjectTable::new(2_048).unwrap();
+        assert!(table.data_range_domain_count_for_test() >= 2);
+
+        let first = table.lock_data_range_domain_for_test(0).unwrap();
+        assert!(table.try_lock_data_range_domain_for_test(1_024));
+        drop(first);
+
+        assert_eq!(
+            table
+                .validate_data_range_domain_for_test(1_023..1_025)
+                .unwrap_err()
+                .error(),
+            Errno::EINVAL
+        );
     }
 }

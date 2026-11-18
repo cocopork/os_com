@@ -133,37 +133,76 @@ impl PersistEngine {
         record: &NvRedirectExtentRecord,
         fault: Option<FaultPoint>,
     ) -> Result<()> {
+        self.publish_redirect_extents(core::slice::from_ref(record), fault)
+    }
+
+    pub(super) fn publish_redirect_extents(
+        &self,
+        records: &[NvRedirectExtentRecord],
+        fault: Option<FaultPoint>,
+    ) -> Result<()> {
         self.ensure_writable()?;
-        record.validate()?;
-        let index =
-            usize::try_from(record.nv_slot_start()).map_err(|_| Error::new(Errno::EOVERFLOW))?;
-        self.check_index(index)?;
-        let old = self.backend.load_control_u64(commit_offset(index)?)?;
-        if old == 0 {
-            return_errno_with_message!(Errno::ESTALE, "redirect extent head is not published");
+        if records.is_empty() {
+            return Ok(());
         }
-        let mut descriptor = NvDescriptor::default();
-        self.backend
-            .read_control(descriptor_offset(index, old)?, descriptor.as_mut_bytes())?;
-        let next = old
-            .checked_add(1)
-            .ok_or_else(|| Error::new(Errno::EOVERFLOW))?;
-        let descriptor_offset = descriptor_offset(index, next)?;
-        let record_offset = redirect_extent_offset(index, next)?;
-        self.backend
-            .write_control(descriptor_offset, descriptor.as_bytes())?;
-        self.backend
-            .persist_control(descriptor_offset, size_of::<NvDescriptor>())?;
-        self.backend
-            .write_control(record_offset, record.as_bytes())?;
-        self.backend
-            .persist_control(record_offset, size_of::<NvRedirectExtentRecord>())?;
+        if records.len() > 128 {
+            return_errno!(Errno::EINVAL);
+        }
+        let mut selected = Vec::with_capacity(records.len());
+        let mut heads = BTreeSet::new();
+        for record in records {
+            record.validate()?;
+            let index = usize::try_from(record.nv_slot_start())
+                .map_err(|_| Error::new(Errno::EOVERFLOW))?;
+            self.check_index(index)?;
+            if !heads.insert(index) {
+                return_errno_with_message!(Errno::EINVAL, "duplicate redirect extent head");
+            }
+            let old = self.backend.load_control_u64(commit_offset(index)?)?;
+            if old == 0 {
+                return_errno_with_message!(Errno::ESTALE, "redirect extent head is not published");
+            }
+            let mut descriptor = NvDescriptor::default();
+            self.backend
+                .read_control(descriptor_offset(index, old)?, descriptor.as_mut_bytes())?;
+            let next = old
+                .checked_add(1)
+                .ok_or_else(|| Error::new(Errno::EOVERFLOW))?;
+            selected.push((index, next, descriptor));
+        }
+        for (record, (index, next, descriptor)) in records.iter().zip(&selected) {
+            let descriptor_offset = descriptor_offset(*index, *next)?;
+            let record_offset = redirect_extent_offset(*index, *next)?;
+            self.backend
+                .write_control(descriptor_offset, descriptor.as_bytes())?;
+            self.backend
+                .persist_control(descriptor_offset, size_of::<NvDescriptor>())?;
+            self.backend
+                .write_control(record_offset, record.as_bytes())?;
+            self.backend
+                .persist_control(record_offset, size_of::<NvRedirectExtentRecord>())?;
+        }
         self.backend.fence()?;
         inject(fault, FaultPoint::AfterContentPersist)?;
-        let commit = commit_offset(index)?;
-        self.backend.store_control_u64(commit, next)?;
-        self.backend.persist_control(commit, size_of::<u64>())?;
-        self.backend.fence()
+        let publication = (|| {
+            for (index, next, _) in selected {
+                let commit = commit_offset(index)?;
+                self.backend.store_control_u64(commit, next)?;
+                inject(fault, FaultPoint::AfterCommitStore)?;
+                self.backend.persist_control(commit, size_of::<u64>())?;
+                inject(fault, FaultPoint::AfterCommitPersist)?;
+            }
+            self.backend.fence()
+        })();
+        if let Err(error) = publication {
+            self.publication_uncertain.store(true, Ordering::Release);
+            return Err(error);
+        }
+        if let Err(error) = inject(fault, FaultPoint::AfterCommitFence) {
+            self.publication_uncertain.store(true, Ordering::Release);
+            return Err(error);
+        }
+        Ok(())
     }
 
     pub(super) fn extend_redirect_extent(

@@ -365,7 +365,7 @@ fn rnvpce_cross_queue_epoch_issues_one_flush() {
     );
     assert_eq!(fs.nv_in_flight.load(Ordering::Acquire), 4);
     assert_eq!(fs.nv_reclaim_pending.load(Ordering::Acquire), 0);
-    assert_eq!(fs.help_nv_reclaim(4).unwrap(), 0);
+    assert_eq!(fs.help_nv_reclaim(0, 4).unwrap(), 0);
     let before = disk.disk.flush_count();
     let deadline = ostd::timer::Jiffies::elapsed().as_duration() + Duration::from_secs(2);
     let mut completed = 0;
@@ -385,7 +385,7 @@ fn rnvpce_cross_queue_epoch_issues_one_flush() {
     }
     assert_eq!(fs.nv_in_flight.load(Ordering::Acquire), 0);
     assert_eq!(fs.nv_reclaim_pending.load(Ordering::Acquire), 4);
-    assert_eq!(fs.help_nv_reclaim(4).unwrap(), 4);
+    assert_eq!(fs.help_nv_reclaim(0, 4).unwrap(), 4);
     for ino in 11..15 {
         assert_cross_queue_ssd_page(&fs, &disk, ino);
         assert_eq!(
@@ -440,7 +440,7 @@ fn rnvpce_cross_queue_mixed_data_error_preserves_failed_entry() {
     for ino in 11..15 {
         assert_cross_queue_entry(&fs, ino, if ino == 12 { Dirty } else { IoComplete });
     }
-    assert_eq!(fs.help_nv_reclaim(4).unwrap(), 3);
+    assert_eq!(fs.help_nv_reclaim(0, 4).unwrap(), 3);
     for ino in [11, 13, 14] {
         assert_cross_queue_ssd_page(&fs, &disk, ino);
     }
@@ -504,7 +504,7 @@ fn rnvpce_cross_queue_flush_error_preserves_all_entries() {
     assert_eq!(fs.nv_reclaim_pending.load(Ordering::Acquire), 0);
     assert_eq!(fs.rtio_durability.pending_data_page_count(), 0);
     assert_eq!(fs.rtio_durability.ready_page_count(), 0);
-    assert_eq!(fs.help_nv_reclaim(4).unwrap(), 0);
+    assert_eq!(fs.help_nv_reclaim(0, 4).unwrap(), 0);
     for (index, target) in targets.into_iter().enumerate() {
         let ino = 11 + index as u32;
         assert_cross_queue_entry(&fs, ino, Dirty);
@@ -569,7 +569,7 @@ fn nv_route_rnvpce_durability_epoch_coalesces_ready_batches() {
         1,
         "all ready rNVPCe batches in one drain must share one device flush"
     );
-    assert_eq!(fixture.ext4.help_nv_reclaim(8).unwrap(), 8);
+    assert_eq!(fixture.ext4.help_nv_reclaim(0, 8).unwrap(), 8);
 }
 
 fn nv_route_rnvpce_durability_epoch_isolates_failed_batch() {
@@ -635,7 +635,7 @@ fn nv_route_rnvpce_durability_epoch_isolates_failed_batch() {
             .state(),
         NvExtentEntryState::IoComplete
     );
-    assert_eq!(fixture.ext4.help_nv_reclaim(1).unwrap(), 1);
+    assert_eq!(fixture.ext4.help_nv_reclaim(0, 1).unwrap(), 1);
     assert!(
         pool.lookup_dirty_nv_entry(PageKey::new(fs_id, 12, 0))
             .is_none()
@@ -848,7 +848,7 @@ fn nv_route_rnvpce_completion_publishes_reclaim_work_item() {
     }
 
     pool.reset_baseline_validation_calls_for_test();
-    assert_eq!(fixture.ext4.help_nv_reclaim(4).unwrap(), 4);
+    assert_eq!(fixture.ext4.help_nv_reclaim(0, 4).unwrap(), 4);
     assert_eq!(
         pool.baseline_validation_calls_for_test(),
         0,

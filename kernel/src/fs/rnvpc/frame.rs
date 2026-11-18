@@ -1731,13 +1731,23 @@ impl Rnvpc {
     }
 
     pub(crate) fn free_native_data_range(&self, range: Range<usize>) -> Result<()> {
-        if range.start >= range.end {
-            return_errno!(Errno::EINVAL);
+        self.free_native_data_ranges(core::slice::from_ref(&range))
+    }
+
+    pub(crate) fn free_native_data_ranges(&self, ranges: &[Range<usize>]) -> Result<()> {
+        let pages = ranges.iter().try_fold(0usize, |total, range| {
+            if range.start >= range.end {
+                return Err(Error::new(Errno::EINVAL));
+            }
+            total
+                .checked_add(range.end - range.start)
+                .ok_or_else(|| Error::new(Errno::EOVERFLOW))
+        })?;
+        if pages == 0 {
+            return Ok(());
         }
-        self.allocation.slots.free_range(range.clone())?;
-        self.allocation
-            .capacity
-            .release(PoolClass::Data, range.end - range.start);
+        self.allocation.slots.free_ranges(ranges)?;
+        self.allocation.capacity.release(PoolClass::Data, pages);
         self.wake_data_capacity_waiters();
         Ok(())
     }

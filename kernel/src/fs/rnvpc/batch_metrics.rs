@@ -6,6 +6,10 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 pub(crate) const ENABLED: bool = false;
 
+pub(crate) const fn enabled() -> bool {
+    ENABLED || cfg!(ktest)
+}
+
 #[derive(Clone, Copy)]
 #[repr(usize)]
 pub(crate) enum Phase {

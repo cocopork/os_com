@@ -19,6 +19,9 @@ pub(crate) struct MigrationWorkerLoadSnapshot {
     pub(crate) completion_pending_pages: usize,
     pub(crate) owned_inodes: usize,
     pub(crate) ready_inode_dequeues: usize,
+    pub(crate) ready_inode_empty: usize,
+    pub(crate) ready_inode_invalid: usize,
+    pub(crate) entry_state_conflicts: usize,
 }
 
 #[derive(Default)]
@@ -38,6 +41,9 @@ struct MigrationWorkerState {
     completion_pending_pages: AtomicUsize,
     owned_inodes: AtomicUsize,
     ready_inode_dequeues: AtomicUsize,
+    ready_inode_empty: AtomicUsize,
+    ready_inode_invalid: AtomicUsize,
+    entry_state_conflicts: AtomicUsize,
 }
 
 impl MigrationWorkerState {
@@ -49,6 +55,9 @@ impl MigrationWorkerState {
             completion_pending_pages: AtomicUsize::new(0),
             owned_inodes: AtomicUsize::new(0),
             ready_inode_dequeues: AtomicUsize::new(0),
+            ready_inode_empty: AtomicUsize::new(0),
+            ready_inode_invalid: AtomicUsize::new(0),
+            entry_state_conflicts: AtomicUsize::new(0),
         }
     }
 
@@ -65,6 +74,9 @@ impl MigrationWorkerState {
             completion_pending_pages: self.completion_pending_pages.load(Ordering::Acquire),
             owned_inodes: self.owned_inodes.load(Ordering::Acquire),
             ready_inode_dequeues: self.ready_inode_dequeues.load(Ordering::Acquire),
+            ready_inode_empty: self.ready_inode_empty.load(Ordering::Acquire),
+            ready_inode_invalid: self.ready_inode_invalid.load(Ordering::Acquire),
+            entry_state_conflicts: self.entry_state_conflicts.load(Ordering::Acquire),
         }
     }
 }
@@ -315,6 +327,9 @@ impl MigrationWorkerSet {
             .get(worker_id)
             .ok_or_else(|| Error::new(Errno::EINVAL))?;
         let Some(inode_map) = worker.ready_inodes.lock().pop_front() else {
+            if crate::fs::rnvpc::batch_metrics::enabled() {
+                worker.ready_inode_empty.fetch_add(1, Ordering::Relaxed);
+            }
             return Ok(None);
         };
         worker.ready_inode_dequeues.fetch_add(1, Ordering::Relaxed);
@@ -329,9 +344,20 @@ impl MigrationWorkerSet {
                 )
                 .is_err()
         {
+            if crate::fs::rnvpc::batch_metrics::enabled() {
+                worker.ready_inode_invalid.fetch_add(1, Ordering::Relaxed);
+            }
             return Ok(None);
         }
         Ok(Some(inode_map))
+    }
+
+    pub(super) fn record_entry_state_conflict(&self, worker_id: usize) {
+        if crate::fs::rnvpc::batch_metrics::enabled()
+            && let Some(worker) = self.workers.get(worker_id)
+        {
+            worker.entry_state_conflicts.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     pub(super) fn finish_inode_turn(
@@ -454,13 +480,25 @@ impl MigrationWorkerSet {
         inode_map: &InodeRedirectMap,
         pages: usize,
     ) -> Result<()> {
+        self.remove_active_entries(inode_map, 1, pages)
+    }
+
+    pub(super) fn remove_active_entries(
+        &self,
+        inode_map: &InodeRedirectMap,
+        entry_count: usize,
+        pages: usize,
+    ) -> Result<()> {
+        if entry_count == 0 || pages == 0 {
+            return_errno!(Errno::EINVAL);
+        }
         Self::record_migration_lock(inode_map);
         let mut migration = inode_map.migration.lock();
         let owner = migration.owner.ok_or_else(|| Error::new(Errno::ESTALE))?;
-        if migration.active_entries == 0 || migration.completion_pending_pages < pages {
+        if migration.active_entries < entry_count || migration.completion_pending_pages < pages {
             return_errno_with_message!(Errno::ESTALE, "migration entry accounting changed");
         }
-        migration.active_entries -= 1;
+        migration.active_entries -= entry_count;
         migration.completion_pending_pages -= pages;
         self.workers[owner]
             .completion_pending_pages

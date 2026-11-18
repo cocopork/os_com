@@ -2623,6 +2623,53 @@ fn rnvpce_nv_entry_work_item() {
 }
 
 #[ktest]
+fn rnvpce_native_entry_batch_reclaim_shares_persistence_barriers() {
+    const FS_ID: u64 = 0xb20a;
+    let config = RnvpcConfig::from_bytes(
+        Some(32 * PAGE_SIZE),
+        Some(4 * PAGE_SIZE),
+        Some(28 * PAGE_SIZE),
+        Some(NvSimMode::Fast),
+    )
+    .unwrap()
+    .unwrap();
+    let backend = Arc::new(DramNvBackend::allocate_with_chunk_pages(config, 2).unwrap());
+    let pool = Arc::new(Rnvpc::new(backend.clone(), config, None).unwrap());
+    pool.configure_migration_workers(FS_ID, 1).unwrap();
+    for logical_start in [0, 4] {
+        let staged = (0..4)
+            .map(|page| {
+                (
+                    staged_redirect_page(&pool, page as u8),
+                    PageKey::new(FS_ID, 91, logical_start + page as u64),
+                    70_000 + page as u64,
+                )
+            })
+            .collect::<Vec<_>>();
+        let entries = pool.publish_redirect_entries(&staged, 1, None).unwrap();
+        pool.activate_redirect_entries(&entries).unwrap();
+    }
+    let leases = pool.claim_ready_nv_entries_for_worker(FS_ID, 0, 8).unwrap();
+    assert_eq!(leases.len(), 2);
+    for lease in &leases {
+        pool.complete_nv_entry(lease).unwrap();
+    }
+
+    pool.reset_data_range_lock_acquisitions_for_test();
+    let migration_locks = pool.migration_lock_acquisitions_for_test(FS_ID, 91);
+    let before = backend.stats();
+    assert_eq!(pool.reclaim_nv_entries(&leases).unwrap(), 8);
+    let after = backend.stats();
+    assert_eq!(after.fence_calls - before.fence_calls, 3);
+    assert_eq!(pool.data_range_lock_acquisitions_for_test(), 1);
+    assert_eq!(
+        pool.migration_lock_acquisitions_for_test(FS_ID, 91) - migration_locks,
+        1
+    );
+    assert_eq!(pool.stats().data_pages, 0);
+}
+
+#[ktest]
 fn rnvpce_range_owned_slots() {
     const FS_ID: u64 = 0xb20c;
     const INODE: u64 = 81;

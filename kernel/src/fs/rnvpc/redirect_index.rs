@@ -642,6 +642,7 @@ struct InodeRedirectMap {
     fs_id: u64,
     entries: SpinLock<BTreeMap<u64, Arc<DirtyNvExtentEntry>>>,
     dirty_entries: SpinLock<BTreeMap<u64, Arc<DirtyNvExtentEntry>>>,
+    migration_workers: SpinLock<Option<Arc<MigrationWorkerSet>>>,
     migration: SpinLock<InodeMigrationState>,
     migration_owner: AtomicUsize,
     queued_dirty_pages: AtomicUsize,
@@ -658,6 +659,7 @@ impl InodeRedirectMap {
             fs_id,
             entries: SpinLock::new(BTreeMap::new()),
             dirty_entries: SpinLock::new(BTreeMap::new()),
+            migration_workers: SpinLock::new(None),
             migration: SpinLock::new(InodeMigrationState::default()),
             migration_owner: AtomicUsize::new(usize::MAX),
             queued_dirty_pages: AtomicUsize::new(0),
@@ -703,6 +705,8 @@ pub(crate) struct RedirectDirectory {
     overlap_lookups: AtomicUsize,
     #[cfg(ktest)]
     dirty_extent_rebuilds: AtomicUsize,
+    #[cfg(ktest)]
+    migration_worker_table_lookups: AtomicUsize,
 }
 
 impl RedirectDirectory {
@@ -731,6 +735,8 @@ impl RedirectDirectory {
             overlap_lookups: AtomicUsize::new(0),
             #[cfg(ktest)]
             dirty_extent_rebuilds: AtomicUsize::new(0),
+            #[cfg(ktest)]
+            migration_worker_table_lookups: AtomicUsize::new(0),
         })
     }
 
@@ -774,7 +780,7 @@ impl RedirectDirectory {
         let workers = entry
             .migration_registered
             .load(Ordering::Acquire)
-            .then(|| self.migration_worker_set(entry.fs_id()))
+            .then(|| self.migration_worker_set_for_inode(&inode_map))
             .flatten();
         if let Some(workers) = &workers {
             workers.account_dirty_extension(&inode_map, added);
@@ -797,7 +803,7 @@ impl RedirectDirectory {
         let Ok(Some(inode_map)) = self.inode_map(entry.fs_id(), entry.inode(), false) else {
             return;
         };
-        if let Some(workers) = self.migration_worker_set(entry.fs_id()) {
+        if let Some(workers) = self.migration_worker_set_for_inode(&inode_map) {
             inode_map.enqueue_dirty_entry(&entry);
             workers.ensure_dirty_ready(&inode_map);
         }
@@ -900,7 +906,7 @@ impl RedirectDirectory {
         entry: &Arc<DirtyNvExtentEntry>,
         inode_map: &Arc<InodeRedirectMap>,
     ) {
-        let Some(workers) = self.migration_worker_set(entry.fs_id()) else {
+        let Some(workers) = self.migration_worker_set_for_inode(inode_map) else {
             return;
         };
         if entry
@@ -940,6 +946,7 @@ impl RedirectDirectory {
             })
             .collect::<Vec<_>>();
         for inode_map in inode_maps {
+            *inode_map.migration_workers.lock() = Some(workers.clone());
             let entries = inode_map
                 .entries
                 .lock()
@@ -961,7 +968,27 @@ impl RedirectDirectory {
     }
 
     fn migration_worker_set(&self, fs_id: u64) -> Option<Arc<MigrationWorkerSet>> {
+        #[cfg(ktest)]
+        self.migration_worker_table_lookups
+            .fetch_add(1, Ordering::Relaxed);
         self.migration_workers.lock().get(&fs_id).cloned()
+    }
+
+    fn migration_worker_set_for_inode(
+        &self,
+        inode_map: &InodeRedirectMap,
+    ) -> Option<Arc<MigrationWorkerSet>> {
+        if let Some(workers) = inode_map.migration_workers.lock().clone() {
+            return Some(workers);
+        }
+        let workers = self.migration_worker_set(inode_map.fs_id)?;
+        let mut cached = inode_map.migration_workers.lock();
+        Some(cached.get_or_insert_with(|| workers.clone()).clone())
+    }
+
+    #[cfg(ktest)]
+    fn migration_worker_table_lookups_for_test(&self) -> usize {
+        self.migration_worker_table_lookups.load(Ordering::Relaxed)
     }
 
     pub(crate) fn owner_worker(&self, fs_id: u64, inode: u64) -> Option<usize> {
@@ -995,7 +1022,7 @@ impl RedirectDirectory {
     }
 
     #[cfg(ktest)]
-    fn migration_lock_acquisitions_for_test(&self, fs_id: u64, inode: u64) -> usize {
+    pub(crate) fn migration_lock_acquisitions_for_test(&self, fs_id: u64, inode: u64) -> usize {
         self.inode_map(fs_id, inode, false)
             .ok()
             .flatten()
@@ -1170,6 +1197,7 @@ impl RedirectDirectory {
                     .transition(NvExtentEntryState::Dirty, NvExtentEntryState::Migrating)
                     .is_err()
                 {
+                    workers.record_entry_state_conflict(worker_id);
                     continue;
                 }
                 let pages = usize::from(entry.page_count());
@@ -1234,6 +1262,47 @@ impl RedirectDirectory {
         Ok(())
     }
 
+    pub(crate) fn remove_reclaimed_entries(&self, leases: &[NvExtentEntryLease]) -> Result<()> {
+        let mut groups: BTreeMap<(u64, u64), Vec<&NvExtentEntryLease>> = BTreeMap::new();
+        for lease in leases {
+            let entry = lease.entry();
+            if entry.state() != NvExtentEntryState::Reclaiming {
+                return_errno_with_message!(Errno::ESTALE, "NV extent entry is not reclaiming");
+            }
+            groups
+                .entry((entry.fs_id(), entry.inode()))
+                .or_default()
+                .push(lease);
+        }
+        for ((fs_id, inode), group) in groups {
+            let inode_map = self
+                .inode_map(fs_id, inode, false)?
+                .ok_or_else(|| Error::new(Errno::ESTALE))?;
+            let mut entries = inode_map.entries.lock();
+            for lease in &group {
+                let entry = lease.entry();
+                if !entries
+                    .get(&entry.logical_start())
+                    .is_some_and(|candidate| Arc::ptr_eq(candidate, entry))
+                {
+                    return_errno_with_message!(Errno::ESTALE, "NV extent entry owner changed");
+                }
+            }
+            if let Some(workers) = self.migration_worker_set_for_inode(&inode_map) {
+                let pages = group.iter().try_fold(0usize, |total, lease| {
+                    total
+                        .checked_add(usize::from(lease.entry().page_count()))
+                        .ok_or_else(|| Error::new(Errno::EOVERFLOW))
+                })?;
+                workers.remove_active_entries(&inode_map, group.len(), pages)?;
+            }
+            for lease in group {
+                entries.remove(&lease.entry().logical_start());
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn remove_entry(&self, entry: &Arc<DirtyNvExtentEntry>) -> Result<()> {
         let state = entry.state();
         let inode_map = self
@@ -1247,7 +1316,7 @@ impl RedirectDirectory {
             return_errno_with_message!(Errno::ESTALE, "NV extent entry owner changed");
         }
         if state == NvExtentEntryState::Reclaiming
-            && let Some(workers) = self.migration_worker_set(entry.fs_id())
+            && let Some(workers) = self.migration_worker_set_for_inode(&inode_map)
         {
             workers.remove_active_entry(&inode_map, usize::from(entry.page_count()))?;
         }
@@ -2337,6 +2406,70 @@ mod tests {
             "a stale worker turn must yield instead of failing the filesystem"
         );
         assert_eq!(inode_map.queued_dirty_pages.load(Ordering::Acquire), 1);
+    }
+
+    #[ktest]
+    fn rnvpce_candidate_diagnostics_distinguish_empty_stale_and_busy_entries() {
+        let fs_id = 0xb7;
+        let directory = RedirectDirectory::new().unwrap();
+        directory.configure_migration_workers(fs_id, 2).unwrap();
+        let workers = directory.migration_worker_set(fs_id).unwrap();
+
+        assert!(workers.pop_ready_inode(0).unwrap().is_none());
+        assert_eq!(workers.snapshot(0).unwrap().ready_inode_empty, 1);
+
+        let stale = dirty_entry(fs_id, 80, 0, 1, 1800, 18000);
+        directory.publish_dirty_entry(stale).unwrap();
+        let stale_map = directory.inode_map(fs_id, 80, false).unwrap().unwrap();
+        let stale_owner = workers.owner(&stale_map).unwrap();
+        let new_owner = (stale_owner + 1) % workers.worker_count();
+        stale_map.migration.lock().owner = Some(new_owner);
+        stale_map
+            .migration_owner
+            .store(new_owner, Ordering::Release);
+        assert!(workers.pop_ready_inode(stale_owner).unwrap().is_none());
+        assert_eq!(
+            workers.snapshot(stale_owner).unwrap().ready_inode_invalid,
+            1
+        );
+
+        let busy = dirty_entry(fs_id, 81, 0, 1, 1900, 19000);
+        directory.publish_dirty_entry(busy.clone()).unwrap();
+        let busy_owner = directory.owner_worker(fs_id, 81).unwrap();
+        let extension = busy.begin_extension(1, 2).unwrap();
+        assert!(
+            directory
+                .claim_ready_entries_for_worker(fs_id, busy_owner, 1)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            workers.snapshot(busy_owner).unwrap().entry_state_conflicts,
+            1
+        );
+        extension.abort();
+    }
+
+    #[ktest]
+    fn rnvpce_redirect_publication_reuses_inode_worker_binding() {
+        let fs_id = 0xb8;
+        let inode = 82;
+        let directory = RedirectDirectory::new().unwrap();
+        directory.configure_migration_workers(fs_id, 2).unwrap();
+
+        directory
+            .publish_dirty_entry(dirty_entry(fs_id, inode, 0, 1, 2000, 20000))
+            .unwrap();
+        let lookups_after_first = directory.migration_worker_table_lookups_for_test();
+        directory
+            .publish_dirty_entry(dirty_entry(fs_id, inode, 1, 1, 2001, 20001))
+            .unwrap();
+
+        assert_eq!(
+            directory.migration_worker_table_lookups_for_test(),
+            lookups_after_first,
+            "publishing another entry for the same inode must not revisit the global worker table"
+        );
     }
 
     #[ktest]
