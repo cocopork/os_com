@@ -2,6 +2,24 @@
 
 Current implementation status is authoritative in [`../STATUS.md`](../STATUS.md). This document preserves the completed rNVPC foreground-checkpoint comparison object; active rNVPCe development follows [`rnvpce-soft-update-implementation-plan.md`](rnvpce-soft-update-implementation-plan.md).
 
+## Active PageCache Integration
+
+The approved rNVPCe hot-path refactor is specified in
+[`../os_com_refactor_plan/025-rnvpce-pagecache-integration/README.md`](../os_com_refactor_plan/025-rnvpce-pagecache-integration/README.md).
+It replaces the current direct extent/redirect lookup on every read with a
+per-inode sparse page-slot index that can reference clean DRAM, dirty NV, or clean
+NV data. Persistent extent/redirect metadata remains authoritative; PageCache is
+discarded on recovery. Completion will publish `CleanNv` rather than immediately
+freeing the page, and later worker/allocation-domain batches will copy hot clean
+pages to DRAM or evict cold clean pages.
+
+The implementation must not add a global hot-path map or lock. Index updates are
+per inode, transitions are per page slot, and allocation/reclaim remains
+partitioned. No such lock may span user copy, 4 KiB copy, NVM persistence, SSD
+I/O, or sleep. Until plan Task 2 is complete, the active source still uses the
+legacy direct rNVPCe read path; this paragraph records the implementation target,
+not a completed-code claim.
+
 For rNVPCe, `committed` means persistently valid, `mapped` means selected by the current inode extent tree, `reachable` describes recovery's root traversal, and `reclaim` means durable clear plus frame reuse. A committed object is not necessarily mapped or reachable.
 
 ## Source Baseline
@@ -52,8 +70,8 @@ The full KVM run executed all 800 `aster-kernel` tests with zero failures. The i
 
 ## Active rNVPCe Task 6
 
-The WAL-free `rnvpc_extend` path feeds rTIO from a duplicate-suppressed global
-dirty-NVPage queue. Each candidate carries an exact allocation sequence and an
+The WAL-free `rnvpc_extend` path feeds rTIO from duplicate-suppressed
+inode-owner worker queues. Each candidate carries an exact allocation sequence and an
 8-byte DRAM reverse locator for its current extent leaf slot, so normal
 candidate discovery, reference validation, SSD publication, and reclaim do not
 walk an inode extent tree. A split freezes only its moved logical interval until
@@ -69,7 +87,9 @@ callbacks only transfer the owned completion payload into a bounded queue and
 wake a dedicated completion thread. That thread materializes completed mappings
 in native EXT4, commits through JBD2 or nojournal metadata sync, performs the
 durability boundary, changes each persistent extent from its exact NV reference
-to SSD, consumes reservation credit once, and reclaims that NV generation.
+to SSD and consumes reservation credit once. Under plan 025 it then publishes
+the matching PageCache slot as `CleanNv`; later cache/capacity reclaim releases
+that NV generation.
 Failed I/O retains the durable target and NV mapping for retry.
 
 Fresh production and ktest-configuration compilation pass, as does the 7-case
