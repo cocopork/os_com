@@ -42,8 +42,9 @@ pub(crate) enum NvExtentEntryState {
     Extending = 3,
     Migrating = 4,
     IoComplete = 5,
-    Reclaiming = 6,
-    Reclaimed = 7,
+    Clean = 6,
+    Reclaiming = 7,
+    Reclaimed = 8,
 }
 
 impl NvExtentEntryState {
@@ -54,8 +55,9 @@ impl NvExtentEntryState {
             3 => Self::Extending,
             4 => Self::Migrating,
             5 => Self::IoComplete,
-            6 => Self::Reclaiming,
-            7 => Self::Reclaimed,
+            6 => Self::Clean,
+            7 => Self::Reclaiming,
+            8 => Self::Reclaimed,
             _ => panic!("invalid NV extent entry state"),
         }
     }
@@ -173,6 +175,7 @@ impl DirtyNvExtentEntry {
                     | NvExtentEntryState::Extending
                     | NvExtentEntryState::Migrating
                     | NvExtentEntryState::IoComplete
+                    | NvExtentEntryState::Clean
             ) {
                 return_errno_with_message!(Errno::ESTALE, "NV extent entry is reclaiming");
             }
@@ -183,6 +186,7 @@ impl DirtyNvExtentEntry {
                     | NvExtentEntryState::Extending
                     | NvExtentEntryState::Migrating
                     | NvExtentEntryState::IoComplete
+                    | NvExtentEntryState::Clean
             ) {
                 return Ok(NvExtentReadGuard {
                     entry: self.clone(),
@@ -239,14 +243,15 @@ impl DirtyNvExtentEntry {
     }
 
     fn begin_reclaim_and_wait_for_readers(&self) -> Result<()> {
-        self.transition(
-            NvExtentEntryState::IoComplete,
-            NvExtentEntryState::Reclaiming,
-        )?;
+        self.transition(NvExtentEntryState::Clean, NvExtentEntryState::Reclaiming)?;
         let _ = self
             .waiters
             .wait_until(|| (self.readers.load(Ordering::Acquire) == 0).then_some(()));
         Ok(())
+    }
+
+    fn publish_clean(&self) -> Result<()> {
+        self.transition(NvExtentEntryState::IoComplete, NvExtentEntryState::Clean)
     }
 
     fn finish_reclaim(&self) -> Result<()> {
@@ -385,6 +390,10 @@ impl NvExtentEntryLease {
 
     pub(crate) fn begin_reclaim_and_wait_for_readers(&self) -> Result<()> {
         self.entry.begin_reclaim_and_wait_for_readers()
+    }
+
+    pub(crate) fn publish_clean(&self) -> Result<()> {
+        self.entry.publish_clean()
     }
 
     pub(crate) fn finish_reclaim(&self) -> Result<()> {

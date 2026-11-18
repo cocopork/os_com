@@ -351,21 +351,25 @@ impl Ext4 {
                                 fs.fail_nv_migration();
                             }
                         }
-                        match fs.help_nv_reclaim(worker_id, MIGRATION_BATCH_PAGES) {
-                            Ok(reclaimed) if reclaimed != 0 => continue,
-                            Ok(_) => {}
-                            Err(error) => {
-                                error!("NV worker-local reclaim failed: {error:?}");
-                                fs.fail_nv_migration();
-                                break;
-                            }
-                        }
                         if fs.is_shutdown() || fs.nv_migration_failed.load(Ordering::Acquire) {
                             break;
                         }
                         let capacity_waiters = fs.nv_capacity_waiters.load(Ordering::Acquire);
                         let progress_waiters =
                             fs.nv_migration_progress_waiters.load(Ordering::Acquire);
+                        // Completed pages remain a clean NV cache until space
+                        // or an explicit progress barrier requires reclamation.
+                        if capacity_waiters != 0 || progress_waiters != 0 {
+                            match fs.help_nv_reclaim(worker_id, MIGRATION_BATCH_PAGES) {
+                                Ok(reclaimed) if reclaimed != 0 => continue,
+                                Ok(_) => {}
+                                Err(error) => {
+                                    error!("NV worker-local reclaim failed: {error:?}");
+                                    fs.fail_nv_migration();
+                                    break;
+                                }
+                            }
+                        }
                         let run_migration = if uses_shared_migration_rounds(fs.rnvpc_mode()) {
                             let pool = rnvpc::pool()
                                 .expect("rNVPCe migration worker requires an initialized pool");
@@ -1362,10 +1366,24 @@ impl Ext4 {
             return_errno_with_message!(Errno::EUCLEAN, "rNVPCe completion lost entry leases");
         }
         drop(result.batch.take_migration_leases());
+        for entry in &entries {
+            pool.complete_nv_entry(entry)?;
+        }
+        // One persistent publication covers the worker-owned completion batch.
+        // The leases and allocator ranges remain alive as a clean NV cache.
+        pool.publish_clean_nv_entries(&entries)?;
+        for lease in &entries {
+            let entry = lease.entry();
+            let Ok(ino) = entry.inode().try_into() else {
+                continue;
+            };
+            if let Some(inode) = self.cached_inode(ino) {
+                inode.publish_rnvpce_clean_nv(entry);
+            }
+        }
         let reclaim_batch = ReclaimBatch::new(entries.len());
         for entry in entries {
             let entry_pages = usize::from(entry.entry().page_count());
-            pool.complete_nv_entry(&entry)?;
             self.nv_reclaim_pending
                 .fetch_add(entry_pages, Ordering::AcqRel);
             self.nv_reclaim_queue.publish(
@@ -1478,7 +1496,21 @@ impl Ext4 {
         }
         let publish_started = pp::now();
         let pool = rnvpc::pool().ok_or_else(|| Error::new(Errno::EINVAL))?;
-        let result = pool.reclaim_nv_entries(&entries).map(|_| ());
+        // Detach only exact CleanNv slots before freeing their backing range.
+        // Each inode owns its XArray lock; no global page-cache lock is taken.
+        for lease in &entries {
+            let entry = lease.entry();
+            let Ok(ino) = entry.inode().try_into() else {
+                continue;
+            };
+            if let Some(inode) = self.cached_inode(ino) {
+                if let Err(error) = inode.retire_rnvpce_clean_nv(&pool, entry) {
+                    self.fail_nv_migration();
+                    return Err(error);
+                }
+            }
+        }
+        let result = pool.release_clean_nv_entries(&entries).map(|_| ());
         pp::NV_EXTENT_PUBLISH.record_since(publish_started, page_total);
         pp::NV_RECLAIM_HELP.record_since(publish_started, page_total);
         let reclaimed_ranges = entries.len();

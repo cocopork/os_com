@@ -2547,6 +2547,16 @@ fn rnvpce_nv_entry_claim() {
 
     pool.complete_nv_entry(&lease).unwrap();
     assert_eq!(entry.state(), NvExtentEntryState::IoComplete);
+    assert_eq!(
+        lease
+            .begin_reclaim_and_wait_for_readers()
+            .unwrap_err()
+            .error(),
+        Errno::ESTALE
+    );
+    lease.publish_clean().unwrap();
+    assert_eq!(entry.state(), NvExtentEntryState::Clean);
+    assert!(entry.try_read().is_ok());
     let state = Arc::new(AtomicUsize::new(0));
     let thread_state = state.clone();
     let reclaim = crate::thread::kernel_thread::ThreadOptions::new(move || {

@@ -2,7 +2,10 @@
 
 //! Volatile per-inode hot-page index for rNVPCe.
 
-use core::ops::Range;
+use core::{
+    ops::Range,
+    sync::atomic::{AtomicBool, Ordering},
+};
 
 use ostd::{sync::WaitQueue, task::disable_preempt};
 use xarray::XArray;
@@ -45,6 +48,7 @@ pub(crate) enum RnvpcePageBacking {
 /// A reference-counted publication object. Waiting is page-local.
 pub(crate) struct RnvpcePageSlot {
     backing: RnvpcePageBacking,
+    accessed: AtomicBool,
     waiters: WaitQueue,
 }
 
@@ -52,6 +56,7 @@ impl RnvpcePageSlot {
     fn loading() -> Arc<Self> {
         Arc::new(Self {
             backing: RnvpcePageBacking::Loading,
+            accessed: AtomicBool::new(false),
             waiters: WaitQueue::new(),
         })
     }
@@ -59,6 +64,7 @@ impl RnvpcePageSlot {
     pub(crate) fn clean_dram(page: CachePage) -> Arc<Self> {
         Arc::new(Self {
             backing: RnvpcePageBacking::CleanDram(page),
+            accessed: AtomicBool::new(true),
             waiters: WaitQueue::new(),
         })
     }
@@ -66,6 +72,7 @@ impl RnvpcePageSlot {
     pub(crate) fn dirty_nv(page: RnvpceNvPage) -> Arc<Self> {
         Arc::new(Self {
             backing: RnvpcePageBacking::DirtyNv(page),
+            accessed: AtomicBool::new(true),
             waiters: WaitQueue::new(),
         })
     }
@@ -73,6 +80,7 @@ impl RnvpcePageSlot {
     pub(crate) fn clean_nv(page: RnvpceNvPage) -> Arc<Self> {
         Arc::new(Self {
             backing: RnvpcePageBacking::CleanNv(page),
+            accessed: AtomicBool::new(false),
             waiters: WaitQueue::new(),
         })
     }
@@ -85,10 +93,19 @@ impl RnvpcePageSlot {
         &self.waiters
     }
 
+    pub(crate) fn mark_accessed(&self) {
+        self.accessed.store(true, Ordering::Relaxed);
+    }
+
+    pub(crate) fn take_accessed(&self) -> bool {
+        self.accessed.swap(false, Ordering::AcqRel)
+    }
+
     #[cfg(ktest)]
     fn new_test(value: u64) -> Arc<Self> {
         Arc::new(Self {
             backing: RnvpcePageBacking::Test(value),
+            accessed: AtomicBool::new(false),
             waiters: WaitQueue::new(),
         })
     }
@@ -124,9 +141,14 @@ impl RnvpcePageCache {
 
     pub(crate) fn lookup(&self, page_index: u64) -> Option<Arc<RnvpcePageSlot>> {
         let guard = disable_preempt();
-        self.pages
+        let slot = self
+            .pages
             .load(&guard, page_index)
-            .map(|slot| Arc::clone(&slot))
+            .map(|slot| Arc::clone(&slot));
+        if let Some(slot) = &slot {
+            slot.mark_accessed();
+        }
+        slot
     }
 
     pub(crate) fn get_or_reserve_loading(&self, page_index: u64) -> Result<LoadingPage> {
@@ -295,6 +317,93 @@ impl RnvpcePageCache {
         }
         Ok(())
     }
+
+    /// Converts only slots that still name `entry`. Rewritten pages and newer
+    /// publications are left untouched. Replacement objects are allocated
+    /// before the single per-inode XArray writer critical section.
+    pub(crate) fn publish_clean_nv(&self, entry: &Arc<DirtyNvExtentEntry>) -> usize {
+        let mut replacements = Vec::new();
+        for (index, slot) in self.snapshot_range(entry.logical_range(), usize::MAX) {
+            let RnvpcePageBacking::DirtyNv(page) = slot.backing() else {
+                continue;
+            };
+            if !Arc::ptr_eq(page.entry(), entry) {
+                continue;
+            }
+            let replacement = RnvpcePageSlot::clean_nv(RnvpceNvPage::new(entry.clone(), index));
+            if slot.take_accessed() {
+                replacement.mark_accessed();
+            }
+            replacements.push((index, slot, replacement));
+        }
+
+        let mut replaced = Vec::new();
+        {
+            let mut pages = self.pages.lock();
+            for (index, expected, replacement) in replacements {
+                let Some(current) = pages.load(index) else {
+                    continue;
+                };
+                if !Arc::ptr_eq(&current, &expected) {
+                    continue;
+                }
+                pages.store(index, replacement);
+                replaced.push(expected);
+            }
+        }
+        let count = replaced.len();
+        for old in replaced {
+            old.waiters.wake_all();
+        }
+        count
+    }
+
+    pub(crate) fn clean_nv_candidates(
+        &self,
+        entry: &Arc<DirtyNvExtentEntry>,
+    ) -> Vec<(u64, Arc<RnvpcePageSlot>, bool)> {
+        self.snapshot_range(entry.logical_range(), usize::MAX)
+            .into_iter()
+            .filter_map(|(index, slot)| {
+                let RnvpcePageBacking::CleanNv(page) = slot.backing() else {
+                    return None;
+                };
+                Arc::ptr_eq(page.entry(), entry)
+                    .then(|| (index, slot.clone(), slot.take_accessed()))
+            })
+            .collect()
+    }
+
+    /// Applies a prepared clean-NV retirement plan with one XArray writer
+    /// acquisition. `None` evicts a cold page; `Some` installs a DRAM copy.
+    pub(crate) fn retire_clean_nv(
+        &self,
+        operations: Vec<(u64, Arc<RnvpcePageSlot>, Option<Arc<RnvpcePageSlot>>)>,
+    ) -> usize {
+        let mut retired = Vec::new();
+        {
+            let mut pages = self.pages.lock();
+            for (index, expected, replacement) in operations {
+                let Some(current) = pages.load(index) else {
+                    continue;
+                };
+                if !Arc::ptr_eq(&current, &expected) {
+                    continue;
+                }
+                if let Some(replacement) = replacement {
+                    pages.store(index, replacement);
+                } else {
+                    pages.remove(index);
+                }
+                retired.push(expected);
+            }
+        }
+        let count = retired.len();
+        for old in retired {
+            old.waiters.wake_all();
+        }
+        count
+    }
 }
 
 #[cfg(ktest)]
@@ -374,6 +483,43 @@ mod tests {
         assert_eq!(snapshot.len(), 2);
         assert_eq!(snapshot[0].0, 4);
         assert_eq!(snapshot[1].0, 9);
+    }
+
+    #[ktest]
+    fn rnvpce_page_cache_lookup_marks_only_the_target_page_accessed() {
+        let cache = RnvpcePageCache::new();
+        let left = cache.get_or_reserve_loading(1).unwrap();
+        let left_slot = test_slot(1);
+        cache
+            .replace_exact(1, left.slot(), left_slot.clone())
+            .unwrap();
+        let right = cache.get_or_reserve_loading(2).unwrap();
+        let right_slot = test_slot(2);
+        cache
+            .replace_exact(2, right.slot(), right_slot.clone())
+            .unwrap();
+
+        cache.lookup(1).unwrap();
+
+        assert!(left_slot.take_accessed());
+        assert!(!right_slot.take_accessed());
+    }
+
+    #[ktest]
+    fn rnvpce_page_cache_retires_a_batch_with_exact_owners() {
+        let cache = RnvpcePageCache::new();
+        let mut operations = Vec::new();
+        for index in 4..8 {
+            let loading = cache.get_or_reserve_loading(index).unwrap();
+            let resident = test_slot(index);
+            cache
+                .replace_exact(index, loading.slot(), resident.clone())
+                .unwrap();
+            operations.push((index, resident, None));
+        }
+
+        assert_eq!(cache.retire_clean_nv(operations), 4);
+        assert!(cache.snapshot_range(4..8, 4).is_empty());
     }
 
     #[ktest]

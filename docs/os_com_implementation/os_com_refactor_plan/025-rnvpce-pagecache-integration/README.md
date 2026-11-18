@@ -109,3 +109,22 @@ NVPage 紧张时，前台只负责触发/协助有界批量回收，不能按一
 
 正确性门槛：不存在 stale PageCache 映射、悬空 NVPage 引用、双重释放或未持久化数据被标为 clean。性能门槛：PageCache
 命中不再执行 extent tree 路由；32 线程不能因新增全局共享锁而出现新的串行断崖。
+
+## 10. 2026-11-18 实现状态
+
+已完成：
+
+- 每 inode 一个 XArray，支持 `CleanDram`、`DirtyNv`、`CleanNv` 和 page-local `Loading`；
+- 冷读按最多 32 页合并 SSD 请求，热读直接使用 PageCache 槽位；
+- range write 提交后一次查询 redirect overlap，并用一次 inode XArray 写锁发布整个 DirtyNv 范围；
+- rTIO 把 `IoComplete` 与 `Clean` 分开：先批量持久化 SSD 权威状态，再保留运行时 NV 数据和 allocation owner；
+- completion 精确地把仍指向旧 entry 的 `DirtyNv` 槽改为 `CleanNv`，不会覆盖并发的新版本；
+- 仅在容量/进度压力或 sync 排空时执行 worker-local 批量回收；热页先在锁外复制为 `CleanDram`，冷页直接淘汰，最后
+  每 inode 只获取一次 XArray 写锁；
+- redirect directory、reclaim queue 和容量释放继续按 inode owner worker/allocation domain 分区，没有新增全局热路径锁。
+
+尚未完成：
+
+- `CleanNv` 再次写入目前先请求所属 worker 回收旧 clean entry，再重试正常写事务；直接原槽恢复 NVM 权威并转为
+  `DirtyNv` 仍是后续优化；
+- NVMe/SATA 完整性能矩阵和 32 线程验收属于阶段 5，不能仅凭正确性 ktest 宣称性能目标已经达到。

@@ -6,19 +6,30 @@ Current implementation status is authoritative in [`../STATUS.md`](../STATUS.md)
 
 The approved rNVPCe hot-path refactor is specified in
 [`../os_com_refactor_plan/025-rnvpce-pagecache-integration/README.md`](../os_com_refactor_plan/025-rnvpce-pagecache-integration/README.md).
-It replaces the current direct extent/redirect lookup on every read with a
+It replaces the former direct extent/redirect lookup on every read with a
 per-inode sparse page-slot index that can reference clean DRAM, dirty NV, or clean
 NV data. Persistent extent/redirect metadata remains authoritative; PageCache is
-discarded on recovery. Completion will publish `CleanNv` rather than immediately
+discarded on recovery. Completion publishes `CleanNv` rather than immediately
 freeing the page, and later worker/allocation-domain batches will copy hot clean
 pages to DRAM or evict cold clean pages.
 
 The implementation must not add a global hot-path map or lock. Index updates are
 per inode, transitions are per page slot, and allocation/reclaim remains
 partitioned. No such lock may span user copy, 4 KiB copy, NVM persistence, SSD
-I/O, or sleep. Until plan Task 2 is complete, the active source still uses the
-legacy direct rNVPCe read path; this paragraph records the implementation target,
-not a completed-code claim.
+I/O, or sleep.
+
+As of 2026-11-18, the active branch implements the per-inode XArray, page-local
+miss ownership, 32-page SSD read windows, batched DirtyNv publication, the
+`IoComplete -> Clean` authority boundary, delayed worker-local reclaim, and one
+per-inode batched compare-and-replace/remove operation. An accessed CleanNv page
+is copied to a CleanDram page before its NV range is freed; an unaccessed page is
+evicted without a DRAM copy. The inode-cache read lock is used only to clone an
+`Arc<Inode>` and is dropped before copying or freeing.
+
+Direct `CleanNv -> DirtyNv` reuse remains a follow-up. A write that encounters a
+clean retained entry currently requests worker progress, lets the worker retire
+that entry, and retries through the normal range-write transaction. This is
+correct but may forfeit reuse under rewrite-heavy workloads.
 
 For rNVPCe, `committed` means persistently valid, `mapped` means selected by the current inode extent tree, `reachable` describes recovery's root traversal, and `reclaim` means durable clear plus frame reuse. A committed object is not necessarily mapped or reachable.
 

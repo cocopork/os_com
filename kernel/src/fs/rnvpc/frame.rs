@@ -44,8 +44,8 @@ use super::{
     recover,
     redirect_index::{
         DescriptorHandle, DirtyNvExtentEntry, MigrationConflict, MigrationExtentLease,
-        NvExtentEntryExtension, NvExtentEntryLease, NvExtentReadGuard, NvExtentWriteGuard,
-        RedirectDirectory,
+        NvExtentEntryExtension, NvExtentEntryLease, NvExtentEntryState, NvExtentReadGuard,
+        NvExtentWriteGuard, RedirectDirectory,
     },
     slot_allocator::NvSlotAllocator,
 };

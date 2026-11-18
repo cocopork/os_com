@@ -1542,7 +1542,7 @@ impl Inode {
             let mut locked_pages = Vec::with_capacity(run_end - run_start);
             for (_, _, _, page) in &disk_pages[run_start..run_end] {
                 segments.push(BioSegment::new_from_segment(
-                    Segment::from(page.clone()).into(),
+                    ostd::mm::Segment::from(page.clone()).into(),
                     BioDirection::FromDevice,
                 ));
                 locked_pages.push(page.clone().lock());
@@ -1606,6 +1606,39 @@ impl Inode {
                     logical_page,
                 )))
             })
+    }
+
+    pub(super) fn publish_rnvpce_clean_nv(
+        &self,
+        entry: &Arc<crate::fs::rnvpc::redirect_index::DirtyNvExtentEntry>,
+    ) -> usize {
+        self.rnvpce_page_cache.publish_clean_nv(entry)
+    }
+
+    pub(super) fn retire_rnvpce_clean_nv(
+        &self,
+        pool: &crate::fs::rnvpc::frame::Rnvpc,
+        entry: &Arc<crate::fs::rnvpc::redirect_index::DirtyNvExtentEntry>,
+    ) -> Result<usize> {
+        let candidates = self.rnvpce_page_cache.clean_nv_candidates(entry);
+        let mut operations = Vec::new();
+        operations
+            .try_reserve_exact(candidates.len())
+            .map_err(|_| Error::new(Errno::ENOMEM))?;
+        for (logical_page, slot, hot) in candidates {
+            let replacement = if hot {
+                let guard = entry.try_read()?;
+                let segment = pool.data_segment_from_entry(&guard, logical_page)?;
+                let page = CachePage::alloc_zero()?;
+                let mut source = segment.reader();
+                page.writer().write(&mut source);
+                Some(RnvpcePageSlot::clean_dram(page))
+            } else {
+                None
+            };
+            operations.push((logical_page, slot, replacement));
+        }
+        Ok(self.rnvpce_page_cache.retire_clean_nv(operations))
     }
 
     fn read_rnvpce_at(

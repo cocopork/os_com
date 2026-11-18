@@ -416,32 +416,19 @@ impl Rnvpc {
     }
 
     pub(crate) fn reclaim_nv_entry(&self, lease: &NvExtentEntryLease) -> Result<usize> {
+        if lease.entry().record_snapshot()?.visibility_generation() != 0 {
+            self.publish_clean_nv_entries(core::slice::from_ref(lease))?;
+            return self.release_clean_nv_entries(core::slice::from_ref(lease));
+        }
         self.ensure_publication_certain()?;
-        lease.begin_reclaim_and_wait_for_readers()?;
         let entry = lease.entry();
         let pending = entry
             .record_snapshot()?
             .with_authority(NvRedirectAuthority::SsdAuthoritativePendingFree)?;
         self.persist.publish_redirect_extent(&pending, None)?;
-
-        if entry.record_snapshot()?.visibility_generation() == 0 {
-            return self.reclaim_legacy_nv_entry(lease);
-        }
-
-        let head_slot = usize::try_from(entry.nv_slot_range().start)
-            .map_err(|_| Error::new(Errno::EOVERFLOW))?;
-        self.persist.clear_frame(head_slot, None)?;
-        self.redirects.remove_reclaimed_entry(lease)?;
-        let owned_pages = self.remove_data_range_owner(entry)?;
-        let reclaimed = usize::from(entry.page_count());
-        if owned_pages.start.index() != head_slot
-            || owned_pages.end.index() != head_slot + reclaimed
-        {
-            return_errno_with_message!(Errno::ESTALE, "NV extent entry range owner changed");
-        }
-        self.free_native_data_range(head_slot..head_slot + reclaimed)?;
-        lease.finish_reclaim()?;
-        Ok(reclaimed)
+        lease.publish_clean()?;
+        lease.begin_reclaim_and_wait_for_readers()?;
+        self.reclaim_legacy_nv_entry(lease)
     }
 
     pub(crate) fn reclaim_nv_entries(&self, leases: &[NvExtentEntryLease]) -> Result<usize> {
@@ -463,12 +450,33 @@ impl Rnvpc {
             return Ok(reclaimed);
         }
 
+        self.publish_clean_nv_entries(leases)?;
+        self.release_clean_nv_entries(leases)
+    }
+
+    /// Makes SSD authoritative while retaining the NV data range as a clean
+    /// runtime cache. Persistent publication is batched; no volatile redirect
+    /// or allocator ownership is removed here.
+    pub(crate) fn publish_clean_nv_entries(&self, leases: &[NvExtentEntryLease]) -> Result<()> {
+        if leases.is_empty() {
+            return Ok(());
+        }
+        if leases.iter().any(|lease| {
+            lease
+                .entry()
+                .record_snapshot()
+                .is_ok_and(|record| record.visibility_generation() == 0)
+        }) {
+            return_errno_with_message!(Errno::EOPNOTSUPP, "legacy NV entry cannot remain clean");
+        }
         self.ensure_publication_certain()?;
         let mut pending = Vec::with_capacity(leases.len());
         let mut heads = Vec::with_capacity(leases.len());
         for lease in leases {
-            lease.begin_reclaim_and_wait_for_readers()?;
             let entry = lease.entry();
+            if entry.state() != NvExtentEntryState::IoComplete {
+                return_errno_with_message!(Errno::ESTALE, "NV extent I/O is not complete");
+            }
             let record = entry
                 .record_snapshot()?
                 .with_authority(NvRedirectAuthority::SsdAuthoritativePendingFree)?;
@@ -480,7 +488,22 @@ impl Rnvpc {
         }
         self.persist.publish_redirect_extents(&pending, None)?;
         self.persist.clear_frames(&heads, None)?;
+        for lease in leases {
+            lease.publish_clean()?;
+        }
+        Ok(())
+    }
 
+    /// Releases clean NV cache ranges after PageCache has stopped naming them.
+    /// This phase performs no device I/O or persistence and can be batched by
+    /// the owning rTIO worker/allocation domains.
+    pub(crate) fn release_clean_nv_entries(&self, leases: &[NvExtentEntryLease]) -> Result<usize> {
+        if leases.is_empty() {
+            return Ok(0);
+        }
+        for lease in leases {
+            lease.begin_reclaim_and_wait_for_readers()?;
+        }
         let entries = leases
             .iter()
             .map(|lease| lease.entry().clone())

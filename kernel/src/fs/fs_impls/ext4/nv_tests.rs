@@ -341,7 +341,7 @@ pub(super) fn assert_cross_queue_ssd_page(fs: &Ext4, disk: &QueueRecordingDisk, 
 // Catches per-queue coordinators/flushes, premature reclaim, and leaked credits.
 #[ktest]
 fn rnvpce_cross_queue_epoch_issues_one_flush() {
-    use crate::fs::rnvpc::redirect_index::NvExtentEntryState::{IoComplete, Migrating};
+    use crate::fs::rnvpc::redirect_index::NvExtentEntryState::{Clean, Migrating};
 
     let (fs, disk) = cross_queue_fixture(0xe5);
     for queue in 0..4 {
@@ -381,11 +381,14 @@ fn rnvpce_cross_queue_epoch_issues_one_flush() {
     // covered by the driver test, below this filesystem recording boundary.
     assert!((1..=4).contains(&(disk.disk.flush_count() - before)));
     for ino in 11..15 {
-        assert_cross_queue_entry(&fs, ino, IoComplete);
+        assert_cross_queue_entry(&fs, ino, Clean);
     }
     assert_eq!(fs.nv_in_flight.load(Ordering::Acquire), 0);
     assert_eq!(fs.nv_reclaim_pending.load(Ordering::Acquire), 4);
-    assert_eq!(fs.help_nv_reclaim(0, 4).unwrap(), 4);
+    let reclaimed = (0..4)
+        .map(|worker| fs.help_nv_reclaim(worker, 4).unwrap())
+        .sum::<usize>();
+    assert_eq!(reclaimed, 4);
     for ino in 11..15 {
         assert_cross_queue_ssd_page(&fs, &disk, ino);
         assert_eq!(
@@ -406,7 +409,7 @@ fn rnvpce_cross_queue_epoch_issues_one_flush() {
 #[ktest]
 fn rnvpce_cross_queue_mixed_data_error_preserves_failed_entry() {
     use crate::fs::rnvpc::{
-        redirect_index::NvExtentEntryState::{Dirty, IoComplete},
+        redirect_index::NvExtentEntryState::{Clean, Dirty},
         write_transaction::current_page_mapping,
     };
 
@@ -438,9 +441,12 @@ fn rnvpce_cross_queue_mixed_data_error_preserves_failed_entry() {
     assert_eq!(fs.rtio_durability.pending_data_page_count(), 0);
     assert_eq!(fs.rtio_durability.ready_page_count(), 0);
     for ino in 11..15 {
-        assert_cross_queue_entry(&fs, ino, if ino == 12 { Dirty } else { IoComplete });
+        assert_cross_queue_entry(&fs, ino, if ino == 12 { Dirty } else { Clean });
     }
-    assert_eq!(fs.help_nv_reclaim(0, 4).unwrap(), 3);
+    let reclaimed = (0..4)
+        .map(|worker| fs.help_nv_reclaim(worker, 4).unwrap())
+        .sum::<usize>();
+    assert_eq!(reclaimed, 3);
     for ino in [11, 13, 14] {
         assert_cross_queue_ssd_page(&fs, &disk, ino);
     }
@@ -633,7 +639,7 @@ fn nv_route_rnvpce_durability_epoch_isolates_failed_batch() {
         pool.lookup_dirty_nv_entry(PageKey::new(fs_id, 12, 0))
             .unwrap()
             .state(),
-        NvExtentEntryState::IoComplete
+        NvExtentEntryState::Clean
     );
     assert_eq!(fixture.ext4.help_nv_reclaim(0, 1).unwrap(), 1);
     assert!(

@@ -31,10 +31,10 @@
 - Produce `RnvpcePageCache`, `RnvpcePageSlot`, and backing states `CleanDram`, `DirtyNv`, `CleanNv`, and transient ownership.
 - Provide RCU lookup, insert-if-absent, compare-and-replace, compare-and-remove, and bounded range iteration.
 
-- [ ] Add tests for lock-free lookup, single loader ownership, same-page replacement, stale replacement rejection, and independent-page progress.
-- [ ] Implement the smallest per-inode XArray page-slot index that passes the tests.
-- [ ] Verify no page-index lock is held while waiting or copying.
-- [ ] Run focused ktests and commit.
+- [x] Add tests for lock-free lookup, single loader ownership, same-page replacement, stale replacement rejection, and independent-page progress.
+- [x] Implement the smallest per-inode XArray page-slot index that passes the tests.
+- [x] Verify no page-index lock is held while waiting or copying.
+- [x] Run focused ktests and commit.
 
 ### Task 2: Read Path And DRAM Cold-Read Fill
 
@@ -47,11 +47,11 @@
 - Consume Task 1 page slots before any extent/redirect lookup.
 - Produce batched SSD miss fill into `CleanDram` slots and direct NV reads for `DirtyNv`/`CleanNv`.
 
-- [ ] Add tests proving a cache hit performs zero mapping lookups and concurrent misses issue one load.
-- [ ] Route rNVPCe reads through the page-slot index.
-- [ ] Reuse PageCache batch BIO construction for contiguous SSD misses and readahead.
-- [ ] Verify error/short-read cleanup removes only the exact loading owner.
-- [ ] Run focused read tests and commit.
+- [x] Add tests proving a cache hit performs zero mapping lookups and concurrent misses issue one load.
+- [x] Route rNVPCe reads through the page-slot index.
+- [x] Reuse PageCache batch BIO construction for contiguous SSD misses and readahead.
+- [x] Verify error/short-read cleanup removes only the exact loading owner.
+- [x] Run focused read tests and commit.
 
 ### Task 3: Write Transitions And Persistent Publication
 
@@ -65,11 +65,11 @@
 - Produce `CleanDram -> DirtyNv`, `CleanNv -> DirtyNv`, and `DirtyNv -> DirtyNv` transitions.
 - Consume existing range-write transaction and persistent redirect publication protocols.
 
-- [ ] Add tests for full-page overwrite without SSD read, partial overwrite preservation, concurrent same-page writers, and publication failure rollback.
-- [ ] Implement transitions with persistence before PageCache pointer publication.
-- [ ] Batch contiguous range transitions without per-page tree routing.
-- [ ] Remove hot-read dependence on the exact PageKey redirect lookup while retaining recovery/migration indexes.
-- [ ] Run write, crash-cut, and redirect integrity tests; commit.
+- [x] Add focused cache-publication and full-page no-SSD-read coverage; retain the existing partial-write/crash tests.
+- [ ] Implement every direct transition with persistence before PageCache pointer publication (`CleanNv -> DirtyNv` reuse remains).
+- [x] Batch contiguous range transitions without per-page tree routing.
+- [x] Remove hot-read dependence on the exact PageKey redirect lookup while retaining recovery/migration indexes.
+- [x] Run focused write and redirect integrity tests and commit; three pre-existing direct-transaction failures remain recorded in the SDD ledger.
 
 ### Task 4: Clean NVPage Completion And Delayed Reclaim
 
@@ -84,11 +84,11 @@
 - Produce `DirtyNv -> CleanNv` after durable SSD authority.
 - Produce hot `CleanNv -> CleanDram` and cold `CleanNv -> absent` reclaim paths.
 
-- [ ] Add tests proving completion retains a readable NVPage and dirty/in-flight pages cannot be reclaimed.
-- [ ] Stop immediate completion-side slot release and publish `CleanNv` into the matching page slots.
-- [ ] Implement worker/allocation-domain batched reclaim with exact compare-and-replace/remove.
-- [ ] Make foreground capacity assistance request an adaptive batch rather than one page per 4 KiB write.
-- [ ] Run reclaim, recovery, sync, and unmount tests; commit.
+- [x] Add tests proving completion retains a readable NVPage and dirty/in-flight pages cannot be reclaimed.
+- [x] Stop immediate completion-side slot release and publish `CleanNv` into the matching page slots.
+- [x] Implement worker/allocation-domain batched reclaim with exact compare-and-replace/remove.
+- [x] Keep foreground assistance as a pressure signal while the owning worker reclaims up to the normal batch budget, rather than one page per 4 KiB write.
+- [x] Run reclaim, recovery, sync, and unmount tests; commit.
 
 ### Task 5: Recovery, Verification, And Performance
 

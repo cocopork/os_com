@@ -2097,6 +2097,13 @@ impl Ext4 {
             .and_then(|group| group.remove_inode(ino))
     }
 
+    /// Looks up an already-live inode without taking the slow load path.
+    pub(super) fn cached_inode(&self, ino: Ext4Ino) -> Option<Arc<Inode>> {
+        self.find_group(ino)
+            .ok()
+            .and_then(|group| group.cached_inode(ino))
+    }
+
     /// Returns whether `ino` is marked allocated in its owning group's inode
     /// bitmap. Used by the reclaim path to skip an already-freed inode. Mirrors
     /// ext2 routing through the owning block group.

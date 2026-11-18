@@ -1062,6 +1062,13 @@ impl BlockGroup {
         Ok(inode)
     }
 
+    /// Returns a live inode without loading it from storage. The cache lock is
+    /// held only long enough to clone the `Arc`.
+    pub(super) fn cached_inode(&self, ino: Ext4Ino) -> Option<Arc<Inode>> {
+        let inode_idx = self.inode_idx_in_group(ino);
+        self.inode_cache.read().get(&inode_idx).cloned()
+    }
+
     /// Inserts a newly created inode into this group's live cache.
     pub(super) fn insert_inode(&self, inode: Arc<Inode>) {
         let inode_idx = self.inode_idx_in_group(inode.ino());
