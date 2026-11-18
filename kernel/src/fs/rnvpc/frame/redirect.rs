@@ -486,8 +486,10 @@ impl Rnvpc {
             );
             pending.push(record);
         }
-        self.persist.publish_redirect_extents(&pending, None)?;
-        self.persist.clear_frames(&heads, None)?;
+        for (records, slots) in pending.chunks(128).zip(heads.chunks(128)) {
+            self.persist.publish_redirect_extents(records, None)?;
+            self.persist.clear_frames(slots, None)?;
+        }
         for lease in leases {
             lease.publish_clean()?;
         }

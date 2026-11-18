@@ -46,7 +46,11 @@ class Point(NamedTuple):
 
     @property
     def value(self) -> str:
-        return str(self.jobs) if self.axis == "threads" else self.bs
+        if self.axis == "threads":
+            return str(self.jobs)
+        if self.axis == "pagecache-regression":
+            return f"{self.bs}-j{self.jobs}"
+        return self.bs
 
     @property
     def case(self) -> str:
@@ -90,9 +94,32 @@ def matrix() -> list[Point]:
     return points
 
 
+def pagecache_regression_matrix() -> list[Point]:
+    """Focused performance-regression screen for the PageCache integration."""
+    coordinates = (
+        ("append-write", 128, 1),
+        ("append-write", 128, 16),
+        ("overwrite-randwrite", 4, 1),
+        ("overwrite-randwrite", 4, 16),
+        ("cold-randread", 4, 1),
+        ("cold-randread", 16, 1),
+        ("cold-randread", 64, 1),
+        ("cold-randread", 256, 1),
+    )
+    return [
+        Point("nvme", "rnvpce", workload, "pagecache-regression", jobs, bs_kib, repeat)
+        for repeat in REPEATS
+        for workload, bs_kib, jobs in coordinates
+    ]
+
+
 def point_by_case(case: str) -> Point:
     try:
-        return next(point for point in matrix() if point.case == case)
+        return next(
+            point
+            for point in (*matrix(), *pagecache_regression_matrix())
+            if point.case == case
+        )
     except StopIteration as error:
         raise ValueError(f"unknown case: {case}") from error
 
@@ -175,14 +202,16 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("list")
+    commands.add_parser("pagecache-regression-list")
     config = commands.add_parser("config")
     config.add_argument("case")
     parse = commands.add_parser("parse")
     parse.add_argument("point_dir", type=Path)
     parse.add_argument("case")
     args = parser.parse_args()
-    if args.command == "list":
-        for point in matrix():
+    if args.command in ("list", "pagecache-regression-list"):
+        points = matrix() if args.command == "list" else pagecache_regression_matrix()
+        for point in points:
             print_point(point)
     elif args.command == "config":
         print_point(point_by_case(args.case))

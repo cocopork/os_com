@@ -2680,6 +2680,39 @@ fn rnvpce_native_entry_batch_reclaim_shares_persistence_barriers() {
 }
 
 #[ktest]
+fn rnvpce_clean_publication_chunks_more_than_128_entries() {
+    const FS_ID: u64 = 0xb20b;
+    const ENTRY_COUNT: usize = 129;
+    let pool = test_pool(384, 184, 200, None);
+    pool.configure_migration_workers(FS_ID, 1).unwrap();
+    for inode in 1..=ENTRY_COUNT as u64 {
+        let page = staged_redirect_page(&pool, inode as u8);
+        let entries = pool
+            .publish_redirect_entries(
+                &[(page, PageKey::new(FS_ID, inode, 0), 80_000 + inode)],
+                1,
+                None,
+            )
+            .unwrap();
+        pool.activate_redirect_entries(&entries).unwrap();
+    }
+    let leases = pool
+        .claim_ready_nv_entries_for_worker(FS_ID, 0, ENTRY_COUNT)
+        .unwrap();
+    assert_eq!(leases.len(), ENTRY_COUNT);
+    for lease in &leases {
+        pool.complete_nv_entry(lease).unwrap();
+    }
+
+    pool.publish_clean_nv_entries(&leases).unwrap();
+    assert!(
+        leases
+            .iter()
+            .all(|lease| lease.entry().state() == NvExtentEntryState::Clean)
+    );
+}
+
+#[ktest]
 fn rnvpce_range_owned_slots() {
     const FS_ID: u64 = 0xb20c;
     const INODE: u64 = 81;

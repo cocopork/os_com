@@ -37,7 +37,8 @@ fn ext4_research_routes() {
         nv_route_rnvpce_rejects_unrecovered_journal,
         nv_route_rnvpce_reservation_abort_wakes_writer,
         nv_route_rnvpce_reclaim_ready_queue_contract,
-        nv_route_rnvpce_completion_publishes_reclaim_work_item,
+        nv_route_rnvpce_completion_releases_uncached_write,
+        nv_route_rnvpce_completion_retains_cached_nv,
         nv_route_rnvpce_durability_epoch_coalesces_ready_batches,
         nv_route_rnvpce_durability_epoch_isolates_failed_batch,
         rnvpce_cross_queue_epoch_issues_one_flush,
@@ -341,7 +342,7 @@ pub(super) fn assert_cross_queue_ssd_page(fs: &Ext4, disk: &QueueRecordingDisk, 
 // Catches per-queue coordinators/flushes, premature reclaim, and leaked credits.
 #[ktest]
 fn rnvpce_cross_queue_epoch_issues_one_flush() {
-    use crate::fs::rnvpc::redirect_index::NvExtentEntryState::{Clean, Migrating};
+    use crate::fs::rnvpc::redirect_index::NvExtentEntryState::Migrating;
 
     let (fs, disk) = cross_queue_fixture(0xe5);
     for queue in 0..4 {
@@ -380,15 +381,12 @@ fn rnvpce_cross_queue_epoch_issues_one_flush() {
     // Common sync constructs Any; the concrete virtio queue-0 flush route is
     // covered by the driver test, below this filesystem recording boundary.
     assert!((1..=4).contains(&(disk.disk.flush_count() - before)));
-    for ino in 11..15 {
-        assert_cross_queue_entry(&fs, ino, Clean);
-    }
     assert_eq!(fs.nv_in_flight.load(Ordering::Acquire), 0);
-    assert_eq!(fs.nv_reclaim_pending.load(Ordering::Acquire), 4);
+    assert_eq!(fs.nv_reclaim_pending.load(Ordering::Acquire), 0);
     let reclaimed = (0..4)
         .map(|worker| fs.help_nv_reclaim(worker, 4).unwrap())
         .sum::<usize>();
-    assert_eq!(reclaimed, 4);
+    assert_eq!(reclaimed, 0);
     for ino in 11..15 {
         assert_cross_queue_ssd_page(&fs, &disk, ino);
         assert_eq!(
@@ -409,8 +407,7 @@ fn rnvpce_cross_queue_epoch_issues_one_flush() {
 #[ktest]
 fn rnvpce_cross_queue_mixed_data_error_preserves_failed_entry() {
     use crate::fs::rnvpc::{
-        redirect_index::NvExtentEntryState::{Clean, Dirty},
-        write_transaction::current_page_mapping,
+        redirect_index::NvExtentEntryState::Dirty, write_transaction::current_page_mapping,
     };
 
     let (fs, disk) = cross_queue_fixture(0xe6);
@@ -437,19 +434,17 @@ fn rnvpce_cross_queue_mixed_data_error_preserves_failed_entry() {
     assert_eq!(fs.process_nv_completions().unwrap_err().error(), Errno::EIO);
     assert_eq!(disk.disk.flush_count() - before, 1);
     assert_eq!(fs.nv_in_flight.load(Ordering::Acquire), 0);
-    assert_eq!(fs.nv_reclaim_pending.load(Ordering::Acquire), 3);
+    assert_eq!(fs.nv_reclaim_pending.load(Ordering::Acquire), 0);
     assert_eq!(fs.rtio_durability.pending_data_page_count(), 0);
     assert_eq!(fs.rtio_durability.ready_page_count(), 0);
-    for ino in 11..15 {
-        assert_cross_queue_entry(&fs, ino, if ino == 12 { Dirty } else { Clean });
-    }
-    let reclaimed = (0..4)
-        .map(|worker| fs.help_nv_reclaim(worker, 4).unwrap())
-        .sum::<usize>();
-    assert_eq!(reclaimed, 3);
     for ino in [11, 13, 14] {
         assert_cross_queue_ssd_page(&fs, &disk, ino);
     }
+    assert_cross_queue_entry(&fs, 12, Dirty);
+    let reclaimed = (0..4)
+        .map(|worker| fs.help_nv_reclaim(worker, 4).unwrap())
+        .sum::<usize>();
+    assert_eq!(reclaimed, 0);
     assert_cross_queue_entry(&fs, 12, Dirty);
     let mut bytes = [0; PAGE_SIZE];
     fs.read_inode(12)
@@ -575,7 +570,7 @@ fn nv_route_rnvpce_durability_epoch_coalesces_ready_batches() {
         1,
         "all ready rNVPCe batches in one drain must share one device flush"
     );
-    assert_eq!(fixture.ext4.help_nv_reclaim(0, 8).unwrap(), 8);
+    assert_eq!(fixture.ext4.help_nv_reclaim(0, 8).unwrap(), 0);
 }
 
 fn nv_route_rnvpce_durability_epoch_isolates_failed_batch() {
@@ -635,13 +630,11 @@ fn nv_route_rnvpce_durability_epoch_isolates_failed_batch() {
             .state(),
         NvExtentEntryState::Dirty
     );
-    assert_eq!(
+    assert!(
         pool.lookup_dirty_nv_entry(PageKey::new(fs_id, 12, 0))
-            .unwrap()
-            .state(),
-        NvExtentEntryState::Clean
+            .is_none()
     );
-    assert_eq!(fixture.ext4.help_nv_reclaim(0, 1).unwrap(), 1);
+    assert_eq!(fixture.ext4.help_nv_reclaim(0, 1).unwrap(), 0);
     assert!(
         pool.lookup_dirty_nv_entry(PageKey::new(fs_id, 12, 0))
             .is_none()
@@ -819,7 +812,7 @@ fn nv_route_rnvpce_reclaim_ready_queue_contract() {
     super::migration::assert_reclaim_queue_contract();
 }
 
-fn nv_route_rnvpce_completion_publishes_reclaim_work_item() {
+fn nv_route_rnvpce_completion_releases_uncached_write() {
     crate::fs::rnvpc::init_for_ext4_tests();
     crate::time::clocks::init_for_ktest();
     let fixture = Ext4FixtureBuilder::new(2048, 256, 2048)
@@ -839,34 +832,58 @@ fn nv_route_rnvpce_completion_publishes_reclaim_work_item() {
 
     assert_eq!(fixture.ext4.migrate_nv_round(4).unwrap(), 4);
     assert_eq!(fixture.ext4.process_nv_completions().unwrap(), 4);
-    assert_eq!(fixture.ext4.nv_reclaim_pending.load(Ordering::Acquire), 4);
+    assert_eq!(fixture.ext4.nv_reclaim_pending.load(Ordering::Acquire), 0);
     let pool = crate::fs::rnvpc::pool().unwrap();
     for page_index in 0..4 {
         assert!(
-            pool.lookup_dirty_nv_entry(crate::fs::rnvpc::index::PageKey::new(
-                fixture.ext4.rnvpc_fs_id(),
-                11,
-                page_index,
-            ))
-            .is_some(),
-            "completion must leave the durable NV redirect for a helper"
+            !has_native_redirect(pool, fixture.ext4.rnvpc_fs_id(), 11, page_index),
+            "completion must release a clean NV range with no PageCache reference"
         );
     }
 
     pool.reset_baseline_validation_calls_for_test();
-    assert_eq!(fixture.ext4.help_nv_reclaim(0, 4).unwrap(), 4);
+    assert_eq!(fixture.ext4.help_nv_reclaim(0, 4).unwrap(), 0);
     assert_eq!(
         pool.baseline_validation_calls_for_test(),
         0,
         "entry reclaim must not validate a per-page or shared baseline token"
     );
-    assert_eq!(fixture.ext4.nv_reclaim_pending.load(Ordering::Acquire), 0);
+}
+
+fn nv_route_rnvpce_completion_retains_cached_nv() {
+    crate::fs::rnvpc::init_for_ext4_tests();
+    crate::time::clocks::init_for_ktest();
+    let fixture = Ext4FixtureBuilder::new(2048, 256, 2048)
+        .with_block_bitmap_metadata_marked()
+        .with_uuid([0xcb; 16])
+        .with_mount_options("rnvpce=on,rtio=off")
+        .build()
+        .unwrap();
+    fixture.write_raw_inode(11, &make_empty_file_inode());
+    let inode = fixture.ext4.read_inode(11).unwrap();
+    let input = [0x6a; 4 * PAGE_SIZE];
+    inode
+        .write_at(0, &mut VmReader::from(input.as_slice()).to_fallible())
+        .unwrap();
+    let mut output = [0; 4 * PAGE_SIZE];
+    inode
+        .read_at(0, &mut VmWriter::from(output.as_mut_slice()).to_fallible())
+        .unwrap();
+    assert_eq!(output, input);
+
+    assert_eq!(fixture.ext4.migrate_nv_round(4).unwrap(), 4);
+    assert_eq!(fixture.ext4.process_nv_completions().unwrap(), 4);
+    assert_eq!(fixture.ext4.nv_reclaim_pending.load(Ordering::Acquire), 4);
+    let pool = crate::fs::rnvpc::pool().unwrap();
     for page_index in 0..4 {
         assert!(
-            !has_native_redirect(pool, fixture.ext4.rnvpc_fs_id(), 11, page_index),
-            "the helper must publish the SSD baseline and retire the redirect"
+            has_native_redirect(pool, fixture.ext4.rnvpc_fs_id(), 11, page_index),
+            "PageCache-resident clean NV data must remain available to the hot path"
         );
     }
+
+    assert_eq!(fixture.ext4.help_nv_reclaim(0, 4).unwrap(), 4);
+    assert_eq!(fixture.ext4.nv_reclaim_pending.load(Ordering::Acquire), 0);
 }
 
 fn nv_route_rnvpce_same_group_entries_submit_independently() {

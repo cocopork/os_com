@@ -130,13 +130,21 @@ impl LoadingPage {
 /// lock is held only while publishing or removing an `Arc`.
 pub(crate) struct RnvpcePageCache {
     pages: XArray<Arc<RnvpcePageSlot>>,
+    ever_populated: AtomicBool,
 }
 
 impl RnvpcePageCache {
     pub(crate) const fn new() -> Self {
         Self {
             pages: XArray::new(),
+            ever_populated: AtomicBool::new(false),
         }
+    }
+
+    /// False is an exact fast path; true only means that invalidation may be
+    /// necessary because this inode has populated the hot-page index before.
+    pub(crate) fn may_contain_pages(&self) -> bool {
+        self.ever_populated.load(Ordering::Acquire)
     }
 
     pub(crate) fn lookup(&self, page_index: u64) -> Option<Arc<RnvpcePageSlot>> {
@@ -161,6 +169,7 @@ impl RnvpcePageCache {
         }
         let slot = RnvpcePageSlot::loading();
         pages.store(page_index, slot.clone());
+        self.ever_populated.store(true, Ordering::Release);
         Ok(LoadingPage { slot, owner: true })
     }
 
@@ -311,6 +320,7 @@ impl RnvpcePageCache {
                 }
                 pages.store(index, replacement);
             }
+            self.ever_populated.store(true, Ordering::Release);
         }
         for old in replaced {
             old.waiters.wake_all();
@@ -331,9 +341,6 @@ impl RnvpcePageCache {
                 continue;
             }
             let replacement = RnvpcePageSlot::clean_nv(RnvpceNvPage::new(entry.clone(), index));
-            if slot.take_accessed() {
-                replacement.mark_accessed();
-            }
             replacements.push((index, slot, replacement));
         }
 
@@ -412,8 +419,15 @@ mod tests {
 
     use ostd::prelude::ktest;
 
-    use super::{RnvpcePageBacking, RnvpcePageCache, RnvpcePageSlot};
-    use crate::{prelude::*, thread::kernel_thread::ThreadOptions};
+    use super::{RnvpceNvPage, RnvpcePageBacking, RnvpcePageCache, RnvpcePageSlot};
+    use crate::{
+        fs::rnvpc::{
+            descriptor::{NvRedirectAuthority, NvRedirectExtentRecord},
+            redirect_index::DirtyNvExtentEntry,
+        },
+        prelude::*,
+        thread::kernel_thread::ThreadOptions,
+    };
 
     fn test_slot(value: u64) -> Arc<RnvpcePageSlot> {
         RnvpcePageSlot::new_test(value)
@@ -422,9 +436,11 @@ mod tests {
     #[ktest]
     fn rnvpce_page_cache_one_loader_owns_an_absent_page() {
         let cache = RnvpcePageCache::new();
+        assert!(!cache.may_contain_pages());
         let first = cache.get_or_reserve_loading(7).unwrap();
         let second = cache.get_or_reserve_loading(7).unwrap();
 
+        assert!(cache.may_contain_pages());
         assert!(first.is_owner());
         assert!(!second.is_owner());
         assert!(Arc::ptr_eq(first.slot(), second.slot()));
@@ -503,6 +519,39 @@ mod tests {
 
         assert!(left_slot.take_accessed());
         assert!(!right_slot.take_accessed());
+    }
+
+    #[ktest]
+    fn rnvpce_clean_nv_recency_starts_at_publication() {
+        let cache = RnvpcePageCache::new();
+        let record = NvRedirectExtentRecord::new_with_visibility(
+            1,
+            2,
+            7,
+            1,
+            11,
+            13,
+            NvRedirectAuthority::NvAuthoritative,
+            1,
+        )
+        .unwrap();
+        let entry = Arc::new(DirtyNvExtentEntry::new(record).unwrap());
+        let loading = cache.get_or_reserve_loading(7).unwrap();
+        cache
+            .replace_exact(
+                7,
+                loading.slot(),
+                RnvpcePageSlot::dirty_nv(RnvpceNvPage::new(entry.clone(), 7)),
+            )
+            .unwrap();
+
+        assert_eq!(cache.publish_clean_nv(&entry), 1);
+        let candidates = cache.clean_nv_candidates(&entry);
+        assert_eq!(candidates.len(), 1);
+        assert!(!candidates[0].2, "a write is not a clean-page cache hit");
+
+        cache.lookup(7).unwrap();
+        assert!(cache.clean_nv_candidates(&entry)[0].2);
     }
 
     #[ktest]

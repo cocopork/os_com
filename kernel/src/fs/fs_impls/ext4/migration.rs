@@ -1370,19 +1370,41 @@ impl Ext4 {
             pool.complete_nv_entry(entry)?;
         }
         // One persistent publication covers the worker-owned completion batch.
-        // The leases and allocator ranges remain alive as a clean NV cache.
         pool.publish_clean_nv_entries(&entries)?;
-        for lease in &entries {
+        let mut cached_entries = Vec::new();
+        let mut uncached_entries = Vec::new();
+        for lease in entries {
             let entry = lease.entry();
-            let Ok(ino) = entry.inode().try_into() else {
-                continue;
-            };
-            if let Some(inode) = self.cached_inode(ino) {
-                inode.publish_rnvpce_clean_nv(entry);
+            let cached_pages = entry
+                .inode()
+                .try_into()
+                .ok()
+                .and_then(|ino| self.cached_inode(ino))
+                .map_or(0, |inode| inode.publish_rnvpce_clean_nv(entry));
+            if cached_pages == 0 {
+                uncached_entries.push(lease);
+            } else {
+                cached_entries.push(lease);
             }
         }
-        let reclaim_batch = ReclaimBatch::new(entries.len());
-        for entry in entries {
+        // A write-only range has no hot-path owner after SSD becomes
+        // authoritative. Release it in this completion batch instead of
+        // filling the NV pool and forcing foreground capacity reclaim.
+        if !uncached_entries.is_empty() {
+            let uncached_pages = uncached_entries
+                .iter()
+                .map(|entry| usize::from(entry.entry().page_count()))
+                .sum();
+            pool.release_clean_nv_entries(&uncached_entries)?;
+            batch_metrics::count(Event::ReclaimedPages, uncached_pages);
+            batch_metrics::count(Event::ReclaimedSlotRanges, uncached_entries.len());
+        }
+        if cached_entries.is_empty() {
+            pp::NV_COMPLETION_TOTAL.record_since(completion_started, result.batch.page_count());
+            return Ok(());
+        }
+        let reclaim_batch = ReclaimBatch::new(cached_entries.len());
+        for entry in cached_entries {
             let entry_pages = usize::from(entry.entry().page_count());
             self.nv_reclaim_pending
                 .fetch_add(entry_pages, Ordering::AcqRel);
@@ -2000,7 +2022,7 @@ pub(super) mod tests {
         let before = disk.disk.flush_count();
         assert_eq!(fs.process_nv_completions().unwrap(), 8);
         assert_eq!(disk.disk.flush_count() - before, 1);
-        assert_eq!(fs.help_nv_reclaim(0, 8).unwrap(), 8);
+        assert_eq!(fs.help_nv_reclaim(0, 8).unwrap(), 0);
 
         fs.read_inode(19)
             .unwrap()
@@ -2020,7 +2042,7 @@ pub(super) mod tests {
             "quiesced sync submissions are not worker activity"
         );
         assert_eq!(fs.process_nv_completions().unwrap(), 1);
-        assert_eq!(fs.help_nv_reclaim(0, 1).unwrap(), 1);
+        assert_eq!(fs.help_nv_reclaim(0, 1).unwrap(), 0);
         disk.writes.lock().clear();
         fs.write_segments_async(
             200,

@@ -57,6 +57,35 @@ class MatrixTests(unittest.TestCase):
             self.assertEqual(point.per_job_mib * point.jobs, point.actual_mib)
             self.assertLessEqual(point.actual_mib, 2048)
 
+    def test_pagecache_regression_matrix_has_requested_focused_points(self):
+        points = sweep.pagecache_regression_matrix()
+
+        self.assertEqual(len(points), 24)
+        self.assertEqual(len({point.case for point in points}), 24)
+        self.assertEqual({point.repeat for point in points}, {1, 2, 3})
+        coordinates = {
+            (point.workload, point.bs_kib, point.jobs)
+            for point in points
+            if point.repeat == 1
+        }
+        self.assertEqual(
+            coordinates,
+            {
+                ("append-write", 128, 1),
+                ("append-write", 128, 16),
+                ("overwrite-randwrite", 4, 1),
+                ("overwrite-randwrite", 4, 16),
+                ("cold-randread", 4, 1),
+                ("cold-randread", 16, 1),
+                ("cold-randread", 64, 1),
+                ("cold-randread", 256, 1),
+            },
+        )
+        self.assertTrue(all(point.device == "nvme" for point in points))
+        self.assertTrue(all(point.mode == "rnvpce" for point in points))
+        self.assertTrue(all(point.axis == "pagecache-regression" for point in points))
+        self.assertTrue(all(f"{point.bs}-j{point.jobs}" in point.case for point in points))
+
 
 class ResultTests(unittest.TestCase):
     def write_fixture(self, root, point, *, operation, bytes_done=None, check_status=0):
