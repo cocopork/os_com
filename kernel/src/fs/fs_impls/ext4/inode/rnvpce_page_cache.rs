@@ -260,6 +260,41 @@ impl RnvpcePageCache {
             slot.waiters.wake_all();
         }
     }
+
+    /// Builds an entire replacement outside the XArray lock, then publishes
+    /// it with one per-inode writer acquisition.
+    pub(crate) fn replace_range_with<F>(&self, range: Range<u64>, mut build: F) -> Result<()>
+    where
+        F: FnMut(u64) -> Result<Arc<RnvpcePageSlot>>,
+    {
+        let count = usize::try_from(range.end.saturating_sub(range.start))
+            .map_err(|_| Error::new(Errno::EOVERFLOW))?;
+        let mut replacements = Vec::new();
+        replacements
+            .try_reserve_exact(count)
+            .map_err(|_| Error::new(Errno::ENOMEM))?;
+        for index in range {
+            replacements.push((index, build(index)?));
+        }
+
+        let mut replaced = Vec::new();
+        replaced
+            .try_reserve_exact(replacements.len())
+            .map_err(|_| Error::new(Errno::ENOMEM))?;
+        {
+            let mut pages = self.pages.lock();
+            for (index, replacement) in replacements {
+                if let Some(old) = pages.load(index) {
+                    replaced.push(Arc::clone(&old));
+                }
+                pages.store(index, replacement);
+            }
+        }
+        for old in replaced {
+            old.waiters.wake_all();
+        }
+        Ok(())
+    }
 }
 
 #[cfg(ktest)]
@@ -417,5 +452,53 @@ mod tests {
 
         assert!(Arc::ptr_eq(&first_slot, &second_slot));
         assert_eq!(loads.load(Ordering::Relaxed), 1);
+    }
+
+    #[ktest]
+    fn rnvpce_page_cache_range_publication_is_all_or_nothing_before_lock() {
+        let cache = RnvpcePageCache::new();
+        for index in 4..7 {
+            let loading = cache.get_or_reserve_loading(index).unwrap();
+            cache
+                .replace_exact(index, loading.slot(), test_slot(index))
+                .unwrap();
+        }
+
+        let result = cache.replace_range_with(4..7, |index| {
+            if index == 5 {
+                return Err(Error::new(Errno::EIO));
+            }
+            Ok(test_slot(index + 100))
+        });
+
+        assert!(result.is_err());
+        for index in 4..7 {
+            assert!(matches!(
+                cache.lookup(index).unwrap().backing(),
+                RnvpcePageBacking::Test(value) if *value == index
+            ));
+        }
+    }
+
+    #[ktest]
+    fn rnvpce_page_cache_range_publication_replaces_every_page() {
+        let cache = RnvpcePageCache::new();
+        for index in 20..24 {
+            let loading = cache.get_or_reserve_loading(index).unwrap();
+            cache
+                .replace_exact(index, loading.slot(), test_slot(index))
+                .unwrap();
+        }
+
+        cache
+            .replace_range_with(20..24, |index| Ok(test_slot(index + 100)))
+            .unwrap();
+
+        for index in 20..24 {
+            assert!(matches!(
+                cache.lookup(index).unwrap().backing(),
+                RnvpcePageBacking::Test(value) if *value == index + 100
+            ));
+        }
     }
 }

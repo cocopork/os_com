@@ -1579,6 +1579,35 @@ impl Inode {
         first_error.map_or(Ok(()), Err)
     }
 
+    fn publish_rnvpce_dirty_cache_range(
+        &self,
+        pool: &Arc<crate::fs::rnvpc::frame::Rnvpc>,
+        fs_id: u64,
+        inode_id: u64,
+        range: Range<u64>,
+    ) -> Result<()> {
+        let entries = pool.lookup_dirty_nv_overlaps(fs_id, inode_id, range.clone())?;
+        let mut entry_index = 0;
+        self.rnvpce_page_cache
+            .replace_range_with(range, |logical_page| {
+                while entries
+                    .get(entry_index)
+                    .is_some_and(|entry| entry.logical_range().end <= logical_page)
+                {
+                    entry_index += 1;
+                }
+                let entry = entries
+                    .get(entry_index)
+                    .filter(|entry| entry.logical_range().contains(&logical_page))
+                    .ok_or_else(|| Error::new(Errno::EUCLEAN))?
+                    .clone();
+                Ok(RnvpcePageSlot::dirty_nv(RnvpceNvPage::new(
+                    entry,
+                    logical_page,
+                )))
+            })
+    }
+
     fn read_rnvpce_at(
         &self,
         fs: &Arc<Ext4>,
@@ -2327,8 +2356,18 @@ impl Inode {
                     inner.desc.set_sector_count(committed.block_count());
                     let cache_start = (offset / PAGE_SIZE) as u64;
                     let cache_end = (offset + committed.copied()).div_ceil(PAGE_SIZE) as u64;
-                    self.rnvpce_page_cache
-                        .invalidate_range(cache_start..cache_end);
+                    if let Err(error) = self.publish_rnvpce_dirty_cache_range(
+                        &pool,
+                        fs_id,
+                        inode_id,
+                        cache_start..cache_end,
+                    ) {
+                        // The write is already durable. A volatile cache
+                        // publication failure falls back to a cold lookup.
+                        self.rnvpce_page_cache
+                            .invalidate_range(cache_start..cache_end);
+                        error!("rNVPCe PageCache publication skipped: {error:?}");
+                    }
                     fs.request_nv_migration_for_inode(inode_id);
                     pp::NV_FOREGROUND_POST_COMMIT.record_since(post_commit_started, write_len);
                     Ok(committed.copied())
