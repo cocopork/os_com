@@ -30,3 +30,6 @@ python3 plot_results.py "$ROOT_ART/results.csv" /path/to/output
 图中实线是各轮均值，`X` 是每轮原始结果。每个负载和 sweep 轴分别输出带宽、
 平均延迟和 P99 延迟图，图内以两个子图分隔 NVMe 与 SATA。
 
+供后续 AI 直接执行同一实验的完整前置条件、构建参数、命令和验收标准记录在
+[`test_results/full-e2e-20261117/README.md`](../../test_results/full-e2e-20261117/README.md)。
+

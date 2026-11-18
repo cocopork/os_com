@@ -56,5 +56,10 @@ docs/experiments/**
 !docs/experiments/scripts/**/*.c
 !docs/experiments/scripts/**/*.h
 
+# Keep the reproducibility runbook, but not generated measurements or figures.
+!docs/experiments/test_results/
+!docs/experiments/test_results/full-e2e-20261117/
+!docs/experiments/test_results/full-e2e-20261117/README.md
+
 # Paper draft is maintained in a separate repository and linked into docs locally.
 /docs/paper_draft

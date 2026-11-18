@@ -101,20 +101,21 @@ rNVPCe 2581/1820 MiB/s；SATA 对应为 EXT4 340/316 MiB/s，rNVPCe
 
 ## 结果图
 
-- [Overwrite 带宽：thread sweep](../test_result_images/full-e2e-20261117/overwrite-randwrite-threads-bandwidth.png)
-- [Overwrite 带宽：bs sweep](../test_result_images/full-e2e-20261117/overwrite-randwrite-bs-bandwidth.png)
-- [Append 带宽：thread sweep](../test_result_images/full-e2e-20261117/append-write-threads-bandwidth.png)
-- [Append 带宽：bs sweep](../test_result_images/full-e2e-20261117/append-write-bs-bandwidth.png)
-- [Cold randread 带宽：thread sweep](../test_result_images/full-e2e-20261117/cold-randread-threads-bandwidth.png)
-- [Cold randread 带宽：bs sweep](../test_result_images/full-e2e-20261117/cold-randread-bs-bandwidth.png)
+- [Overwrite 带宽：thread sweep](../test_results/full-e2e-20261117/overwrite-randwrite-threads-bandwidth.png)
+- [Overwrite 带宽：bs sweep](../test_results/full-e2e-20261117/overwrite-randwrite-bs-bandwidth.png)
+- [Append 带宽：thread sweep](../test_results/full-e2e-20261117/append-write-threads-bandwidth.png)
+- [Append 带宽：bs sweep](../test_results/full-e2e-20261117/append-write-bs-bandwidth.png)
+- [Cold randread 带宽：thread sweep](../test_results/full-e2e-20261117/cold-randread-threads-bandwidth.png)
+- [Cold randread 带宽：bs sweep](../test_results/full-e2e-20261117/cold-randread-bs-bandwidth.png)
 
 同目录还包含上述六组实验的平均延迟和 P99 图。图中实线是三轮均值，每个 `X`
 是单轮原始值。
 
 ## 数据与复现
 
-- 原始逐轮数据：[results.csv](../test_result_images/fio_test/full-e2e-20261117/results.csv)
-- 三轮聚合数据：[aggregate.csv](../test_result_images/fio_test/full-e2e-20261117/aggregate.csv)
+- 复现说明：[README.md](../test_results/full-e2e-20261117/README.md)
+- 原始逐轮数据：[results.csv](../test_results/full-e2e-20261117/results.csv)
+- 三轮聚合数据：[aggregate.csv](../test_results/full-e2e-20261117/aggregate.csv)
 - 测试与聚合脚本：[full-e2e-sweep-20261117](../scripts/full-e2e-sweep-20261117/README.md)
 
 冻结代码为 `cce2180a2bdf324f9032633800a5f0eb6cd6e186` 加未提交差异，差异
