@@ -13,6 +13,27 @@ SPEC.loader.exec_module(plot)
 
 
 class PlotTests(unittest.TestCase):
+    def test_axis_ticks_match_every_test_point(self):
+        figure, axes = plot.plt.subplots(1, 2)
+        try:
+            plot.configure_x_axis(axes[0], "threads", [1, 4, 8, 12, 16, 20, 24, 28, 32])
+            self.assertEqual(
+                list(axes[0].get_xticks()),
+                [1, 4, 8, 12, 16, 20, 24, 28, 32],
+            )
+
+            plot.configure_x_axis(axes[1], "bs", [4, 8, 16, 32, 64, 128, 256, 512, 1024])
+            self.assertEqual(
+                list(axes[1].get_xticks()),
+                [4, 8, 16, 32, 64, 128, 256, 512, 1024],
+            )
+            self.assertEqual(
+                [label.get_text() for label in axes[1].get_xticklabels()],
+                ["4K", "8K", "16K", "32K", "64K", "128K", "256K", "512K", "1024K"],
+            )
+        finally:
+            plot.plt.close(figure)
+
     def test_plot_creates_bandwidth_and_latency_figures(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
