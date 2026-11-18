@@ -52,10 +52,12 @@ use super::{
 mod delalloc;
 mod dir;
 mod extent_manager;
+mod rnvpce_page_cache;
 mod symlink;
 
 use self::{
     extent_manager::{ExtentManager, ExtentTree, RnvpceSsdRoute},
+    rnvpce_page_cache::RnvpcePageCache,
     symlink::FastSymlinkTarget,
 };
 use crate::fs::{
@@ -939,6 +941,9 @@ pub struct Inode {
     rnvpce_authority_ref: Once<crate::fs::rnvpc::metadata::PersistentObjectRef>,
     /// Inode-local publication coordinator, retained for the inode lifetime.
     rnvpce_publication: Once<Arc<crate::fs::rnvpc::frame::InodePublication>>,
+    /// Volatile hot-data index. Its writer lock only publishes page-slot Arcs;
+    /// page copy, persistence, I/O, and waiting happen after that lock is dropped.
+    rnvpce_page_cache: RnvpcePageCache,
     /// The VFS extension slot (flock, POSIX locks, inotify); must exist from
     /// day one or the VFS layer panics on inodes that use these features.
     extension: Extension,
@@ -1022,6 +1027,7 @@ impl Inode {
             rnvpce_allocation_hint: AtomicU64::new(inode_goal),
             rnvpce_authority_ref: Once::new(),
             rnvpce_publication: Once::new(),
+            rnvpce_page_cache: RnvpcePageCache::new(),
             extension: Extension::new(),
         });
         if type_ == InodeType::File {
