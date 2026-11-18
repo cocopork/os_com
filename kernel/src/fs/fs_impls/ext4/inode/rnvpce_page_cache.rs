@@ -142,6 +142,55 @@ impl RnvpcePageCache {
         Ok(LoadingPage { slot, owner: true })
     }
 
+    /// Returns a resident slot or runs the one page-local loader outside all
+    /// XArray locks. Concurrent callers sleep on this page's wait queue.
+    pub(crate) fn get_or_load<F>(&self, page_index: u64, load: F) -> Result<Arc<RnvpcePageSlot>>
+    where
+        F: FnOnce() -> Result<Arc<RnvpcePageSlot>>,
+    {
+        let reservation = self.get_or_reserve_loading(page_index)?;
+        if !reservation.is_owner() {
+            if !matches!(reservation.slot().backing(), RnvpcePageBacking::Loading) {
+                return Ok(reservation.slot().clone());
+            }
+            return reservation
+                .slot()
+                .waiters
+                .wait_until(|| match self.lookup(page_index) {
+                    Some(current) if !Arc::ptr_eq(&current, reservation.slot()) => {
+                        Some(Ok(current))
+                    }
+                    None => Some(Err(Error::new(Errno::ESTALE))),
+                    _ => None,
+                });
+        }
+
+        match load() {
+            Ok(loaded) => {
+                self.replace_exact(page_index, reservation.slot(), loaded.clone())?;
+                Ok(loaded)
+            }
+            Err(error) => {
+                let _ = self.remove_exact(page_index, reservation.slot());
+                Err(error)
+            }
+        }
+    }
+
+    pub(crate) fn wait_for_replacement(
+        &self,
+        page_index: u64,
+        loading: &Arc<RnvpcePageSlot>,
+    ) -> Result<Arc<RnvpcePageSlot>> {
+        loading
+            .waiters
+            .wait_until(|| match self.lookup(page_index) {
+                Some(current) if !Arc::ptr_eq(&current, loading) => Some(Ok(current)),
+                None => Some(Err(Error::new(Errno::ESTALE))),
+                _ => None,
+            })
+    }
+
     pub(crate) fn replace_exact(
         &self,
         page_index: u64,
@@ -194,14 +243,33 @@ impl RnvpcePageCache {
             .map(|(index, slot)| (index, Arc::clone(&slot)))
             .collect()
     }
+
+    /// Removes a bounded logical range with one per-inode writer acquisition.
+    /// Wakeups happen after dropping the XArray lock.
+    pub(crate) fn invalidate_range(&self, range: Range<u64>) {
+        let mut removed = Vec::new();
+        {
+            let mut pages = self.pages.lock();
+            for index in range {
+                if let Some(slot) = pages.remove(index) {
+                    removed.push(Arc::clone(&slot));
+                }
+            }
+        }
+        for slot in removed {
+            slot.waiters.wake_all();
+        }
+    }
 }
 
 #[cfg(ktest)]
 mod tests {
+    use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
     use ostd::prelude::ktest;
 
     use super::{RnvpcePageBacking, RnvpcePageCache, RnvpcePageSlot};
-    use crate::prelude::*;
+    use crate::{prelude::*, thread::kernel_thread::ThreadOptions};
 
     fn test_slot(value: u64) -> Arc<RnvpcePageSlot> {
         RnvpcePageSlot::new_test(value)
@@ -271,5 +339,83 @@ mod tests {
         assert_eq!(snapshot.len(), 2);
         assert_eq!(snapshot[0].0, 4);
         assert_eq!(snapshot[1].0, 9);
+    }
+
+    #[ktest]
+    fn rnvpce_page_cache_hit_does_not_call_loader() {
+        let cache = RnvpcePageCache::new();
+        let loading = cache.get_or_reserve_loading(8).unwrap();
+        let resident = test_slot(8);
+        cache
+            .replace_exact(8, loading.slot(), resident.clone())
+            .unwrap();
+        let loads = AtomicUsize::new(0);
+
+        let found = cache
+            .get_or_load(8, || {
+                loads.fetch_add(1, Ordering::Relaxed);
+                Ok(test_slot(99))
+            })
+            .unwrap();
+
+        assert!(Arc::ptr_eq(&found, &resident));
+        assert_eq!(loads.load(Ordering::Relaxed), 0);
+    }
+
+    #[ktest]
+    fn rnvpce_page_cache_concurrent_miss_has_one_loader() {
+        let cache = Arc::new(RnvpcePageCache::new());
+        let started = Arc::new(AtomicBool::new(false));
+        let release = Arc::new(AtomicBool::new(false));
+        let loads = Arc::new(AtomicUsize::new(0));
+        let first_result = Arc::new(Mutex::new(None));
+        let second_result = Arc::new(Mutex::new(None));
+        let first = {
+            let cache = cache.clone();
+            let started = started.clone();
+            let release = release.clone();
+            let loads = loads.clone();
+            let first_result = first_result.clone();
+            ThreadOptions::new(move || {
+                let slot = cache
+                    .get_or_load(19, || {
+                        loads.fetch_add(1, Ordering::Relaxed);
+                        started.store(true, Ordering::Release);
+                        while !release.load(Ordering::Acquire) {
+                            crate::thread::Thread::yield_now();
+                        }
+                        Ok(test_slot(19))
+                    })
+                    .unwrap();
+                *first_result.lock() = Some(slot);
+            })
+            .spawn()
+        };
+        while !started.load(Ordering::Acquire) {
+            crate::thread::Thread::yield_now();
+        }
+        let second = {
+            let cache = cache.clone();
+            let loads = loads.clone();
+            let second_result = second_result.clone();
+            ThreadOptions::new(move || {
+                let slot = cache
+                    .get_or_load(19, || {
+                        loads.fetch_add(1, Ordering::Relaxed);
+                        Ok(test_slot(119))
+                    })
+                    .unwrap();
+                *second_result.lock() = Some(slot);
+            })
+            .spawn()
+        };
+        release.store(true, Ordering::Release);
+        first.join();
+        second.join();
+        let first_slot = first_result.lock().clone().unwrap();
+        let second_slot = second_result.lock().clone().unwrap();
+
+        assert!(Arc::ptr_eq(&first_slot, &second_slot));
+        assert_eq!(loads.load(Ordering::Relaxed), 1);
     }
 }

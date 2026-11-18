@@ -57,12 +57,15 @@ mod symlink;
 
 use self::{
     extent_manager::{ExtentManager, ExtentTree, RnvpceSsdRoute},
-    rnvpce_page_cache::RnvpcePageCache,
+    rnvpce_page_cache::{RnvpceNvPage, RnvpcePageBacking, RnvpcePageCache, RnvpcePageSlot},
     symlink::FastSymlinkTarget,
 };
-use crate::fs::{
-    file::InodeMode,
-    vfs::inode::{Extension, FallocMode},
+use crate::{
+    fs::{
+        file::InodeMode,
+        vfs::inode::{Extension, FallocMode},
+    },
+    vm::page_cache::{CachePage, CachePageExt, read_run_complete_fn},
 };
 
 pub(in crate::fs::fs_impls::ext4) fn is_nv_capacity_pressure(error: &Error) -> bool {
@@ -1452,6 +1455,130 @@ impl Inode {
         inner.write_back_inode_desc_forced(fs, self.ino, op.get())
     }
 
+    fn populate_rnvpce_read_window(
+        &self,
+        fs: &Ext4,
+        pool: &Arc<crate::fs::rnvpc::frame::Rnvpc>,
+        fs_id: u64,
+        inode_id: u64,
+        start_page: u64,
+        end_page: u64,
+    ) -> Result<()> {
+        const READ_WINDOW_PAGES: u64 = 32;
+        const MAX_BIO_SEGMENTS: usize = 61;
+
+        let window_end = end_page.min(start_page.saturating_add(READ_WINDOW_PAGES));
+        let mut disk_pages = Vec::new();
+        for logical_page in start_page..window_end {
+            if self.rnvpce_page_cache.lookup(logical_page).is_some() {
+                continue;
+            }
+            let reservation = self
+                .rnvpce_page_cache
+                .get_or_reserve_loading(logical_page)?;
+            if !reservation.is_owner() {
+                continue;
+            }
+            let key = crate::fs::rnvpc::index::PageKey::new(fs_id, inode_id, logical_page);
+            if let Some(entry) = pool.lookup_dirty_nv_entry(key) {
+                let slot = RnvpcePageSlot::dirty_nv(RnvpceNvPage::new(entry, logical_page));
+                self.rnvpce_page_cache
+                    .replace_exact(logical_page, reservation.slot(), slot)?;
+                continue;
+            }
+            // Legacy exact-page redirects retain their compatibility path. Do
+            // not publish a second hot-index representation for them.
+            if pool.redirect_lookup(key).is_some() {
+                let _ = self
+                    .rnvpce_page_cache
+                    .remove_exact(logical_page, reservation.slot());
+                continue;
+            }
+            let mapping = match crate::fs::rnvpc::write_transaction::current_page_mapping(
+                pool,
+                fs_id,
+                inode_id,
+                logical_page,
+            ) {
+                Ok(mapping) => mapping,
+                Err(error) => {
+                    let _ = self
+                        .rnvpce_page_cache
+                        .remove_exact(logical_page, reservation.slot());
+                    return Err(error);
+                }
+            };
+            if mapping.as_ref().is_none_or(|mapping| !mapping.is_written()) {
+                let page = CachePage::alloc_zero()?;
+                self.rnvpce_page_cache.replace_exact(
+                    logical_page,
+                    reservation.slot(),
+                    RnvpcePageSlot::clean_dram(page),
+                )?;
+                continue;
+            }
+            let page = CachePage::alloc_uninit()?;
+            disk_pages.push((
+                logical_page,
+                mapping.unwrap().ssd_block(),
+                reservation.slot().clone(),
+                page,
+            ));
+        }
+
+        let mut batch = IoBatch::new();
+        let mut first_error = None;
+        let mut run_start = 0;
+        while run_start < disk_pages.len() {
+            let mut run_end = run_start + 1;
+            while run_end < disk_pages.len()
+                && run_end - run_start < MAX_BIO_SEGMENTS
+                && disk_pages[run_end].0 == disk_pages[run_end - 1].0 + 1
+                && disk_pages[run_end].1 == disk_pages[run_end - 1].1 + 1
+            {
+                run_end += 1;
+            }
+            let mut segments = Vec::with_capacity(run_end - run_start);
+            let mut locked_pages = Vec::with_capacity(run_end - run_start);
+            for (_, _, _, page) in &disk_pages[run_start..run_end] {
+                segments.push(BioSegment::new_from_segment(
+                    Segment::from(page.clone()).into(),
+                    BioDirection::FromDevice,
+                ));
+                locked_pages.push(page.clone().lock());
+            }
+            let complete = read_run_complete_fn(locked_pages);
+            if let Err(error) = fs.read_segments_async(
+                disk_pages[run_start].1,
+                segments,
+                Some(complete),
+                &mut batch,
+            ) && first_error.is_none()
+            {
+                first_error = Some(error);
+            }
+            run_start = run_end;
+        }
+        if let Err(error) = batch.wait_all()
+            && first_error.is_none()
+        {
+            first_error = Some(error.into());
+        }
+
+        for (logical_page, _, loading, page) in disk_pages {
+            if page.is_up_to_date() {
+                let _ = self.rnvpce_page_cache.replace_exact(
+                    logical_page,
+                    &loading,
+                    RnvpcePageSlot::clean_dram(page),
+                );
+            } else {
+                let _ = self.rnvpce_page_cache.remove_exact(logical_page, &loading);
+            }
+        }
+        first_error.map_or(Ok(()), Err)
+    }
+
     fn read_rnvpce_at(
         &self,
         fs: &Arc<Ext4>,
@@ -1501,7 +1628,6 @@ impl Inode {
         }
         let read_len = writer.avail().min(file_size - offset);
         writer.limit(read_len);
-        let mut inner = Some(self.inner.read());
         let mut position = offset;
         let end = offset + read_len;
         while position < end {
@@ -1510,99 +1636,84 @@ impl Inode {
             let amount = (end - position).min(PAGE_SIZE - page_offset);
             let redirect_key =
                 crate::fs::rnvpc::index::PageKey::new(fs_id, inode_id, logical_block);
-            if let Some(entry) = pool.lookup_dirty_nv_entry(redirect_key) {
-                let guard = match entry.try_read() {
-                    Ok(guard) => guard,
-                    Err(error) if error.error() == Errno::ESTALE => continue,
-                    Err(error) => return Err(error),
-                };
-                let copied = match pool.copy_entry_to_writer(
-                    &guard,
-                    logical_block,
-                    page_offset,
-                    writer,
-                    amount,
-                ) {
-                    Ok(copied) => copied,
-                    Err(_error) if position != offset => return Ok(position - offset),
-                    Err(error) => return Err(error),
-                };
-                if copied != amount {
-                    return Ok(position - offset + copied);
-                }
-            } else if let Some(handle) = pool.redirect_lookup(redirect_key) {
-                let lease_epoch = pool.data_page_lease_epoch();
-                let page = match pool.pin_redirect(redirect_key, handle) {
-                    Ok(page) => page,
-                    Err(error) if error.error() == Errno::EBUSY => {
-                        drop(inner.take());
-                        pool.wait_for_data_page_lease_change(lease_epoch);
-                        inner = Some(self.inner.read());
+            let slot = match self.rnvpce_page_cache.lookup(logical_block) {
+                Some(slot) => slot,
+                None => {
+                    self.populate_rnvpce_read_window(
+                        fs,
+                        &pool,
+                        fs_id,
+                        inode_id,
+                        logical_block,
+                        (end as u64).div_ceil(PAGE_SIZE as u64),
+                    )?;
+                    let Some(slot) = self.rnvpce_page_cache.lookup(logical_block) else {
+                        // Only old exact-page redirect records use this path.
+                        let Some(handle) = pool.redirect_lookup(redirect_key) else {
+                            continue;
+                        };
+                        let lease_epoch = pool.data_page_lease_epoch();
+                        let page = match pool.pin_redirect(redirect_key, handle) {
+                            Ok(page) => page,
+                            Err(error) if error.error() == Errno::EBUSY => {
+                                pool.wait_for_data_page_lease_change(lease_epoch);
+                                continue;
+                            }
+                            Err(error) if error.error() == Errno::ESTALE => continue,
+                            Err(error) => return Err(error),
+                        };
+                        let copied = page.copy_to_writer(page_offset, writer, amount)?;
+                        if copied != amount {
+                            return Ok(position - offset + copied);
+                        }
+                        position += amount;
                         continue;
-                    }
-                    Err(error) if error.error() == Errno::ESTALE => continue,
-                    Err(error) => return Err(error),
-                };
-                let copied = match page.copy_to_writer(page_offset, writer, amount) {
-                    Ok(copied) => copied,
-                    Err(_error) if position != offset => return Ok(position - offset),
-                    Err(error) => return Err(error),
-                };
-                if copied != amount {
-                    return Ok(position - offset + copied);
+                    };
+                    slot
                 }
-            } else if let Some(mapping) = crate::fs::rnvpc::write_transaction::current_page_mapping(
-                &pool,
-                fs_id,
-                inode_id,
-                logical_block,
-            )? {
-                if mapping.is_written() {
-                    let segment = BioSegment::alloc(1, BioDirection::FromDevice);
-                    let mut batch = IoBatch::new();
-                    fs.read_blocks_async(mapping.ssd_block(), segment.clone(), None, &mut batch)?;
-                    batch.wait_all()?;
-                    let mut source = segment.reader()?;
+            };
+            let copied = match slot.backing() {
+                RnvpcePageBacking::Loading => {
+                    let _ = self
+                        .rnvpce_page_cache
+                        .wait_for_replacement(logical_block, &slot);
+                    continue;
+                }
+                RnvpcePageBacking::CleanDram(page) => {
+                    let mut source = page.reader();
                     source.skip(page_offset).limit(amount);
                     match source.read_fallible(writer) {
-                        Ok(copied) if copied == amount => {}
-                        Ok(copied) => return Ok(position - offset + copied),
-                        Err((error, copied)) => {
-                            let total = position - offset + copied;
-                            return if total != 0 {
-                                Ok(total)
-                            } else {
-                                Err(error.into())
-                            };
-                        }
-                    }
-                } else {
-                    match writer.fill_zeros(amount) {
-                        Ok(copied) if copied == amount => {}
-                        Ok(copied) => return Ok(position - offset + copied),
-                        Err((error, copied)) => {
-                            let total = position - offset + copied;
-                            return if total != 0 {
-                                Ok(total)
-                            } else {
-                                Err(error.into())
-                            };
-                        }
+                        Ok(copied) => copied,
+                        Err((error, copied)) if copied != 0 => copied,
+                        Err((error, _)) => return Err(error.into()),
                     }
                 }
-            } else {
-                match writer.fill_zeros(amount) {
-                    Ok(copied) if copied == amount => {}
-                    Ok(copied) => return Ok(position - offset + copied),
-                    Err((error, copied)) => {
-                        let total = position - offset + copied;
-                        return if total != 0 {
-                            Ok(total)
-                        } else {
-                            Err(error.into())
-                        };
+                RnvpcePageBacking::DirtyNv(page) | RnvpcePageBacking::CleanNv(page) => {
+                    let guard = match page.entry().try_read() {
+                        Ok(guard) => guard,
+                        Err(error) if error.error() == Errno::ESTALE => {
+                            let _ = self.rnvpce_page_cache.remove_exact(logical_block, &slot);
+                            continue;
+                        }
+                        Err(error) => return Err(error),
+                    };
+                    match pool.copy_entry_to_writer(
+                        &guard,
+                        page.logical_page(),
+                        page_offset,
+                        writer,
+                        amount,
+                    ) {
+                        Ok(copied) => copied,
+                        Err(_error) if position != offset => return Ok(position - offset),
+                        Err(error) => return Err(error),
                     }
                 }
+                #[cfg(ktest)]
+                RnvpcePageBacking::Test(_) => unreachable!(),
+            };
+            if copied != amount {
+                return Ok(position - offset + copied);
             }
             position += amount;
         }
@@ -2214,6 +2325,10 @@ impl Inode {
                     }
                     inner.set_file_size(old_size.max(offset + committed.copied()));
                     inner.desc.set_sector_count(committed.block_count());
+                    let cache_start = (offset / PAGE_SIZE) as u64;
+                    let cache_end = (offset + committed.copied()).div_ceil(PAGE_SIZE) as u64;
+                    self.rnvpce_page_cache
+                        .invalidate_range(cache_start..cache_end);
                     fs.request_nv_migration_for_inode(inode_id);
                     pp::NV_FOREGROUND_POST_COMMIT.record_since(post_commit_started, write_len);
                     Ok(committed.copied())
