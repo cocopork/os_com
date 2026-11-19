@@ -113,10 +113,10 @@ if [ "$MIXED_SYNC_AUDIT" -ne 1 ]; then
     grep -E '^(MemTotal|MemFree|MemAvailable|Cached):' /proc/meminfo || true
 fi
 
-action "BENCHMARK directory=$MOUNT_POINT/data threads=$THREADS file_bytes=$FILE_BYTES read_percent=$READ_PERCENT sync_percent=$SYNC_PERCENT seed=$SEED warmup_seconds=$WARMUP_SECONDS runtime_seconds=$RUNTIME_SECONDS"
+action "BENCHMARK cpus=0-7 directory=$MOUNT_POINT/data threads=$THREADS file_bytes=$FILE_BYTES read_percent=$READ_PERCENT sync_percent=$SYNC_PERCENT seed=$SEED warmup_seconds=$WARMUP_SECONDS runtime_seconds=$RUNTIME_SECONDS"
 benchmark_status=0
 if [ "$MIXED_SYNC_AUDIT" -ne 1 ]; then
-    "$BENCHMARK" \
+    taskset -c 0-7 "$BENCHMARK" \
         --directory "$MOUNT_POINT/data" \
         --threads "$THREADS" \
         --file-bytes "$FILE_BYTES" \

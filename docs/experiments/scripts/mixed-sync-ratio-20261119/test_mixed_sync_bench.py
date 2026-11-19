@@ -43,6 +43,10 @@ class MixedSyncBenchTest(unittest.TestCase):
         self.assertEqual(first["address_digest"], 17199379227451352568)
         self.assertEqual(first["operation_digest"], 2011287794019180530)
 
+    def test_guest_binary_is_statically_linked(self) -> None:
+        description = subprocess.check_output(["file", str(BINARY)], text=True)
+        self.assertIn("statically linked", description)
+
     def test_rejects_invalid_percentage(self) -> None:
         result = self.run_bench("--read-percent", "101", check=False)
         self.assertNotEqual(result.returncode, 0)

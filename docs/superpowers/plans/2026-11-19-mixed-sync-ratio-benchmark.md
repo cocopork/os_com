@@ -78,12 +78,12 @@
 - Consume source ISO/initramfs images, explicit result root, optional exact `CASES`, and the Task 2 matrix.
 - Produce one immutable point directory with configuration, hashes, QEMU/affinity logs, raw JSON, parsed `result.json`, cleanup evidence, and e2fsck output.
 
-- [ ] Write failing parser tests for valid output and rejection of wrong seed, ratios, operation counts, prewrite bytes, missing cleanup, failed I/O, and failed e2fsck.
-- [ ] Implement parsing and validate reported actual ratios against operation counts rather than expected percentages alone.
-- [ ] Adapt the existing full-e2e destructive target preflight and exact device-size checks without broadening device paths.
-- [ ] Build/inject the benchmark, configure 1 SATA or 8 NVMe virtqueues/IOThreads, pin IOThreads away from benchmark CPUs, and save QMP queue evidence.
-- [ ] Implement resume only for fully reparsed points; preserve incomplete/failed evidence and never overwrite it automatically.
-- [ ] Run shell syntax checks, parser tests, and one non-destructive mocked runner test.
+- [x] Write failing parser tests for valid output and rejection of wrong seed, ratios, operation counts, prewrite bytes, missing cleanup, failed I/O, and failed e2fsck.
+- [x] Implement parsing and validate reported actual ratios against operation counts rather than expected percentages alone.
+- [x] Adapt the existing full-e2e destructive target preflight and exact device-size checks without broadening device paths.
+- [x] Build/inject the benchmark, configure 1 SATA or 8 NVMe virtqueues/IOThreads, pin IOThreads away from benchmark CPUs, and save QMP queue evidence.
+- [x] Implement resume only for fully reparsed points; preserve incomplete/failed evidence and never overwrite it automatically.
+- [x] Run shell syntax checks, parser tests, and one non-destructive mocked runner test.
 
 ### Task 4: Aggregation, plotting, and reproduction report
 
