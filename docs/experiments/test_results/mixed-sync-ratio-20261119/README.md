@@ -116,3 +116,47 @@ python3 "$SCRIPT_DIR/plot_results.py" \
 6. 固定种子、实际读写比例和实际同步比例通过计数校验；
 7. QMP、IOThread affinity、镜像/二进制哈希和构建元数据完整；
 8. 测试结束后目标分区未挂载，且没有残留 `mixed-sync-qemu-*` 容器。
+
+## 2026-11-19 NVMe smoke 验证
+
+完整矩阵启动前，在 `/dev/nvme1n1p2` 上完成两个结构验证点。两点均为
+read:write=3:7、`fsync` 注入 40%、第 1 轮；结果只用于验证工具链，不构成三轮正式
+对比。
+
+| 模式 | operations/s | MiB/s | 平均延迟 | p99 | 实际读比例 | 实际同步比例 |
+|---|---:|---:|---:|---:|---:|---:|
+| EXT4 | 20,430.23 | 79.81 | 391.20 us | 1,995 us | 30.029% | 40.032% |
+| rNVPCe-SU | 116,371.56 | 454.58 | 68.50 us | 267 us | 29.986% | 39.982% |
+
+共同验证结果：
+
+- 每点预写 `2,684,354,560` 字节，8 个文件均为 320 MiB；
+- 配置数据缓存总预算均为 256 MiB；EXT4 为 256 MiB DRAM，rNVPCe 为
+  128 MiB DRAM + 128 MiB NV data；
+- 来宾报告 `MemTotal=8,341,160 KiB`；EXT4 测量前 `MemFree=7,471,684 KiB`，
+  rNVPCe 测量前 `MemFree=7,468,692 KiB`。这些是 VM 内存快照，不冒充文件系统缓存
+  实际驻留量；
+- QMP 均报告 `iothread0`--`iothread7`，分别固定到宿主 CPU 56--63；
+- benchmark、后置 sync、卸载均返回 0，QEMU 通过 isa-debug-exit 正常退出；
+- 两点 `e2fsck -fn` 均返回 0；测试结束后分区未挂载且无残留 QEMU 容器；
+- `pipeline_profile::ENABLED=false`、`LATENCY_ENABLED=false`，命令行为
+  `rtio_cpu_trace=off`。
+
+冻结构建信息：
+
+```text
+git commit: 1a2a51a572ec53619f8dbe120bf66f704d7329d2
+uncommitted diff SHA-256: c5ab0ef068c1c41031b6d3fb2315ac074a479a30022a75c0ddceddac2dec9633
+selected.iso: e90fc7c24901867faaaca2b4ea2be2d98761a26b13e1c98de338cb94c8356973
+ext2.img: e458f983d1565ab08710ee3030c0d3d50fcd379f4157faaf2b78cd7d6c8dcef8
+exfat.img: 7bc88244039f0409bad103316881407768cdc6faf44837963f27a8cc68ea10d8
+mixed_sync_bench: 7dd657522d4f2809124d1dbc5a33f96951e75b3bbc2067064ee99b6eb3ac2a6e
+```
+
+完整原始证据位于：
+
+```text
+/home/zn/asterinas-build-env/mixed-sync-20261119/results/
+```
+
+按计划未自动启动 432 点完整矩阵。

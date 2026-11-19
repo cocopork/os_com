@@ -112,8 +112,8 @@
 - Consume the completed Tasks 1--4 and the current release kernel image.
 - Produce evidence that the benchmark is executable in Asterinas and two representative real-device points are structurally valid before launching the full destructive matrix.
 
-- [ ] Run formatting, all new unit/contract tests, C warnings-as-errors build, shell syntax checks, and Python compilation.
-- [ ] Build a release image with 128 MiB rNVPCe data capacity and the documented worker/CPU isolation settings.
-- [ ] With existing explicit device authorization revalidated, run one EXT4 and one rNVPCe smoke point and verify prewrite, benchmark JSON, sync, unmount, and e2fsck.
-- [ ] Record actual hashes, cache configuration/observations, queue configuration, and smoke results in the reproduction report.
-- [ ] Stop before the 432-point full matrix unless the user explicitly requests launching the complete destructive run.
+- [x] Run formatting, all new unit/contract tests, C warnings-as-errors build, shell syntax checks, and Python compilation.
+- [x] Build a release image with 128 MiB rNVPCe data capacity and the documented worker/CPU isolation settings.
+- [x] With existing explicit device authorization revalidated, run one EXT4 and one rNVPCe smoke point and verify prewrite, benchmark JSON, sync, unmount, and e2fsck.
+- [x] Record actual hashes, cache configuration/observations, queue configuration, and smoke results in the reproduction report.
+- [x] Stop before the 432-point full matrix unless the user explicitly requests launching the complete destructive run.
