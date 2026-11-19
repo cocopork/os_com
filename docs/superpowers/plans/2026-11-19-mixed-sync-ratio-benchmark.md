@@ -97,11 +97,11 @@
 - Consume 432 validated result objects.
 - Produce `results.csv`, `aggregate.csv`, plotting-source CSV, per-device/per-read-write-ratio throughput and latency plots, and a Chinese reproduction guide.
 
-- [ ] Write failing tests for three-sample grouping, arithmetic mean/stddev/min/max, categorical 0--100 percent x-axis labels, raw-sample markers, and missing-point rejection.
-- [ ] Implement aggregation without treating failed or absent rounds as zero.
-- [ ] Implement plots whose x coordinates correspond one-to-one with the six sync percentages and whose legends distinguish filesystems and individual rounds.
-- [ ] Document device destruction requirements, build hashes, 256 MiB cache-budget accounting, the EXT2 limitation, commands, expected artifact counts, and validation criteria.
-- [ ] Run all reporting tests and generate plots from a synthetic complete matrix.
+- [x] Write failing tests for three-sample grouping, arithmetic mean/stddev/min/max, categorical 0--100 percent x-axis labels, raw-sample markers, and missing-point rejection.
+- [x] Implement aggregation without treating failed or absent rounds as zero.
+- [x] Implement plots whose x coordinates correspond one-to-one with the six sync percentages and whose legends distinguish filesystems and individual rounds.
+- [x] Document device destruction requirements, build hashes, 256 MiB cache-budget accounting, the EXT2 limitation, commands, expected artifact counts, and validation criteria.
+- [x] Run all reporting tests and generate plots from a synthetic complete matrix.
 
 ### Task 5: Build and experimental smoke validation
 
