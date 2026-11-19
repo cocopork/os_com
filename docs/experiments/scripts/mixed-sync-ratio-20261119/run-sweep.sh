@@ -5,6 +5,29 @@ set -euo pipefail
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 REPO_ROOT=$(realpath "$SCRIPT_DIR/../../../..")
 MQ_HELPER=$(realpath "$SCRIPT_DIR/../rtio-virtio-multiqueue-20261102/summarize.py")
+QEMU_CLEANUP_NAME=
+
+cleanup_qemu() {
+    if [[ -n $QEMU_CLEANUP_NAME ]]; then
+        docker rm -f "$QEMU_CLEANUP_NAME" >/dev/null 2>&1 || true
+        QEMU_CLEANUP_NAME=
+    fi
+}
+
+install_qemu_cleanup() {
+    QEMU_CLEANUP_NAME=$1
+    trap cleanup_qemu EXIT INT TERM
+}
+
+clear_qemu_cleanup() {
+    QEMU_CLEANUP_NAME=
+    trap - EXIT INT TERM
+}
+
+if [[ ${MIXED_SYNC_LIBRARY_ONLY:-0} == 1 ]]; then
+    return 0
+fi
+
 ROOT_ART=${ROOT_ART:?set ROOT_ART to an existing result directory}
 SOURCE_ART=${SOURCE_ART:?set SOURCE_ART to selected.iso/ext2.img/exfat.img}
 TOOLS_IMAGE=${TOOLS_IMAGE:-os-com-recovery-tools:workspace-20261018}
@@ -71,6 +94,8 @@ list_points() {
     fi
 }
 
+POINT_ROWS=$(list_points)
+
 if [[ $MIXED_SYNC_RUNNER_AUDIT == 1 ]]; then
     while IFS=$'\t' read -r case_name device mode read_percent sync_percent repeat \
         threads file_mib file_bytes dataset_mib seed warmup_seconds runtime_seconds \
@@ -79,7 +104,7 @@ if [[ $MIXED_SYNC_RUNNER_AUDIT == 1 ]]; then
             "$case_name" "$(target_for_device "$device")" "$mode" "$virtqueues" \
             "$(iothread_cpus_for_device "$device")" "$dataset_mib" \
             "$((dram_cache_mib + nv_data_cache_mib))" "$cache_control"
-    done < <(list_points)
+    done <<< "$POINT_ROWS"
     exit 0
 fi
 
@@ -125,7 +150,8 @@ preflight_target() {
         echo "target is active swap: $target" >&2
         return 2
     }
-    docker run --rm --privileged --pid=host --userns=host --network none -v /:/host:ro \
+    timeout --signal=TERM --kill-after=5 60 docker run --rm --privileged --pid=host \
+        --userns=host --network none -v /:/host:ro \
         "$TOOLS_IMAGE" chroot /host /usr/bin/fuser -s "$target" "$parent" || fuser_status=$?
     [[ $fuser_status == 1 ]] || { echo "target or parent in use: $target" >&2; return 2; }
 }
@@ -184,7 +210,7 @@ run_guest() {
         -drive if=none,format=raw,id=target,file=/dev/benchmark-target,cache=none,aio=threads \
         -device pcie-root-port,id=target-port,chassis=1,slot=1 \
         "${iothread_objects[@]}" >"$point/qemu-container-id.txt"
-    trap 'docker rm -f "$qemu_name" >/dev/null 2>&1 || true' RETURN
+    install_qemu_cleanup "$qemu_name"
     docker exec "$qemu_name" python3 /benchmark/qmp-helper.py qmp-add-device /benchmark/qmp.sock "$virtqueues" \
         >"$point/qmp-device-add.json"
     docker exec "$qemu_name" python3 /benchmark/qmp-helper.py qmp-query /benchmark/qmp.sock \
@@ -199,6 +225,12 @@ for queue, cpu in enumerate(cpus):
                sys.argv[2], "taskset", "-pc", str(cpu), str(tid)]
     print(subprocess.check_output(command, text=True).strip())
 PY
+    cp -- "$SCRIPT_DIR/qmp_vcpu_affinity.py" "$point/qmp-vcpu-affinity.py"
+    docker exec "$qemu_name" python3 /benchmark/qmp-vcpu-affinity.py query /benchmark/qmp.sock \
+        >"$point/qmp-vcpus.json"
+    python3 "$SCRIPT_DIR/qmp_vcpu_affinity.py" pin "$point/qmp-vcpus.json" \
+        "$TOOLS_IMAGE" "$(iothread_cpus_for_device "$device")" \
+        >"$point/vcpu-affinity.json"
     docker exec "$qemu_name" python3 /benchmark/qmp-helper.py qmp-cont /benchmark/qmp.sock \
         >"$point/qmp-cont.json"
     docker wait "$qemu_name" >"$point/qemu-exit.txt"
@@ -210,7 +242,7 @@ PY
         return 2
     }
     docker rm "$qemu_name" >/dev/null
-    trap - RETURN
+    clear_qemu_cleanup
 }
 
 make -C "$SCRIPT_DIR" clean mixed_sync_bench
@@ -225,7 +257,7 @@ run_point() {
     target=$(target_for_device "$device")
     point="$ROOT_ART/$case_name"
     if [[ -f $point/result.json ]]; then
-        python3 "$SCRIPT_DIR/parse_result.py" "$point" "$case_name" >/dev/null
+        python3 "$SCRIPT_DIR/parse_result.py" --validate-saved "$point" "$case_name" >/dev/null
         echo "SKIP validated $case_name"
         return
     fi
@@ -251,7 +283,8 @@ run_point() {
         "$TOOLS_IMAGE" e2fsck -fn /dev/benchmark-target >"$point/e2fsck.log" 2>&1 || check_status=$?
     printf '%s\n' "$check_status" >"$point/e2fsck.status"
     [[ $check_status == 0 ]] || { echo "$case_name: e2fsck failed" >&2; return 2; }
-    python3 "$SCRIPT_DIR/parse_result.py" "$point" "$case_name" >"$point/result.json"
+    python3 "$SCRIPT_DIR/parse_result.py" "$point" "$case_name" >"$point/result.json.tmp"
+    mv -- "$point/result.json.tmp" "$point/result.json"
     rm -f -- "$point/selected.iso" "$point/ext2.img" "$point/exfat.img" \
         "$point/qmp-helper.py" "$point/qmp.sock"
     python3 - "$point/result.json" <<'PY'
@@ -268,4 +301,4 @@ while IFS=$'\t' read -r case_name device mode read_percent sync_percent repeat \
         "$threads" "$file_mib" "$file_bytes" "$dataset_mib" "$seed" "$warmup_seconds" \
         "$runtime_seconds" "$virtqueues" "$disk_format" "$dram_cache_mib" \
         "$nv_data_cache_mib" "$cache_control"
-done < <(list_points)
+done <<< "$POINT_ROWS"

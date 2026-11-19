@@ -79,6 +79,16 @@ class ReportingTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "missing"):
             summarize.validate_complete(self.rows[:-1])
 
+    def test_load_results_revalidates_saved_result_against_raw_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for point in matrix.matrix():
+                point_dir = root / point.case
+                point_dir.mkdir()
+                (point_dir / "result.json").write_text("{}\n")
+            with self.assertRaisesRegex(ValueError, "saved result"):
+                summarize.load_results(root)
+
     def test_plot_has_categorical_sync_ticks_filesystems_and_raw_samples(self) -> None:
         figure, axis = plot_results.build_figure(
             self.rows, "nvme", 30, "operations_per_second"

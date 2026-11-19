@@ -53,6 +53,9 @@ prewrite_file() {
     dd if=/dev/zero of="$path" bs=1048576 count="$FILE_MIB" conv=fsync status=none
     actual_bytes=$(stat -c %s "$path")
     [ "$actual_bytes" -eq "$FILE_BYTES" ] || fail "prewrite-size-$thread_id"
+    allocated_blocks=$(stat -c %b "$path")
+    [ "$((allocated_blocks * 512))" -ge "$FILE_BYTES" ] || \
+        fail "prewrite-allocation-$thread_id"
 }
 
 case "$MODE" in

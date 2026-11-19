@@ -42,6 +42,17 @@ class MixedSyncBenchTest(unittest.TestCase):
         self.assertEqual(first["sync_counts"]["100"], first["write_count"])
         self.assertEqual(first["address_digest"], 17199379227451352568)
         self.assertEqual(first["operation_digest"], 2011287794019180530)
+        self.assertEqual(
+            first["sync_digests"],
+            {
+                "0": 1469598103934665603,
+                "20": 6006194862186044860,
+                "40": 14209598604338577549,
+                "60": 5877748052607373086,
+                "80": 12154269550461606499,
+                "100": 13382538412120072467,
+            },
+        )
 
     def test_guest_binary_is_statically_linked(self) -> None:
         description = subprocess.check_output(["file", str(BINARY)], text=True)
@@ -70,6 +81,89 @@ class MixedSyncBenchTest(unittest.TestCase):
             )
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("f.1", result.stderr)
+
+    def test_rejects_a_correctly_sized_sparse_file(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "f.0"
+            with path.open("wb") as output:
+                output.truncate(1024 * 1024)
+            result = self.run_bench(
+                "--directory",
+                directory,
+                "--threads",
+                "1",
+                "--file-bytes",
+                str(1024 * 1024),
+                "--runtime-seconds",
+                "1",
+                "--warmup-seconds",
+                "0",
+                check=False,
+            )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("fully allocated", result.stderr)
+
+    def test_partial_thread_startup_failure_exits_without_hanging(self) -> None:
+        subprocess.run(
+            ["make", "-C", str(SCRIPT_DIR), "mixed_sync_bench_fault_create"],
+            check=True,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            for thread_id in range(2):
+                (Path(directory) / f"f.{thread_id}").write_bytes(bytes(1024 * 1024))
+            result = subprocess.run(
+                [
+                    str(SCRIPT_DIR / "mixed_sync_bench_fault_create"),
+                    "--directory",
+                    directory,
+                    "--threads",
+                    "2",
+                    "--file-bytes",
+                    str(1024 * 1024),
+                    "--runtime-seconds",
+                    "1",
+                    "--warmup-seconds",
+                    "0",
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=2,
+            )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("pthread_create", result.stderr)
+
+    def test_long_io_latency_is_not_capped_at_65535_microseconds(self) -> None:
+        subprocess.run(
+            ["make", "-C", str(SCRIPT_DIR), "mixed_sync_bench_slow_io"],
+            check=True,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            (Path(directory) / "f.0").write_bytes(bytes(1024 * 1024))
+            result = subprocess.run(
+                [
+                    str(SCRIPT_DIR / "mixed_sync_bench_slow_io"),
+                    "--directory",
+                    directory,
+                    "--threads",
+                    "1",
+                    "--file-bytes",
+                    str(1024 * 1024),
+                    "--read-percent",
+                    "100",
+                    "--runtime-seconds",
+                    "1",
+                    "--warmup-seconds",
+                    "0",
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+        payload = json.loads(result.stdout)
+        self.assertGreaterEqual(payload["p50_latency_us"], 90000)
+        self.assertGreaterEqual(payload["p99_latency_us"], 90000)
+        self.assertEqual(payload["latency_overflow_count"], 0)
 
     def test_runs_real_mixed_io_and_emits_consistent_json(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

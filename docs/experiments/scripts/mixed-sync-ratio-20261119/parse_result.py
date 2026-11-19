@@ -14,6 +14,23 @@ import matrix
 BLOCK_SIZE = 4096
 
 
+def require_integer(payload: dict, field: str, case: str, *, minimum: int = 0) -> int:
+    value = payload.get(field)
+    if type(value) is not int or value < minimum:
+        raise ValueError(f"{case}: invalid {field}")
+    return value
+
+
+def require_finite(payload: dict, field: str, case: str, *, positive: bool = False) -> float:
+    value = payload.get(field)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{case}: invalid {field}")
+    result = float(value)
+    if not math.isfinite(result) or (result <= 0 if positive else result < 0):
+        raise ValueError(f"{case}: invalid {field}")
+    return result
+
+
 def fields_from_line(line: str) -> dict[str, str]:
     return dict(re.findall(r"([a-zA-Z_][a-zA-Z0-9_]*)=([^\s]+)", line))
 
@@ -75,17 +92,22 @@ def parse_point(point_dir: Path, point: matrix.Point) -> dict:
                 f"{point.case}: {field} mismatch: {payload.get(field)!r} != {expected!r}"
             )
 
-    operations = int(payload.get("operations", -1))
-    reads = int(payload.get("reads", -1))
-    writes = int(payload.get("writes", -1))
-    fsyncs = int(payload.get("fsyncs", -1))
-    if min(operations, reads, writes, fsyncs) < 0 or reads + writes != operations:
+    operations = require_integer(payload, "operations", point.case, minimum=1)
+    reads = require_integer(payload, "reads", point.case)
+    writes = require_integer(payload, "writes", point.case)
+    fsyncs = require_integer(payload, "fsyncs", point.case)
+    read_bytes = require_integer(payload, "read_bytes", point.case)
+    write_bytes = require_integer(payload, "write_bytes", point.case)
+    latency_overflow_count = require_integer(
+        payload, "latency_overflow_count", point.case
+    )
+    if reads + writes != operations:
         raise ValueError(f"{point.case}: operation counts are inconsistent")
     if fsyncs > writes:
         raise ValueError(f"{point.case}: sync count exceeds writes")
-    if int(payload.get("read_bytes", -1)) != reads * BLOCK_SIZE:
+    if read_bytes != reads * BLOCK_SIZE:
         raise ValueError(f"{point.case}: read byte count is inconsistent")
-    if int(payload.get("write_bytes", -1)) != writes * BLOCK_SIZE:
+    if write_bytes != writes * BLOCK_SIZE:
         raise ValueError(f"{point.case}: write byte count is inconsistent")
     if not ratio_is_plausible(reads, operations, point.read_percent):
         raise ValueError(f"{point.case}: observed read ratio is implausible")
@@ -128,6 +150,22 @@ def parse_point(point_dir: Path, point: matrix.Point) -> dict:
         if runtime_config.get(field) != expected:
             raise ValueError(f"{point.case}: runtime {field} mismatch")
 
+    elapsed_seconds = require_finite(
+        payload, "elapsed_seconds", point.case, positive=True
+    )
+    operations_per_second = require_finite(
+        payload, "operations_per_second", point.case, positive=True
+    )
+    mib_per_second = require_finite(
+        payload, "mib_per_second", point.case, positive=True
+    )
+    expected_ops = operations / elapsed_seconds
+    expected_mib = (read_bytes + write_bytes) / (1024 * 1024) / elapsed_seconds
+    if not math.isclose(operations_per_second, expected_ops, rel_tol=1e-5, abs_tol=1e-6):
+        raise ValueError(f"{point.case}: operations_per_second is inconsistent")
+    if not math.isclose(mib_per_second, expected_mib, rel_tol=1e-5, abs_tol=1e-6):
+        raise ValueError(f"{point.case}: mib_per_second is inconsistent")
+
     latency_fields = (
         "mean_latency_us",
         "p50_latency_us",
@@ -135,9 +173,14 @@ def parse_point(point_dir: Path, point: matrix.Point) -> dict:
         "p99_latency_us",
         "p999_latency_us",
     )
-    for field in latency_fields:
-        if float(payload.get(field, -1)) < 0:
-            raise ValueError(f"{point.case}: invalid {field}")
+    latencies = {
+        field: require_finite(payload, field, point.case) for field in latency_fields
+    }
+    if not (
+        latencies["p50_latency_us"] <= latencies["p95_latency_us"]
+        <= latencies["p99_latency_us"] <= latencies["p999_latency_us"]
+    ):
+        raise ValueError(f"{point.case}: latency quantiles are inconsistent")
 
     return {
         "case": point.case,
@@ -161,19 +204,40 @@ def parse_point(point_dir: Path, point: matrix.Point) -> dict:
         "fsyncs": fsyncs,
         "actual_read_percent": reads * 100 / operations if operations else 0.0,
         "actual_sync_percent": fsyncs * 100 / writes if writes else 0.0,
-        "elapsed_seconds": float(payload["elapsed_seconds"]),
-        "operations_per_second": float(payload["operations_per_second"]),
-        "mib_per_second": float(payload["mib_per_second"]),
-        **{field: float(payload[field]) for field in latency_fields},
+        "elapsed_seconds": elapsed_seconds,
+        "operations_per_second": operations_per_second,
+        "mib_per_second": mib_per_second,
+        "latency_overflow_count": latency_overflow_count,
+        **latencies,
     }
+
+
+def validate_saved_result(point_dir: Path, point: matrix.Point) -> dict:
+    try:
+        saved = json.loads((point_dir / "result.json").read_text())
+    except (FileNotFoundError, json.JSONDecodeError) as error:
+        raise ValueError(f"{point.case}: invalid saved result") from error
+    if not isinstance(saved, dict) or saved.get("case") != point.case:
+        raise ValueError(f"{point.case}: invalid saved result")
+    canonical = parse_point(point_dir, point)
+    if saved != canonical:
+        raise ValueError(f"{point.case}: saved result differs from raw evidence")
+    return canonical
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("point_dir", type=Path)
     parser.add_argument("case")
+    parser.add_argument("--validate-saved", action="store_true")
     args = parser.parse_args()
-    print(json.dumps(parse_point(args.point_dir, matrix.point_by_case(args.case)), indent=2))
+    point = matrix.point_by_case(args.case)
+    result = (
+        validate_saved_result(args.point_dir, point)
+        if args.validate_saved
+        else parse_point(args.point_dir, point)
+    )
+    print(json.dumps(result, indent=2))
 
 
 if __name__ == "__main__":

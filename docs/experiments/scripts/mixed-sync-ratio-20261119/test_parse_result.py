@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: MPL-2.0
 
-import copy
 import json
 import os
 from pathlib import Path
@@ -37,12 +36,13 @@ class ParseResultTest(unittest.TestCase):
             "read_bytes": 12288000,
             "write_bytes": 28672000,
             "operations_per_second": 333.322,
-            "mib_per_second": 1.302,
+            "mib_per_second": 1.302040,
             "mean_latency_us": 20000.0,
             "p50_latency_us": 1000,
             "p95_latency_us": 2000,
             "p99_latency_us": 3000,
             "p999_latency_us": 4000,
+            "latency_overflow_count": 0,
         }
 
     def write_fixture(
@@ -129,6 +129,34 @@ class ParseResultTest(unittest.TestCase):
                         self.write_fixture(Path(directory), self.payload, **options), self.point
                     )
 
+    def test_rejects_nonfinite_nonpositive_and_inconsistent_measurements(self) -> None:
+        variants = (
+            ({**self.payload, "elapsed_seconds": 0.0}, "elapsed_seconds"),
+            ({**self.payload, "operations_per_second": -1.0}, "operations_per_second"),
+            ({**self.payload, "mib_per_second": 99.0}, "mib_per_second"),
+            ({**self.payload, "p99_latency_us": float("nan")}, "p99_latency_us"),
+            ({**self.payload, "p50_latency_us": 5000, "p95_latency_us": 2000}, "quantiles"),
+            ({**self.payload, "operations": 10000.5}, "operations"),
+        )
+        for payload, message in variants:
+            with self.subTest(message=message), tempfile.TemporaryDirectory() as directory:
+                with self.assertRaisesRegex(ValueError, message):
+                    parse_result.parse_point(
+                        self.write_fixture(Path(directory), payload), self.point
+                    )
+
+    def test_resume_requires_saved_json_to_equal_canonical_reparse(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            point_dir = self.write_fixture(Path(directory))
+            canonical = parse_result.parse_point(point_dir, self.point)
+            (point_dir / "result.json").write_text(json.dumps(canonical) + "\n")
+            self.assertEqual(
+                parse_result.validate_saved_result(point_dir, self.point), canonical
+            )
+            (point_dir / "result.json").write_text("{\n")
+            with self.assertRaisesRegex(ValueError, "saved result"):
+                parse_result.validate_saved_result(point_dir, self.point)
+
 
 class RunnerAuditTest(unittest.TestCase):
     def test_audit_resolves_exact_device_and_queue_plan_without_device_access(self) -> None:
@@ -161,6 +189,33 @@ class RunnerAuditTest(unittest.TestCase):
         self.assertIn("virtqueues=8", result.stdout)
         self.assertIn("iothread_cpus=56-63", result.stdout)
         self.assertIn("profiling=off", result.stdout)
+
+    def test_audit_rejects_unknown_case_before_processing_valid_prefix(self) -> None:
+        valid_case = "mixed-nvme-rnvpce-r30w70-sync40-r1"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source"
+            results = root / "results"
+            source.mkdir()
+            results.mkdir()
+            for name in ("selected.iso", "ext2.img", "exfat.img"):
+                (source / name).write_bytes(b"audit")
+            environment = os.environ.copy()
+            environment.update(
+                ROOT_ART=str(results),
+                SOURCE_ART=str(source),
+                CASES=f"{valid_case} unknown-case",
+                MIXED_SYNC_RUNNER_AUDIT="1",
+            )
+            result = subprocess.run(
+                ["bash", str(SCRIPT_DIR / "run-sweep.sh")],
+                check=False,
+                capture_output=True,
+                text=True,
+                env=environment,
+            )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn(f"AUDIT case={valid_case}", result.stdout)
 
 
 if __name__ == "__main__":

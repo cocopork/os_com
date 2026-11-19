@@ -16,7 +16,10 @@
 #include <unistd.h>
 
 #define BLOCK_SIZE 4096ULL
-#define HISTOGRAM_BINS 65536U
+#define HISTOGRAM_EXACT_BINS 1024U
+#define HISTOGRAM_SUB_BINS 16U
+#define HISTOGRAM_EXPONENTS 54U
+#define HISTOGRAM_BINS (HISTOGRAM_EXACT_BINS + HISTOGRAM_SUB_BINS * HISTOGRAM_EXPONENTS)
 #define FNV_OFFSET UINT64_C(1469598103934665603)
 #define FNV_PRIME UINT64_C(1099511628211)
 
@@ -46,6 +49,7 @@ struct stats {
 	uint64_t read_bytes;
 	uint64_t write_bytes;
 	uint64_t latency_sum_ns;
+	uint64_t latency_overflow_count;
 	uint64_t *latency_histogram;
 };
 
@@ -56,6 +60,10 @@ struct shared_state {
 	struct timespec measurement_start;
 	struct timespec measurement_end;
 	atomic_bool failed;
+	pthread_mutex_t startup_mutex;
+	pthread_cond_t startup_cond;
+	unsigned int started_threads;
+	enum { STARTUP_WAIT, STARTUP_RUN, STARTUP_ABORT } startup_state;
 };
 
 struct worker {
@@ -143,6 +151,9 @@ static bool perform_operation(struct worker *worker, uint64_t operation_index,
 
 	if (measured)
 		started = monotonic_now();
+#ifdef MIXED_SYNC_TEST_IO_DELAY_US
+	usleep(MIXED_SYNC_TEST_IO_DELAY_US);
+#endif
 	if (is_read) {
 		length = pread(worker->fd, buffer, BLOCK_SIZE, offset);
 		if (length != (ssize_t)BLOCK_SIZE) {
@@ -172,9 +183,24 @@ static bool perform_operation(struct worker *worker, uint64_t operation_index,
 	if (measured) {
 		uint64_t latency = elapsed_ns(started, monotonic_now());
 		uint64_t latency_us = latency / 1000;
-		unsigned int bin = latency_us < HISTOGRAM_BINS ?
-			(unsigned int)latency_us : HISTOGRAM_BINS - 1;
+		unsigned int bin;
 		struct stats *stats = &worker->stats;
+
+		if (latency_us < HISTOGRAM_EXACT_BINS) {
+			bin = (unsigned int)latency_us;
+		} else {
+			unsigned int exponent = 63U - (unsigned int)__builtin_clzll(latency_us);
+			uint64_t base = UINT64_C(1) << exponent;
+			unsigned int sub = (unsigned int)((latency_us - base) /
+				(base / HISTOGRAM_SUB_BINS));
+
+			bin = HISTOGRAM_EXACT_BINS +
+				(exponent - 10U) * HISTOGRAM_SUB_BINS + sub;
+			if (bin >= HISTOGRAM_BINS) {
+				bin = HISTOGRAM_BINS - 1;
+				stats->latency_overflow_count++;
+			}
+		}
 
 		stats->operations++;
 		stats->latency_sum_ns += latency;
@@ -216,6 +242,18 @@ static void *worker_main(void *argument)
 	}
 	if (buffer != NULL)
 		memset(buffer, (int)(worker->thread_id + 1), BLOCK_SIZE);
+
+	pthread_mutex_lock(&shared->startup_mutex);
+	shared->started_threads++;
+	pthread_cond_broadcast(&shared->startup_cond);
+	while (shared->startup_state == STARTUP_WAIT)
+		pthread_cond_wait(&shared->startup_cond, &shared->startup_mutex);
+	if (shared->startup_state == STARTUP_ABORT) {
+		pthread_mutex_unlock(&shared->startup_mutex);
+		free(buffer);
+		return NULL;
+	}
+	pthread_mutex_unlock(&shared->startup_mutex);
 
 	barrier_result = pthread_barrier_wait(&shared->phase_barrier);
 	if (barrier_result == PTHREAD_BARRIER_SERIAL_THREAD)
@@ -261,8 +299,18 @@ static uint64_t histogram_quantile(const uint64_t *histogram, uint64_t count,
 		return 0;
 	for (bin = 0; bin < HISTOGRAM_BINS; bin++) {
 		cumulative += histogram[bin];
-		if (cumulative >= target)
-			return bin;
+		if (cumulative >= target) {
+			unsigned int offset, exponent, sub;
+			uint64_t base;
+
+			if (bin < HISTOGRAM_EXACT_BINS)
+				return bin;
+			offset = bin - HISTOGRAM_EXACT_BINS;
+			exponent = 10U + offset / HISTOGRAM_SUB_BINS;
+			sub = offset % HISTOGRAM_SUB_BINS;
+			base = UINT64_C(1) << exponent;
+			return base + (base * sub) / HISTOGRAM_SUB_BINS;
+		}
 	}
 	return HISTOGRAM_BINS - 1;
 }
@@ -278,6 +326,8 @@ static int run_self_test(void)
 	uint64_t address_digest = FNV_OFFSET;
 	uint64_t operation_digest = FNV_OFFSET;
 	uint64_t sync_counts[6] = { 0 };
+	uint64_t sync_digests[6] = { FNV_OFFSET, FNV_OFFSET, FNV_OFFSET,
+		FNV_OFFSET, FNV_OFFSET, FNV_OFFSET };
 	const unsigned int percentages[6] = { 0, 20, 40, 60, 80, 100 };
 	uint64_t writes = 0;
 	uint64_t index;
@@ -295,18 +345,36 @@ static int run_self_test(void)
 		writes++;
 		for (threshold = 0; threshold < 6; threshold++) {
 			if (decision(&config, 0, index, DECIDE_SYNC) % 100 <
-			    percentages[threshold])
+			    percentages[threshold]) {
 				sync_counts[threshold]++;
+				sync_digests[threshold] =
+					(sync_digests[threshold] ^ index) * FNV_PRIME;
+			}
 		}
 	}
 	printf("{\"status\":\"pass\",\"decision_count\":10000,"
 	       "\"write_count\":%" PRIu64 ",\"address_digest\":%" PRIu64
 	       ",\"operation_digest\":%" PRIu64 ",\"sync_counts\":{"
 	       "\"0\":%" PRIu64 ",\"20\":%" PRIu64 ",\"40\":%" PRIu64
-	       ",\"60\":%" PRIu64 ",\"80\":%" PRIu64 ",\"100\":%" PRIu64 "}}\n",
+	       ",\"60\":%" PRIu64 ",\"80\":%" PRIu64 ",\"100\":%" PRIu64 "},"
+	       "\"sync_digests\":{\"0\":%" PRIu64 ",\"20\":%" PRIu64
+	       ",\"40\":%" PRIu64 ",\"60\":%" PRIu64 ",\"80\":%" PRIu64
+	       ",\"100\":%" PRIu64 "}}\n",
 	       writes, address_digest, operation_digest, sync_counts[0], sync_counts[1],
-	       sync_counts[2], sync_counts[3], sync_counts[4], sync_counts[5]);
+	       sync_counts[2], sync_counts[3], sync_counts[4], sync_counts[5],
+	       sync_digests[0], sync_digests[1], sync_digests[2], sync_digests[3],
+	       sync_digests[4], sync_digests[5]);
 	return 0;
+}
+
+static int create_worker(pthread_t *thread, void *(*start)(void *), void *argument)
+{
+#ifdef MIXED_SYNC_TEST_FAIL_CREATE_SECOND
+	static unsigned int calls;
+	if (++calls == 2)
+		return EAGAIN;
+#endif
+	return pthread_create(thread, NULL, start, argument);
 }
 
 static int parse_unsigned(const char *name, const char *text, unsigned int *output)
@@ -416,6 +484,7 @@ int main(int argc, char **argv)
 	uint64_t *histogram = NULL;
 	uint64_t operations = 0, reads = 0, writes = 0, fsyncs = 0;
 	uint64_t read_bytes = 0, write_bytes = 0, latency_sum_ns = 0;
+	uint64_t latency_overflow_count = 0;
 	unsigned int opened = 0, created = 0, index;
 	struct timespec finished;
 	char path[4096];
@@ -437,6 +506,11 @@ int main(int argc, char **argv)
 	memset(&shared, 0, sizeof(shared));
 	shared.config = config;
 	atomic_init(&shared.failed, false);
+	if (pthread_mutex_init(&shared.startup_mutex, NULL) != 0 ||
+	    pthread_cond_init(&shared.startup_cond, NULL) != 0) {
+		fprintf(stderr, "startup synchronization initialization failed\n");
+		goto cleanup;
+	}
 	if (pthread_barrier_init(&shared.phase_barrier, NULL, config.threads) != 0) {
 		fprintf(stderr, "pthread_barrier_init failed\n");
 		goto cleanup;
@@ -457,9 +531,13 @@ int main(int argc, char **argv)
 		}
 		opened++;
 		if (fstat(workers[index].fd, &status) != 0 ||
-		    (uint64_t)status.st_size != config.file_bytes) {
+		    !S_ISREG(status.st_mode) || (uint64_t)status.st_size != config.file_bytes) {
 			fprintf(stderr, "%s must be exactly %" PRIu64 " bytes\n", path,
 				config.file_bytes);
+			goto destroy_barrier;
+		}
+		if ((uint64_t)status.st_blocks * 512 < config.file_bytes) {
+			fprintf(stderr, "%s must be fully allocated before measurement\n", path);
 			goto destroy_barrier;
 		}
 		workers[index].shared = &shared;
@@ -473,16 +551,25 @@ int main(int argc, char **argv)
 	}
 
 	for (index = 0; index < config.threads; index++) {
-		int error = pthread_create(&threads[index], NULL, worker_main, &workers[index]);
+		int error = create_worker(&threads[index], worker_main, &workers[index]);
 
 		if (error != 0) {
 			errno = error;
 			perror("pthread_create");
-			atomic_store_explicit(&shared.failed, true, memory_order_relaxed);
+			pthread_mutex_lock(&shared.startup_mutex);
+			shared.startup_state = STARTUP_ABORT;
+			pthread_cond_broadcast(&shared.startup_cond);
+			pthread_mutex_unlock(&shared.startup_mutex);
 			goto join_threads;
 		}
 		created++;
 	}
+	pthread_mutex_lock(&shared.startup_mutex);
+	while (shared.started_threads != config.threads)
+		pthread_cond_wait(&shared.startup_cond, &shared.startup_mutex);
+	shared.startup_state = STARTUP_RUN;
+	pthread_cond_broadcast(&shared.startup_cond);
+	pthread_mutex_unlock(&shared.startup_mutex);
 
 join_threads:
 	for (index = 0; index < created; index++)
@@ -502,6 +589,7 @@ join_threads:
 		read_bytes += stats->read_bytes;
 		write_bytes += stats->write_bytes;
 		latency_sum_ns += stats->latency_sum_ns;
+		latency_overflow_count += stats->latency_overflow_count;
 		for (bin = 0; bin < HISTOGRAM_BINS; bin++)
 			histogram[bin] += stats->latency_histogram[bin];
 	}
@@ -515,7 +603,8 @@ join_threads:
 	       ",\"write_bytes\":%" PRIu64 ",\"operations_per_second\":%.6f,"
 	       "\"mib_per_second\":%.6f,\"mean_latency_us\":%.6f,"
 	       "\"p50_latency_us\":%" PRIu64 ",\"p95_latency_us\":%" PRIu64
-	       ",\"p99_latency_us\":%" PRIu64 ",\"p999_latency_us\":%" PRIu64 "}\n",
+	       ",\"p99_latency_us\":%" PRIu64 ",\"p999_latency_us\":%" PRIu64
+	       ",\"latency_overflow_count\":%" PRIu64 "}\n",
 	       config.threads, opened, config.file_bytes, config.read_percent,
 	       config.sync_percent, config.seed, config.warmup_seconds,
 	       config.runtime_seconds, elapsed, operations, reads, writes, fsyncs,
@@ -525,11 +614,14 @@ join_threads:
 	       histogram_quantile(histogram, operations, 50, 100),
 	       histogram_quantile(histogram, operations, 95, 100),
 	       histogram_quantile(histogram, operations, 99, 100),
-	       histogram_quantile(histogram, operations, 999, 1000));
+	       histogram_quantile(histogram, operations, 999, 1000),
+	       latency_overflow_count);
 	result = operations == 0 ? EXIT_FAILURE : EXIT_SUCCESS;
 
 destroy_barrier:
 	pthread_barrier_destroy(&shared.phase_barrier);
+	pthread_cond_destroy(&shared.startup_cond);
+	pthread_mutex_destroy(&shared.startup_mutex);
 cleanup:
 	if (workers != NULL) {
 		for (index = 0; index < config.threads; index++) {

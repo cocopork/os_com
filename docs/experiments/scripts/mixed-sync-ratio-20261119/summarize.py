@@ -3,12 +3,12 @@
 """Aggregates a complete mixed-sync experiment matrix."""
 
 import csv
-import json
 from pathlib import Path
 import statistics
 import sys
 
 import matrix
+import parse_result
 
 
 KEYS = ("device", "mode", "read_percent", "write_percent", "sync_percent")
@@ -72,7 +72,10 @@ def write_csv(path: Path, rows: list[dict]) -> None:
 
 
 def load_results(root: Path) -> list[dict]:
-    rows = [json.loads(path.read_text()) for path in sorted(root.glob("*/result.json"))]
+    rows = [
+        parse_result.validate_saved_result(root / point.case, point)
+        for point in matrix.matrix()
+    ]
     validate_complete(rows)
     return rows
 

@@ -26,8 +26,8 @@
 | 重复 | 每坐标 3 轮 |
 | 数据集 | 8 × 320 MiB = 2560 MiB |
 | 预分配 | 每轮测量前顺序写满全部文件并同步，正式写均为覆盖写 |
-| NVMe | 8 virtqueue、8 IOThread，宿主 CPU 56--63 |
-| SATA | 1 virtqueue、1 IOThread，宿主 CPU 63 |
+| NVMe | 8 virtqueue、8 IOThread，宿主 CPU 56--63；64 个 vCPU 避开该集合 |
+| SATA | 1 virtqueue、1 IOThread，宿主 CPU 63；64 个 vCPU 避开该 CPU |
 | 前台线程 | 来宾 CPU 0--7 |
 
 固定种子为 `20261119`。读写类型、页面地址和同步选择使用相互独立的计数器哈希；
@@ -114,7 +114,8 @@ python3 "$SCRIPT_DIR/plot_results.py" \
 4. 每轮的基准、后置 sync、卸载和 e2fsck 状态均为 0；
 5. 8 个文件均有完整 320 MiB 预写证据；
 6. 固定种子、实际读写比例和实际同步比例通过计数校验；
-7. QMP、IOThread affinity、镜像/二进制哈希和构建元数据完整；
+7. QMP、IOThread/vCPU affinity、镜像/二进制哈希和构建元数据完整，且 vCPU 与
+   IOThread 的宿主 CPU 集合不重叠；
 8. 测试结束后目标分区未挂载，且没有残留 `mixed-sync-qemu-*` 容器。
 
 ## 2026-11-19 NVMe smoke 验证
