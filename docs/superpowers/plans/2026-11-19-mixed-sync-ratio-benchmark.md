@@ -61,11 +61,11 @@
 - Consume the benchmark binary plus a generated `case.cfg`.
 - Produce exact case names/configuration rows and guest completion markers enclosing the benchmark JSON.
 
-- [ ] Write failing matrix tests for 432 points, exact case uniqueness, three repeats, all ratio coordinates, 2560 MiB total prewrite, and device-specific queue counts.
-- [ ] Implement typed matrix generation and strict case lookup without accepting unknown coordinates.
-- [ ] Write guest-script contract tests that require native prewrite plus sync before the measured mount, eight existing 320 MiB files, mode-specific mount options, and post-run sync/unmount markers.
-- [ ] Implement EXT2, EXT4, and rNVPCe mounts; set EXT4 cache to 256 MiB and rNVPCe DRAM/NV data budgets to 128 MiB each; emit the EXT2 uncontrolled-capacity annotation.
-- [ ] Run the matrix and guest contract tests and verify they pass.
+- [x] Write failing matrix tests for 432 points, exact case uniqueness, three repeats, all ratio coordinates, 2560 MiB total prewrite, and device-specific queue counts.
+- [x] Implement typed matrix generation and strict case lookup without accepting unknown coordinates.
+- [x] Write guest-script contract tests that require native prewrite plus sync before the measured mount, eight existing 320 MiB files, mode-specific mount options, and post-run sync/unmount markers.
+- [x] Implement EXT2, EXT4, and rNVPCe mounts; set EXT4 cache to 256 MiB and rNVPCe DRAM/NV data budgets to 128 MiB each; emit the EXT2 uncontrolled-capacity annotation.
+- [x] Run the matrix and guest contract tests and verify they pass.
 
 ### Task 3: Safe two-device runner and result validation
 
