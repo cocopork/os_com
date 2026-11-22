@@ -1,0 +1,34 @@
+{
+  "raw": {
+    "case": "raw-nvme-randwrite-8q-module-profile-j4",
+    "tsc_hz": 2099539460,
+    "samples": 1536,
+    "file_pre_ticks": 44812018,
+    "block_call_ticks": 262309292,
+    "file_post_ticks": 58926,
+    "total_ticks": 307180236,
+    "file_pre_us_per_sample": 13.895662092207912,
+    "block_call_us_per_sample": 81.33892308260467,
+    "file_post_us_per_sample": 0.01827223635510999,
+    "total_us_per_sample": 95.25285741116768
+  },
+  "block": {
+    "case": "raw-nvme-randwrite-8q-module-profile-j4",
+    "tsc_hz": 2099539460,
+    "samples": 1536,
+    "prepare_ticks": 46079706,
+    "bio_wait_ticks": 215947534,
+    "post_ticks": 55816,
+    "total_ticks": 262083056,
+    "virtio_samples": 1536,
+    "virtio_e2e_ticks": 183551148,
+    "resume_samples": 1536,
+    "resume_ticks": 30433842,
+    "prepare_us_per_sample": 14.288756732274038,
+    "bio_wait_us_per_sample": 66.96270545346962,
+    "post_us_per_sample": 0.017307863157126215,
+    "total_us_per_sample": 81.26877004890079,
+    "virtio_e2e_us_per_sample": 56.91697993258959,
+    "completion_to_resume_us_per_sample": 9.43716448118103
+  }
+}
