@@ -214,7 +214,7 @@ impl aster_block::BlockDevice for BlockDevice {
     fn metadata(&self) -> BlockDeviceMeta {
         BlockDeviceMeta {
             max_nr_segments_per_bio: self.device.max_nr_segments_per_bio,
-            nr_sectors: self.device.config_manager.capacity_sectors(),
+            nr_sectors: self.device.cached_nr_sectors.load(Ordering::Acquire),
             nr_submission_queues: self.nr_submission_queues(),
         }
     }
@@ -282,6 +282,7 @@ impl aster_block::BlockDevice for BlockDevice {
 #[derive(Debug)]
 struct DeviceInner {
     config_manager: ConfigManager<VirtioBlockConfig>,
+    cached_nr_sectors: AtomicUsize,
     features: BlockFeatures,
     queues: Vec<Arc<VirtioBlockQueue>>,
     max_nr_segments_per_bio: usize,
@@ -336,6 +337,7 @@ impl DeviceInner {
             .unwrap();
         let device = Arc::new(Self {
             config_manager,
+            cached_nr_sectors: AtomicUsize::new(config.capacity as usize),
             features,
             queues,
             max_nr_segments_per_bio,
@@ -367,6 +369,8 @@ impl DeviceInner {
     }
 
     fn handle_config_change(&self) {
+        self.cached_nr_sectors
+            .store(self.config_manager.capacity_sectors(), Ordering::Release);
         info!("block device config space change");
     }
 }
@@ -1080,6 +1084,7 @@ mod tests {
         let device = BlockDevice {
             device: Arc::new(DeviceInner {
                 config_manager: ConfigManager::new(None, None),
+                cached_nr_sectors: AtomicUsize::new(4096),
                 features: BlockFeatures::empty(),
                 queues: queue_device.queues,
                 max_nr_segments_per_bio: 2,
@@ -1100,6 +1105,30 @@ mod tests {
         finish_staged(&device.device.queues[1]);
         assert_eq!(common.queue_diagnostics(1).unwrap().staging_depth, 0);
         assert!(batch.wait_all().is_ok());
+    }
+
+    #[ktest]
+    fn block_metadata_does_not_reread_device_config() {
+        let (queue_device, transport) = QueueDevice::new(2, 4);
+        let device = BlockDevice {
+            device: Arc::new(DeviceInner {
+                config_manager: ConfigManager::new(None, None),
+                cached_nr_sectors: AtomicUsize::new(4096),
+                features: BlockFeatures::empty(),
+                queues: queue_device.queues,
+                max_nr_segments_per_bio: 2,
+                transport: SpinLock::new(Box::new(transport)),
+            }),
+            id: DeviceId::new(MajorId::new(1), MinorId::new(0)),
+            name: String::from("cached-metadata-test"),
+            partitions: SpinLock::new(None),
+            weak_self: Weak::new(),
+        };
+
+        let metadata = aster_block::BlockDevice::metadata(&device);
+        assert_eq!(metadata.nr_sectors, 4096);
+        assert_eq!(metadata.nr_submission_queues, 2);
+        assert_eq!(metadata.max_nr_segments_per_bio, 2);
     }
 
     #[ktest]
