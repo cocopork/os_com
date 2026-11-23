@@ -4,6 +4,8 @@
 
 use alloc::vec::Vec;
 
+#[cfg(target_arch = "x86_64")]
+use ostd::cpu::CpuId;
 use ostd::{Error, Result, io::IoMem, irq::IrqLine, mm::VmIoOnce};
 
 use crate::{
@@ -166,6 +168,22 @@ impl CapabilityMsixData {
         self.table_bar
             .write_once((16 * index + 12) as usize + self.table_offset, &0_u32)
             .unwrap();
+    }
+
+    /// Routes an initialized MSI-X table entry to a target CPU.
+    #[cfg(target_arch = "x86_64")]
+    pub fn set_interrupt_target_cpu(&mut self, index: u16, cpu_id: CpuId) {
+        let Some(irq) = self.irqs.get(index as usize).and_then(Option::as_ref) else {
+            return;
+        };
+        irq.set_target_cpu(cpu_id);
+        if irq.remapping_index().is_none() {
+            let destination_id = ostd::smp::hardware_cpu_id(cpu_id);
+            let address = crate::arch::construct_direct_msix_address(destination_id);
+            self.table_bar
+                .write_once((16 * index) as usize + self.table_offset, &address)
+                .unwrap();
+        }
     }
 
     /// Returns a mutable reference to the [`IrqLine`].

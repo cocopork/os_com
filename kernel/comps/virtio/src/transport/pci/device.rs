@@ -232,6 +232,11 @@ impl VirtioTransport for VirtioPciModernTransport {
             self.msix_manager.shared_irq_line()
         };
         irq.on_active(func);
+        #[cfg(target_arch = "x86_64")]
+        if single_interrupt {
+            let cpu = crate::transport::queue_interrupt_cpu(index, ostd::cpu::num_cpus());
+            self.msix_manager.set_vector_target_cpu(vector, cpu);
+        }
         field_ptr!(&self.common_cfg, VirtioPciCommonCfg, queue_select)
             .write_once(&index)
             .unwrap();

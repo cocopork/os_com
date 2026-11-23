@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MPL-2.0
 
 use alloc::boxed::Box;
+use core::sync::atomic::{AtomicBool, AtomicU64};
 
 use align_ext::AlignExt;
 use aster_util::mem_obj_slice::Slice;
@@ -23,6 +24,62 @@ use spin::Once;
 
 use super::{BlockDevice, id::Sid};
 use crate::{BLOCK_SIZE, SECTOR_SIZE, impl_block_device::general_complete_fn, prelude::*};
+
+static BIO_RESUME_PROFILE_SAMPLES: AtomicU64 = AtomicU64::new(0);
+static BIO_RESUME_PROFILE_TICKS: AtomicU64 = AtomicU64::new(0);
+static MODULE_PROFILE_ENABLED: AtomicBool = AtomicBool::new(false);
+static VIRTIO_E2E_PROFILE_SAMPLES: AtomicU64 = AtomicU64::new(0);
+static VIRTIO_E2E_PROFILE_TICKS: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct BioResumeProfileSnapshot {
+    pub samples: u64,
+    pub ticks: u64,
+}
+
+pub fn bio_resume_profile_snapshot() -> BioResumeProfileSnapshot {
+    BioResumeProfileSnapshot {
+        samples: BIO_RESUME_PROFILE_SAMPLES.load(Ordering::Relaxed),
+        ticks: BIO_RESUME_PROFILE_TICKS.load(Ordering::Relaxed),
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ModuleProfileSnapshot {
+    pub virtio_samples: u64,
+    pub virtio_e2e_ticks: u64,
+    pub resume_samples: u64,
+    pub resume_ticks: u64,
+}
+
+pub fn set_module_profile_enabled(enabled: bool) {
+    MODULE_PROFILE_ENABLED.store(enabled, Ordering::Release);
+}
+
+pub fn module_profile_enabled() -> bool {
+    MODULE_PROFILE_ENABLED.load(Ordering::Acquire)
+}
+
+pub fn module_profile_snapshot() -> ModuleProfileSnapshot {
+    ModuleProfileSnapshot {
+        virtio_samples: VIRTIO_E2E_PROFILE_SAMPLES.load(Ordering::Relaxed),
+        virtio_e2e_ticks: VIRTIO_E2E_PROFILE_TICKS.load(Ordering::Relaxed),
+        resume_samples: BIO_RESUME_PROFILE_SAMPLES.load(Ordering::Relaxed),
+        resume_ticks: BIO_RESUME_PROFILE_TICKS.load(Ordering::Relaxed),
+    }
+}
+
+fn record_virtio_e2e(elapsed: u64) {
+    VIRTIO_E2E_PROFILE_TICKS.fetch_add(elapsed, Ordering::Relaxed);
+    VIRTIO_E2E_PROFILE_SAMPLES.fetch_add(1, Ordering::Relaxed);
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ProfiledBioCompletion {
+    pub status: BioStatus,
+    pub virtio_e2e_ticks: u64,
+    pub completion_to_resume_ticks: u64,
+}
 
 /// The unit for block I/O.
 ///
@@ -87,6 +144,12 @@ impl Bio {
             queue_affinity,
             status: AtomicU32::new(BioStatus::Init as u32),
             wait_queue: WaitQueue::new(),
+            resume_profiled: AtomicBool::new(false),
+            completion_tsc: AtomicU64::new(0),
+            virtio_profiled: AtomicBool::new(false),
+            virtio_entry_tsc: AtomicU64::new(0),
+            virtio_elapsed_ticks: AtomicU64::new(0),
+            resume_elapsed_ticks: AtomicU64::new(0),
         });
         Self {
             metadata,
@@ -191,6 +254,22 @@ impl Bio {
         let metadata = io_batch[0].downcast_ref::<BioMetadata>().unwrap();
         Ok(metadata.status())
     }
+
+    /// Submits synchronously while retaining the sampled virtio and wakeup intervals.
+    pub fn submit_and_wait_profiled(
+        self,
+        block_device: &dyn BlockDevice,
+    ) -> Result<ProfiledBioCompletion, BioEnqueueError> {
+        self.metadata.virtio_profiled.store(true, Ordering::Release);
+        self.metadata.resume_profiled.store(true, Ordering::Release);
+        let metadata = self.metadata.clone();
+        let status = self.submit_and_wait(block_device)?;
+        Ok(ProfiledBioCompletion {
+            status,
+            virtio_e2e_ticks: metadata.virtio_elapsed_ticks.load(Ordering::Acquire),
+            completion_to_resume_ticks: metadata.resume_elapsed_ticks.load(Ordering::Acquire),
+        })
+    }
 }
 
 /// The submission queue selected for a `Bio`.
@@ -255,6 +334,16 @@ mod queue_error_tests {
             assert!(matches!(Error::from(error), Error::NotEnoughResources));
         }
     }
+
+    #[ktest]
+    fn module_profile_records_virtio_end_to_end_sample() {
+        set_module_profile_enabled(true);
+        let before = module_profile_snapshot();
+        record_virtio_e2e(ostd::arch::read_tsc());
+        let after = module_profile_snapshot();
+        assert_eq!(after.virtio_samples, before.virtio_samples + 1);
+        assert!(after.virtio_e2e_ticks >= before.virtio_e2e_ticks);
+    }
 }
 
 /// A submitted `Bio` object.
@@ -268,6 +357,20 @@ pub struct SubmittedBio {
 }
 
 impl SubmittedBio {
+    /// Marks this bio for sampled completion-to-resume profiling.
+    pub fn enable_resume_profile(&self) {
+        self.metadata.resume_profiled.store(true, Ordering::Relaxed);
+    }
+
+    /// Marks entry into the virtio device for sampled module-level profiling.
+    pub fn begin_virtio_e2e_profile(&self) {
+        if self.metadata.virtio_profiled.load(Ordering::Acquire) {
+            self.metadata
+                .virtio_entry_tsc
+                .store(ostd::arch::read_tsc(), Ordering::Release);
+        }
+    }
+
     /// Returns the type.
     pub fn type_(&self) -> BioType {
         self.metadata.type_()
@@ -317,6 +420,20 @@ impl SubmittedBio {
             ..
         } = self;
 
+        if metadata.resume_profiled.load(Ordering::Relaxed) {
+            metadata
+                .completion_tsc
+                .store(ostd::arch::read_tsc(), Ordering::Release);
+        }
+        if metadata.virtio_profiled.swap(false, Ordering::AcqRel) {
+            let elapsed = ostd::arch::read_tsc()
+                .wrapping_sub(metadata.virtio_entry_tsc.load(Ordering::Acquire));
+            metadata
+                .virtio_elapsed_ticks
+                .store(elapsed, Ordering::Release);
+            record_virtio_e2e(elapsed);
+        }
+
         // Set the status.
         let result = metadata.status.compare_exchange(
             BioStatus::Submit as u32,
@@ -356,6 +473,12 @@ struct BioMetadata {
     status: AtomicU32,
     /// The wait queue for I/O completion
     wait_queue: WaitQueue,
+    resume_profiled: AtomicBool,
+    completion_tsc: AtomicU64,
+    virtio_profiled: AtomicBool,
+    virtio_entry_tsc: AtomicU64,
+    virtio_elapsed_ticks: AtomicU64,
+    resume_elapsed_ticks: AtomicU64,
 }
 
 impl BioMetadata {
@@ -378,6 +501,14 @@ impl IoCompletion for BioMetadata {
             let status = self.status();
             (status != BioStatus::Submit).then_some(status)
         });
+
+        if self.resume_profiled.swap(false, Ordering::AcqRel) {
+            let completed = self.completion_tsc.load(Ordering::Acquire);
+            let elapsed = ostd::arch::read_tsc().wrapping_sub(completed);
+            self.resume_elapsed_ticks.store(elapsed, Ordering::Release);
+            BIO_RESUME_PROFILE_TICKS.fetch_add(elapsed, Ordering::Relaxed);
+            BIO_RESUME_PROFILE_SAMPLES.fetch_add(1, Ordering::Relaxed);
+        }
 
         match status {
             BioStatus::Complete => Ok(()),

@@ -40,9 +40,15 @@ macro_rules! __log_prefix {
 }
 
 pub mod bio;
+pub use bio::{
+    BioResumeProfileSnapshot, ModuleProfileSnapshot, ProfiledBioCompletion,
+    bio_resume_profile_snapshot, module_profile_enabled, module_profile_snapshot,
+    set_module_profile_enabled,
+};
 mod device_id;
 pub mod id;
 mod impl_block_device;
+pub use impl_block_device::{BlockModuleProfile, record_block_module_profile};
 mod partition;
 mod prelude;
 pub mod request_queue;

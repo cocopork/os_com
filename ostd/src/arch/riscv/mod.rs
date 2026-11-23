@@ -100,6 +100,9 @@ pub fn read_tsc() -> u64 {
     riscv::register::time::read64()
 }
 
+/// Ignores the QEMU PIO profiling marker on architectures without x86 PIO.
+pub fn emit_qemu_profile_marker(_value: u8) {}
+
 /// Reads a hardware generated 64-bit random value.
 ///
 /// Returns `None` if no random value was generated.

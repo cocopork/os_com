@@ -15,6 +15,10 @@ impl HwCpuId {
         // No races because of `_guard`.
         Self(crate::arch::boot::smp::get_current_hart_id())
     }
+
+    pub(crate) fn as_u32(self) -> u32 {
+        self.0
+    }
 }
 
 pub(in crate::arch) static IPI_IRQ: Once<IrqLine> = Once::new();

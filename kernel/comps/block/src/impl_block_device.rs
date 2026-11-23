@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: MPL-2.0
 
+use core::sync::atomic::AtomicU64;
+
 use align_ext::AlignExt;
 use io_util::batch::IoBatch;
 use ostd::mm::{VmIo, VmReader, VmWriter};
@@ -13,6 +15,51 @@ use crate::{
     bio::{BioDirection, is_sector_aligned},
     prelude::*,
 };
+
+const MODULE_PROFILE_REPORT_SAMPLES: u64 = 64;
+static BLOCK_PROFILE_SAMPLES: AtomicU64 = AtomicU64::new(0);
+static BLOCK_PREPARE_TICKS: AtomicU64 = AtomicU64::new(0);
+static BLOCK_BIO_WAIT_TICKS: AtomicU64 = AtomicU64::new(0);
+static BLOCK_POST_TICKS: AtomicU64 = AtomicU64::new(0);
+static BLOCK_TOTAL_TICKS: AtomicU64 = AtomicU64::new(0);
+static BLOCK_VIRTIO_E2E_TICKS: AtomicU64 = AtomicU64::new(0);
+static BLOCK_RESUME_TICKS: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct BlockModuleProfile {
+    pub prepare_ticks: u64,
+    pub bio_wait_ticks: u64,
+    pub post_ticks: u64,
+    pub total_ticks: u64,
+    pub virtio_e2e_ticks: u64,
+    pub completion_to_resume_ticks: u64,
+}
+
+pub fn record_block_module_profile(profile: BlockModuleProfile) {
+    BLOCK_PREPARE_TICKS.fetch_add(profile.prepare_ticks, Ordering::Relaxed);
+    BLOCK_BIO_WAIT_TICKS.fetch_add(profile.bio_wait_ticks, Ordering::Relaxed);
+    BLOCK_POST_TICKS.fetch_add(profile.post_ticks, Ordering::Relaxed);
+    BLOCK_TOTAL_TICKS.fetch_add(profile.total_ticks, Ordering::Relaxed);
+    BLOCK_VIRTIO_E2E_TICKS.fetch_add(profile.virtio_e2e_ticks, Ordering::Relaxed);
+    BLOCK_RESUME_TICKS.fetch_add(profile.completion_to_resume_ticks, Ordering::Relaxed);
+    let samples = BLOCK_PROFILE_SAMPLES.fetch_add(1, Ordering::Relaxed) + 1;
+    if !samples.is_multiple_of(MODULE_PROFILE_REPORT_SAMPLES) {
+        return;
+    }
+    ostd::error!(
+        "[BLOCK_MODULE_PROFILE] tsc_hz={} samples={} prepare_ticks={} bio_wait_ticks={} post_ticks={} total_ticks={} virtio_samples={} virtio_e2e_ticks={} resume_samples={} resume_ticks={}",
+        ostd::arch::tsc_freq(),
+        samples,
+        BLOCK_PREPARE_TICKS.load(Ordering::Relaxed),
+        BLOCK_BIO_WAIT_TICKS.load(Ordering::Relaxed),
+        BLOCK_POST_TICKS.load(Ordering::Relaxed),
+        BLOCK_TOTAL_TICKS.load(Ordering::Relaxed),
+        samples,
+        BLOCK_VIRTIO_E2E_TICKS.load(Ordering::Relaxed),
+        samples,
+        BLOCK_RESUME_TICKS.load(Ordering::Relaxed),
+    );
+}
 
 /// Implements several commonly used APIs for the block device to conveniently
 /// read and write block(s), including the scatter/gather multi-segment variants
@@ -206,86 +253,20 @@ impl VmIo for dyn BlockDevice {
 
     /// Writes consecutive bytes of several sectors in size.
     fn write(&self, offset: usize, reader: &mut VmReader) -> ostd::Result<()> {
-        let write_len = reader.remain();
-        if write_len == 0 {
-            return Ok(());
-        }
-
-        let request_end = offset.checked_add(write_len).ok_or(ostd::Error::Overflow)?;
-        let device_size = self.metadata().nr_sectors * SECTOR_SIZE;
-        if request_end > device_size {
-            return Err(ostd::Error::InvalidArgs);
-        }
-
-        let aligned_offset = offset.align_down(SECTOR_SIZE);
-        let aligned_end = request_end.align_up(SECTOR_SIZE);
-
-        // If the write range is not sector-aligned, preserve the bytes in the
-        // surrounding sectors that are outside the user-requested range.
-        // The request is split into at most three segments: a read-modify-write
-        // first sector, sector-aligned middle sectors written directly from the
-        // reader, and a read-modify-write last sector. Each segment consumes
-        // only the bytes that belong to it so later segments see the remaining
-        // input bytes.
-
-        let need_read_first_sector = !is_sector_aligned(offset);
-        let mut middle_sector_offset = aligned_offset;
-        let last_sector_offset = (request_end - 1).align_down(SECTOR_SIZE);
-        let need_read_last_sector = {
-            let is_last_sector_aligned = is_sector_aligned(request_end);
-            let is_the_same_sector = last_sector_offset == aligned_offset;
-            !(is_last_sector_aligned || need_read_first_sector && is_the_same_sector)
-        };
-        let middle_end = if need_read_last_sector {
-            last_sector_offset
-        } else {
-            aligned_end
-        };
-
-        let mut bio_segments = Vec::new();
-
-        if need_read_first_sector {
-            let first_segment = self.read_sector_for_write(aligned_offset)?;
-            let first_segment_offset = offset - aligned_offset;
-            let first_write_len = (SECTOR_SIZE - first_segment_offset).min(write_len);
-            let mut first_reader = reader.clone();
-            first_reader.limit(first_write_len);
-            first_segment.write(first_segment_offset, &mut first_reader)?;
-            reader.skip(first_write_len);
-            bio_segments.push(first_segment);
-            middle_sector_offset += SECTOR_SIZE;
-        }
-        if middle_sector_offset < middle_end {
-            let middle_len = middle_end - middle_sector_offset;
-            let middle_segment = alloc_write_segment(middle_sector_offset, middle_len);
-            let mut middle_reader = reader.clone();
-            middle_reader.limit(middle_len);
-            middle_segment.write(0, &mut middle_reader)?;
-            reader.skip(middle_len);
-            bio_segments.push(middle_segment);
-        }
-        if need_read_last_sector {
-            let last_segment = self.read_sector_for_write(last_sector_offset)?;
-            last_segment.write(0, reader)?;
-            bio_segments.push(last_segment);
-        }
-        debug_assert!(!reader.has_remain());
-
-        let bio = Bio::new(
-            BioType::Write,
-            Sid::from_offset(aligned_offset),
-            bio_segments,
-            None,
-        );
-        let status = bio.submit_and_wait(self)?;
-        match status {
-            BioStatus::Complete => Ok(()),
-            _ => Err(ostd::Error::IoError),
-        }
+        write_bytes_impl(self, offset, reader, false).map(|_| ())
     }
 }
 
 impl dyn BlockDevice {
+    /// Writes bytes and returns exact module intervals for this request.
+    pub fn write_with_module_profile(
+        &self,
+        offset: usize,
+        reader: &mut VmReader,
+    ) -> ostd::Result<BlockModuleProfile> {
+        write_bytes_impl(self, offset, reader, true)?.ok_or(ostd::Error::IoError)
+    }
+
     /// Asynchronously writes consecutive bytes of several sectors in size.
     pub fn write_bytes_async(
         &self,
@@ -342,6 +323,103 @@ impl dyn BlockDevice {
 
         Ok(write_segment)
     }
+}
+
+fn write_bytes_impl(
+    device: &dyn BlockDevice,
+    offset: usize,
+    reader: &mut VmReader,
+    profile: bool,
+) -> ostd::Result<Option<BlockModuleProfile>> {
+    let started = profile.then(ostd::arch::read_tsc);
+    let write_len = reader.remain();
+    if write_len == 0 {
+        return Ok(profile.then(BlockModuleProfile::default));
+    }
+
+    let request_end = offset.checked_add(write_len).ok_or(ostd::Error::Overflow)?;
+    let device_size = device.metadata().nr_sectors * SECTOR_SIZE;
+    if request_end > device_size {
+        return Err(ostd::Error::InvalidArgs);
+    }
+
+    let aligned_offset = offset.align_down(SECTOR_SIZE);
+    let aligned_end = request_end.align_up(SECTOR_SIZE);
+    let need_read_first_sector = !is_sector_aligned(offset);
+    let mut middle_sector_offset = aligned_offset;
+    let last_sector_offset = (request_end - 1).align_down(SECTOR_SIZE);
+    let need_read_last_sector = {
+        let is_last_sector_aligned = is_sector_aligned(request_end);
+        let is_the_same_sector = last_sector_offset == aligned_offset;
+        !(is_last_sector_aligned || need_read_first_sector && is_the_same_sector)
+    };
+    let middle_end = if need_read_last_sector {
+        last_sector_offset
+    } else {
+        aligned_end
+    };
+
+    let mut bio_segments = Vec::new();
+    if need_read_first_sector {
+        let first_segment = device.read_sector_for_write(aligned_offset)?;
+        let first_segment_offset = offset - aligned_offset;
+        let first_write_len = (SECTOR_SIZE - first_segment_offset).min(write_len);
+        let mut first_reader = reader.clone();
+        first_reader.limit(first_write_len);
+        first_segment.write(first_segment_offset, &mut first_reader)?;
+        reader.skip(first_write_len);
+        bio_segments.push(first_segment);
+        middle_sector_offset += SECTOR_SIZE;
+    }
+    if middle_sector_offset < middle_end {
+        let middle_len = middle_end - middle_sector_offset;
+        let middle_segment = alloc_write_segment(middle_sector_offset, middle_len);
+        let mut middle_reader = reader.clone();
+        middle_reader.limit(middle_len);
+        middle_segment.write(0, &mut middle_reader)?;
+        reader.skip(middle_len);
+        bio_segments.push(middle_segment);
+    }
+    if need_read_last_sector {
+        let last_segment = device.read_sector_for_write(last_sector_offset)?;
+        last_segment.write(0, reader)?;
+        bio_segments.push(last_segment);
+    }
+    debug_assert!(!reader.has_remain());
+
+    let bio = Bio::new(
+        BioType::Write,
+        Sid::from_offset(aligned_offset),
+        bio_segments,
+        None,
+    );
+    let prepared = started.map(|_| ostd::arch::read_tsc());
+    let (status, virtio_e2e_ticks, completion_to_resume_ticks) = if profile {
+        let completion = bio.submit_and_wait_profiled(device)?;
+        (
+            completion.status,
+            completion.virtio_e2e_ticks,
+            completion.completion_to_resume_ticks,
+        )
+    } else {
+        (bio.submit_and_wait(device)?, 0, 0)
+    };
+    let waited = started.map(|_| ostd::arch::read_tsc());
+    if status != BioStatus::Complete {
+        return Err(ostd::Error::IoError);
+    }
+    let finished = started.map(|_| ostd::arch::read_tsc());
+    Ok(match (started, prepared, waited, finished) {
+        (Some(started), Some(prepared), Some(waited), Some(finished)) => Some(BlockModuleProfile {
+            prepare_ticks: prepared.wrapping_sub(started),
+            bio_wait_ticks: waited.wrapping_sub(prepared),
+            post_ticks: finished.wrapping_sub(waited),
+            total_ticks: finished.wrapping_sub(started),
+            virtio_e2e_ticks,
+            completion_to_resume_ticks,
+        }),
+        _ => None,
+    })
 }
 
 fn alloc_write_segment(offset: usize, len: usize) -> BioSegment {

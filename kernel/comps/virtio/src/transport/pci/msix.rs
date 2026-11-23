@@ -3,6 +3,8 @@
 use alloc::vec::Vec;
 
 use aster_pci::capability::msix::CapabilityMsixData;
+#[cfg(target_arch = "x86_64")]
+use ostd::cpu::CpuId;
 use ostd::irq::IrqLine;
 
 pub struct VirtioMsixManager {
@@ -62,6 +64,11 @@ impl VirtioMsixManager {
         let vector = self.unused_msix_vectors.pop()?;
         self.used_msix_vectors.push(vector);
         Some((vector, self.msix.irq_mut(vector as usize).unwrap()))
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    pub fn set_vector_target_cpu(&mut self, vector: u16, cpu_id: CpuId) {
+        self.msix.set_interrupt_target_cpu(vector, cpu_id);
     }
 
     /// Returns true if MSI-X is enabled.

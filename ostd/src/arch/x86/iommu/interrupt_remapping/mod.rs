@@ -23,8 +23,14 @@ impl IrtEntryHandle {
     }
 
     pub fn enable(&self, vector: u32) {
-        self.table
-            .set_entry(self.index, table::IrtEntry::new_enabled(vector));
+        self.enable_on_cpu(vector, 0);
+    }
+
+    pub fn enable_on_cpu(&self, vector: u32, destination_id: u32) {
+        self.table.set_entry(
+            self.index,
+            table::IrtEntry::new_enabled(vector, destination_id),
+        );
 
         IOMMU_REGS
             .get()

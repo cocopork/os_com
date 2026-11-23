@@ -166,8 +166,8 @@ impl IrtEntry {
     /// Creates an enabled entry with no validation,
     ///
     /// DST = 0, IM = 0, DLM = 0, TM = 0, RH = 0, DM = 0, FPD = 1, P = 1
-    pub(super) fn new_enabled(vector: u32) -> Self {
-        Self(0b11 | ((vector as u128) << 16))
+    pub(super) fn new_enabled(vector: u32, destination_id: u32) -> Self {
+        Self(0b11 | ((vector as u128) << 16) | ((destination_id as u128) << 32))
     }
 
     fn as_raw_u64(&self) -> [u64; 2] {

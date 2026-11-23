@@ -140,6 +140,23 @@ pub fn read_tsc() -> u64 {
     unsafe { _rdtsc() }
 }
 
+/// Emits a low-frequency profiling marker that QEMU exposes as a PIO exit.
+pub fn emit_qemu_profile_marker(value: u8) {
+    const PROFILE_MARKER_PORT: u16 = 0x5050;
+
+    // SAFETY: The profiling QEMU configuration has no device at this otherwise
+    // unused port, so the write can only cause a VM exit and has no device side
+    // effects. Callers enable this only in diagnostic images.
+    unsafe {
+        core::arch::asm!(
+            "out dx, al",
+            in("dx") PROFILE_MARKER_PORT,
+            in("al") value,
+            options(nomem, nostack, preserves_flags),
+        );
+    }
+}
+
 /// Reads a hardware generated 64-bit random value.
 ///
 /// Returns `None` if no random value was generated.

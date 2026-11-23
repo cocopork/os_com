@@ -13,6 +13,10 @@ impl HwCpuId {
         // TODO: Support SMP in LoongArch.
         Self(0)
     }
+
+    pub(crate) fn as_u32(self) -> u32 {
+        self.0
+    }
 }
 
 /// Sends a general inter-processor interrupt (IPI) to the specified CPU.

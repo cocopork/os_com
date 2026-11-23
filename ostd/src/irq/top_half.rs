@@ -13,6 +13,7 @@ use crate::{
         irq::{HwIrqLine, IRQ_NUM_MAX, IRQ_NUM_MIN, IrqRemapping},
         trap::TrapFrame,
     },
+    cpu::CpuId,
     prelude::*,
     sync::{RwLock, SpinLock, WriteIrqDisabled},
 };
@@ -106,6 +107,14 @@ impl IrqLine {
     /// not supported by the architecture.
     pub fn remapping_index(&self) -> Option<u16> {
         self.inner.remapping.remapping_index()
+    }
+
+    /// Routes this interrupt to a target CPU when the architecture supports it.
+    pub fn set_target_cpu(&self, cpu_id: CpuId) {
+        let destination_id = crate::smp::hardware_cpu_id(cpu_id);
+        self.inner
+            .remapping
+            .set_target_cpu(self.num(), destination_id);
     }
 }
 
