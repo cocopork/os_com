@@ -19,6 +19,10 @@ impl HwCpuId {
         let apic = apic::get_or_init(guard);
         Self(apic.id())
     }
+
+    pub(crate) fn as_u32(self) -> u32 {
+        self.0
+    }
 }
 
 static IPI_IRQ: Once<IrqLine> = Once::new();

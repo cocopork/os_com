@@ -7,6 +7,7 @@ use aster_pci::cfg_space::BarAccess;
 use aster_util::safe_ptr::SafePtr;
 use ostd::{
     arch::device::io_port::{PortRead, PortWrite},
+    cpu::CpuId,
     io::IoMem,
     irq::IrqCallbackFunction,
     mm::{PodOnce, dma::DmaCoherent},
@@ -21,6 +22,10 @@ use crate::{
 
 pub mod mmio;
 pub mod pci;
+
+pub(crate) fn queue_interrupt_cpu(queue_index: u16, cpu_count: usize) -> CpuId {
+    CpuId::try_from(usize::from(queue_index) % cpu_count).unwrap()
+}
 
 /// The transport of virtio device. Virtio device can use this transport to:
 /// 1. Set device status.

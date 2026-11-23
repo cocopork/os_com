@@ -129,6 +129,11 @@ pub(crate) fn init() -> Option<RangeInclusive<u8>> {
 
 pub(crate) const MSIX_DEFAULT_MSG_ADDR: u32 = 0xFEE0_0000;
 
+pub(crate) fn construct_direct_msix_address(destination_id: u32) -> u32 {
+    assert!(destination_id <= u8::MAX.into());
+    MSIX_DEFAULT_MSG_ADDR | (destination_id << 12)
+}
+
 pub(crate) fn construct_remappable_msix_address(remapping_index: u32) -> u32 {
     // Use remappable format. The bits[4:3] should be always set to 1 according to the manual.
     let mut address = MSIX_DEFAULT_MSG_ADDR | 0b1_1000;

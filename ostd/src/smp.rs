@@ -11,7 +11,7 @@ use spin::Once;
 
 use crate::{
     arch::{irq::HwCpuId, trap::TrapFrame},
-    cpu::{CpuSet, PinCurrentCpu},
+    cpu::{CpuId, CpuSet, PinCurrentCpu},
     cpu_local, irq,
     sync::SpinLock,
     util::id_set::Id,
@@ -34,6 +34,11 @@ use crate::{
 pub fn inter_processor_call(targets: &CpuSet, f: fn()) {
     let ipi_sender = IPI_SENDER.get().unwrap();
     ipi_sender.inter_processor_call(targets, f);
+}
+
+/// Returns the architecture-specific hardware ID for an online CPU.
+pub fn hardware_cpu_id(cpu_id: CpuId) -> u32 {
+    IPI_SENDER.get().unwrap().hw_cpu_ids[cpu_id.as_usize()].as_u32()
 }
 
 /// A sender that carries necessary information to send inter-processor interrupts.
@@ -91,7 +96,7 @@ cpu_local! {
 /// inter-processor interrupts.
 pub(crate) unsafe fn do_inter_processor_call(_trapframe: &TrapFrame) {
     // No races because we are in IRQs.
-    let this_cpu_id = crate::cpu::CpuId::current_racy();
+    let this_cpu_id = CpuId::current_racy();
 
     let mut queue = CALL_QUEUES.get_on_cpu(this_cpu_id).lock();
     while let Some(f) = queue.pop_front() {

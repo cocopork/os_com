@@ -37,4 +37,10 @@ impl IrqRemapping {
     pub(crate) fn remapping_index(&self) -> Option<u16> {
         Some(self.entry.get()?.index())
     }
+
+    pub(crate) fn set_target_cpu(&self, irq_num: u8, destination_id: u32) {
+        if let Some(entry) = self.entry.get() {
+            entry.enable_on_cpu(irq_num as u32, destination_id);
+        }
+    }
 }

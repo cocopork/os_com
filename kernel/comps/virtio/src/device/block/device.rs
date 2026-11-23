@@ -10,7 +10,7 @@ use alloc::{
 };
 use core::{
     fmt::Debug,
-    sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering},
+    sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering},
 };
 
 use aster_block::{
@@ -174,16 +174,18 @@ impl BlockDevice {
         let queue = &self.device.queues[usize::from(queue_id)];
         let _forwarder = ForwardingGuard::new(&queue.counters);
         let request = queue.staging.dequeue();
-        match request.type_() {
-            BioType::Read => queue.read(request),
-            BioType::Write => queue.write(request),
-            BioType::Flush if self.device.features.contains(BlockFeatures::FLUSH) => {
-                debug_assert_eq!(queue_id, 0);
-                queue.flush(request);
-            }
-            BioType::Flush => request.into_bios().for_each(|bio| {
-                bio.complete(BioStatus::Complete);
-            }),
+        submit_request(queue_id, queue, self.device.features, request);
+    }
+
+    /// Selects whether callers submit requests directly to the virtqueue.
+    pub fn set_direct_submit(&self, enabled: bool) {
+        self.device.direct_submit.store(enabled, Ordering::Release);
+    }
+
+    /// Enables sampled queue-stage profiling for this device.
+    pub fn set_profile_enabled(&self, enabled: bool) {
+        for queue in &self.device.queues {
+            queue.set_profile_enabled(enabled);
         }
     }
 
@@ -208,13 +210,22 @@ impl BlockDevice {
 
 impl aster_block::BlockDevice for BlockDevice {
     fn enqueue(&self, bio: SubmittedBio) -> Result<(), BioEnqueueError> {
+        bio.begin_virtio_e2e_profile();
+        if self.device.direct_submit.load(Ordering::Acquire) {
+            return submit_direct_on_queue(
+                &self.device.queues,
+                self.device.features,
+                bio,
+                CpuId::current_racy().as_usize(),
+            );
+        }
         enqueue_on_queue(&self.device.queues, bio, CpuId::current_racy().as_usize())
     }
 
     fn metadata(&self) -> BlockDeviceMeta {
         BlockDeviceMeta {
             max_nr_segments_per_bio: self.device.max_nr_segments_per_bio,
-            nr_sectors: self.device.config_manager.capacity_sectors(),
+            nr_sectors: self.device.cached_nr_sectors.load(Ordering::Acquire),
             nr_submission_queues: self.nr_submission_queues(),
         }
     }
@@ -282,8 +293,10 @@ impl aster_block::BlockDevice for BlockDevice {
 #[derive(Debug)]
 struct DeviceInner {
     config_manager: ConfigManager<VirtioBlockConfig>,
+    cached_nr_sectors: AtomicUsize,
     features: BlockFeatures,
     queues: Vec<Arc<VirtioBlockQueue>>,
+    direct_submit: AtomicBool,
     max_nr_segments_per_bio: usize,
     transport: SpinLock<Box<dyn VirtioTransport>>,
 }
@@ -336,8 +349,10 @@ impl DeviceInner {
             .unwrap();
         let device = Arc::new(Self {
             config_manager,
+            cached_nr_sectors: AtomicUsize::new(config.capacity as usize),
             features,
             queues,
+            direct_submit: AtomicBool::new(false),
             max_nr_segments_per_bio,
             transport: SpinLock::new(transport),
         });
@@ -357,7 +372,7 @@ impl DeviceInner {
                     Box::new(move |_: &TrapFrame| {
                         queue.handle_irq();
                     }),
-                    false,
+                    true,
                 )?;
             }
             transport.finish_init();
@@ -367,6 +382,8 @@ impl DeviceInner {
     }
 
     fn handle_config_change(&self) {
+        self.cached_nr_sectors
+            .store(self.config_manager.capacity_sectors(), Ordering::Release);
         info!("block device config space change");
     }
 }
@@ -416,6 +433,41 @@ fn enqueue_on_queue(
     Ok(())
 }
 
+fn submit_direct_on_queue(
+    queues: &[Arc<VirtioBlockQueue>],
+    features: BlockFeatures,
+    bio: SubmittedBio,
+    cpu: usize,
+) -> Result<(), BioEnqueueError> {
+    let index = select_queue(bio.type_(), bio.queue_affinity(), cpu, queues.len() as u16)?;
+    let queue = &queues[index];
+    if bio.segments().len() > queue.staging.max_nr_segments_per_bio() {
+        return Err(BioEnqueueError::TooBig);
+    }
+    let _submitter = ForwardingGuard::new(&queue.counters);
+    submit_request(index as u16, queue, features, BioRequest::from(bio));
+    Ok(())
+}
+
+fn submit_request(
+    queue_id: u16,
+    queue: &VirtioBlockQueue,
+    features: BlockFeatures,
+    request: BioRequest,
+) {
+    match request.type_() {
+        BioType::Read => queue.read(request),
+        BioType::Write => queue.write(request),
+        BioType::Flush if features.contains(BlockFeatures::FLUSH) => {
+            debug_assert_eq!(queue_id, 0);
+            queue.flush(request);
+        }
+        BioType::Flush => request.into_bios().for_each(|bio| {
+            bio.complete(BioStatus::Complete);
+        }),
+    }
+}
+
 /// Per-queue counters for diagnosing submission balance and backpressure.
 pub use aster_block::BlockQueueDiagnostics as VirtioBlockQueueDiagnostics;
 
@@ -432,6 +484,169 @@ struct QueueCounters {
     peak_forwarders: AtomicUsize,
     irq_completions: AtomicUsize,
     in_flight_requests: AtomicUsize,
+}
+
+const PROFILE_SAMPLE_INTERVAL: usize = 1024;
+const PROFILE_REPORT_INTERVAL: usize = 8192;
+const IRQ_ENTRY_MARKER_INTERVAL: usize = 257;
+
+#[derive(Clone, Copy, Debug, Default)]
+struct QueueProfileSnapshot {
+    submit_samples: u64,
+    submit_id_alloc_ticks: u64,
+    submit_dma_prepare_ticks: u64,
+    submit_vq_acquire_ticks: u64,
+    submit_vq_add_ticks: u64,
+    submit_owner_publish_ticks: u64,
+    submit_should_notify_ticks: u64,
+    submit_device_notify_ticks: u64,
+    submit_publish_notify_ticks: u64,
+    submit_total_ticks: u64,
+    completion_samples: u64,
+    completion_wait_ticks: u64,
+    completion_pop_owner_ticks: u64,
+    completion_descriptor_wake_ticks: u64,
+    completion_response_id_ticks: u64,
+    completion_bio_complete_ticks: u64,
+    completion_total_ticks: u64,
+}
+
+#[derive(Debug, Default)]
+struct QueueProfileCounters {
+    enabled: AtomicBool,
+    submit_sequence: AtomicUsize,
+    irq_entry_sequence: AtomicUsize,
+    submit_samples: AtomicU64,
+    submit_id_alloc_ticks: AtomicU64,
+    submit_dma_prepare_ticks: AtomicU64,
+    submit_vq_acquire_ticks: AtomicU64,
+    submit_vq_add_ticks: AtomicU64,
+    submit_owner_publish_ticks: AtomicU64,
+    submit_should_notify_ticks: AtomicU64,
+    submit_device_notify_ticks: AtomicU64,
+    submit_publish_notify_ticks: AtomicU64,
+    submit_total_ticks: AtomicU64,
+    completion_samples: AtomicU64,
+    completion_wait_ticks: AtomicU64,
+    completion_pop_owner_ticks: AtomicU64,
+    completion_descriptor_wake_ticks: AtomicU64,
+    completion_response_id_ticks: AtomicU64,
+    completion_bio_complete_ticks: AtomicU64,
+    completion_total_ticks: AtomicU64,
+}
+
+impl QueueProfileCounters {
+    fn mark_irq_entry(&self, queue_index: u16) {
+        if self.enabled.load(Ordering::Relaxed)
+            && self
+                .irq_entry_sequence
+                .fetch_add(1, Ordering::Relaxed)
+                .is_multiple_of(IRQ_ENTRY_MARKER_INTERVAL)
+        {
+            ostd::arch::emit_qemu_profile_marker(queue_index as u8);
+        }
+    }
+
+    fn should_sample_submit(&self) -> bool {
+        self.enabled.load(Ordering::Relaxed)
+            && self.submit_sequence.fetch_add(1, Ordering::Relaxed) % PROFILE_SAMPLE_INTERVAL == 0
+    }
+
+    fn record_submit(&self, profile: WriteRequestProfile) {
+        self.submit_samples.fetch_add(1, Ordering::Relaxed);
+        self.submit_id_alloc_ticks
+            .fetch_add(profile.id_alloc_ticks, Ordering::Relaxed);
+        self.submit_dma_prepare_ticks
+            .fetch_add(profile.dma_prepare_ticks, Ordering::Relaxed);
+        self.submit_vq_acquire_ticks
+            .fetch_add(profile.vq_acquire_ticks, Ordering::Relaxed);
+        self.submit_vq_add_ticks
+            .fetch_add(profile.vq_add_ticks, Ordering::Relaxed);
+        self.submit_owner_publish_ticks
+            .fetch_add(profile.owner_publish_ticks, Ordering::Relaxed);
+        self.submit_should_notify_ticks
+            .fetch_add(profile.should_notify_ticks, Ordering::Relaxed);
+        self.submit_device_notify_ticks
+            .fetch_add(profile.device_notify_ticks, Ordering::Relaxed);
+        self.submit_publish_notify_ticks
+            .fetch_add(profile.publish_notify_ticks, Ordering::Relaxed);
+        self.submit_total_ticks.fetch_add(
+            ostd::arch::read_tsc().wrapping_sub(profile.submit_started),
+            Ordering::Relaxed,
+        );
+    }
+
+    fn record_completion(
+        &self,
+        profile: WriteRequestProfile,
+        started: u64,
+        pop_owner_done: u64,
+        descriptor_wake_done: u64,
+        response_id_done: u64,
+        bio_complete_done: u64,
+    ) {
+        self.completion_samples.fetch_add(1, Ordering::Relaxed);
+        self.completion_wait_ticks.fetch_add(
+            started.wrapping_sub(profile.completion_wait_started),
+            Ordering::Relaxed,
+        );
+        self.completion_pop_owner_ticks
+            .fetch_add(pop_owner_done.wrapping_sub(started), Ordering::Relaxed);
+        self.completion_descriptor_wake_ticks.fetch_add(
+            descriptor_wake_done.wrapping_sub(pop_owner_done),
+            Ordering::Relaxed,
+        );
+        self.completion_response_id_ticks.fetch_add(
+            response_id_done.wrapping_sub(descriptor_wake_done),
+            Ordering::Relaxed,
+        );
+        self.completion_bio_complete_ticks.fetch_add(
+            bio_complete_done.wrapping_sub(response_id_done),
+            Ordering::Relaxed,
+        );
+        self.completion_total_ticks
+            .fetch_add(bio_complete_done.wrapping_sub(started), Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> QueueProfileSnapshot {
+        QueueProfileSnapshot {
+            submit_samples: self.submit_samples.load(Ordering::Relaxed),
+            submit_id_alloc_ticks: self.submit_id_alloc_ticks.load(Ordering::Relaxed),
+            submit_dma_prepare_ticks: self.submit_dma_prepare_ticks.load(Ordering::Relaxed),
+            submit_vq_acquire_ticks: self.submit_vq_acquire_ticks.load(Ordering::Relaxed),
+            submit_vq_add_ticks: self.submit_vq_add_ticks.load(Ordering::Relaxed),
+            submit_owner_publish_ticks: self.submit_owner_publish_ticks.load(Ordering::Relaxed),
+            submit_should_notify_ticks: self.submit_should_notify_ticks.load(Ordering::Relaxed),
+            submit_device_notify_ticks: self.submit_device_notify_ticks.load(Ordering::Relaxed),
+            submit_publish_notify_ticks: self.submit_publish_notify_ticks.load(Ordering::Relaxed),
+            submit_total_ticks: self.submit_total_ticks.load(Ordering::Relaxed),
+            completion_samples: self.completion_samples.load(Ordering::Relaxed),
+            completion_wait_ticks: self.completion_wait_ticks.load(Ordering::Relaxed),
+            completion_pop_owner_ticks: self.completion_pop_owner_ticks.load(Ordering::Relaxed),
+            completion_descriptor_wake_ticks: self
+                .completion_descriptor_wake_ticks
+                .load(Ordering::Relaxed),
+            completion_response_id_ticks: self.completion_response_id_ticks.load(Ordering::Relaxed),
+            completion_bio_complete_ticks: self
+                .completion_bio_complete_ticks
+                .load(Ordering::Relaxed),
+            completion_total_ticks: self.completion_total_ticks.load(Ordering::Relaxed),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct WriteRequestProfile {
+    submit_started: u64,
+    completion_wait_started: u64,
+    id_alloc_ticks: u64,
+    dma_prepare_ticks: u64,
+    vq_acquire_ticks: u64,
+    vq_add_ticks: u64,
+    owner_publish_ticks: u64,
+    should_notify_ticks: u64,
+    device_notify_ticks: u64,
+    publish_notify_ticks: u64,
 }
 
 struct ForwardingGuard<'a>(&'a QueueCounters);
@@ -453,6 +668,7 @@ impl Drop for ForwardingGuard<'_> {
 }
 
 struct VirtioBlockQueue {
+    index: u16,
     staging: BioRequestSingleQueue,
     // Lock order is always virtqueue -> submitted_requests. Both locks disable
     // local IRQs, so completion cannot interrupt a local submitter holding either.
@@ -465,6 +681,7 @@ struct VirtioBlockQueue {
     submitted_requests: SpinLock<BTreeMap<u16, SubmittedRequest>, LocalIrqDisabled>,
     descriptor_waiters: WaitQueue,
     counters: QueueCounters,
+    profile: QueueProfileCounters,
 }
 
 impl Debug for VirtioBlockQueue {
@@ -499,6 +716,7 @@ impl VirtioBlockQueue {
             .map_err(VirtioDeviceError::ResourceAlloc)?,
         );
         Ok(Self {
+            index,
             // Keep the aggregation bound independent of queue depth; reserve
             // header/status descriptors even for fully fragmented data DMA.
             staging: BioRequestSingleQueue::with_max_nr_segments_per_bio(
@@ -512,7 +730,57 @@ impl VirtioBlockQueue {
             submitted_requests: SpinLock::new(BTreeMap::new()),
             descriptor_waiters: WaitQueue::new(),
             counters: QueueCounters::default(),
+            profile: QueueProfileCounters::default(),
         })
+    }
+
+    fn set_profile_enabled(&self, enabled: bool) {
+        self.profile.enabled.store(enabled, Ordering::Release);
+    }
+
+    fn profile_snapshot(&self) -> QueueProfileSnapshot {
+        self.profile.snapshot()
+    }
+
+    fn maybe_report_profile(&self, completed: usize) {
+        if !self.profile.enabled.load(Ordering::Relaxed)
+            || (completed != 1 && !completed.is_multiple_of(PROFILE_REPORT_INTERVAL))
+        {
+            return;
+        }
+        let profile = self.profile.snapshot();
+        let queue = self.diagnostics();
+        let resume = aster_block::bio_resume_profile_snapshot();
+        ostd::error!(
+            "[VIRTIO_PROFILE] queue={} irq_cpu={} tsc_hz={} completions={} submitted_bios={} descriptor_wait_count={} descriptor_wait_ticks={} max_staging_depth={} submit_samples={} submit_id_alloc_ticks={} submit_dma_prepare_ticks={} submit_vq_acquire_ticks={} submit_vq_add_ticks={} submit_owner_publish_ticks={} submit_should_notify_ticks={} submit_device_notify_ticks={} submit_publish_notify_ticks={} submit_total_ticks={} completion_samples={} completion_wait_ticks={} completion_pop_owner_ticks={} completion_descriptor_wake_ticks={} completion_response_id_ticks={} completion_bio_complete_ticks={} completion_total_ticks={} resume_samples={} resume_ticks={}",
+            self.index,
+            CpuId::current_racy().as_usize(),
+            ostd::arch::tsc_freq(),
+            completed,
+            queue.submitted_bios,
+            queue.descriptor_wait_count,
+            queue.descriptor_wait_ticks,
+            queue.max_sampled_staging_depth,
+            profile.submit_samples,
+            profile.submit_id_alloc_ticks,
+            profile.submit_dma_prepare_ticks,
+            profile.submit_vq_acquire_ticks,
+            profile.submit_vq_add_ticks,
+            profile.submit_owner_publish_ticks,
+            profile.submit_should_notify_ticks,
+            profile.submit_device_notify_ticks,
+            profile.submit_publish_notify_ticks,
+            profile.submit_total_ticks,
+            profile.completion_samples,
+            profile.completion_wait_ticks,
+            profile.completion_pop_owner_ticks,
+            profile.completion_descriptor_wake_ticks,
+            profile.completion_response_id_ticks,
+            profile.completion_bio_complete_ticks,
+            profile.completion_total_ticks,
+            resume.samples,
+            resume.ticks,
+        );
     }
 
     fn diagnostics(&self) -> VirtioBlockQueueDiagnostics {
@@ -570,7 +838,7 @@ impl VirtioBlockQueue {
         &self,
         queue: &mut VirtQueue,
         token: u16,
-        request: SubmittedRequest,
+        mut request: SubmittedRequest,
         notify_fn: impl FnOnce(&mut VirtQueue),
     ) {
         let bios = request.bio_request.bios().count();
@@ -580,6 +848,11 @@ impl VirtioBlockQueue {
             .flat_map(|bio| bio.segments())
             .map(|segment| segment.nblocks())
             .sum::<usize>();
+        let publish_started = request.profile.map(|_| ostd::arch::read_tsc());
+        if let Some(profile) = request.profile.as_mut() {
+            profile.completion_wait_started = publish_started.unwrap();
+        }
+        let request_profile = request.profile;
         {
             let mut submitted = self.submitted_requests.lock();
             let previous = submitted.insert(token, request);
@@ -596,18 +869,35 @@ impl VirtioBlockQueue {
         self.counters
             .submitted_pages
             .fetch_add(pages, Ordering::Relaxed);
-        if queue.should_notify() {
+        let owner_publish_done = request_profile.map(|_| ostd::arch::read_tsc());
+        let should_notify = queue.should_notify();
+        let should_notify_done = request_profile.map(|_| ostd::arch::read_tsc());
+        if should_notify {
             notify_fn(queue);
+        }
+        let device_notify_done = request_profile.map(|_| ostd::arch::read_tsc());
+        if let Some(mut profile) = request_profile {
+            let publish_started = publish_started.expect("profile start must exist");
+            let owner_publish_done = owner_publish_done.expect("profile end must exist");
+            let should_notify_done = should_notify_done.expect("profile end must exist");
+            let device_notify_done = device_notify_done.expect("profile end must exist");
+            profile.owner_publish_ticks = owner_publish_done.wrapping_sub(publish_started);
+            profile.should_notify_ticks = should_notify_done.wrapping_sub(owner_publish_done);
+            profile.device_notify_ticks = device_notify_done.wrapping_sub(should_notify_done);
+            profile.publish_notify_ticks = device_notify_done.wrapping_sub(publish_started);
+            self.profile.record_submit(profile);
         }
     }
 
     /// Handles the IRQ issued from the device.
     fn handle_irq(&self) {
+        self.profile.mark_irq_entry(self.index);
         info!("block device handle IRQ");
         // When we enter the IRQs handling function,
         // IRQs have already been disabled,
         // so there is no need to call `disable_irq`.
         loop {
+            let completion_started = ostd::arch::read_tsc();
             // Pops the complete request
             let complete_request = {
                 let mut queue = self.queue.lock();
@@ -629,11 +919,16 @@ impl VirtioBlockQueue {
                     .store(in_flight, Ordering::Relaxed);
                 request
             };
+            let pop_owner_done = ostd::arch::read_tsc();
+            let request_profile = complete_request.profile;
 
             self.descriptor_waiters.wake_all();
-            self.counters
+            let completed = self
+                .counters
                 .irq_completions
-                .fetch_add(1, Ordering::Relaxed);
+                .fetch_add(1, Ordering::Relaxed)
+                + 1;
+            let descriptor_wake_done = ostd::arch::read_tsc();
 
             // Handles the response
             let id = complete_request.id as usize;
@@ -642,6 +937,7 @@ impl VirtioBlockQueue {
             resp_slice.sync_from_device().unwrap();
             let resp: BlockResp = resp_slice.read_val(0).unwrap();
             self.id_allocator.dealloc(id);
+            let response_id_done = ostd::arch::read_tsc();
             match RespStatus::try_from(resp.status) {
                 Ok(RespStatus::Ok) => {}
                 _ => {
@@ -649,6 +945,18 @@ impl VirtioBlockQueue {
                     complete_request.bio_request.into_bios().for_each(|bio| {
                         bio.complete(BioStatus::IoError);
                     });
+                    let bio_complete_done = ostd::arch::read_tsc();
+                    if let Some(profile) = request_profile {
+                        self.profile.record_completion(
+                            profile,
+                            completion_started,
+                            pop_owner_done,
+                            descriptor_wake_done,
+                            response_id_done,
+                            bio_complete_done,
+                        );
+                    }
+                    self.maybe_report_profile(completed);
                     continue;
                 }
             };
@@ -670,6 +978,18 @@ impl VirtioBlockQueue {
             complete_request.bio_request.into_bios().for_each(|bio| {
                 bio.complete(BioStatus::Complete);
             });
+            let bio_complete_done = ostd::arch::read_tsc();
+            if let Some(profile) = request_profile {
+                self.profile.record_completion(
+                    profile,
+                    completion_started,
+                    pop_owner_done,
+                    descriptor_wake_done,
+                    response_id_done,
+                    bio_complete_done,
+                );
+            }
+            self.maybe_report_profile(completed);
         }
     }
 
@@ -733,7 +1053,25 @@ impl VirtioBlockQueue {
 
     /// Submits a write, waiting for queue-local capacity if needed.
     fn write(&self, bio_request: BioRequest) {
+        let mut profile = self
+            .profile
+            .should_sample_submit()
+            .then(|| WriteRequestProfile {
+                submit_started: ostd::arch::read_tsc(),
+                ..WriteRequestProfile::default()
+            });
+        if profile.is_some() {
+            bio_request
+                .bios()
+                .for_each(|bio| bio.enable_resume_profile());
+        }
+        let phase_started = profile.map(|_| ostd::arch::read_tsc());
         let id = self.id_allocator.alloc();
+        if let Some(profile) = profile.as_mut() {
+            profile.id_alloc_ticks = ostd::arch::read_tsc()
+                .wrapping_sub(phase_started.expect("profile start must exist"));
+        }
+        let phase_started = profile.map(|_| ostd::arch::read_tsc());
         let req_slice = {
             let req_slice = Slice::new(
                 self.block_requests.clone(),
@@ -776,16 +1114,30 @@ impl VirtioBlockQueue {
         };
 
         let input_refs: SmallVec<[_; 64]> = inputs.iter().collect();
+        if let Some(profile) = profile.as_mut() {
+            profile.dma_prepare_ticks = ostd::arch::read_tsc()
+                .wrapping_sub(phase_started.expect("profile start must exist"));
+        }
+        let phase_started = profile.map(|_| ostd::arch::read_tsc());
         let mut queue = self.wait_for_descriptors(inputs.len() + 1);
+        if let Some(profile) = profile.as_mut() {
+            profile.vq_acquire_ticks = ostd::arch::read_tsc()
+                .wrapping_sub(phase_started.expect("profile start must exist"));
+        }
+        let phase_started = profile.map(|_| ostd::arch::read_tsc());
         let token = queue
             .add_dma_bufs(input_refs.as_slice(), &[&resp_slice])
             .expect("add queue failed");
+        if let Some(profile) = profile.as_mut() {
+            profile.vq_add_ticks = ostd::arch::read_tsc()
+                .wrapping_sub(phase_started.expect("profile start must exist"));
+        }
         drop(input_refs);
         drop(inputs);
         self.finish_submit(
             &mut queue,
             token,
-            SubmittedRequest::new(id as u16, bio_request),
+            SubmittedRequest::new_profiled(id as u16, bio_request, profile),
             VirtQueue::notify,
         );
     }
@@ -849,7 +1201,7 @@ mod tests {
     use crate::{
         VirtioDeviceType,
         queue::{AvailRing, Descriptor, UsedRing},
-        transport::{DeviceStatus, VirtioTransportError},
+        transport::{DeviceStatus, VirtioTransportError, queue_interrupt_cpu},
     };
 
     // Only the device boundary is simulated. The driver uses real staging,
@@ -984,6 +1336,34 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct DirectQueueDevice {
+        queues: Vec<Arc<VirtioBlockQueue>>,
+        cpu: usize,
+    }
+
+    impl aster_block::BlockDevice for DirectQueueDevice {
+        fn enqueue(&self, bio: SubmittedBio) -> Result<(), BioEnqueueError> {
+            submit_direct_on_queue(&self.queues, BlockFeatures::empty(), bio, self.cpu)
+        }
+
+        fn metadata(&self) -> BlockDeviceMeta {
+            BlockDeviceMeta {
+                nr_submission_queues: self.queues.len() as u16,
+                nr_sectors: 4096,
+                max_nr_segments_per_bio: 2,
+            }
+        }
+
+        fn name(&self) -> &str {
+            "direct-queue-runtime-test"
+        }
+
+        fn id(&self) -> DeviceId {
+            DeviceId::new(MajorId::new(1), MinorId::new(1))
+        }
+    }
+
     fn finish_staged(queue: &VirtioBlockQueue) {
         for bio in queue.staging.dequeue().into_bios() {
             bio.complete(BioStatus::Complete);
@@ -1030,6 +1410,49 @@ mod tests {
             select_queue(BioType::Flush, BioQueueAffinity::Any, 17, 3).unwrap(),
             0
         );
+    }
+
+    #[ktest]
+    fn direct_submit_bypasses_staging_and_preserves_completion() {
+        let (queue_device, transport) = QueueDevice::new(2, 8);
+        let device = DirectQueueDevice {
+            queues: queue_device.queues,
+            cpu: 1,
+        };
+        let mut batch = IoBatch::new();
+        Bio::new_on_queue(
+            BioType::Write,
+            Sid::new(0),
+            alloc::vec![BioSegment::alloc(1, BioDirection::ToDevice)],
+            None,
+            BioQueueAffinity::Any,
+        )
+        .submit(&device, &mut batch)
+        .unwrap();
+
+        assert_eq!(device.queues[0].staging.num_requests(), 0);
+        assert_eq!(device.queues[1].staging.num_requests(), 0);
+        assert_eq!(device.queues[1].submitted_requests.lock().len(), 1);
+        Slice::new(&device.queues[1].block_responses, 0..RESP_SIZE)
+            .write_val(0, &BlockResp { status: 0 })
+            .unwrap();
+        transport.complete(1, 0, 0);
+        device.queues[1].handle_irq();
+
+        assert!(batch.wait_all().is_ok());
+        assert!(device.queues[1].submitted_requests.lock().is_empty());
+        assert_eq!(device.queues[1].diagnostics().irq_completions, 1);
+    }
+
+    #[ktest]
+    fn queue_interrupts_are_distributed_across_cpus() {
+        let cpu_count = ostd::cpu::num_cpus();
+        for queue in 0..8 {
+            assert_eq!(
+                queue_interrupt_cpu(queue, cpu_count).as_usize(),
+                usize::from(queue) % cpu_count
+            );
+        }
     }
 
     #[ktest]
@@ -1080,8 +1503,10 @@ mod tests {
         let device = BlockDevice {
             device: Arc::new(DeviceInner {
                 config_manager: ConfigManager::new(None, None),
+                cached_nr_sectors: AtomicUsize::new(4096),
                 features: BlockFeatures::empty(),
                 queues: queue_device.queues,
+                direct_submit: AtomicBool::new(false),
                 max_nr_segments_per_bio: 2,
                 transport: SpinLock::new(Box::new(transport)),
             }),
@@ -1100,6 +1525,31 @@ mod tests {
         finish_staged(&device.device.queues[1]);
         assert_eq!(common.queue_diagnostics(1).unwrap().staging_depth, 0);
         assert!(batch.wait_all().is_ok());
+    }
+
+    #[ktest]
+    fn block_metadata_does_not_reread_device_config() {
+        let (queue_device, transport) = QueueDevice::new(2, 4);
+        let device = BlockDevice {
+            device: Arc::new(DeviceInner {
+                config_manager: ConfigManager::new(None, None),
+                cached_nr_sectors: AtomicUsize::new(4096),
+                features: BlockFeatures::empty(),
+                queues: queue_device.queues,
+                direct_submit: AtomicBool::new(false),
+                max_nr_segments_per_bio: 2,
+                transport: SpinLock::new(Box::new(transport)),
+            }),
+            id: DeviceId::new(MajorId::new(1), MinorId::new(0)),
+            name: String::from("cached-metadata-test"),
+            partitions: SpinLock::new(None),
+            weak_self: Weak::new(),
+        };
+
+        let metadata = aster_block::BlockDevice::metadata(&device);
+        assert_eq!(metadata.nr_sectors, 4096);
+        assert_eq!(metadata.nr_submission_queues, 2);
+        assert_eq!(metadata.max_nr_segments_per_bio, 2);
     }
 
     #[ktest]
@@ -1163,6 +1613,44 @@ mod tests {
         assert_eq!(queue.diagnostics().in_flight_requests, 0);
         queue.handle_irq();
         assert_eq!(queue.diagnostics().in_flight_requests, 0);
+    }
+
+    #[ktest]
+    fn sampled_profile_records_submit_and_completion_stages() {
+        let (device, transport) = QueueDevice::new(1, 8);
+        let queue = &device.queues[0];
+        queue.set_profile_enabled(true);
+        let resume_before = aster_block::bio_resume_profile_snapshot();
+        let mut batch = IoBatch::new();
+        Bio::new_on_queue(
+            BioType::Write,
+            Sid::new(0),
+            alloc::vec![BioSegment::alloc(1, BioDirection::ToDevice)],
+            None,
+            BioQueueAffinity::Queue(0),
+        )
+        .submit(&device, &mut batch)
+        .unwrap();
+        queue.write(queue.staging.dequeue());
+        let submitted = queue.profile_snapshot();
+        assert_eq!(submitted.submit_samples, 1);
+        assert!(submitted.submit_total_ticks > 0);
+        assert!(submitted.submit_owner_publish_ticks > 0);
+        assert!(submitted.submit_should_notify_ticks > 0);
+        assert!(submitted.submit_device_notify_ticks > 0);
+
+        Slice::new(&queue.block_responses, 0..RESP_SIZE)
+            .write_val(0, &BlockResp { status: 0 })
+            .unwrap();
+        transport.complete(0, 0, 0);
+        queue.handle_irq();
+        let completed = queue.profile_snapshot();
+        assert_eq!(completed.completion_samples, 1);
+        assert!(completed.completion_total_ticks > 0);
+        assert!(batch.wait_all().is_ok());
+        let resume_after = aster_block::bio_resume_profile_snapshot();
+        assert_eq!(resume_after.samples, resume_before.samples + 1);
+        assert!(resume_after.ticks > resume_before.ticks);
     }
 
     #[ktest]
@@ -1376,11 +1864,28 @@ mod tests {
 struct SubmittedRequest {
     id: u16,
     bio_request: BioRequest,
+    profile: Option<WriteRequestProfile>,
 }
 
 impl SubmittedRequest {
     pub fn new(id: u16, bio_request: BioRequest) -> Self {
-        Self { id, bio_request }
+        Self {
+            id,
+            bio_request,
+            profile: None,
+        }
+    }
+
+    fn new_profiled(
+        id: u16,
+        bio_request: BioRequest,
+        profile: Option<WriteRequestProfile>,
+    ) -> Self {
+        Self {
+            id,
+            bio_request,
+            profile,
+        }
     }
 }
 
