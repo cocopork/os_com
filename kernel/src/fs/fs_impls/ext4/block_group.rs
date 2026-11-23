@@ -55,12 +55,14 @@ use crate::fs::rnvpc::{allocation_metadata::AllocationGroupImage, metadata::Pers
 /// `bg_flags` bit: the group's inode bitmap and inode table are uninitialized
 /// (`EXT4_BG_INODE_UNINIT`). No inode has ever been allocated here; the on-disk
 /// inode bitmap is not maintained and the inode table is not zeroed.
-const BG_INODE_UNINIT: u16 = 0x0001;
+pub(super) const BG_INODE_UNINIT: u16 = 0x0001;
 /// `bg_flags` bit: the group's block bitmap is uninitialized
 /// (`EXT4_BG_BLOCK_UNINIT`). No data block has ever been allocated here; the
 /// on-disk block bitmap is not maintained and must be reconstructed from the
 /// group layout (only the group's fixed metadata/backup overhead is in use).
 const BG_BLOCK_UNINIT: u16 = 0x0002;
+/// `bg_flags` bit certifying that the inode table is already zeroed.
+pub(super) const BG_INODE_ZEROED: u16 = 0x0004;
 
 const_assert!(size_of::<RawBlockGroup>() == 32);
 
@@ -327,6 +329,10 @@ impl BlockGroupDesc {
     /// (`EXT4_BG_INODE_UNINIT`).
     pub(super) const fn is_inode_uninit(&self) -> bool {
         self.flags & BG_INODE_UNINIT != 0
+    }
+
+    pub(super) const fn is_inode_zeroed(&self) -> bool {
+        self.flags & BG_INODE_ZEROED != 0
     }
 }
 
@@ -1569,14 +1575,9 @@ impl BlockGroup {
         if metadata.desc.free_inodes_count() == 0 {
             return Ok(None);
         }
-        // Skip a group whose inode table is uninitialized. Lazy inode-table init
-        // (zeroing the table + maintaining `itable_unused`) is not yet
-        // implemented; clearing INODE_UNINIT without it would expose an
-        // unzeroed table of garbage inodes to e2fsck. Treating the group as
-        // "no free inode here" confines allocation to initialized groups (on a
-        // fresh image, effectively group 0's flex until it fills) — a capacity
-        // limit, never corruption. Full support is a later phase.
-        if metadata.desc.is_inode_uninit() {
+        // A zeroed inode table can be activated without exposing stale records.
+        // Truly lazy, non-zeroed tables remain unsupported and are skipped.
+        if metadata.desc.is_inode_uninit() && !metadata.desc.is_inode_zeroed() {
             return Ok(None);
         }
         if type_.is_directory() && metadata.desc.used_dirs_count() == u32::from(u16::MAX) {
@@ -1585,6 +1586,7 @@ impl BlockGroup {
 
         let inode_bitmap_bid = metadata.desc.inode_bitmap_bid();
         let bitmap_access = journal::get_write_access(handle, inode_bitmap_bid)?;
+        metadata.desc.flags &= !BG_INODE_UNINIT;
 
         // Allocate exactly one free inode bit.
         let Some(range) = metadata.inode_bitmap.alloc_consecutive(1) else {
@@ -1866,10 +1868,14 @@ impl BlockGroup {
         // correct bitmap keeps any incidental read (e.g. a bogus inode number)
         // from observing spurious allocations.
         if desc.is_inode_uninit() {
-            return Ok(IdBitmap::from_buf(
-                vec![0u8; BLOCK_SIZE].into_boxed_slice(),
-                capacity,
-            ));
+            let valid_bits = usize::from(capacity);
+            let mut bitmap = vec![0u8; BLOCK_SIZE];
+            let first_padding_byte = valid_bits.div_ceil(8);
+            if !valid_bits.is_multiple_of(8) {
+                bitmap[valid_bits / 8] = !((1u8 << (valid_bits % 8)) - 1);
+            }
+            bitmap[first_padding_byte..].fill(u8::MAX);
+            return Ok(IdBitmap::from_buf(bitmap.into_boxed_slice(), capacity));
         }
 
         let bitmap_bid = desc.inode_bitmap_bid();

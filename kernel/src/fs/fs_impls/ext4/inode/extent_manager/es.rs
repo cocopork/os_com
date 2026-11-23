@@ -413,6 +413,11 @@ impl EsCache {
     pub(super) fn invalidate_range(&self, span: Range<u64>) -> EsInvalidated {
         if span.start < span.end {
             let mut inner = self.inner.lock();
+            if let Some(routes) = inner.rnvpce_routes.as_mut() {
+                routes.retain(|route| {
+                    route.logical_end() <= span.start || route.logical_start >= span.end
+                });
+            }
             if let Some(k) = inner.straddler_key(span.start) {
                 inner.map.remove(&k);
             }
@@ -431,7 +436,11 @@ impl EsCache {
     /// Drops every fact and mints the credential — the whole-tree-rebuild
     /// invalidation (`reserialize`, beside its `node_cache.clear()`).
     pub(super) fn clear_all(&self) -> EsInvalidated {
-        self.inner.lock().map.clear();
+        let mut inner = self.inner.lock();
+        inner.map.clear();
+        if let Some(routes) = inner.rnvpce_routes.as_mut() {
+            routes.clear();
+        }
         EsInvalidated { _priv: () }
     }
 
@@ -561,6 +570,7 @@ mod tests {
             record_on_full_cache_clears_then_seeds,
             record_removes_overlapping_facts_first,
             rnvpce_routes_require_complete_current_generation_coverage,
+            rnvpce_routes_follow_extent_invalidation,
             range_state_returns_strongest_true_tier,
             tail_span_invalidation_clears_tail_and_spares_head,
             clear_all_drops_every_fact,
@@ -631,6 +641,25 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
+    }
+
+    fn rnvpce_routes_follow_extent_invalidation() {
+        let es = EsCache::new();
+        es.record_rnvpce_routes(
+            0,
+            &[
+                RnvpceSsdRoute::new(0, 8, 100, true).unwrap(),
+                RnvpceSsdRoute::new(16, 8, 200, true).unwrap(),
+            ],
+        )
+        .unwrap();
+
+        es.invalidate_range(4..6);
+        assert!(es.rnvpce_route(0, 0..1).unwrap().is_none());
+        assert!(es.rnvpce_route(0, 16..17).unwrap().is_some());
+
+        es.clear_all();
+        assert!(es.rnvpce_route(0, 16..17).unwrap().is_none());
     }
 
     fn delayed_ownership_survives_fact_eviction_and_splits() {

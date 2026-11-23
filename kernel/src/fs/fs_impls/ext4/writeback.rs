@@ -45,15 +45,16 @@ pub(super) struct CachePressure {
 }
 
 impl CachePressure {
-    pub(super) fn new() -> Arc<Self> {
+    pub(super) fn new(resident_high: Option<usize>) -> Arc<Self> {
+        let resident_high = resident_high.unwrap_or(64 * 1024 * 1024 / PAGE_SIZE);
         Arc::new(Self {
             accounting: Arc::new(PageCacheAccounting::default()),
             reservations: Mutex::new(0),
             inodes: Mutex::new(BTreeMap::new()),
             next_inode: AtomicUsize::new(0),
-            resident_high: AtomicUsize::new(64 * 1024 * 1024 / PAGE_SIZE),
-            dirty_high: AtomicUsize::new(64 * 1024 * 1024 / PAGE_SIZE),
-            background: AtomicUsize::new(64 * 1024 * 1024 / PAGE_SIZE),
+            resident_high: AtomicUsize::new(resident_high),
+            dirty_high: AtomicUsize::new(resident_high),
+            background: AtomicUsize::new(resident_high),
             trigger: WaitQueue::new(),
             progress: WaitQueue::new(),
             progress_epoch: AtomicUsize::new(0),
@@ -99,8 +100,44 @@ impl CachePressure {
     }
 
     pub(super) fn reserve(self: &Arc<Self>, fs: &Ext4, pages: usize) -> Result<CacheReservation> {
+        self.reserve_inner(fs, pages, true)
+    }
+
+    pub(super) fn reserve_resident(
+        self: &Arc<Self>,
+        fs: &Ext4,
+        pages: usize,
+    ) -> Result<CacheReservation> {
+        self.reserve_inner(fs, pages, false)
+    }
+
+    pub(super) fn try_reserve_resident(self: &Arc<Self>) -> Option<CacheReservation> {
+        let pages = 1;
+        let mut reserved = self.reservations.lock();
+        if self
+            .accounting
+            .resident_pages()
+            .saturating_add(*reserved)
+            .saturating_add(pages)
+            > self.resident_high.load(Ordering::Relaxed)
+        {
+            return None;
+        }
+        *reserved += pages;
+        Some(CacheReservation {
+            pressure: self.clone(),
+            pages,
+        })
+    }
+
+    fn reserve_inner(
+        self: &Arc<Self>,
+        fs: &Ext4,
+        pages: usize,
+        include_dirty: bool,
+    ) -> Result<CacheReservation> {
         if pages > self.resident_high.load(Ordering::Relaxed)
-            || pages > self.dirty_high.load(Ordering::Relaxed)
+            || (include_dirty && pages > self.dirty_high.load(Ordering::Relaxed))
         {
             return_errno!(Errno::ENOMEM);
         }
@@ -120,11 +157,12 @@ impl CachePressure {
                 .saturating_add(*reserved)
                 .saturating_add(pages)
                 <= self.resident_high.load(Ordering::Relaxed)
-                && self
-                    .dirty_pressure()
-                    .saturating_add(*reserved)
-                    .saturating_add(pages)
-                    <= self.dirty_high.load(Ordering::Relaxed)
+                && (!include_dirty
+                    || self
+                        .dirty_pressure()
+                        .saturating_add(*reserved)
+                        .saturating_add(pages)
+                        <= self.dirty_high.load(Ordering::Relaxed))
             {
                 *reserved += pages;
                 break Ok(CacheReservation {
@@ -192,8 +230,11 @@ impl Drop for CacheReservation {
 
 impl Ext4 {
     pub(super) fn start_cache_writeback(self: &Arc<Self>) {
-        if self.rnvpc_mode() != crate::fs::rnvpc::mode::RnvpcMode::Native
-            || self.cache_pressure.started.swap(true, Ordering::AcqRel)
+        if !matches!(
+            self.rnvpc_mode(),
+            crate::fs::rnvpc::mode::RnvpcMode::Native
+                | crate::fs::rnvpc::mode::RnvpcMode::RnvpcExtend
+        ) || self.cache_pressure.started.swap(true, Ordering::AcqRel)
         {
             return;
         }
@@ -273,7 +314,9 @@ impl Ext4 {
             let Some(inode) = inode.upgrade() else {
                 continue;
             };
-            let result = if self.is_rdonly() {
+            let result = if self.is_rdonly()
+                || self.rnvpc_mode() != crate::fs::rnvpc::mode::RnvpcMode::Native
+            {
                 Ok(0)
             } else {
                 inode.writeback_cache_pages(WRITEBACK_BATCH - written)
@@ -287,10 +330,15 @@ impl Ext4 {
                 }
             };
             written += pages;
-            if pressure.accounting.resident_pages() > pressure.resident_low()
-                || pressure.waiting.load(Ordering::Acquire) != 0
-            {
-                if let Some(cache) = inode.page_cache() {
+            let capacity_waiting = pressure.waiting.load(Ordering::Acquire) != 0;
+            if pressure.accounting.resident_pages() > pressure.resident_low() || capacity_waiting {
+                if self.rnvpc_mode() == crate::fs::rnvpc::mode::RnvpcMode::RnvpcExtend {
+                    reclaimed += if capacity_waiting {
+                        inode.reclaim_rnvpce_clean_dram_forced(RECLAIM_BATCH - reclaimed)
+                    } else {
+                        inode.reclaim_rnvpce_clean_dram(RECLAIM_BATCH - reclaimed)
+                    };
+                } else if let Some(cache) = inode.page_cache() {
                     reclaimed += cache.reclaim_clean_pages(RECLAIM_BATCH - reclaimed);
                 }
             }

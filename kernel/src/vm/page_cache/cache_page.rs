@@ -209,8 +209,18 @@ pub trait CachePageExt: Sized {
 
     /// Allocates a new zeroed cache page with the up-to-date state.
     fn alloc_zero() -> Result<CachePage> {
+        Self::alloc_zero_accounted(None)
+    }
+
+    /// Allocates a zeroed, up-to-date page charged to an accounting group.
+    fn alloc_zero_accounted(accounting: Option<Arc<PageCacheAccounting>>) -> Result<CachePage> {
+        if let Some(accounting) = &accounting {
+            accounting.resident.fetch_add(1, Ordering::Relaxed);
+        }
         let meta = CachePageMeta::default();
         meta.state.store(PageState::UpToDate, Ordering::Relaxed);
+        let mut meta = meta;
+        meta.accounting = accounting;
         let page = FrameAllocOptions::new()
             .zeroed(true)
             .alloc_frame_with(meta)?;

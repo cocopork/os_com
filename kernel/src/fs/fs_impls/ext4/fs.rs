@@ -135,6 +135,7 @@ struct Ext4MountOptions {
     rnvpc_extend: Option<bool>,
     rtio: Option<bool>,
     nodelalloc: bool,
+    pagecache_capacity_pages: Option<usize>,
 }
 
 impl Ext4MountOptions {
@@ -182,6 +183,13 @@ impl Ext4MountOptions {
                         options.rnvpc_extend = Some(parse_onoff(value));
                     } else if let Some(value) = token.strip_prefix("rtio=") {
                         options.rtio = Some(parse_onoff(value));
+                    } else if let Some(value) = token.strip_prefix("pagecache_capacity_mb=")
+                        && let Ok(mebibytes) = value.parse::<usize>()
+                    {
+                        options.pagecache_capacity_pages = mebibytes
+                            .checked_mul(1024 * 1024)
+                            .map(|bytes| bytes / PAGE_SIZE)
+                            .filter(|pages| *pages != 0);
                     }
                 }
             }
@@ -480,7 +488,9 @@ impl Ext4 {
             s_orphan_lock: Mutex::new(OrphanChain::new()),
             mount_options,
             rnvpc_mode,
-            cache_pressure: super::writeback::CachePressure::new(),
+            cache_pressure: super::writeback::CachePressure::new(
+                mount_options.pagecache_capacity_pages,
+            ),
             nv_migration_lock: Mutex::new(()),
             nv_migration_gate: super::migration::MigrationGate::new(),
             rtio_profile,
@@ -3724,6 +3734,14 @@ mod tests {
         );
     }
 
+    #[ktest]
+    fn mount_options_parse_pagecache_capacity() {
+        let value = CString::new("pagecache_capacity_mb=64").unwrap();
+        let options = Ext4MountOptions::parse(Some(value.as_c_str()));
+
+        assert_eq!(options.pagecache_capacity_pages, Some(16_384));
+    }
+
     /// Under `-o minixdf`, `statfs` reports the raw volume size in `f_blocks`
     /// — no metadata/journal overhead subtraction — while an explicit `bsddf`
     /// keeps the default usable-capacity accounting
@@ -4580,9 +4598,11 @@ mod tests {
 
     #[ktest]
     fn ext4_inode_allocation() {
+        crate::time::clocks::init_for_ktest();
         crate::fs::fs_impls::ext4::test_utils::scenarios!(
             alloc_ino_free_inode_round_trip,
             alloc_ino_rings_to_next_group,
+            alloc_ino_activates_zeroed_uninit_group,
             alloc_dir_tracks_used_dirs_count,
             alloc_file_does_not_touch_used_dirs_count,
             alloc_ino_enospc,
@@ -4636,6 +4656,20 @@ mod tests {
         // The 23rd allocation, with parent in group 0, rings to group 1.
         let ino = f.ext4.alloc_ino(ROOT_INO, InodeType::File, None).unwrap();
         assert!(ino > 32, "ino {} should ring into group 1", ino);
+        assert_eq!(((ino - 1) / 32) as usize, 1);
+    }
+
+    fn alloc_ino_activates_zeroed_uninit_group() {
+        let f = Ext4FixtureBuilder::new(256, 32, 2 * 256)
+            .with_inode_bitmap_metadata_marked()
+            .with_zeroed_uninit_inode_groups()
+            .build()
+            .unwrap();
+
+        for _ in 0..22 {
+            f.ext4.alloc_ino(ROOT_INO, InodeType::File, None).unwrap();
+        }
+        let ino = f.ext4.alloc_ino(ROOT_INO, InodeType::File, None).unwrap();
         assert_eq!(((ino - 1) / 32) as usize, 1);
     }
 

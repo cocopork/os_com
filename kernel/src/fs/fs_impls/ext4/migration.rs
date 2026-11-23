@@ -290,7 +290,10 @@ impl Ext4 {
         )
     }
 
-    fn rollback_unpublished_rnvpce_ranges(&self, ranges: &[Range<Ext4Bid>]) -> Result<()> {
+    pub(super) fn rollback_unpublished_rnvpce_ranges(
+        &self,
+        ranges: &[Range<Ext4Bid>],
+    ) -> Result<()> {
         for range in ranges.iter().rev() {
             self.release_unpublished_rnvpce_range(range.clone(), true)?;
         }
@@ -1526,7 +1529,7 @@ impl Ext4 {
                 continue;
             };
             if let Some(inode) = self.cached_inode(ino) {
-                if let Err(error) = inode.retire_rnvpce_clean_nv(&pool, entry) {
+                if let Err(error) = inode.retire_rnvpce_clean_nv(self, &pool, entry) {
                     self.fail_nv_migration();
                     return Err(error);
                 }

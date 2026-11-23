@@ -4,7 +4,7 @@
 
 use core::{
     ops::Range,
-    sync::atomic::{AtomicBool, Ordering},
+    sync::atomic::{AtomicBool, AtomicU64, Ordering},
 };
 
 use ostd::{sync::WaitQueue, task::disable_preempt};
@@ -130,21 +130,27 @@ impl LoadingPage {
 /// lock is held only while publishing or removing an `Arc`.
 pub(crate) struct RnvpcePageCache {
     pages: XArray<Arc<RnvpcePageSlot>>,
-    ever_populated: AtomicBool,
+    active_pages: AtomicU64,
+    reclaim_cursor: AtomicU64,
+}
+
+enum CleanDramReclaim {
+    SecondChance,
+    Forced,
 }
 
 impl RnvpcePageCache {
     pub(crate) const fn new() -> Self {
         Self {
             pages: XArray::new(),
-            ever_populated: AtomicBool::new(false),
+            active_pages: AtomicU64::new(0),
+            reclaim_cursor: AtomicU64::new(0),
         }
     }
 
-    /// False is an exact fast path; true only means that invalidation may be
-    /// necessary because this inode has populated the hot-page index before.
+    /// Reports whether the inode currently has any published or loading slots.
     pub(crate) fn may_contain_pages(&self) -> bool {
-        self.ever_populated.load(Ordering::Acquire)
+        self.active_pages.load(Ordering::Acquire) != 0
     }
 
     pub(crate) fn lookup(&self, page_index: u64) -> Option<Arc<RnvpcePageSlot>> {
@@ -169,7 +175,7 @@ impl RnvpcePageCache {
         }
         let slot = RnvpcePageSlot::loading();
         pages.store(page_index, slot.clone());
-        self.ever_populated.store(true, Ordering::Release);
+        self.active_pages.fetch_add(1, Ordering::Release);
         Ok(LoadingPage { slot, owner: true })
     }
 
@@ -257,6 +263,7 @@ impl RnvpcePageCache {
             .remove(page_index)
             .map(|slot| Arc::clone(&slot))
             .ok_or_else(|| Error::new(Errno::ESTALE))?;
+        self.active_pages.fetch_sub(1, Ordering::Release);
         drop(pages);
         expected.waiters.wake_all();
         Ok(removed)
@@ -287,9 +294,85 @@ impl RnvpcePageCache {
                 }
             }
         }
+        self.active_pages
+            .fetch_sub(removed.len() as u64, Ordering::Release);
         for slot in removed {
             slot.waiters.wake_all();
         }
+    }
+
+    /// Reclaims cold DRAM-backed pages with one bounded scan and one inode-local
+    /// XArray writer critical section. A recently accessed page gets one pass.
+    pub(crate) fn reclaim_clean_dram(&self, limit: usize) -> usize {
+        self.reclaim_clean_dram_inner(limit, CleanDramReclaim::SecondChance)
+    }
+
+    /// Reclaims DRAM-backed clean pages immediately for blocked capacity waiters.
+    pub(crate) fn reclaim_clean_dram_forced(&self, limit: usize) -> usize {
+        self.reclaim_clean_dram_inner(limit, CleanDramReclaim::Forced)
+    }
+
+    fn reclaim_clean_dram_inner(&self, limit: usize, mode: CleanDramReclaim) -> usize {
+        if limit == 0 || !self.may_contain_pages() {
+            return 0;
+        }
+        let start = self.reclaim_cursor.load(Ordering::Relaxed);
+        let guard = disable_preempt();
+        let mut candidates = Vec::new();
+        for range in [start..u64::MAX, 0..start] {
+            if candidates.len() >= limit || range.is_empty() {
+                break;
+            }
+            let mut cursor = self.pages.cursor(&guard, range.start);
+            loop {
+                if cursor.index() >= range.end {
+                    break;
+                }
+                if let Some(slot) = cursor.load()
+                    && matches!(slot.backing(), RnvpcePageBacking::CleanDram(_))
+                {
+                    candidates.push((cursor.index(), Arc::clone(&slot)));
+                    if candidates.len() >= limit {
+                        break;
+                    }
+                }
+                if cursor.next_present().is_none_or(|next| next >= range.end) {
+                    break;
+                }
+            }
+        }
+        drop(guard);
+        if let Some((last, _)) = candidates.last() {
+            self.reclaim_cursor
+                .store(last.saturating_add(1), Ordering::Relaxed);
+        }
+        if matches!(mode, CleanDramReclaim::SecondChance) {
+            candidates.retain(|(_, slot)| !slot.take_accessed());
+        }
+
+        let mut removed = Vec::new();
+        {
+            let mut pages = self.pages.lock();
+            for (index, expected) in candidates {
+                let Some(current) = pages.load(index) else {
+                    continue;
+                };
+                if !Arc::ptr_eq(&current, &expected)
+                    || !matches!(current.backing(), RnvpcePageBacking::CleanDram(_))
+                {
+                    continue;
+                }
+                if let Some(slot) = pages.remove(index) {
+                    removed.push(Arc::clone(&slot));
+                }
+            }
+        }
+        let count = removed.len();
+        self.active_pages.fetch_sub(count as u64, Ordering::Release);
+        for slot in removed {
+            slot.waiters.wake_all();
+        }
+        count
     }
 
     /// Builds an entire replacement outside the XArray lock, then publishes
@@ -314,13 +397,16 @@ impl RnvpcePageCache {
             .map_err(|_| Error::new(Errno::ENOMEM))?;
         {
             let mut pages = self.pages.lock();
+            let mut inserted = 0u64;
             for (index, replacement) in replacements {
                 if let Some(old) = pages.load(index) {
                     replaced.push(Arc::clone(&old));
+                } else {
+                    inserted += 1;
                 }
                 pages.store(index, replacement);
             }
-            self.ever_populated.store(true, Ordering::Release);
+            self.active_pages.fetch_add(inserted, Ordering::Release);
         }
         for old in replaced {
             old.waiters.wake_all();
@@ -388,6 +474,7 @@ impl RnvpcePageCache {
         operations: Vec<(u64, Arc<RnvpcePageSlot>, Option<Arc<RnvpcePageSlot>>)>,
     ) -> usize {
         let mut retired = Vec::new();
+        let mut removed = 0u64;
         {
             let mut pages = self.pages.lock();
             for (index, expected, replacement) in operations {
@@ -401,10 +488,12 @@ impl RnvpcePageCache {
                     pages.store(index, replacement);
                 } else {
                     pages.remove(index);
+                    removed += 1;
                 }
                 retired.push(expected);
             }
         }
+        self.active_pages.fetch_sub(removed, Ordering::Release);
         let count = retired.len();
         for old in retired {
             old.waiters.wake_all();
@@ -427,6 +516,7 @@ mod tests {
         },
         prelude::*,
         thread::kernel_thread::ThreadOptions,
+        vm::page_cache::{CachePage, CachePageExt},
     };
 
     fn test_slot(value: u64) -> Arc<RnvpcePageSlot> {
@@ -519,6 +609,75 @@ mod tests {
 
         assert!(left_slot.take_accessed());
         assert!(!right_slot.take_accessed());
+    }
+
+    #[ktest]
+    fn rnvpce_page_cache_reclaims_clean_dram_after_second_chance() {
+        let cache = RnvpcePageCache::new();
+        for index in 0..2 {
+            let loading = cache.get_or_reserve_loading(index).unwrap();
+            cache
+                .replace_exact(index, loading.slot(), test_slot(index))
+                .unwrap();
+        }
+        for index in 2..=3 {
+            let loading = cache.get_or_reserve_loading(index).unwrap();
+            cache
+                .replace_exact(
+                    index,
+                    loading.slot(),
+                    RnvpcePageSlot::clean_dram(CachePage::alloc_zero().unwrap()),
+                )
+                .unwrap();
+        }
+
+        assert_eq!(cache.reclaim_clean_dram(2), 0);
+        assert_eq!(cache.reclaim_clean_dram(2), 2);
+        assert_eq!(cache.snapshot_range(0..4, 4).len(), 2);
+    }
+
+    #[ktest]
+    fn rnvpce_page_cache_forced_reclaim_skips_second_chance() {
+        let cache = RnvpcePageCache::new();
+        let loading = cache.get_or_reserve_loading(7).unwrap();
+        cache
+            .replace_exact(
+                7,
+                loading.slot(),
+                RnvpcePageSlot::clean_dram(CachePage::alloc_zero().unwrap()),
+            )
+            .unwrap();
+
+        assert_eq!(cache.reclaim_clean_dram_forced(1), 1);
+        assert!(cache.lookup(7).is_none());
+        assert!(!cache.may_contain_pages());
+    }
+
+    #[ktest]
+    fn rnvpce_forced_reclaim_releases_accounted_page() {
+        let cache = RnvpcePageCache::new();
+        let accounting = Arc::new(crate::vm::page_cache::PageCacheAccounting::default());
+        let loading = cache.get_or_reserve_loading(9).unwrap();
+        cache
+            .replace_exact(
+                9,
+                loading.slot(),
+                RnvpcePageSlot::clean_dram(
+                    CachePage::alloc_zero_accounted(Some(accounting.clone())).unwrap(),
+                ),
+            )
+            .unwrap();
+        drop(loading);
+        assert_eq!(accounting.resident_pages(), 1);
+
+        assert_eq!(cache.reclaim_clean_dram_forced(1), 1);
+        for _ in 0..1000 {
+            if accounting.resident_pages() == 0 {
+                break;
+            }
+            crate::thread::Thread::yield_now();
+        }
+        assert_eq!(accounting.resident_pages(), 0);
     }
 
     #[ktest]

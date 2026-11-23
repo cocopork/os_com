@@ -721,9 +721,23 @@ impl Rnvpc {
         observed: u64,
         cancelled: impl Fn() -> bool,
     ) {
-        let _ = DATA_PAGE_LEASE_WAITERS.wait_until(|| {
-            (cancelled() || DATA_PAGE_LEASE_EPOCH.load(Ordering::Acquire) != observed).then_some(())
-        });
+        // Periodically recheck the condition so a notification racing with
+        // waiter installation cannot strand a foreground writer indefinitely.
+        // The timer exists only on the already-blocked slow path.
+        loop {
+            if DATA_PAGE_LEASE_WAITERS
+                .wait_until_or_timeout(
+                    || {
+                        (cancelled() || DATA_PAGE_LEASE_EPOCH.load(Ordering::Acquire) != observed)
+                            .then_some(())
+                    },
+                    &Duration::from_secs(1),
+                )
+                .is_ok()
+            {
+                break;
+            }
+        }
     }
 
     /// Waits on actual data-page releases, including aborted reservations.
@@ -739,9 +753,22 @@ impl Rnvpc {
         cancelled: impl Fn() -> bool,
         alternative: impl Fn() -> bool,
     ) {
-        DATA_CAPACITY_WAITERS.wait_until(|| {
-            (cancelled() || alternative() || self.can_reserve_data_pages(pages)).then_some(())
-        });
+        // Batch reclaim wakes all current waiters, while this bounded recheck
+        // closes the remaining wake-before-sleep race on the pressure path.
+        loop {
+            if DATA_CAPACITY_WAITERS
+                .wait_until_or_timeout(
+                    || {
+                        (cancelled() || alternative() || self.can_reserve_data_pages(pages))
+                            .then_some(())
+                    },
+                    &Duration::from_secs(1),
+                )
+                .is_ok()
+            {
+                break;
+            }
+        }
     }
 
     pub(crate) fn wake_data_capacity_waiters(&self) {
@@ -1341,7 +1368,10 @@ impl Rnvpc {
         self.allocation
             .capacity
             .release(PoolClass::Data, pages.len());
-        self.wake_one_data_capacity_waiter();
+        // A batch can make several independent reservations satisfiable. A
+        // single wake can strand the remaining waiters forever when no later
+        // reclaim occurs, even though free capacity is already available.
+        self.wake_data_capacity_waiters();
         Ok(())
     }
 
@@ -6357,6 +6387,60 @@ impl Drop for EvictingDataPage {
 mod allocation_tests {
     use super::*;
     use crate::fs::rnvpc::{config::NvSimMode, dram::DramNvBackend};
+
+    #[ostd::prelude::ktest]
+    fn rnvpce_batch_free_wakes_all_capacity_waiters() {
+        let config = RnvpcConfig::from_bytes(
+            Some(8 * PAGE_SIZE),
+            Some(2 * PAGE_SIZE),
+            Some(6 * PAGE_SIZE),
+            Some(NvSimMode::Fast),
+        )
+        .unwrap()
+        .unwrap();
+        let backend = Arc::new(DramNvBackend::allocate(config).unwrap());
+        let pool = Arc::new(Rnvpc::new(backend, config, None).unwrap());
+        let mut pages = Vec::new();
+        while let Ok(page) = pool.alloc_data_page() {
+            pages.push(page);
+        }
+        assert!(pages.len() >= 2);
+
+        let entered = Arc::new(AtomicUsize::new(0));
+        let completed = Arc::new(AtomicUsize::new(0));
+        let mut waiters = Vec::new();
+        for _ in 0..2 {
+            let pool = pool.clone();
+            let entered = entered.clone();
+            let completed = completed.clone();
+            waiters.push(
+                crate::thread::kernel_thread::ThreadOptions::new(move || {
+                    entered.fetch_add(1, Ordering::Release);
+                    pool.wait_for_data_capacity(1, || false);
+                    completed.fetch_add(1, Ordering::Release);
+                })
+                .spawn(),
+            );
+        }
+        while entered.load(Ordering::Acquire) != 2 {
+            crate::thread::Thread::yield_now();
+        }
+        for _ in 0..32 {
+            crate::thread::kernel_thread::ThreadOptions::new(|| {})
+                .spawn()
+                .join();
+        }
+
+        let released = pages.split_off(pages.len() - 2);
+        pool.free_data_pages(&released).unwrap();
+        for waiter in waiters {
+            waiter.join();
+        }
+        assert_eq!(completed.load(Ordering::Acquire), 2);
+        for page in pages {
+            pool.free_data_page(page).unwrap();
+        }
+    }
 
     #[ostd::prelude::ktest]
     fn rnvpce_pool_control_isolation() {

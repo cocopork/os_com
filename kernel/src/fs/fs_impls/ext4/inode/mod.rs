@@ -33,7 +33,7 @@
 //! while syncing an inode (`sync_inodes` clones the `Arc`s out and drops the read
 //! lock first).
 
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use aster_block::bio::BioDirection;
 use ostd::mm::io::util::HasVmReaderWriter;
@@ -947,9 +947,15 @@ pub struct Inode {
     /// Volatile hot-data index. Its writer lock only publishes page-slot Arcs;
     /// page copy, persistence, I/O, and waiting happen after that lock is dropped.
     rnvpce_page_cache: RnvpcePageCache,
+    /// Ensures this inode enters the filesystem cache-work registry at most once.
+    cache_work_registered: AtomicBool,
     /// The VFS extension slot (flock, POSIX locks, inotify); must exist from
     /// day one or the VFS layer panics on inodes that use these features.
     extension: Extension,
+}
+
+fn rnvpce_read_window_should_retry(error: &Error) -> bool {
+    error.error() == Errno::ESTALE
 }
 
 /// How much of an inode's pending metadata a sync must wait on — the caller's
@@ -1031,16 +1037,28 @@ impl Inode {
             rnvpce_authority_ref: Once::new(),
             rnvpce_publication: Once::new(),
             rnvpce_page_cache: RnvpcePageCache::new(),
+            cache_work_registered: AtomicBool::new(false),
             extension: Extension::new(),
         });
         if type_ == InodeType::File {
             if let Ok(fs) = inode.fs() {
                 if fs.rnvpc_mode() == crate::fs::rnvpc::mode::RnvpcMode::Native {
-                    fs.cache_pressure.register(&inode, ino);
+                    inode.ensure_cache_work_registered(&fs);
                 }
             }
         }
         Ok(inode)
+    }
+
+    fn ensure_cache_work_registered(&self, fs: &Ext4) {
+        if self.cache_work_registered.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let Some(inode) = self.self_weak.upgrade() else {
+            self.cache_work_registered.store(false, Ordering::Release);
+            return;
+        };
+        fs.cache_pressure.register(&inode, self.ino);
     }
 
     /// Builds a live inode for a crash-recovery orphan reclaim from its raw
@@ -1459,6 +1477,7 @@ impl Inode {
         &self,
         fs: &Ext4,
         pool: &Arc<crate::fs::rnvpc::frame::Rnvpc>,
+        extent_manager: &Arc<ExtentManager>,
         fs_id: u64,
         inode_id: u64,
         start_page: u64,
@@ -1467,8 +1486,17 @@ impl Inode {
         const READ_WINDOW_PAGES: u64 = 32;
         const MAX_BIO_SEGMENTS: usize = 61;
 
+        self.ensure_cache_work_registered(fs);
+
         let window_end = end_page.min(start_page.saturating_add(READ_WINDOW_PAGES));
+        let _resident_reservation = fs.cache_pressure.reserve_resident(
+            fs,
+            usize::try_from(window_end.saturating_sub(start_page))
+                .map_err(|_| Error::new(Errno::EOVERFLOW))?,
+        )?;
         let mut disk_pages = Vec::new();
+        let mut ssd_run = None;
+        const NATIVE_SSD_ROUTE_GENERATION: u64 = 0;
         for logical_page in start_page..window_end {
             if self.rnvpce_page_cache.lookup(logical_page).is_some() {
                 continue;
@@ -1494,13 +1522,61 @@ impl Inode {
                     .remove_exact(logical_page, reservation.slot());
                 continue;
             }
-            let mapping = match crate::fs::rnvpc::write_transaction::current_page_mapping(
-                pool,
-                fs_id,
-                inode_id,
-                logical_page,
-            ) {
-                Ok(mapping) => mapping,
+            let resolved_ssd_block = (|| -> Result<Option<u64>> {
+                let cached_mapping = ssd_run
+                    .filter(|(end, _, _)| logical_page < *end)
+                    .map(|(_, first_page, first_block)| first_block + logical_page - first_page);
+                if let Some(block) = cached_mapping {
+                    Ok(Some(block))
+                } else {
+                    let cached_route = extent_manager
+                        .rnvpce_ssd_route(NATIVE_SSD_ROUTE_GENERATION, logical_page..window_end)?;
+                    if let Some(route) = cached_route {
+                        let end = route
+                            .logical_start()
+                            .checked_add(u64::from(route.length()))
+                            .ok_or_else(|| Error::new(Errno::EOVERFLOW))?;
+                        ssd_run = route.is_written().then_some((
+                            end,
+                            route.logical_start(),
+                            route.ssd_start(),
+                        ));
+                        if route.is_written() {
+                            Ok(Some(route.ssd_start()))
+                        } else {
+                            Ok(None)
+                        }
+                    } else {
+                        let iblock = Iblock::try_from(logical_page)
+                            .map_err(|_| Error::new(Errno::EOVERFLOW))?;
+                        match extent_manager.map_blocks(iblock)? {
+                            extent_manager::Mapping::Mapped {
+                                pblock,
+                                len,
+                                written,
+                            } => {
+                                let end = logical_page
+                                    .checked_add(u64::from(len))
+                                    .ok_or_else(|| Error::new(Errno::EOVERFLOW))?;
+                                let route =
+                                    RnvpceSsdRoute::new(logical_page, len, pblock, written)?;
+                                extent_manager.record_rnvpce_ssd_routes(
+                                    NATIVE_SSD_ROUTE_GENERATION,
+                                    &[route],
+                                )?;
+                                ssd_run = written.then_some((end, logical_page, pblock));
+                                Ok(written.then_some(pblock))
+                            }
+                            _ => {
+                                ssd_run = None;
+                                Ok(None)
+                            }
+                        }
+                    }
+                }
+            })();
+            let ssd_block = match resolved_ssd_block {
+                Ok(ssd_block) => ssd_block,
                 Err(error) => {
                     let _ = self
                         .rnvpce_page_cache
@@ -1508,22 +1584,19 @@ impl Inode {
                     return Err(error);
                 }
             };
-            if mapping.as_ref().is_none_or(|mapping| !mapping.is_written()) {
-                let page = CachePage::alloc_zero()?;
+            let Some(ssd_block) = ssd_block else {
+                let page =
+                    CachePage::alloc_zero_accounted(Some(fs.cache_pressure.accounting.clone()))?;
                 self.rnvpce_page_cache.replace_exact(
                     logical_page,
                     reservation.slot(),
                     RnvpcePageSlot::clean_dram(page),
                 )?;
                 continue;
-            }
-            let page = CachePage::alloc_uninit()?;
-            disk_pages.push((
-                logical_page,
-                mapping.unwrap().ssd_block(),
-                reservation.slot().clone(),
-                page,
-            ));
+            };
+            let page =
+                CachePage::alloc_uninit_accounted(Some(fs.cache_pressure.accounting.clone()))?;
+            disk_pages.push((logical_page, ssd_block, reservation.slot().clone(), page));
         }
 
         let mut batch = IoBatch::new();
@@ -1586,8 +1659,17 @@ impl Inode {
         self.rnvpce_page_cache.publish_clean_nv(entry)
     }
 
+    pub(super) fn reclaim_rnvpce_clean_dram(&self, limit: usize) -> usize {
+        self.rnvpce_page_cache.reclaim_clean_dram(limit)
+    }
+
+    pub(super) fn reclaim_rnvpce_clean_dram_forced(&self, limit: usize) -> usize {
+        self.rnvpce_page_cache.reclaim_clean_dram_forced(limit)
+    }
+
     pub(super) fn retire_rnvpce_clean_nv(
         &self,
+        fs: &Ext4,
         pool: &crate::fs::rnvpc::frame::Rnvpc,
         entry: &Arc<crate::fs::rnvpc::redirect_index::DirtyNvExtentEntry>,
     ) -> Result<usize> {
@@ -1597,16 +1679,21 @@ impl Inode {
             .try_reserve_exact(candidates.len())
             .map_err(|_| Error::new(Errno::ENOMEM))?;
         for (logical_page, slot, hot) in candidates {
-            let replacement = if hot {
+            let reservation = hot
+                .then(|| fs.cache_pressure.try_reserve_resident())
+                .flatten();
+            let replacement = if reservation.is_some() {
                 let guard = entry.try_read()?;
                 let segment = pool.data_segment_from_entry(&guard, logical_page)?;
-                let page = CachePage::alloc_zero()?;
+                let page =
+                    CachePage::alloc_zero_accounted(Some(fs.cache_pressure.accounting.clone()))?;
                 let mut source = segment.reader();
                 page.writer().write(&mut source);
                 Some(RnvpcePageSlot::clean_dram(page))
             } else {
                 None
             };
+            drop(reservation);
             operations.push((logical_page, slot, replacement));
         }
         Ok(self.rnvpce_page_cache.retire_clean_nv(operations))
@@ -1624,38 +1711,10 @@ impl Inode {
         pool.ensure_publication_certain()?;
         let fs_id = fs.rnvpc_fs_id();
         let inode_id = self.ino as u64;
-        if crate::fs::rnvpc::write_transaction::authoritative_inode_state(&pool, fs_id, inode_id)?
-            .is_none()
-        {
-            let inner = self.inner.write();
-            if crate::fs::rnvpc::write_transaction::authoritative_inode_state(
-                &pool, fs_id, inode_id,
-            )?
-            .is_none()
-            {
-                let snapshot_extents = inner.extent_manager()?.snapshot_ssd_extents()?;
-                let snapshot = crate::fs::rnvpc::write_transaction::AuthoritySnapshot::new(
-                    1,
-                    &snapshot_extents,
-                    inner.file_size() as u64,
-                    inner.sector_count(),
-                    self.type_ as u32 | inner.desc.perm().bits() as u32,
-                    inner.desc.flags().bits(),
-                )?;
-                crate::fs::rnvpc::write_transaction::bootstrap_inode_authority(
-                    pool.clone(),
-                    fs_id,
-                    inode_id,
-                    &snapshot,
-                    None,
-                )?;
-            }
-        }
-        let authority =
-            crate::fs::rnvpc::write_transaction::authoritative_inode_state(&pool, fs_id, inode_id)?
-                .ok_or_else(|| Error::new(Errno::EUCLEAN))?;
-        let file_size =
-            usize::try_from(authority.file_size()).map_err(|_| Error::new(Errno::EOVERFLOW))?;
+        let (file_size, extent_manager) = {
+            let inner = self.inner.read();
+            (inner.file_size(), inner.extent_manager()?.clone())
+        };
         if offset >= file_size || writer.avail() == 0 {
             return Ok(0);
         }
@@ -1672,14 +1731,20 @@ impl Inode {
             let slot = match self.rnvpce_page_cache.lookup(logical_block) {
                 Some(slot) => slot,
                 None => {
-                    self.populate_rnvpce_read_window(
+                    if let Err(error) = self.populate_rnvpce_read_window(
                         fs,
                         &pool,
+                        &extent_manager,
                         fs_id,
                         inode_id,
                         logical_block,
                         (end as u64).div_ceil(PAGE_SIZE as u64),
-                    )?;
+                    ) {
+                        if rnvpce_read_window_should_retry(&error) {
+                            continue;
+                        }
+                        return Err(error);
+                    }
                     let Some(slot) = self.rnvpce_page_cache.lookup(logical_block) else {
                         // Only old exact-page redirect records use this path.
                         let Some(handle) = pool.redirect_lookup(redirect_key) else {
@@ -1717,7 +1782,7 @@ impl Inode {
                     source.skip(page_offset).limit(amount);
                     match source.read_fallible(writer) {
                         Ok(copied) => copied,
-                        Err((error, copied)) if copied != 0 => copied,
+                        Err((_error, copied)) if copied != 0 => copied,
                         Err((error, _)) => return Err(error.into()),
                     }
                 }
@@ -2372,6 +2437,10 @@ impl Inode {
                     Ok(committed.copied())
                 }
                 Err(error) if error.error() == Errno::EAGAIN => {
+                    // Migration won before this transaction published any file
+                    // mapping. Undo the already durable allocation bitmap before
+                    // rebuilding the plan; otherwise every retry leaks its SSD run.
+                    fs.rollback_unpublished_rnvpce_ranges(&allocated_ranges)?;
                     drop(inner);
                     fs.wait_for_nv_migration_progress(&pool, lease_epoch)?;
                     continue;
@@ -5944,6 +6013,15 @@ mod tests {
             ra_state_frontier_does_not_go_backwards,
             ra_state_read_within_frontier_requests_nothing,
         );
+    }
+
+    #[ktest]
+    fn rnvpce_read_retries_loading_slot_invalidation() {
+        assert!(rnvpce_read_window_should_retry(&Error::with_message(
+            Errno::ESTALE,
+            "rNVPCe page slot disappeared",
+        )));
+        assert!(!rnvpce_read_window_should_retry(&Error::new(Errno::EIO)));
     }
 
     /// A cold detector misses on its first read: the prefetch covers exactly

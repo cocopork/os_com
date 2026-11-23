@@ -20,7 +20,7 @@ use device_id::{DeviceId, MajorId, MinorId};
 use ostd::mm::{HasSize, io::util::HasVmReaderWriter};
 
 use super::{
-    block_group::RawBlockGroup,
+    block_group::{BG_INODE_UNINIT, BG_INODE_ZEROED, RawBlockGroup},
     fs::{Ext4, JOURNAL_INO, ROOT_INO},
     inode::{FileFlags, RawInode},
     prelude::*,
@@ -254,6 +254,7 @@ pub(super) struct Ext4FixtureBuilder {
     /// When set, override the free-inode counters to zero (for inode-ENOSPC
     /// tests). Implies the inode metadata is marked.
     no_free_inodes: bool,
+    zeroed_uninit_inode_groups: bool,
     /// When set, additionally mark this group-0 inode allocated in the inode
     /// bitmap and decrement the free-inode counters by one. Used to reserve a
     /// pre-placed test directory inode so the allocator does not hand its number
@@ -294,6 +295,7 @@ impl Ext4FixtureBuilder {
             free_block_cap: None,
             mark_inode_metadata: false,
             no_free_inodes: false,
+            zeroed_uninit_inode_groups: false,
             reserved_inode: None,
             has_journal: false,
             has_dir_index: false,
@@ -402,6 +404,11 @@ impl Ext4FixtureBuilder {
     /// allocator tests a realistic starting image.
     pub(super) fn with_inode_bitmap_metadata_marked(mut self) -> Self {
         self.mark_inode_metadata = true;
+        self
+    }
+
+    pub(super) fn with_zeroed_uninit_inode_groups(mut self) -> Self {
+        self.zeroed_uninit_inode_groups = true;
         self
     }
 
@@ -551,6 +558,11 @@ impl Ext4FixtureBuilder {
                 inode_table_lo: group_first + INODE_TABLE_BID,
                 free_blocks_count_lo: free as u16,
                 free_inodes_count_lo: free_inodes as u16,
+                flags: if self.zeroed_uninit_inode_groups && g != 0 {
+                    BG_INODE_UNINIT | BG_INODE_ZEROED
+                } else {
+                    0
+                },
                 ..Default::default()
             };
             disk.segment()
