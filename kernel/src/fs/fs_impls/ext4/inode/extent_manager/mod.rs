@@ -16,6 +16,7 @@
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 use aster_block::bio::BioDirection;
+use ostd::mm::HasPaddr;
 // `Segment` is re-exported by the module prelude only under `ktest`; the
 // prefetch override below needs it in production builds too.
 #[cfg(not(ktest))]
@@ -25,7 +26,7 @@ use ostd::mm::Segment;
 use ostd::mm::io::util::HasVmReaderWriter;
 
 use super::{
-    super::{checksum::InodeCsumSeed, journal, prelude::*},
+    super::{checksum::InodeCsumSeed, journal, pipeline_profile as pp, prelude::*},
     RAW_BLOCK_PTRS_LEN,
 };
 use crate::vm::page_cache::{
@@ -1344,7 +1345,7 @@ pub(super) struct NewMappings {
 /// device's per-BIO limit (`QUEUE_SIZE - 2`, currently 62), so a run is kept
 /// strictly below it; a longer physically contiguous extent is issued as several
 /// back-to-back BIOs (the request queue may still merge adjacent ones).
-const MAX_RUN_SEGMENTS: usize = 61;
+const MAX_RUN_SEGMENTS: usize = 256;
 
 impl BlockAsPageCacheBackend for ExtentManager {
     fn submit_read_bio(
@@ -1457,30 +1458,49 @@ impl BlockAsPageCacheBackend for ExtentManager {
                     // Extend it only across input-consecutive pages — a gap would
                     // break both the segment layout and the physical contiguity.
                     let cap = (len as usize).min(MAX_RUN_SEGMENTS);
-                    let mut segments = Vec::with_capacity(cap);
                     let mut run_pages = Vec::with_capacity(cap);
-                    segments.push(BioSegment::new_from_segment(
-                        Segment::from(first_page.deref().clone()).into(),
-                        BioDirection::FromDevice,
-                    ));
                     run_pages.push(first_page);
                     let mut next_idx = start_idx + 1;
                     while run_pages.len() < cap
                         && pages.peek().is_some_and(|&(idx, _)| idx == next_idx)
                     {
                         let (_, page) = pages.next().unwrap();
-                        segments.push(BioSegment::new_from_segment(
-                            Segment::from(page.deref().clone()).into(),
-                            BioDirection::FromDevice,
-                        ));
                         run_pages.push(page);
                         next_idx += 1;
+                    }
+                    let mut segments = Vec::new();
+                    let mut segment_start = 0;
+                    while segment_start < run_pages.len() {
+                        let mut segment_end = segment_start + 1;
+                        while segment_end < run_pages.len()
+                            && run_pages[segment_end].paddr()
+                                == run_pages[segment_end - 1].paddr() + PAGE_SIZE
+                        {
+                            segment_end += 1;
+                        }
+                        let segment = Segment::from_contiguous_frames(
+                            run_pages[segment_start..segment_end]
+                                .iter()
+                                .map(|page| page.deref()),
+                        )
+                        .expect("physical run was checked contiguous");
+                        segments.push(BioSegment::new_from_segment(
+                            segment.into(),
+                            BioDirection::FromDevice,
+                        ));
+                        segment_start = segment_end;
                     }
                     // On a submission error the BIO drops both `segments` and the
                     // completion callback without invoking it, so the run's page
                     // locks are released and the pages stay uninitialized — the
                     // next reader re-reads them.
-                    let complete_fn = read_run_complete_fn(run_pages);
+                    let run_len = run_pages.len();
+                    let io_started = pp::now();
+                    let complete = read_run_complete_fn(run_pages);
+                    let complete_fn: BioCompleteFn = Box::new(move |status| {
+                        pp::NATIVE_READ_DEVICE_IO.record_since(io_started, run_len);
+                        complete(status);
+                    });
                     let _ = fs.read_segments_async(pblock, segments, Some(complete_fn), io_batch);
                 }
                 Mapping::Mapped {

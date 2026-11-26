@@ -357,6 +357,7 @@ mod tests {
                 peak_forwarders: 2,
                 irq_completions: 99,
                 in_flight_requests: 3,
+                max_in_flight_requests: 4,
             })
         }
         fn name(&self) -> &str {

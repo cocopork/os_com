@@ -7,12 +7,19 @@ use core::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
+use ostd::{cpu::CpuId, util::id_set::Id};
+
 use crate::prelude::*;
 
 pub(crate) const ENABLED: bool = false;
 const HISTOGRAM_BINS: usize = 48;
+const METRIC_SHARDS: usize = 64;
 
 pub(crate) struct Metric {
+    shards: [MetricShard; METRIC_SHARDS],
+}
+
+struct MetricShard {
     count: AtomicU64,
     total_ns: AtomicU64,
     max_ns: AtomicU64,
@@ -23,12 +30,44 @@ pub(crate) struct Metric {
 impl Metric {
     const fn new() -> Self {
         Self {
-            count: AtomicU64::new(0),
-            total_ns: AtomicU64::new(0),
-            max_ns: AtomicU64::new(0),
-            units: AtomicU64::new(0),
-            histogram: [const { AtomicU64::new(0) }; HISTOGRAM_BINS],
+            shards: [const { MetricShard::new() }; METRIC_SHARDS],
         }
+    }
+
+    fn count(&self) -> u64 {
+        self.shards
+            .iter()
+            .map(|shard| shard.count.load(Ordering::Relaxed))
+            .sum()
+    }
+
+    fn total_ns(&self) -> u64 {
+        self.shards
+            .iter()
+            .map(|shard| shard.total_ns.load(Ordering::Relaxed))
+            .sum()
+    }
+
+    fn max_ns(&self) -> u64 {
+        self.shards
+            .iter()
+            .map(|shard| shard.max_ns.load(Ordering::Relaxed))
+            .max()
+            .unwrap_or(0)
+    }
+
+    fn units(&self) -> u64 {
+        self.shards
+            .iter()
+            .map(|shard| shard.units.load(Ordering::Relaxed))
+            .sum()
+    }
+
+    fn histogram_bucket_count(&self, bucket: usize) -> u64 {
+        self.shards
+            .iter()
+            .map(|shard| shard.histogram[bucket].load(Ordering::Relaxed))
+            .sum()
     }
 
     pub(crate) fn record_since(&self, started_ns: u64, units: usize) {
@@ -36,6 +75,23 @@ impl Metric {
             return;
         }
         self.record(now().saturating_sub(started_ns), units);
+    }
+
+    fn record(&self, elapsed_ns: u64, units: usize) {
+        let shard = &self.shards[CpuId::current_racy().as_usize() % METRIC_SHARDS];
+        shard.record(elapsed_ns, units);
+    }
+}
+
+impl MetricShard {
+    const fn new() -> Self {
+        Self {
+            count: AtomicU64::new(0),
+            total_ns: AtomicU64::new(0),
+            max_ns: AtomicU64::new(0),
+            units: AtomicU64::new(0),
+            histogram: [const { AtomicU64::new(0) }; HISTOGRAM_BINS],
+        }
     }
 
     fn record(&self, elapsed_ns: u64, units: usize) {
@@ -75,6 +131,23 @@ pub(crate) static NATIVE_DIRTY_SCAN: Metric = Metric::new();
 pub(crate) static NATIVE_DATA_SUBMIT: Metric = Metric::new();
 pub(crate) static NATIVE_COMPLETION_WAIT: Metric = Metric::new();
 pub(crate) static NATIVE_METADATA_FINISH: Metric = Metric::new();
+pub(crate) static NATIVE_READ_TOTAL: Metric = Metric::new();
+pub(crate) static NATIVE_READ_RESERVE: Metric = Metric::new();
+pub(crate) static NATIVE_READ_PREFETCH: Metric = Metric::new();
+pub(crate) static NATIVE_READ_BODY: Metric = Metric::new();
+pub(crate) static NATIVE_READ_DEVICE_IO: Metric = Metric::new();
+pub(crate) static NATIVE_READ_VMO_COMMIT: Metric = Metric::new();
+pub(crate) static NATIVE_READ_VMO_ALLOCATE: Metric = Metric::new();
+pub(crate) static NATIVE_READ_VMO_BACKEND: Metric = Metric::new();
+pub(crate) static NATIVE_READ_VMO_SUBMIT: Metric = Metric::new();
+pub(crate) static NATIVE_READ_VMO_WAIT: Metric = Metric::new();
+pub(crate) static NATIVE_READ_VMO_COPY: Metric = Metric::new();
+pub(crate) static NATIVE_READ_STAGING_ALLOC: Metric = Metric::new();
+pub(crate) static NATIVE_READ_STAGING_COPY: Metric = Metric::new();
+pub(crate) static NATIVE_READ_STAGING_DROP: Metric = Metric::new();
+pub(crate) static NATIVE_DIRECT_READ_PLAN: Metric = Metric::new();
+pub(crate) static NATIVE_DIRECT_READ_WAIT: Metric = Metric::new();
+pub(crate) static NATIVE_DIRECT_READ_COPY: Metric = Metric::new();
 
 pub(crate) static NV_FOREGROUND_TOTAL: Metric = Metric::new();
 pub(crate) static NV_FOREGROUND_SSD_ALLOCATE: Metric = Metric::new();
@@ -126,6 +199,13 @@ pub(crate) static NV_EXTENT_RESULT: Metric = Metric::new();
 pub(crate) static NV_RECLAIM: Metric = Metric::new();
 pub(crate) static NV_RECLAIM_READY_WAIT: Metric = Metric::new();
 pub(crate) static NV_RECLAIM_HELP: Metric = Metric::new();
+pub(crate) static NV_READ_TOTAL: Metric = Metric::new();
+pub(crate) static NV_READ_CACHE_LOOKUP: Metric = Metric::new();
+pub(crate) static NV_READ_WINDOW_TOTAL: Metric = Metric::new();
+pub(crate) static NV_READ_WINDOW_ROUTE: Metric = Metric::new();
+pub(crate) static NV_READ_WINDOW_IO: Metric = Metric::new();
+pub(crate) static NV_READ_WINDOW_PUBLISH: Metric = Metric::new();
+pub(crate) static NV_READ_DEVICE_IO: Metric = Metric::new();
 
 struct RtioMultiWorkerMetrics {
     configured_workers: AtomicU64,
@@ -560,7 +640,7 @@ impl RtioQueueProfile {
                 continue;
             };
             ostd::error!(
-                "[PIPELINE] name=block_submission_queue device={} queue={} supported=true queued_bios={} queued_pages={} submitted_bios={} submitted_pages={} staging_depth={} max_sampled_staging_depth={} descriptor_wait_count={} descriptor_wait_ticks={} active_forwarders={} peak_forwarders={} irq_completions={} in_flight_requests={}",
+                "[PIPELINE] name=block_submission_queue device={} queue={} supported=true queued_bios={} queued_pages={} submitted_bios={} submitted_pages={} staging_depth={} max_sampled_staging_depth={} descriptor_wait_count={} descriptor_wait_ticks={} active_forwarders={} peak_forwarders={} irq_completions={} in_flight_requests={} max_in_flight_requests={}",
                 device.name(),
                 queue_id,
                 queue.queued_bios,
@@ -575,6 +655,7 @@ impl RtioQueueProfile {
                 queue.peak_forwarders,
                 queue.irq_completions,
                 queue.in_flight_requests,
+                queue.max_in_flight_requests,
             );
         }
     }
@@ -590,8 +671,11 @@ pub(super) fn dump_snapshot(
         return;
     }
     queues.dump_snapshot(device, fs_id, runtimes);
-    if NATIVE_FOREGROUND_TOTAL.count.load(Ordering::Relaxed) == 0
-        && NV_FOREGROUND_TOTAL.count.load(Ordering::Relaxed) == 0
+    if NATIVE_FOREGROUND_TOTAL.count() == 0
+        && NV_FOREGROUND_TOTAL.count() == 0
+        && NATIVE_READ_TOTAL.count() == 0
+        && NATIVE_DIRECT_READ_PLAN.count() == 0
+        && NV_READ_TOTAL.count() == 0
     {
         return;
     }
@@ -605,6 +689,23 @@ pub(super) fn dump_snapshot(
         ("native_data_submit", &NATIVE_DATA_SUBMIT),
         ("native_completion_wait", &NATIVE_COMPLETION_WAIT),
         ("native_metadata_finish", &NATIVE_METADATA_FINISH),
+        ("native_read_total", &NATIVE_READ_TOTAL),
+        ("native_read_reserve", &NATIVE_READ_RESERVE),
+        ("native_read_prefetch", &NATIVE_READ_PREFETCH),
+        ("native_read_body", &NATIVE_READ_BODY),
+        ("native_read_device_io", &NATIVE_READ_DEVICE_IO),
+        ("native_read_vmo_commit", &NATIVE_READ_VMO_COMMIT),
+        ("native_read_vmo_allocate", &NATIVE_READ_VMO_ALLOCATE),
+        ("native_read_vmo_backend", &NATIVE_READ_VMO_BACKEND),
+        ("native_read_vmo_submit", &NATIVE_READ_VMO_SUBMIT),
+        ("native_read_vmo_wait", &NATIVE_READ_VMO_WAIT),
+        ("native_read_vmo_copy", &NATIVE_READ_VMO_COPY),
+        ("native_read_staging_alloc", &NATIVE_READ_STAGING_ALLOC),
+        ("native_read_staging_copy", &NATIVE_READ_STAGING_COPY),
+        ("native_read_staging_drop", &NATIVE_READ_STAGING_DROP),
+        ("native_direct_read_plan", &NATIVE_DIRECT_READ_PLAN),
+        ("native_direct_read_wait", &NATIVE_DIRECT_READ_WAIT),
+        ("native_direct_read_copy", &NATIVE_DIRECT_READ_COPY),
         ("nv_foreground_total", &NV_FOREGROUND_TOTAL),
         ("nv_foreground_ssd_allocate", &NV_FOREGROUND_SSD_ALLOCATE),
         ("nv_foreground_group_reserve", &NV_FOREGROUND_GROUP_RESERVE),
@@ -679,23 +780,30 @@ pub(super) fn dump_snapshot(
         ("nv_reclaim", &NV_RECLAIM),
         ("nv_reclaim_ready_wait", &NV_RECLAIM_READY_WAIT),
         ("nv_reclaim_help", &NV_RECLAIM_HELP),
+        ("nv_read_total", &NV_READ_TOTAL),
+        ("nv_read_cache_lookup", &NV_READ_CACHE_LOOKUP),
+        ("nv_read_window_total", &NV_READ_WINDOW_TOTAL),
+        ("nv_read_window_route", &NV_READ_WINDOW_ROUTE),
+        ("nv_read_window_io", &NV_READ_WINDOW_IO),
+        ("nv_read_window_publish", &NV_READ_WINDOW_PUBLISH),
+        ("nv_read_device_io", &NV_READ_DEVICE_IO),
     ] {
         let mut histogram = String::new();
         histogram.push('[');
-        for (index, bucket) in metric.histogram.iter().enumerate() {
+        for index in 0..HISTOGRAM_BINS {
             if index != 0 {
                 histogram.push(',');
             }
-            let _ = write!(histogram, "{}", bucket.load(Ordering::Relaxed));
+            let _ = write!(histogram, "{}", metric.histogram_bucket_count(index));
         }
         histogram.push(']');
         ostd::error!(
             "[PIPELINE] name={} count={} total_ns={} max_ns={} units={} bins={}",
             name,
-            metric.count.load(Ordering::Relaxed),
-            metric.total_ns.load(Ordering::Relaxed),
-            metric.max_ns.load(Ordering::Relaxed),
-            metric.units.load(Ordering::Relaxed),
+            metric.count(),
+            metric.total_ns(),
+            metric.max_ns(),
+            metric.units(),
             histogram
         );
     }

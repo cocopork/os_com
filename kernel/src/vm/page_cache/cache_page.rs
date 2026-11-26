@@ -3,7 +3,7 @@
 use core::{
     borrow::Borrow,
     ops::Deref,
-    sync::atomic::{AtomicBool, AtomicU8, Ordering},
+    sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering},
 };
 
 use atomic_integer_wrapper::define_atomic_version_of_integer_like_type;
@@ -68,6 +68,9 @@ pub struct CachePageMeta {
     /// When this bit is set, the holder has the exclusive right to perform critical
     /// state transitions (e.g., preparing for I/O).
     lock: AtomicBool,
+    /// Number of tasks waiting for this page lock. Wait queues are hashed, so
+    /// the queue itself cannot tell whether its waiters belong to this page.
+    lock_waiters: AtomicU32,
     /// This bit indicates that the page's contents are "in-flight" to storage.
     ///
     /// This bit works like `PG_writeback` in Linux, it helps the page cache
@@ -87,6 +90,7 @@ impl Default for CachePageMeta {
             accounting: None,
             state: AtomicPageState::new(PageState::Uninit),
             lock: AtomicBool::new(false),
+            lock_waiters: AtomicU32::new(0),
             is_writing_back: AtomicBool::new(false),
         }
     }
@@ -207,6 +211,37 @@ pub trait CachePageExt: Sized {
         Ok(page)
     }
 
+    /// Allocates physically contiguous uninitialized cache pages with distinct
+    /// per-page metadata. This keeps the ordinary page-cache ownership model
+    /// while allowing a cold-read batch to use one DMA mapping.
+    fn alloc_uninit_batch_accounted(
+        count: usize,
+        accounting: Option<Arc<PageCacheAccounting>>,
+    ) -> Result<Vec<CachePage>> {
+        if count == 0 {
+            return Ok(Vec::new());
+        }
+        if let Some(accounting) = &accounting {
+            accounting.resident.fetch_add(count, Ordering::Relaxed);
+        }
+        let mut options = FrameAllocOptions::new();
+        options.zeroed(false);
+        let segment = match options.alloc_segment_with(count, |_| {
+            let mut meta = CachePageMeta::default();
+            meta.accounting = accounting.clone();
+            meta
+        }) {
+            Ok(segment) => segment,
+            Err(error) => {
+                if let Some(accounting) = &accounting {
+                    accounting.resident.fetch_sub(count, Ordering::Release);
+                }
+                return Err(error.into());
+            }
+        };
+        Ok(segment.collect())
+    }
+
     /// Allocates a new zeroed cache page with the up-to-date state.
     fn alloc_zero() -> Result<CachePage> {
         Self::alloc_zero_accounted(None)
@@ -259,7 +294,7 @@ impl CachePageExt for CachePage {
 
     fn wait_queue(&self) -> &'static WaitQueue {
         const PAGE_SHIFT: u32 = PAGE_SIZE.trailing_zeros();
-        const PAGE_WAIT_QUEUE_MASK: usize = 0xff;
+        const PAGE_WAIT_QUEUE_MASK: usize = 0xfff;
         const PAGE_WAIT_QUEUE_NUM: usize = PAGE_WAIT_QUEUE_MASK + 1;
 
         /// Global array of wait queues for page cache operations.
@@ -268,7 +303,9 @@ impl CachePageExt for CachePage {
         /// The queue for a specific page is selected using: `PAGE_WAIT_QUEUES[page.paddr() & PAGE_WAIT_QUEUE_MASK]`.
         ///
         /// This approach avoids the overhead of per-page wait queues while still providing
-        /// reasonable concurrency through hashing.
+        /// reasonable concurrency through hashing. Use enough buckets that
+        /// unrelated cold-read completions do not form a wakeup hot spot at
+        /// high thread counts.
         static PAGE_WAIT_QUEUES: [WaitQueue; PAGE_WAIT_QUEUE_NUM] =
             [const { WaitQueue::new() }; PAGE_WAIT_QUEUE_NUM];
 
@@ -445,7 +482,12 @@ impl<PageRef: Borrow<CachePage>> Drop for LockedCachePage<PageRef> {
 
 fn unlock_page(page: &CachePage, wait_queue: &'static WaitQueue) {
     page.metadata().lock.store(false, Ordering::Release);
-    wait_queue.wake_all();
+    // A large BIO may unlock hundreds of cache pages, while normally only the
+    // first page has a sleeping reader. Avoid one atomic fence and hashed-queue
+    // lookup per page when no task is waiting for this particular page.
+    if page.metadata().lock_waiters.load(Ordering::Acquire) != 0 {
+        wait_queue.wake_all();
+    }
 }
 
 fn try_lock_page(page: &CachePage) -> Option<&'static WaitQueue> {
@@ -459,11 +501,22 @@ fn try_lock_page(page: &CachePage) -> Option<&'static WaitQueue> {
 
 fn lock_page(page: &CachePage) -> &'static WaitQueue {
     let wait_queue = page.wait_queue();
+    if page
+        .metadata()
+        .lock
+        .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+        .is_ok()
+    {
+        return wait_queue;
+    }
+
+    page.metadata().lock_waiters.fetch_add(1, Ordering::AcqRel);
     wait_queue.wait_until(|| {
         page.metadata()
             .lock
             .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
             .ok()
     });
+    page.metadata().lock_waiters.fetch_sub(1, Ordering::Release);
     wait_queue
 }

@@ -372,6 +372,24 @@ mod segment {
     }
 
     #[ktest]
+    fn segment_from_contiguous_frames_holds_each_frame() {
+        let frames: Vec<_> = FrameAllocOptions::new()
+            .alloc_segment_with(3, |_| MockFrameMeta { value: 42 })
+            .unwrap()
+            .collect();
+        let segment = Segment::from_contiguous_frames(frames.iter()).unwrap();
+        assert_eq!(segment.paddr(), frames[0].paddr());
+        assert_eq!(segment.size(), 3 * PAGE_SIZE);
+        assert!(frames.iter().all(|frame| frame.reference_count() == 2));
+        drop(segment);
+        assert!(frames.iter().all(|frame| frame.reference_count() == 1));
+
+        let discontiguous = [&frames[0], &frames[2]];
+        assert!(Segment::from_contiguous_frames(discontiguous).is_none());
+        assert!(frames.iter().all(|frame| frame.reference_count() == 1));
+    }
+
+    #[ktest]
     #[should_panic]
     fn invalid_segment_split() {
         let total_frames = 2;

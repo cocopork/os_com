@@ -484,6 +484,7 @@ struct QueueCounters {
     peak_forwarders: AtomicUsize,
     irq_completions: AtomicUsize,
     in_flight_requests: AtomicUsize,
+    max_in_flight_requests: AtomicUsize,
 }
 
 const PROFILE_SAMPLE_INTERVAL: usize = 1024;
@@ -717,11 +718,12 @@ impl VirtioBlockQueue {
         );
         Ok(Self {
             index,
-            // Keep the aggregation bound independent of queue depth; reserve
-            // header/status descriptors even for fully fragmented data DMA.
-            staging: BioRequestSingleQueue::with_max_nr_segments_per_bio(
-                usize::from(queue_size - 2).min(62),
-            ),
+            // Reserve the request-header and status descriptors. The old
+            // 62-segment ceiling belonged to the former 64-entry queue and
+            // unnecessarily split large I/O after queues grew to 1024 entries.
+            staging: BioRequestSingleQueue::with_max_nr_segments_per_bio(usize::from(
+                queue_size - 2,
+            )),
             queue: SpinLock::new(queue),
             queue_size,
             block_requests,
@@ -752,7 +754,7 @@ impl VirtioBlockQueue {
         let queue = self.diagnostics();
         let resume = aster_block::bio_resume_profile_snapshot();
         ostd::error!(
-            "[VIRTIO_PROFILE] queue={} irq_cpu={} tsc_hz={} completions={} submitted_bios={} descriptor_wait_count={} descriptor_wait_ticks={} max_staging_depth={} submit_samples={} submit_id_alloc_ticks={} submit_dma_prepare_ticks={} submit_vq_acquire_ticks={} submit_vq_add_ticks={} submit_owner_publish_ticks={} submit_should_notify_ticks={} submit_device_notify_ticks={} submit_publish_notify_ticks={} submit_total_ticks={} completion_samples={} completion_wait_ticks={} completion_pop_owner_ticks={} completion_descriptor_wake_ticks={} completion_response_id_ticks={} completion_bio_complete_ticks={} completion_total_ticks={} resume_samples={} resume_ticks={}",
+            "[VIRTIO_PROFILE] queue={} irq_cpu={} tsc_hz={} completions={} submitted_bios={} descriptor_wait_count={} descriptor_wait_ticks={} max_staging_depth={} in_flight_requests={} max_in_flight_requests={} submit_samples={} submit_id_alloc_ticks={} submit_dma_prepare_ticks={} submit_vq_acquire_ticks={} submit_vq_add_ticks={} submit_owner_publish_ticks={} submit_should_notify_ticks={} submit_device_notify_ticks={} submit_publish_notify_ticks={} submit_total_ticks={} completion_samples={} completion_wait_ticks={} completion_pop_owner_ticks={} completion_descriptor_wake_ticks={} completion_response_id_ticks={} completion_bio_complete_ticks={} completion_total_ticks={} resume_samples={} resume_ticks={}",
             self.index,
             CpuId::current_racy().as_usize(),
             ostd::arch::tsc_freq(),
@@ -761,6 +763,8 @@ impl VirtioBlockQueue {
             queue.descriptor_wait_count,
             queue.descriptor_wait_ticks,
             queue.max_sampled_staging_depth,
+            queue.in_flight_requests,
+            queue.max_in_flight_requests,
             profile.submit_samples,
             profile.submit_id_alloc_ticks,
             profile.submit_dma_prepare_ticks,
@@ -800,6 +804,7 @@ impl VirtioBlockQueue {
             peak_forwarders: self.counters.peak_forwarders.load(Ordering::Relaxed),
             irq_completions: self.counters.irq_completions.load(Ordering::Relaxed),
             in_flight_requests: self.counters.in_flight_requests.load(Ordering::Relaxed),
+            max_in_flight_requests: self.counters.max_in_flight_requests.load(Ordering::Relaxed),
         }
     }
 
@@ -858,9 +863,14 @@ impl VirtioBlockQueue {
             let previous = submitted.insert(token, request);
             debug_assert!(previous.is_none());
             if previous.is_none() {
-                self.counters
+                let in_flight = self
+                    .counters
                     .in_flight_requests
-                    .fetch_add(1, Ordering::Relaxed);
+                    .fetch_add(1, Ordering::Relaxed)
+                    + 1;
+                self.counters
+                    .max_in_flight_requests
+                    .fetch_max(in_flight, Ordering::Relaxed);
             }
         }
         self.counters
@@ -995,7 +1005,25 @@ impl VirtioBlockQueue {
 
     /// Submits a read, waiting for queue-local capacity if needed.
     fn read(&self, bio_request: BioRequest) {
+        let mut profile = self
+            .profile
+            .should_sample_submit()
+            .then(|| WriteRequestProfile {
+                submit_started: ostd::arch::read_tsc(),
+                ..WriteRequestProfile::default()
+            });
+        if profile.is_some() {
+            bio_request
+                .bios()
+                .for_each(|bio| bio.enable_resume_profile());
+        }
+        let phase_started = profile.map(|_| ostd::arch::read_tsc());
         let id = self.id_allocator.alloc();
+        if let Some(profile) = profile.as_mut() {
+            profile.id_alloc_ticks = ostd::arch::read_tsc()
+                .wrapping_sub(phase_started.expect("profile start must exist"));
+        }
+        let phase_started = profile.map(|_| ostd::arch::read_tsc());
         let req_slice = {
             let req_slice = Slice::new(
                 self.block_requests.clone(),
@@ -1037,16 +1065,30 @@ impl VirtioBlockQueue {
         };
 
         let output_refs: SmallVec<[_; 64]> = outputs.iter().collect();
+        if let Some(profile) = profile.as_mut() {
+            profile.dma_prepare_ticks = ostd::arch::read_tsc()
+                .wrapping_sub(phase_started.expect("profile start must exist"));
+        }
+        let phase_started = profile.map(|_| ostd::arch::read_tsc());
         let mut queue = self.wait_for_descriptors(outputs.len() + 1);
+        if let Some(profile) = profile.as_mut() {
+            profile.vq_acquire_ticks = ostd::arch::read_tsc()
+                .wrapping_sub(phase_started.expect("profile start must exist"));
+        }
+        let phase_started = profile.map(|_| ostd::arch::read_tsc());
         let token = queue
             .add_dma_bufs(&[&req_slice], output_refs.as_slice())
             .expect("add queue failed");
+        if let Some(profile) = profile.as_mut() {
+            profile.vq_add_ticks = ostd::arch::read_tsc()
+                .wrapping_sub(phase_started.expect("profile start must exist"));
+        }
         drop(output_refs);
         drop(outputs);
         self.finish_submit(
             &mut queue,
             token,
-            SubmittedRequest::new(id as u16, bio_request),
+            SubmittedRequest::new_profiled(id as u16, bio_request, profile),
             VirtQueue::notify,
         );
     }

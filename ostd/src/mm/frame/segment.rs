@@ -146,6 +146,35 @@ impl<M: AnyFrameMeta + ?Sized> Split for Segment<M> {
 }
 
 impl<M: AnyFrameMeta + ?Sized> Segment<M> {
+    /// Gets a segment handle for an ordered, physically contiguous sequence of
+    /// frames. The returned segment owns one additional reference to each
+    /// frame; a non-contiguous or empty sequence returns `None`.
+    pub fn from_contiguous_frames<'a>(
+        frames: impl IntoIterator<Item = &'a Frame<M>>,
+    ) -> Option<Self>
+    where
+        M: 'a,
+    {
+        let mut segment: Option<Self> = None;
+        for frame in frames {
+            let paddr = frame.paddr();
+            match segment.as_mut() {
+                Some(segment) if segment.range.end != paddr => return None,
+                Some(segment) => segment.range.end += PAGE_SIZE,
+                None => {
+                    segment = Some(Self {
+                        range: paddr..paddr + PAGE_SIZE,
+                        _marker: core::marker::PhantomData,
+                    });
+                }
+            }
+            // SAFETY: `frame` proves this physical frame is live. The segment
+            // being built owns the matching additional reference.
+            unsafe { inc_frame_ref_count(paddr) };
+        }
+        segment
+    }
+
     /// Gets an extra handle to the frames in the byte offset range.
     ///
     /// The sliced byte offset range in indexed by the offset from the start of

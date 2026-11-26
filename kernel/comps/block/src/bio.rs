@@ -443,11 +443,14 @@ impl SubmittedBio {
         );
         assert!(result.is_ok());
 
-        drop(segments);
-
+        // Complete higher-level state transitions before waking synchronous
+        // waiters. The device has already finished and synchronized the DMA
+        // buffers, so segment teardown need not extend the request's visible
+        // completion latency; release it after the waiter can resume.
         general_complete_fn(metadata.type_(), status, complete_fn);
 
         metadata.wait_queue.wake_all();
+        drop(segments);
     }
 }
 

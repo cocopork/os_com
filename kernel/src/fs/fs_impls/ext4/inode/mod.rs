@@ -36,7 +36,7 @@
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use aster_block::bio::BioDirection;
-use ostd::mm::io::util::HasVmReaderWriter;
+use ostd::mm::{HasPaddr, Segment, io::util::HasVmReaderWriter};
 use spin::once::Once;
 
 use super::{
@@ -814,6 +814,9 @@ const RA_MIN: usize = 256 * 1024;
 /// Maximum sequential read-ahead window: the window doubles per consecutive
 /// sequential read up to this ceiling.
 const RA_MAX: usize = 8 * 1024 * 1024;
+/// Keep one large buffered read intact so the page cache can submit it as one
+/// batched operation. Write-side chunking remains independently bounded.
+const READ_IO_CHUNK: usize = 1024 * 1024;
 
 /// Per-inode sequential read-ahead detector.
 ///
@@ -956,6 +959,12 @@ pub struct Inode {
 
 fn rnvpce_read_window_should_retry(error: &Error) -> bool {
     error.error() == Errno::ESTALE
+}
+
+const RNVPCE_READ_WINDOW_PAGES: u64 = 256;
+
+fn rnvpce_read_window_end(start_page: u64, request_end_page: u64) -> u64 {
+    request_end_page.min(start_page.saturating_add(RNVPCE_READ_WINDOW_PAGES))
 }
 
 /// How much of an inode's pending metadata a sync must wait on — the caller's
@@ -1483,17 +1492,18 @@ impl Inode {
         start_page: u64,
         end_page: u64,
     ) -> Result<()> {
-        const READ_WINDOW_PAGES: u64 = 32;
-        const MAX_BIO_SEGMENTS: usize = 61;
+        const MAX_BIO_SEGMENTS: usize = 256;
 
+        let window_started = pp::now();
         self.ensure_cache_work_registered(fs);
 
-        let window_end = end_page.min(start_page.saturating_add(READ_WINDOW_PAGES));
+        let window_end = rnvpce_read_window_end(start_page, end_page);
         let _resident_reservation = fs.cache_pressure.reserve_resident(
             fs,
             usize::try_from(window_end.saturating_sub(start_page))
                 .map_err(|_| Error::new(Errno::EOVERFLOW))?,
         )?;
+        let route_started = pp::now();
         let mut disk_pages = Vec::new();
         let mut ssd_run = None;
         const NATIVE_SSD_ROUTE_GENERATION: u64 = 0;
@@ -1594,11 +1604,31 @@ impl Inode {
                 )?;
                 continue;
             };
-            let page =
-                CachePage::alloc_uninit_accounted(Some(fs.cache_pressure.accounting.clone()))?;
-            disk_pages.push((logical_page, ssd_block, reservation.slot().clone(), page));
+            disk_pages.push((logical_page, ssd_block, reservation.slot().clone()));
         }
 
+        // Preserve per-page metadata and locks, but allocate cold pages in
+        // small physical runs so the block layer can map each run once.
+        const ALLOCATION_BATCH_PAGES: usize = 32;
+        let mut pending = disk_pages.into_iter();
+        let mut disk_pages = Vec::with_capacity(pending.len());
+        while pending.len() != 0 {
+            let count = pending.len().min(ALLOCATION_BATCH_PAGES);
+            let pages = CachePage::alloc_uninit_batch_accounted(
+                count,
+                Some(fs.cache_pressure.accounting.clone()),
+            )?;
+            for page in pages {
+                let (logical_page, ssd_block, loading) = pending.next().unwrap();
+                disk_pages.push((logical_page, ssd_block, loading, page));
+            }
+        }
+
+        pp::NV_READ_WINDOW_ROUTE.record_since(
+            route_started,
+            usize::try_from(window_end.saturating_sub(start_page)).unwrap_or(usize::MAX),
+        );
+        let io_started = pp::now();
         let mut batch = IoBatch::new();
         let mut first_error = None;
         let mut run_start = 0;
@@ -1611,16 +1641,39 @@ impl Inode {
             {
                 run_end += 1;
             }
-            let mut segments = Vec::with_capacity(run_end - run_start);
             let mut locked_pages = Vec::with_capacity(run_end - run_start);
             for (_, _, _, page) in &disk_pages[run_start..run_end] {
-                segments.push(BioSegment::new_from_segment(
-                    ostd::mm::Segment::from(page.clone()).into(),
-                    BioDirection::FromDevice,
-                ));
                 locked_pages.push(page.clone().lock());
             }
-            let complete = read_run_complete_fn(locked_pages);
+            let mut segments = Vec::new();
+            let mut segment_start = 0;
+            while segment_start < locked_pages.len() {
+                let mut segment_end = segment_start + 1;
+                while segment_end < locked_pages.len()
+                    && locked_pages[segment_end].paddr()
+                        == locked_pages[segment_end - 1].paddr() + PAGE_SIZE
+                {
+                    segment_end += 1;
+                }
+                let segment = Segment::from_contiguous_frames(
+                    locked_pages[segment_start..segment_end]
+                        .iter()
+                        .map(|page| &**page),
+                )
+                .expect("physical run was checked contiguous");
+                segments.push(BioSegment::new_from_segment(
+                    segment.into(),
+                    BioDirection::FromDevice,
+                ));
+                segment_start = segment_end;
+            }
+            let run_len = locked_pages.len();
+            let device_io_started = pp::now();
+            let run_complete = read_run_complete_fn(locked_pages);
+            let complete: BioCompleteFn = Box::new(move |status| {
+                pp::NV_READ_DEVICE_IO.record_since(device_io_started, run_len);
+                run_complete(status);
+            });
             if let Err(error) = fs.read_segments_async(
                 disk_pages[run_start].1,
                 segments,
@@ -1638,6 +1691,9 @@ impl Inode {
             first_error = Some(error.into());
         }
 
+        pp::NV_READ_WINDOW_IO.record_since(io_started, disk_pages.len());
+        let publish_started = pp::now();
+        let published_pages = disk_pages.len();
         for (logical_page, _, loading, page) in disk_pages {
             if page.is_up_to_date() {
                 let _ = self.rnvpce_page_cache.replace_exact(
@@ -1649,6 +1705,11 @@ impl Inode {
                 let _ = self.rnvpce_page_cache.remove_exact(logical_page, &loading);
             }
         }
+        pp::NV_READ_WINDOW_PUBLISH.record_since(publish_started, published_pages);
+        pp::NV_READ_WINDOW_TOTAL.record_since(
+            window_started,
+            usize::try_from(window_end.saturating_sub(start_page)).unwrap_or(usize::MAX),
+        );
         first_error.map_or(Ok(()), Err)
     }
 
@@ -1705,6 +1766,7 @@ impl Inode {
         offset: usize,
         writer: &mut VmWriter,
     ) -> Result<usize> {
+        let read_started = pp::now();
         let pool = crate::fs::rnvpc::pool()
             .ok_or_else(|| Error::with_message(Errno::EINVAL, "rNVPC pool is not configured"))?
             .clone();
@@ -1719,6 +1781,41 @@ impl Inode {
             return Ok(0);
         }
         let read_len = writer.avail().min(file_size - offset);
+
+        // Clean SSD-authoritative data needs no rNVPCe redirect state. Keep the
+        // inode read lock across the authority check and page-cache fill so a
+        // foreground writer cannot publish an NV replacement between them.
+        // This makes the common cold-read path identical to native EXT4 instead
+        // of building a second per-page loading/route/clean-DRAM index.
+        {
+            let inner = self.inner.read();
+            let first_page = offset / PAGE_SIZE;
+            let last_page = (offset + read_len).div_ceil(PAGE_SIZE);
+            let all_ssd_authoritative = (first_page..last_page).all(|logical_page| {
+                let logical_page = logical_page as u64;
+                if self.rnvpce_page_cache.lookup(logical_page).is_some() {
+                    return false;
+                }
+                let key = crate::fs::rnvpc::index::PageKey::new(fs_id, inode_id, logical_page);
+                pool.lookup_dirty_nv_entry(key).is_none() && pool.redirect_lookup(key).is_none()
+            });
+            if all_ssd_authoritative {
+                self.ensure_cache_work_registered(fs);
+                let pages = ((offset % PAGE_SIZE) + read_len).div_ceil(PAGE_SIZE);
+                let _reservation = fs.cache_pressure.reserve(fs, pages)?;
+                if read_len > PAGE_SIZE {
+                    // Demand-faulting a large read would synchronously fetch one
+                    // page at a time. Warm the exact request range first so the
+                    // native backend can coalesce and submit its BIO batch just
+                    // as the EXT4 readahead path does.
+                    inner
+                        .page_cache()?
+                        .prefetch_range(offset..offset + read_len)?;
+                }
+                return inner.read_at(offset, writer);
+            }
+        }
+
         writer.limit(read_len);
         let mut position = offset;
         let end = offset + read_len;
@@ -1728,7 +1825,10 @@ impl Inode {
             let amount = (end - position).min(PAGE_SIZE - page_offset);
             let redirect_key =
                 crate::fs::rnvpc::index::PageKey::new(fs_id, inode_id, logical_block);
-            let slot = match self.rnvpce_page_cache.lookup(logical_block) {
+            let lookup_started = pp::now();
+            let cached_slot = self.rnvpce_page_cache.lookup(logical_block);
+            pp::NV_READ_CACHE_LOOKUP.record_since(lookup_started, 1);
+            let slot = match cached_slot {
                 Some(slot) => slot,
                 None => {
                     if let Err(error) = self.populate_rnvpce_read_window(
@@ -1815,6 +1915,7 @@ impl Inode {
             }
             position += amount;
         }
+        pp::NV_READ_TOTAL.record_since(read_started, read_len.div_ceil(PAGE_SIZE));
         Ok(read_len)
     }
 
@@ -1879,35 +1980,38 @@ impl Inode {
         {
             return self.read_rnvpc_at(&fs, offset, writer);
         }
+        let read_started = pp::now();
         offset
             .checked_add(writer.avail())
             .ok_or_else(|| Error::new(Errno::EINVAL))?;
         let mut done = 0;
         while writer.avail() != 0 {
-            let amount = writer.avail().min(super::writeback::IO_CHUNK);
+            let amount = writer.avail().min(READ_IO_CHUNK);
             // Preserve the detector's existing window. Reserve prefetch capacity
             // too, so sequential reads cannot bypass the resident budget.
-            let prefetch = self.ra.lock().on_read(offset + done, amount).map(|range| {
-                let end = range.end.min(
-                    range
-                        .start
-                        .saturating_add(fs.cache_pressure.prefetch_limit()),
-                );
-                range.start..end
-            });
+            // Single-page random reads should not speculate. For a multi-page
+            // request, prefetch the exact demand range: this guarantees one
+            // coalesced backend batch even when the historical sequential
+            // detector is cold, without reading beyond the caller's request.
+            let prefetch = (amount > PAGE_SIZE).then_some(offset + done..offset + done + amount);
             let prefetch_pages = prefetch
                 .as_ref()
                 .map_or(0, |range| range.len().div_ceil(PAGE_SIZE));
             let pages = ((offset + done) % PAGE_SIZE + amount).div_ceil(PAGE_SIZE) + prefetch_pages;
+            let reserve_started = pp::now();
             let _reservation = match fs.cache_pressure.reserve(&fs, pages) {
                 Ok(reservation) => reservation,
                 Err(error) => return if done != 0 { Ok(done) } else { Err(error) },
             };
+            pp::NATIVE_READ_RESERVE.record_since(reserve_started, pages);
             if let Some(range) = prefetch {
                 if let Some(cache) = self.page_cache() {
+                    let prefetch_started = pp::now();
                     let _ = cache.prefetch_range(range);
+                    pp::NATIVE_READ_PREFETCH.record_since(prefetch_started, prefetch_pages);
                 }
             }
+            let body_started = pp::now();
             let result = {
                 let cursor_before = writer.cursor().addr();
                 let mut chunk = writer.clone_exclusive();
@@ -1918,6 +2022,7 @@ impl Inode {
                 writer.skip(copied);
                 result
             };
+            pp::NATIVE_READ_BODY.record_since(body_started, amount.div_ceil(PAGE_SIZE));
             match result {
                 Ok(read) => {
                     done += read;
@@ -1928,6 +2033,7 @@ impl Inode {
                 Err(error) => return if done != 0 { Ok(done) } else { Err(error) },
             }
         }
+        pp::NATIVE_READ_TOTAL.record_since(read_started, done.div_ceil(PAGE_SIZE));
         Ok(done)
     }
 
@@ -2049,6 +2155,10 @@ impl Inode {
             let mut inner = self.inner.write();
             LATENCY_STATS.rnvpce_write_inner_wait.record_since(t_lock);
             let old_size = inner.file_size();
+            // Achilles cold SSD reads use the native PageCache fast path. Once
+            // this write publishes an NV-authoritative replacement, no clean
+            // SSD page from that range may remain reachable through it.
+            inner.page_cache()?.invalidate_range(offset..end)?;
             if self.rnvpce_authority_ref.get().is_none() {
                 let reference =
                     if let Some(loaded) = pool.read_fixed_inode(fs_id, inode_id, None)? {
@@ -4725,6 +4835,7 @@ impl InodeInner {
         let mut plan: Vec<DirectRun> = Vec::new();
         let mut io_batch = IoBatch::new();
         let mut iblock = start_ib;
+        let plan_started = pp::now();
         while iblock < end_ib {
             let remaining = end_ib - iblock;
             match extent_manager.map_blocks(iblock)? {
@@ -4765,10 +4876,20 @@ impl InodeInner {
                 }
             }
         }
+        pp::NATIVE_DIRECT_READ_PLAN.record_since(
+            plan_started,
+            usize::try_from(end_ib - start_ib).unwrap_or(usize::MAX),
+        );
 
         // One barrier for every submitted read, then copy out in file order. A
         // `Zeros` span or a partial tail block is clamped by the writer's limit.
+        let wait_started = pp::now();
         io_batch.wait_all()?;
+        pp::NATIVE_DIRECT_READ_WAIT.record_since(
+            wait_started,
+            usize::try_from(end_ib - start_ib).unwrap_or(usize::MAX),
+        );
+        let copy_started = pp::now();
         for run in plan {
             match run {
                 DirectRun::Data(bio_segment) => {
@@ -4780,6 +4901,10 @@ impl InodeInner {
                 }
             }
         }
+        pp::NATIVE_DIRECT_READ_COPY.record_since(
+            copy_started,
+            usize::try_from(end_ib - start_ib).unwrap_or(usize::MAX),
+        );
         Ok(())
     }
 
@@ -6022,6 +6147,14 @@ mod tests {
             "rNVPCe page slot disappeared",
         )));
         assert!(!rnvpce_read_window_should_retry(&Error::new(Errno::EIO)));
+    }
+
+    #[ktest]
+    fn rnvpce_read_window_tracks_request_up_to_one_mib() {
+        assert_eq!(rnvpce_read_window_end(100, 101), 101);
+        assert_eq!(rnvpce_read_window_end(100, 356), 356);
+        assert_eq!(rnvpce_read_window_end(100, 357), 356);
+        assert_eq!(rnvpce_read_window_end(u64::MAX - 8, u64::MAX), u64::MAX);
     }
 
     /// A cold detector misses on its first read: the prefetch covers exactly

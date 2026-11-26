@@ -203,7 +203,7 @@ impl InodeInner {
     pub(super) fn retain_delayed_promise(&self) -> Result<()> {
         if let Some(account) = &self.delayed_account {
             let pending = self.extent_manager()?.delayed_blocks() * PROMISE_PER_BLOCK;
-            account.retain(pending.min(account.remaining()))?;
+            account.retain_at_most(pending)?;
         }
         Ok(())
     }

@@ -192,6 +192,7 @@ impl DelayedAccount {
         self.id
     }
 
+    #[cfg_attr(not(ktest), expect(dead_code))]
     pub(super) fn remaining(&self) -> u64 {
         *self
             .capacity
@@ -234,6 +235,20 @@ impl DelayedAccount {
         let released = *remaining - count;
         *remaining = count;
         state.delayed -= released;
+        Ok(())
+    }
+
+    /// Retains at most `count` credits without a separate balance query.
+    pub(super) fn retain_at_most(&self, count: u64) -> Result<()> {
+        let mut state = self.capacity.state.lock();
+        let remaining = state.owners.get_mut(&self.id).expect("live delayed owner");
+        let retained = count.min(*remaining);
+        let released = *remaining - retained;
+        *remaining = retained;
+        state.delayed = state
+            .delayed
+            .checked_sub(released)
+            .ok_or_else(|| Error::new(Errno::EUCLEAN))?;
         Ok(())
     }
 }
@@ -296,12 +311,26 @@ mod tests {
     #[ktest]
     fn ext4_capacity_reservations() {
         crate::fs::fs_impls::ext4::test_utils::scenarios!(
+            delayed_retain_at_most_uses_current_owner_balance,
             delayed_owners_isolate_and_refund_promises,
             rnvpce_reservation_waits_for_partial_or_dropped_claim,
             capacity_inflight_is_not_permanent_enospc,
             capacity_reservation_partial_drop_and_floor,
             capacity_rnvpce_and_pending_free_share_authority,
         );
+    }
+
+    fn delayed_retain_at_most_uses_current_owner_balance() {
+        let capacity = Arc::new(Capacity::new(100));
+        let account = capacity.delayed_account();
+        account.reserve(20, 0, 0).unwrap();
+        account.retain_at_most(25).unwrap();
+        assert_eq!(account.remaining(), 20);
+
+        account.reserve(10, 0, 0).unwrap();
+        account.retain_at_most(7).unwrap();
+        assert_eq!(account.remaining(), 7);
+        assert_eq!(capacity.claim(100, 0, false, || 0).unwrap().count(), 93);
     }
 
     fn delayed_owners_isolate_and_refund_promises() {

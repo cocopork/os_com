@@ -283,10 +283,17 @@ impl ClassScheduler {
 
     // TODO: Implement a better algorithm and replace the current naive implementation.
     fn select_cpu(&self, thread: &Thread, flags: EnqueueFlags) -> CpuId {
-        if let Some(last_cpu) = thread.sched_attr().last_cpu() {
+        let affinity = thread.atomic_cpu_affinity().load(Ordering::Relaxed);
+        if let Some(last_cpu) = thread.sched_attr().last_cpu()
+            && affinity.contains(last_cpu)
+        {
             return last_cpu;
         }
-        debug_assert!(flags == EnqueueFlags::Spawn);
+
+        // `sched_setaffinity` may narrow a running task's mask without moving
+        // it immediately. The next sleep/wakeup is the migration point: an old
+        // `last_cpu` outside the new mask must not bypass affinity forever.
+        debug_assert!(flags == EnqueueFlags::Spawn || thread.sched_attr().last_cpu().is_some());
 
         let guard = disable_local();
 
@@ -304,7 +311,6 @@ impl ClassScheduler {
             }
         };
 
-        let affinity = thread.atomic_cpu_affinity().load(Ordering::Relaxed);
         match self.last_chosen_cpu.get() {
             Some(cpu) => {
                 // Perform a round-robin selection starting after the last chosen CPU.

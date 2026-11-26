@@ -4,7 +4,7 @@
 
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use ostd::sync::WaitQueue;
+use ostd::{sync::WaitQueue, util::id_set::Id};
 
 use super::{fs::Ext4, inode::Inode, pipeline_profile as pp, prelude::*};
 use crate::vm::page_cache::PageCacheAccounting;
@@ -12,6 +12,10 @@ use crate::vm::page_cache::PageCacheAccounting;
 pub(super) const IO_CHUNK: usize = 256 * 1024;
 pub(super) const WRITEBACK_BATCH: usize = 1024;
 const RECLAIM_BATCH: usize = 4096;
+const RESERVATION_SHARDS: usize = 8;
+
+#[repr(align(64))]
+struct ReservationShard(AtomicUsize);
 
 // Selects the worker's retry interval after one bounded round.
 fn round_delay(busy: bool, made_progress: bool) -> Duration {
@@ -28,7 +32,7 @@ fn round_delay(busy: bool, made_progress: bool) -> Duration {
 /// the syscall chunk completes. They are acquired before inode locks/handles.
 pub(super) struct CachePressure {
     pub(super) accounting: Arc<PageCacheAccounting>,
-    reservations: Mutex<usize>,
+    reservations: [ReservationShard; RESERVATION_SHARDS],
     inodes: Mutex<BTreeMap<Ext4Ino, Weak<Inode>>>,
     next_inode: AtomicUsize,
     resident_high: AtomicUsize,
@@ -49,7 +53,7 @@ impl CachePressure {
         let resident_high = resident_high.unwrap_or(64 * 1024 * 1024 / PAGE_SIZE);
         Arc::new(Self {
             accounting: Arc::new(PageCacheAccounting::default()),
-            reservations: Mutex::new(0),
+            reservations: core::array::from_fn(|_| ReservationShard(AtomicUsize::new(0))),
             inodes: Mutex::new(BTreeMap::new()),
             next_inode: AtomicUsize::new(0),
             resident_high: AtomicUsize::new(resident_high),
@@ -113,21 +117,49 @@ impl CachePressure {
 
     pub(super) fn try_reserve_resident(self: &Arc<Self>) -> Option<CacheReservation> {
         let pages = 1;
-        let mut reserved = self.reservations.lock();
-        if self
-            .accounting
-            .resident_pages()
-            .saturating_add(*reserved)
-            .saturating_add(pages)
-            > self.resident_high.load(Ordering::Relaxed)
-        {
-            return None;
-        }
-        *reserved += pages;
+        let shard = self.try_claim_reservation(pages, false)?;
         Some(CacheReservation {
             pressure: self.clone(),
             pages,
+            shard,
         })
+    }
+
+    fn reservation_shard() -> usize {
+        ostd::cpu::CpuId::current_racy().as_usize() % RESERVATION_SHARDS
+    }
+
+    fn reserved_pages(&self) -> usize {
+        self.reservations.iter().fold(0usize, |total, shard| {
+            total.saturating_add(shard.0.load(Ordering::SeqCst))
+        })
+    }
+
+    fn try_claim_reservation(&self, pages: usize, include_dirty: bool) -> Option<usize> {
+        let shard_index = Self::reservation_shard();
+        let shard = &self.reservations[shard_index].0;
+        // The increment precedes the cross-shard snapshot in one global order,
+        // so concurrent claimers cannot both omit each other's reservation.
+        if shard
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |reserved| {
+                reserved.checked_add(pages)
+            })
+            .is_err()
+        {
+            return None;
+        }
+        let reserved = self.reserved_pages();
+        let within_limit = self.accounting.resident_pages().saturating_add(reserved)
+            <= self.resident_high.load(Ordering::Relaxed)
+            && (!include_dirty
+                || self.dirty_pressure().saturating_add(reserved)
+                    <= self.dirty_high.load(Ordering::Relaxed));
+        if !within_limit {
+            let previous = shard.fetch_sub(pages, Ordering::SeqCst);
+            debug_assert!(previous >= pages);
+            return None;
+        }
+        Some(shard_index)
     }
 
     fn reserve_inner(
@@ -150,27 +182,13 @@ impl CachePressure {
                     "EXT4 cache writeback failed",
                 ));
             }
-            let mut reserved = self.reservations.lock();
-            if self
-                .accounting
-                .resident_pages()
-                .saturating_add(*reserved)
-                .saturating_add(pages)
-                <= self.resident_high.load(Ordering::Relaxed)
-                && (!include_dirty
-                    || self
-                        .dirty_pressure()
-                        .saturating_add(*reserved)
-                        .saturating_add(pages)
-                        <= self.dirty_high.load(Ordering::Relaxed))
-            {
-                *reserved += pages;
+            if let Some(shard) = self.try_claim_reservation(pages, include_dirty) {
                 break Ok(CacheReservation {
                     pressure: self.clone(),
                     pages,
+                    shard,
                 });
             }
-            drop(reserved);
             if !waiting {
                 wait_started = pp::now();
                 self.waiting.fetch_add(1, Ordering::AcqRel);
@@ -215,11 +233,15 @@ impl CachePressure {
 pub(super) struct CacheReservation {
     pressure: Arc<CachePressure>,
     pages: usize,
+    shard: usize,
 }
 
 impl Drop for CacheReservation {
     fn drop(&mut self) {
-        *self.pressure.reservations.lock() -= self.pages;
+        let previous = self.pressure.reservations[self.shard]
+            .0
+            .fetch_sub(self.pages, Ordering::SeqCst);
+        debug_assert!(previous >= self.pages);
         self.pressure.progress_epoch.fetch_add(1, Ordering::Release);
         self.pressure.progress.wake_all();
         if self.pressure.needs_work() {
@@ -338,6 +360,16 @@ impl Ext4 {
                     } else {
                         inode.reclaim_rnvpce_clean_dram(RECLAIM_BATCH - reclaimed)
                     };
+                    // SSD-authoritative Achilles cold reads are cached in the
+                    // ordinary PageCache. Charge and reclaim those clean pages
+                    // under the same resident budget as redirect-backed pages;
+                    // otherwise RnvpcExtend silently bypasses the configured
+                    // cache limit after taking the native cold-read fast path.
+                    if reclaimed < RECLAIM_BATCH
+                        && let Some(cache) = inode.page_cache()
+                    {
+                        reclaimed += cache.reclaim_clean_pages(RECLAIM_BATCH - reclaimed);
+                    }
                 } else if let Some(cache) = inode.page_cache() {
                     reclaimed += cache.reclaim_clean_pages(RECLAIM_BATCH - reclaimed);
                 }
@@ -374,6 +406,16 @@ mod tests {
         assert_eq!(round_delay(true, false), Duration::from_millis(10));
         assert_eq!(round_delay(false, true), Duration::from_secs(1));
         assert_eq!(round_delay(false, false), Duration::from_secs(1));
+    }
+
+    #[ktest]
+    fn cache_reservations_use_sharded_atomic_accounting() {
+        let pressure = CachePressure::new(Some(32));
+        assert_eq!(pressure.reserved_pages(), 0);
+        let reservation = pressure.try_reserve_resident().unwrap();
+        assert_eq!(pressure.reserved_pages(), 1);
+        drop(reservation);
+        assert_eq!(pressure.reserved_pages(), 0);
     }
 
     #[ktest]

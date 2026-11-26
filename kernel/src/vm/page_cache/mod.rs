@@ -80,7 +80,7 @@
 
 use core::{
     ops::{Deref, Range},
-    sync::atomic::Ordering,
+    sync::atomic::{AtomicU32, Ordering},
 };
 
 use align_ext::AlignExt;
@@ -88,7 +88,7 @@ use aster_block::bio::{BioCompleteFn, BioDirection, BioSegment, BioStatus};
 use io_util::batch::IoBatch;
 use ostd::mm::{Segment, VmIo, VmIoFill, io::util::HasVmReaderWriter};
 
-use crate::prelude::*;
+use crate::{fs::pipeline_profile as pp, prelude::*};
 
 mod accounting;
 mod cache_page;
@@ -422,6 +422,20 @@ impl VmIo for PageCache {
 /// block-device BIOs, such as network filesystems. Filesystems backed by block
 /// devices usually implement [`BlockAsPageCacheBackend`] instead.
 pub trait PageCacheBackend: Sync + Send {
+    /// Reads one page synchronously. Backends may override this to keep
+    /// completion callbacks minimal and finish cache publication in task
+    /// context.
+    fn read_page(&self, idx: usize, page: LockedCachePage) -> Result<()> {
+        let mut io_batch = IoBatch::with_capacity(1);
+        let submit_started = pp::now();
+        self.read_page_async(idx, page, &mut io_batch)?;
+        pp::NATIVE_READ_VMO_SUBMIT.record_since(submit_started, 1);
+        let wait_started = pp::now();
+        io_batch.wait_all()?;
+        pp::NATIVE_READ_VMO_WAIT.record_since(wait_started, 1);
+        Ok(())
+    }
+
     /// Reads a page from the backend asynchronously.
     ///
     /// The caller may try to pass an index that exceeds the size of the
@@ -501,16 +515,6 @@ pub trait PageCacheBackend: Sync + Send {
             let locked_page = page.lock();
             self.write_page_async(idx, locked_page, io_batch)?;
         }
-        Ok(())
-    }
-}
-
-impl dyn PageCacheBackend {
-    /// Reads a page from the backend synchronously.
-    pub fn read_page(&self, idx: usize, page: LockedCachePage) -> Result<()> {
-        let mut io_batch = IoBatch::with_capacity(1);
-        self.read_page_async(idx, page, &mut io_batch)?;
-        io_batch.wait_all()?;
         Ok(())
     }
 }
@@ -718,22 +722,72 @@ pub(crate) fn write_run_complete_fn(pages: Vec<(usize, CachePage)>) -> BioComple
 }
 
 impl<T: BlockAsPageCacheBackend> PageCacheBackend for T {
+    fn read_page(&self, idx: usize, locked_page: LockedCachePage) -> Result<()> {
+        let alloc_started = pp::now();
+        let bio_segment = BioSegment::alloc(1, BioDirection::FromDevice);
+        pp::NATIVE_READ_STAGING_ALLOC.record_since(alloc_started, 1);
+        let completed_data = bio_segment.clone();
+        let completion_status = Arc::new(AtomicU32::new(BioStatus::Init as u32));
+        let callback_status = completion_status.clone();
+        let complete_fn: BioCompleteFn = Box::new(move |status| {
+            callback_status.store(status as u32, Ordering::Release);
+        });
+        let mut io_batch = IoBatch::with_capacity(1);
+        let submit_started = pp::now();
+        self.submit_read_bio(idx, bio_segment, complete_fn, &mut io_batch)?;
+        pp::NATIVE_READ_VMO_SUBMIT.record_since(submit_started, 1);
+        let wait_started = pp::now();
+        io_batch.wait_all()?;
+        pp::NATIVE_READ_VMO_WAIT.record_since(wait_started, 1);
+
+        match BioStatus::try_from(completion_status.load(Ordering::Acquire)).unwrap() {
+            BioStatus::Complete => {
+                let copy_started = pp::now();
+                let mut reader = completed_data.reader().unwrap();
+                // `to_fallible` uses the architecture's bulk copy routine
+                // instead of the deliberately volatile kernel-to-kernel
+                // `VmWriter::write`; both ranges are nevertheless kernel
+                // memory and cannot fault here.
+                locked_page
+                    .writer()
+                    .to_fallible()
+                    .write_fallible(&mut reader)
+                    .unwrap();
+                locked_page.set_up_to_date();
+                pp::NATIVE_READ_STAGING_COPY.record_since(copy_started, 1);
+            }
+            BioStatus::Zeros => {
+                locked_page.fill_zeros(0, PAGE_SIZE).unwrap();
+                locked_page.set_up_to_date();
+            }
+            _ => return_errno_with_message!(Errno::EIO, "page-cache read did not complete"),
+        }
+        let drop_started = pp::now();
+        drop(completed_data);
+        pp::NATIVE_READ_STAGING_DROP.record_since(drop_started, 1);
+        Ok(())
+    }
+
     fn read_page_async(
         &self,
         idx: usize,
         locked_page: LockedCachePage,
         io_batch: &mut IoBatch,
     ) -> Result<()> {
-        let bio_segment = BioSegment::new_from_segment(
-            Segment::from(locked_page.deref().clone()).into(),
-            BioDirection::FromDevice,
-        );
+        // Device-owned DMA buffers are substantially cheaper than mapping a
+        // freshly allocated cache frame for each cold miss. Copy into the
+        // cache page on completion so the ordinary PageCache remains the
+        // authoritative hot-read path after this first read.
+        let bio_segment = BioSegment::alloc(1, BioDirection::FromDevice);
+        let completed_data = bio_segment.clone();
 
         let complete_fn: BioCompleteFn = Box::new(move |status| {
             if status == BioStatus::Zeros {
                 locked_page.fill_zeros(0, PAGE_SIZE).unwrap();
                 locked_page.set_up_to_date();
             } else if status == BioStatus::Complete {
+                let mut reader = completed_data.reader().unwrap();
+                locked_page.writer().write(&mut reader);
                 locked_page.set_up_to_date();
             }
             // The page lock is released when `locked_page` (LockedCachePage) is dropped here.

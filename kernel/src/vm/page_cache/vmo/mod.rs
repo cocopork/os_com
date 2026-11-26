@@ -223,43 +223,41 @@ impl Vmo {
     /// the lock, since destruction can release accounting/allocator resources.
     pub(super) fn reclaim_clean_pages(&self, limit: usize) -> usize {
         // Anonymous clean pages are the authoritative data, not a cache.
-        if self.backend.is_none() {
+        if self.backend.is_none() || limit == 0 {
             return 0;
         }
-        let mut reclaimed = 0;
-        let mut index = 0;
-        while reclaimed < limit {
-            let removed = {
-                let _commit = self.commit_lock.lock();
-                let mut pages = self.pages.lock();
-                let mut cursor = pages.cursor_mut(index);
-                let mut victim = None;
-                loop {
-                    if let Some(page) = cursor.load() {
-                        if page.reference_count() == 1 && page.is_up_to_date() {
-                            if let Some(guard) = page.try_lock_guard() {
-                                if !guard.is_writing_back() && guard.is_up_to_date() {
-                                    victim = Some(cursor.index());
-                                }
-                            }
-                        }
-                    }
-                    if victim.is_some() {
-                        break;
-                    }
-                    if cursor.next_present().is_none() {
+
+        // Reclaim is already invoked in bounded batches. Scan and detach the
+        // whole batch under one pair of locks; the former per-page lock cycle
+        // serialized cold readers behind thousands of identical acquisitions.
+        // Keep the detached pages alive until after both locks are released so
+        // frame/accounting destruction never runs under the XArray spinlock.
+        let mut removed = Vec::with_capacity(limit);
+        {
+            let _commit = self.commit_lock.lock();
+            let mut pages = self.pages.lock();
+            let mut cursor = pages.cursor_mut(0);
+            loop {
+                let reclaimable = cursor.load().is_some_and(|page| {
+                    page.reference_count() == 1
+                        && page.is_up_to_date()
+                        && page
+                            .try_lock_guard()
+                            .is_some_and(|guard| !guard.is_writing_back() && guard.is_up_to_date())
+                });
+                if reclaimable && let Some(page) = cursor.remove() {
+                    removed.push(page.clone());
+                    if removed.len() == limit {
                         break;
                     }
                 }
-                let Some(victim) = victim else {
+                if cursor.next_present().is_none() {
                     break;
-                };
-                index = victim + 1;
-                cursor.remove().map(|page| page.clone())
-            };
-            drop(removed);
-            reclaimed += 1;
+                }
+            }
         }
+        let reclaimed = removed.len();
+        drop(removed);
         reclaimed
     }
 
@@ -465,10 +463,12 @@ impl Vmo {
                 &mut page_batch,
             )?;
 
+            let copy_started = pp::now();
             for (_, page) in page_batch.iter() {
                 page.reader().skip(page_offset).read_fallible(writer)?;
                 page_offset = 0;
             }
+            pp::NATIVE_READ_VMO_COPY.record_since(copy_started, page_batch.len());
 
             // `current_idx < page_idx_range.end` guarantees at least one page is successfully collected here.
             current_idx = page_batch.last().unwrap().0 + 1;
@@ -881,6 +881,33 @@ impl<'a> BackedVmo<'a> {
             if chunk_start >= end {
                 break;
             }
+            let all_absent = {
+                let mut cursor = locked_pages.cursor(chunk_start as u64);
+                let mut absent = true;
+                while (cursor.index() as usize) < end {
+                    if cursor.load().is_some() {
+                        absent = false;
+                        break;
+                    }
+                    cursor.next();
+                }
+                absent
+            };
+            if all_absent {
+                let pages = CachePage::alloc_uninit_batch_accounted(
+                    end - chunk_start,
+                    self.accounting.clone(),
+                )?;
+                let mut cursor = locked_pages.cursor_mut(chunk_start as u64);
+                for page in pages {
+                    let page_idx = cursor.index() as usize;
+                    cursor.store(page.clone());
+                    pages_to_read.push((page_idx, page));
+                    cursor.next();
+                }
+                chunk_start = end;
+                continue;
+            }
             let mut cursor = locked_pages.cursor_mut(chunk_start as u64);
             while (cursor.index() as usize) < end {
                 let page_idx = cursor.index() as usize;
@@ -995,6 +1022,7 @@ impl<'a> BackedVmo<'a> {
 
     /// Commits a page at the given index for a VMO with a backend.
     fn commit_on_internal(&self, page_idx: usize, commit_mode: CommitMode) -> Result<CachePage> {
+        let commit_started = pp::now();
         let mut locked_pages = self.pages.lock();
         if page_idx >= self.size().div_ceil(PAGE_SIZE) {
             return_errno_with_message!(Errno::EINVAL, "the offset is outside the VMO");
@@ -1007,24 +1035,34 @@ impl<'a> BackedVmo<'a> {
             drop(locked_pages);
 
             if !commit_mode.skips_backend_read() {
+                let backend_started = pp::now();
                 page.ensure_init(|locked_page| self.backend.read_page(page_idx, locked_page))?;
+                pp::NATIVE_READ_VMO_BACKEND.record_since(backend_started, 1);
+                pp::NATIVE_READ_VMO_COMMIT.record_since(commit_started, 1);
                 return Ok(page);
             }
 
+            pp::NATIVE_READ_VMO_COMMIT.record_since(commit_started, 1);
             return Ok(page);
         };
 
         // The page is within the file bounds - need to allocate a cache page.
+        let allocation_started = pp::now();
         let uninit_page = CachePage::alloc_uninit_accounted(self.accounting.clone())?;
         cursor.store(uninit_page.clone());
         drop(locked_pages);
+        pp::NATIVE_READ_VMO_ALLOCATE.record_since(allocation_started, 1);
 
         if commit_mode.skips_backend_read() {
             // The page will be completely overwritten, no need to read.
+            pp::NATIVE_READ_VMO_COMMIT.record_since(commit_started, 1);
             Ok(uninit_page)
         } else {
             // Read the page from the backend storage.
+            let backend_started = pp::now();
             uninit_page.ensure_init(|locked_page| self.backend.read_page(page_idx, locked_page))?;
+            pp::NATIVE_READ_VMO_BACKEND.record_since(backend_started, 1);
+            pp::NATIVE_READ_VMO_COMMIT.record_since(commit_started, 1);
             Ok(uninit_page)
         }
     }

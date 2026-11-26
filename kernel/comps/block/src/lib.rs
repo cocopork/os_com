@@ -135,6 +135,7 @@ pub struct BlockQueueDiagnostics {
     pub peak_forwarders: usize,
     pub irq_completions: usize,
     pub in_flight_requests: usize,
+    pub max_in_flight_requests: usize,
 }
 
 impl dyn BlockDevice {
