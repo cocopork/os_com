@@ -1,0 +1,17 @@
+{
+  "case": "e2e-sata-rnvpce-cold-randread-bs-8k-r3",
+  "device": "sata",
+  "mode": "rnvpce",
+  "workload": "cold-randread",
+  "axis": "bs",
+  "value": "8k",
+  "bs_kib": 8,
+  "jobs": 1,
+  "repeat": 3,
+  "actual_mib": 2048,
+  "fio_mib_s": 33.27700424194336,
+  "including_sync_mib_s": null,
+  "iops": 4259.456649,
+  "mean_latency_us": 233.904632244,
+  "p99_latency_us": 354.304
+}

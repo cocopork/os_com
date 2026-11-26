@@ -31,8 +31,8 @@
 ### Task 1: Matrix and Result Parser
 
 **Files:**
-- Create: `docs/experiments/scripts/preliminary-performance-sweep-20261030/sweep.py`
-- Test: `docs/experiments/scripts/preliminary-performance-sweep-20261030/test_sweep.py`
+- Create: `docs/experiments/fio/temporary/preliminary-performance-sweep-20261030/scripts/sweep.py`
+- Test: `docs/experiments/fio/temporary/preliminary-performance-sweep-20261030/scripts/test_sweep.py`
 
 **Interfaces:**
 - Produces: `matrix() -> list[Point]`, `parse_log(path: Path, point: Point) -> dict`, and CSV/report-table output.
@@ -45,8 +45,8 @@
 ### Task 2: Guest and Host Runners
 
 **Files:**
-- Create: `docs/experiments/scripts/preliminary-performance-sweep-20261030/guest.sh`
-- Create: `docs/experiments/scripts/preliminary-performance-sweep-20261030/run-sweep.sh`
+- Create: `docs/experiments/fio/temporary/preliminary-performance-sweep-20261030/scripts/guest.sh`
+- Create: `docs/experiments/fio/temporary/preliminary-performance-sweep-20261030/scripts/run-sweep.sh`
 
 **Interfaces:**
 - Consumes: point configuration fields emitted by `sweep.py`.
@@ -73,7 +73,7 @@
 ### Task 4: Reviewed Experiment Report
 
 **Files:**
-- Create: `docs/experiments/reports/PRELIMINARY-PERFORMANCE-SWEEP-2026-10-30.md`
+- Create: `docs/experiments/fio/temporary/preliminary-performance-sweep-20261030/README.md`
 
 **Interfaces:**
 - Consumes: validated `results.csv` and raw evidence manifests.

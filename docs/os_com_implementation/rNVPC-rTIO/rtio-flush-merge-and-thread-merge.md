@@ -138,6 +138,7 @@ if mode != Native { ext4.start_rnvpc_flush_thread(); } // rNVPC/rNVPCe 才起
 ## 5. 验收记录
 
 - 双 cfg `cargo osdk check`：0 error / 0 warning。
-- 全量 ktest：见 `ktest-logs/`（期望 `724 passed; 3 failed`，失败集合为固定的 superblock 计数器家族）。
+- 全量 ktest：`724 passed; 3 failed`；失败集合为固定的 superblock 计数器家族。
+  原始 serial/full 日志属于临时诊断数据，已于 2026-11-20 清理；本条保留其关键结果。
 - 插桩全矩阵：`results/20260924_032853_aster-ext4-baseline`（8/8 轮跑通，含超时格修复后复验）。
 - 受控 A/B：`results/20260924_032853`（开）/ `results/20260924_033042`（关）。

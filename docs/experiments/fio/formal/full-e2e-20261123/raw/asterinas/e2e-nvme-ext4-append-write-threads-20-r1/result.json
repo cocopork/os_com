@@ -1,0 +1,17 @@
+{
+  "case": "e2e-nvme-ext4-append-write-threads-20-r1",
+  "device": "nvme",
+  "mode": "ext4",
+  "workload": "append-write",
+  "axis": "threads",
+  "value": "20",
+  "bs_kib": 4,
+  "jobs": 20,
+  "repeat": 1,
+  "actual_mib": 2040,
+  "fio_mib_s": 1042.944785118103,
+  "including_sync_mib_s": 910.7142857142857,
+  "iops": 266993.865031,
+  "mean_latency_us": 72.37345185,
+  "p99_latency_us": 337.92
+}

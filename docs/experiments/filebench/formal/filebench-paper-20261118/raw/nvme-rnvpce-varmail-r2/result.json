@@ -1,0 +1,17 @@
+{
+  "case": "nvme-rnvpce-varmail-r2",
+  "device": "nvme",
+  "mode": "rnvpce",
+  "workload": "varmail",
+  "repeat": 2,
+  "threads": 16,
+  "nfiles": 10000,
+  "filesize_kib": 128,
+  "dataset_mib": 1250,
+  "dram_cache_mib": 64,
+  "nv_data_cache_mib": 64,
+  "operations": 339022,
+  "ops_s": 5606.846,
+  "mb_s": 800.3,
+  "latency_ms": 2.846
+}

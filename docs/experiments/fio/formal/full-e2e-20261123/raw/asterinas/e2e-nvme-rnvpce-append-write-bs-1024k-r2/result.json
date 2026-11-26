@@ -1,0 +1,18 @@
+{
+  "case": "e2e-nvme-rnvpce-append-write-bs-1024k-r2",
+  "device": "nvme",
+  "mode": "rnvpce",
+  "workload": "append-write",
+  "axis": "bs",
+  "value": "1024k",
+  "bs_kib": 1024,
+  "jobs": 1,
+  "repeat": 2,
+  "fio_fsync_blocks": 1,
+  "actual_mib": 2048.0,
+  "fio_mib_s": 2968.115942001343,
+  "including_sync_mib_s": 2068.686868686869,
+  "iops": 2968.115942,
+  "mean_latency_us": 334.629004883,
+  "p99_latency_us": 1122.304
+}

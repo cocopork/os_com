@@ -297,8 +297,8 @@
 
 **Files:**
 - Modify: `kernel/src/fs/fs_impls/ext4/pipeline_profile.rs`
-- Create: `docs/experiments/scripts/nv-extent-entry-migration-20261030/`
-- Create: `docs/experiments/reports/NV-EXTENT-ENTRY-MIGRATION-2026-10-30.md`
+- Create: `docs/experiments/validation/temporary/nv-extent-entry-migration-20261030/scripts/`
+- Create: `docs/experiments/validation/temporary/nv-extent-entry-migration-20261030/README.md`
 
 **Interfaces:**
 - Consumes: Tasks 1-5.
@@ -339,6 +339,6 @@
 - [ ] **Step 7: Commit**
 
   ```bash
-  git add kernel/src/fs/fs_impls/ext4/pipeline_profile.rs docs/experiments/scripts/nv-extent-entry-migration-20261030 docs/experiments/reports/NV-EXTENT-ENTRY-MIGRATION-2026-10-30.md
+  git add kernel/src/fs/fs_impls/ext4/pipeline_profile.rs docs/experiments/validation/temporary/nv-extent-entry-migration-20261030
   git commit -m "test(rnvpce): validate NV extent entry migration"
   ```

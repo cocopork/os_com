@@ -1,0 +1,17 @@
+{
+  "case": "e2e-nvme-rnvpce-cold-randread-threads-20-r2",
+  "device": "nvme",
+  "mode": "rnvpce",
+  "workload": "cold-randread",
+  "axis": "threads",
+  "value": "20",
+  "bs_kib": 4,
+  "jobs": 20,
+  "repeat": 2,
+  "actual_mib": 2040,
+  "fio_mib_s": 366.11629486083984,
+  "including_sync_mib_s": null,
+  "iops": 93725.771716,
+  "mean_latency_us": 206.26390664599998,
+  "p99_latency_us": 432.128
+}

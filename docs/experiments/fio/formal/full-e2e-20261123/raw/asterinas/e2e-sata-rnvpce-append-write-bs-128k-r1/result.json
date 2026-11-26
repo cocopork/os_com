@@ -1,0 +1,18 @@
+{
+  "case": "e2e-sata-rnvpce-append-write-bs-128k-r1",
+  "device": "sata",
+  "mode": "rnvpce",
+  "workload": "append-write",
+  "axis": "bs",
+  "value": "128k",
+  "bs_kib": 128,
+  "jobs": 1,
+  "repeat": 1,
+  "fio_fsync_blocks": 1,
+  "actual_mib": 2048.0,
+  "fio_mib_s": 430.6139612197876,
+  "including_sync_mib_s": 393.0902111324376,
+  "iops": 3444.91169,
+  "mean_latency_us": 288.99390033,
+  "p99_latency_us": 7897.088
+}

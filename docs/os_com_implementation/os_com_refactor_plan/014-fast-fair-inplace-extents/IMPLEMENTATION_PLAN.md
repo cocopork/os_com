@@ -101,7 +101,7 @@
 
 ## Task 7：切换、清理及对照实验
 
-**Files:** `layout.rs`、`metadata.rs`、`extent_mutation.rs`、相关测试；`docs/experiments/scripts/`、`docs/experiments/reports/`。
+**Files:** `layout.rs`、`metadata.rs`、`extent_mutation.rs`、相关测试；`docs/experiments/<test-type>/<formal-or-temporary>/<experiment>/scripts/`、`docs/experiments/validation/temporary/<experiment>/`。
 
 - [ ] 格式版本检查测试：旧格式明确拒绝，无静默转换/清盘。rNVPC WAL 的旧公共类型按需隔离保留。
 - [ ] 新生产路径完整接入后删除其 NodeRewrite repair-image 及旧恢复分支；保留真实 sibling 分配。通过调用审计证明没有 fallback 回到整节点镜像。

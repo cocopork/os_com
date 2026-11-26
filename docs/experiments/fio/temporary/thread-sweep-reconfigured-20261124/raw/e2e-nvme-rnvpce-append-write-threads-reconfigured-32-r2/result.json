@@ -1,0 +1,18 @@
+{
+  "case": "e2e-nvme-rnvpce-append-write-threads-reconfigured-32-r2",
+  "device": "nvme",
+  "mode": "rnvpce",
+  "workload": "append-write",
+  "axis": "threads-reconfigured",
+  "value": "32",
+  "bs_kib": 4,
+  "jobs": 32,
+  "repeat": 2,
+  "fio_fsync_blocks": 1,
+  "actual_mib": 32768.0,
+  "fio_mib_s": 267.9554166793823,
+  "including_sync_mib_s": 260.9540495341244,
+  "iops": 68596.586774,
+  "mean_latency_us": 442.36910544299997,
+  "p99_latency_us": 1122.304
+}

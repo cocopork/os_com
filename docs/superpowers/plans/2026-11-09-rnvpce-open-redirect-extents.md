@@ -99,7 +99,7 @@
 
 **Files:**
 - Modify: `docs/os_com_implementation/os_com_refactor_plan/019-range-write-transactions/README.md`
-- Create: `docs/experiments/reports/RNVPCE-OPEN-REDIRECT-EXTENTS-2026-11-09.md`
+- Create: `docs/experiments/validation/temporary/rnvpce-open-redirect-extents-20261109/README.md`
 
 **Interfaces:**
 - Consumes: existing five-round overwrite sweep configuration.

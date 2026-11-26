@@ -1,0 +1,18 @@
+{
+  "case": "e2e-nvme-rnvpce-overwrite-randwrite-bs-256k-r2",
+  "device": "nvme",
+  "mode": "rnvpce",
+  "workload": "overwrite-randwrite",
+  "axis": "bs",
+  "value": "256k",
+  "bs_kib": 256,
+  "jobs": 1,
+  "repeat": 2,
+  "fio_fsync_blocks": 1,
+  "actual_mib": 2048.0,
+  "fio_mib_s": 3052.1609535217285,
+  "including_sync_mib_s": 1969.230769230769,
+  "iops": 12208.643815,
+  "mean_latency_us": 80.742508423,
+  "p99_latency_us": 1105.92
+}

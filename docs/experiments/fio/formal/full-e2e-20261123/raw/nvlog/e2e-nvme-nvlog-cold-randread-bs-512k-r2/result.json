@@ -1,0 +1,32 @@
+{
+  "case": "e2e-nvme-nvlog-cold-randread-bs-512k-r2",
+  "device": "nvme",
+  "mode": "nvlog",
+  "workload": "cold-randread",
+  "axis": "bs",
+  "value": "512k",
+  "bs_kib": 512,
+  "jobs": 1,
+  "repeat": 2,
+  "actual_mib": 2048,
+  "configured_dram_cache_mib": 128,
+  "configured_nv_data_cache_mib": 128,
+  "configured_total_data_cache_mib": 256,
+  "cache_control": "memcg-memory-high",
+  "cache_file_peak_bytes": 134156288,
+  "cache_anon_peak_bytes": 6021120,
+  "memory_high_mib": 136,
+  "memory_max_mib": 512,
+  "memory_events": {
+    "low": 0,
+    "high": 3923,
+    "max": 0,
+    "oom": 0,
+    "oom_kill": 0
+  },
+  "fio_mib_s": 661.926308631897,
+  "including_sync_mib_s": null,
+  "iops": 1323.852618,
+  "mean_latency_us": 753.000334229,
+  "p99_latency_us": 1171.456
+}

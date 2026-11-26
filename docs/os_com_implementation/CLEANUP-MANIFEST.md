@@ -3,6 +3,27 @@
 > Status: completed. The explicitly approved C1 cache deletion, global `results/` retirement, and root diagnostic-log cleanup ran on 2026-09-27.
 > C1 removed only its 25 exact paths. Separate user approvals removed the complete legacy global `results/` directory after active producers moved under `test/ext4-journal-compare/`, then removed the untracked root-level `i5-*.log` and `smoke-*.log` diagnostics.
 
+## 2026-11-20 temporary-artifact cleanup
+
+The earlier `Archive` decision for `ktest-logs/` was superseded by the user's
+explicit request to compress temporary experiment artifacts. Its only retained
+result, `724 passed; 3 failed` with the fixed superblock-counter failure family,
+is now recorded directly in
+`rNVPC-rTIO/rtio-flush-merge-and-thread-merge.md`. The 14 ignored serial/full
+logs (1,916,274 B) were then deleted. Three ignored root-level journal comparison
+logs were also deleted after repository-wide reference checks found no reader;
+their generating harness remains intact.
+
+Five ignored 2026-09-22 baseline A/B console logs (59,551 B) were compressed into
+the complete bandwidth sample table and methodological conclusion in
+`ext4_performance.md` section 0.1, then deleted. The corresponding A/B scripts
+remain available to reproduce the comparison.
+
+Formal files under `test/bench/evidence/`, curated experiment reports, current
+test scripts, and active NVLog formal result directories were deliberately
+retained. The external NVLog cleanup and its retained conclusions are documented
+in `archive/experiments/nvlog-comparison-2026-11-20.md`.
+
 ## Scope and pre-cleanup metrics
 
 This manifest inventories disposable experiment artifacts in the working tree

@@ -1,0 +1,50 @@
+[
+  {
+    "case": "raw-nvme-linux-overwrite-randwrite-bs-32k",
+    "device": "nvme",
+    "system": "linux",
+    "workload": "overwrite-randwrite",
+    "axis": "bs",
+    "bs_kib": 32,
+    "jobs": 1,
+    "repeat": 1,
+    "actual_mib": 2048,
+    "virtqueues": 8,
+    "fio_mib_s": 721.3807678222656,
+    "iops": 23084.184572,
+    "mean_latency_us": 43.00150444,
+    "p99_latency_us": 78.336
+  },
+  {
+    "case": "raw-nvme-linux-overwrite-randwrite-bs-32k",
+    "device": "nvme",
+    "system": "linux",
+    "workload": "overwrite-randwrite",
+    "axis": "bs",
+    "bs_kib": 32,
+    "jobs": 1,
+    "repeat": 2,
+    "actual_mib": 2048,
+    "virtqueues": 8,
+    "fio_mib_s": 658.3092250823975,
+    "iops": 21065.895211,
+    "mean_latency_us": 47.162584259000006,
+    "p99_latency_us": 82.432
+  },
+  {
+    "case": "raw-nvme-linux-overwrite-randwrite-bs-32k",
+    "device": "nvme",
+    "system": "linux",
+    "workload": "overwrite-randwrite",
+    "axis": "bs",
+    "bs_kib": 32,
+    "jobs": 1,
+    "repeat": 3,
+    "actual_mib": 2048,
+    "virtqueues": 8,
+    "fio_mib_s": 649.952395439148,
+    "iops": 20798.476674,
+    "mean_latency_us": 47.779579391,
+    "p99_latency_us": 82.432
+  }
+]

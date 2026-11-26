@@ -203,8 +203,8 @@ Run the Step 2 command, `cargo osdk check --package aster-kernel`, and `cargo os
 ### Task 6: Correctness and Performance Validation
 
 **Files:**
-- Create: `docs/experiments/reports/RTIO-MULTI-WORKER-2026-11-02.md`
-- Reuse: `docs/experiments/scripts/preliminary-performance-sweep-20261030/`
+- Create: `docs/experiments/validation/temporary/rtio-multi-worker-20261102/README.md`
+- Reuse: `docs/experiments/fio/temporary/preliminary-performance-sweep-20261030/scripts/`
 
 **Interfaces:**
 - Consumes: release kernel with `rtio_workers=1` and the default worker policy.

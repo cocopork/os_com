@@ -1,0 +1,17 @@
+{
+  "case": "e2e-sata-ext4-overwrite-randwrite-threads-reconfigured-16-r3",
+  "device": "sata",
+  "mode": "ext4",
+  "workload": "overwrite-randwrite",
+  "axis": "threads-reconfigured",
+  "value": "16",
+  "bs_kib": 4,
+  "jobs": 16,
+  "repeat": 3,
+  "actual_mib": 16384.0,
+  "fio_mib_s": 187.9200782775879,
+  "including_sync_mib_s": 186.71225071225072,
+  "iops": 48107.540201,
+  "mean_latency_us": 324.950025202,
+  "p99_latency_us": 11730.944
+}

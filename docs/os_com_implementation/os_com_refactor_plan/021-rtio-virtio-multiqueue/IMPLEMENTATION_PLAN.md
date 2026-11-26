@@ -227,11 +227,11 @@ git commit -m "Validate cross queue rTIO durability"
 ### Task 6: Reproducible QEMU IOThread and host-hctx harness
 
 **Files:**
-- Create: `docs/experiments/scripts/rtio-virtio-multiqueue-20261102/run-validation.sh`
-- Create: `docs/experiments/scripts/rtio-virtio-multiqueue-20261102/select-hctx-cpus.sh`
-- Create: `docs/experiments/scripts/rtio-virtio-multiqueue-20261102/trace-nvme-hctx.bt`
-- Create: `docs/experiments/scripts/rtio-virtio-multiqueue-20261102/summarize.py`
-- Create: `docs/experiments/scripts/rtio-virtio-multiqueue-20261102/README.md`
+- Create: `docs/experiments/validation/temporary/rtio-virtio-multiqueue-20261102/scripts/run-validation.sh`
+- Create: `docs/experiments/validation/temporary/rtio-virtio-multiqueue-20261102/scripts/select-hctx-cpus.sh`
+- Create: `docs/experiments/validation/temporary/rtio-virtio-multiqueue-20261102/scripts/trace-nvme-hctx.bt`
+- Create: `docs/experiments/validation/temporary/rtio-virtio-multiqueue-20261102/scripts/summarize.py`
+- Create: `docs/experiments/validation/temporary/rtio-virtio-multiqueue-20261102/scripts/README.md`
 
 **Interfaces:**
 - Produces: `QEMU_BIN` preflight requiring version 9.0+ and the `iothread-vq-mapping` property.
@@ -265,14 +265,14 @@ Run `bash .../run-validation.sh --self-test`, `bash -n` on both shell scripts, a
 - [ ] **Step 7: Commit**
 
 ```bash
-git add docs/experiments/scripts/rtio-virtio-multiqueue-20261102
+git add docs/experiments/validation/temporary/rtio-virtio-multiqueue-20261102
 git commit -m "Add virtio multiqueue hardware queue harness"
 ```
 
 ### Task 7: Bare-device correctness, scaling experiment, and report
 
 **Files:**
-- Create: `docs/experiments/reports/RTIO-VIRTIO-MULTIQUEUE-2026-11-02.md`
+- Create: `docs/experiments/validation/temporary/rtio-virtio-multiqueue-20261102/README.md`
 - Modify: `docs/os_com_implementation/os_com_refactor_plan/021-rtio-virtio-multiqueue/README.md`
 - Modify: `docs/os_com_implementation/os_com_refactor_plan/README.md`
 
@@ -305,6 +305,6 @@ Report fio and including-sync MiB/s, mean and tail latency, `nv_data_submit`, ca
 Update 021 and the refactor index with the exact implementation and validation status. Commit scripts and report only; do not add raw logs, images, generated plots, or large trace files.
 
 ```bash
-git add docs/experiments/reports/RTIO-VIRTIO-MULTIQUEUE-2026-11-02.md docs/os_com_implementation/os_com_refactor_plan
+git add docs/experiments/validation/temporary/rtio-virtio-multiqueue-20261102/README.md docs/os_com_implementation/os_com_refactor_plan
 git commit -m "Validate rTIO virtio multiqueue scaling"
 ```

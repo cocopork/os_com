@@ -119,7 +119,7 @@
 - [ ] 独立诊断构建分开测量metadata准备/提交/完成、data完成、flush排队/服务、NVM发布与回收；记录批次页数分布、in-flight、实际flush次数，避免全局计数混淆来源。
 - [ ] 沿用2GiB、64MiB、128页窗口、1/16线程、4KiB随机/128KiB顺序、CPU隔离；前后各三轮，交替顺序，禁止测试时并行编译。
 - [ ] 每点确认完整写入、fio错误0、drain和卸载成功、e2fsck；单独报告恢复模型边界、native读回和真实掉电尚未验证项。
-- [ ] 保存 `docs/experiments/reports/ORDERLESS-MIGRATION-<date>.md`，诚实报告回退或无提升；更新需求状态与实现清单。未授权不提交推送。
+- [ ] 保存 `docs/experiments/validation/temporary/orderless-migration-<date>.md`，诚实报告回退或无提升；更新需求状态与实现清单。未授权不提交推送。
 
 ## 执行检查命令
 

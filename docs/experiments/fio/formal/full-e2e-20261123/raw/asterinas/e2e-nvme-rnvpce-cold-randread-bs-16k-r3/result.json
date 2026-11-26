@@ -1,0 +1,17 @@
+{
+  "case": "e2e-nvme-rnvpce-cold-randread-bs-16k-r3",
+  "device": "nvme",
+  "mode": "rnvpce",
+  "workload": "cold-randread",
+  "axis": "bs",
+  "value": "16k",
+  "bs_kib": 16,
+  "jobs": 1,
+  "repeat": 3,
+  "actual_mib": 2048,
+  "fio_mib_s": 136.27894592285156,
+  "including_sync_mib_s": null,
+  "iops": 8721.852542,
+  "mean_latency_us": 114.312749268,
+  "p99_latency_us": 158.72
+}

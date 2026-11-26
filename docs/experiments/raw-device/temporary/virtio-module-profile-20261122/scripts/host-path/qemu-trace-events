@@ -1,0 +1,15 @@
+virtio_pci_notify_write
+virtio_queue_notify
+virtqueue_pop
+virtio_blk_handle_write
+blk_co_pwritev
+bdrv_co_pwritev_part
+thread_pool_submit
+thread_pool_complete
+virtio_blk_rw_complete
+virtio_blk_req_complete
+virtqueue_fill
+virtqueue_flush
+virtio_notify_irqfd
+virtio_notify_irqfd_deferred_fn
+virtio_notify

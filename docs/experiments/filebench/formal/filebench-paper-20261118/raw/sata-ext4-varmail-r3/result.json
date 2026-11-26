@@ -1,0 +1,17 @@
+{
+  "case": "sata-ext4-varmail-r3",
+  "device": "sata",
+  "mode": "ext4",
+  "workload": "varmail",
+  "repeat": 3,
+  "threads": 16,
+  "nfiles": 10000,
+  "filesize_kib": 128,
+  "dataset_mib": 1250,
+  "dram_cache_mib": 128,
+  "nv_data_cache_mib": 0,
+  "operations": 228318,
+  "ops_s": 3803.438,
+  "mb_s": 292.0,
+  "latency_ms": 4.193
+}

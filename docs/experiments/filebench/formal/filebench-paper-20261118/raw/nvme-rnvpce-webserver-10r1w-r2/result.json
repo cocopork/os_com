@@ -1,0 +1,17 @@
+{
+  "case": "nvme-rnvpce-webserver-10r1w-r2",
+  "device": "nvme",
+  "mode": "rnvpce",
+  "workload": "webserver-10r1w",
+  "repeat": 2,
+  "threads": 16,
+  "nfiles": 10000,
+  "filesize_kib": 128,
+  "dataset_mib": 1250,
+  "dram_cache_mib": 64,
+  "nv_data_cache_mib": 64,
+  "operations": 2251619,
+  "ops_s": 37234.558,
+  "mb_s": 5434.1,
+  "latency_ms": 0.427
+}

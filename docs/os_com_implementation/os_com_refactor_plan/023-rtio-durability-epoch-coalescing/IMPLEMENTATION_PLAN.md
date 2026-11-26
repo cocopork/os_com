@@ -65,7 +65,7 @@
 **Files:**
 - Modify: `docs/os_com_implementation/os_com_refactor_plan/023-rtio-durability-epoch-coalescing/README.md`
 - Modify: `docs/os_com_implementation/os_com_refactor_plan/README.md`
-- Create: `docs/experiments/reports/RTIO-DURABILITY-EPOCH-COALESCING-2026-11-03.md`
+- Create: `docs/experiments/validation/temporary/rtio-durability-epoch-coalescing-20261103/README.md`
 
 **Interfaces:**
 - Consumes: Task 2 implementation and existing 022 experiment harness.

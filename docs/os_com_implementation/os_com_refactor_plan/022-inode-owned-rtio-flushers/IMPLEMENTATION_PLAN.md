@@ -226,8 +226,8 @@ git commit -m "Complete rTIO migration in inode owners"
 - Modify: `kernel/src/fs/fs_impls/ext4/pipeline_profile.rs`
 - Modify: `docs/os_com_implementation/os_com_refactor_plan/022-inode-owned-rtio-flushers/README.md`
 - Modify: `docs/os_com_implementation/os_com_refactor_plan/README.md`
-- Create: `docs/experiments/reports/RTIO-INODE-OWNED-FLUSHERS-2026-11-03.md`
-- Reuse: `docs/experiments/scripts/rtio-virtio-multiqueue-20261102/`
+- Create: `docs/experiments/validation/temporary/rtio-inode-owned-flushers-20261103/README.md`
+- Reuse: `docs/experiments/validation/temporary/rtio-virtio-multiqueue-20261102/scripts/`
 
 **Interfaces:**
 - Consumes: Task 4 worker counters, queues and durability arbiter.
@@ -263,6 +263,6 @@ Compare throughput, latency, capacity wait, batch-page distribution, owner balan
 git add kernel/src/fs/fs_impls/ext4/pipeline_profile.rs \
   docs/os_com_implementation/os_com_refactor_plan/022-inode-owned-rtio-flushers \
   docs/os_com_implementation/os_com_refactor_plan/README.md \
-  docs/experiments/reports/RTIO-INODE-OWNED-FLUSHERS-2026-11-03.md
+  docs/experiments/validation/temporary/rtio-inode-owned-flushers-20261103/README.md
 git commit -m "Validate inode-owned rTIO flushers"
 ```

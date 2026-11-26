@@ -1,0 +1,9 @@
+{
+  "case": "linux-ext4-append-write-128k-j1-r3",
+  "system": "linux-ext4",
+  "fio_mib_s": 790.1234560012817,
+  "including_sync_mib_s": 708.6505190311418,
+  "iops": 6320.987654,
+  "mean_latency_us": 157.82948407,
+  "p99_latency_us": 185.344
+}

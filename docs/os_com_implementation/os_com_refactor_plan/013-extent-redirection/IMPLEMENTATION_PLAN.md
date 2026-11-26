@@ -79,7 +79,7 @@
 
 ## Task 6：对照测试与报告
 
-**Files:** `docs/experiments/scripts/` 新实验入口；`docs/experiments/reports/` 新报告。
+**Files:** `docs/experiments/<test-type>/<formal-or-temporary>/<experiment>/scripts/` 新实验入口；`docs/experiments/validation/temporary/<experiment>/` 新报告。
 
 - [ ] 复用已有 Docker/OSDK harness：先确认当前可执行入口及参数并把准确命令写入报告，不杜撰新的 make filter。
 - [ ] 固定镜像、代码状态、CPU 隔离及 NVM 模拟参数，以 2 GiB、64/32 MiB 水线执行 README 测试矩阵。

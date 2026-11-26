@@ -1,0 +1,18 @@
+{
+  "case": "e2e-sata-rnvpce-overwrite-randwrite-threads-reconfigured-8-r1",
+  "device": "sata",
+  "mode": "rnvpce",
+  "workload": "overwrite-randwrite",
+  "axis": "threads-reconfigured",
+  "value": "8",
+  "bs_kib": 4,
+  "jobs": 8,
+  "repeat": 1,
+  "fio_fsync_blocks": 1,
+  "actual_mib": 8192.0,
+  "fio_mib_s": 205.1179323196411,
+  "including_sync_mib_s": 202.57171117705244,
+  "iops": 52510.190796,
+  "mean_latency_us": 137.33215124100002,
+  "p99_latency_us": 72.192
+}

@@ -1,0 +1,17 @@
+{
+  "case": "nvme-ext4-webserver-1r1w-r2",
+  "device": "nvme",
+  "mode": "ext4",
+  "workload": "webserver-1r1w",
+  "repeat": 2,
+  "threads": 16,
+  "nfiles": 10000,
+  "filesize_kib": 128,
+  "dataset_mib": 1250,
+  "dram_cache_mib": 128,
+  "nv_data_cache_mib": 0,
+  "operations": 1019728,
+  "ops_s": 16976.166,
+  "mb_s": 970.5,
+  "latency_ms": 0.939
+}

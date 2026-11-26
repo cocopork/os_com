@@ -31,6 +31,9 @@ Useful diagnostic references include:
 - [`ext4_performance.md`](ext4_performance.md) for prior root-cause studies and rejected hypotheses.
 - [`test/aster-ext4-baseline-test/README.md`](test/aster-ext4-baseline-test/README.md) for the FIO matrix, parser semantics, and current harness limitations.
 - [`rNVPC-rTIO/rtio-flush-merge-and-thread-merge.md`](rNVPC-rTIO/rtio-flush-merge-and-thread-merge.md) for the bounded rTIO BIO-merge diagnosis.
+- [`archive/experiments/nvlog-comparison-2026-11-20.md`](archive/experiments/nvlog-comparison-2026-11-20.md)
+  for the retained NVLog comparison configuration, the asynchronous page-lifetime
+  failure and fix, cache-control constraints, and mixed-sync conclusions.
 
 ## Pending Experiments
 

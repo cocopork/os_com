@@ -68,7 +68,7 @@
 ### Task 3: Final Regression and Report
 
 **Files:**
-- Modify: `docs/experiments/reports/RNVPCE-AUTHORITY-HOTPATH-2026-11-11.md`
+- Modify: `docs/experiments/validation/temporary/rnvpce-authority-hotpath-20261111/README.md`
 
 - [x] Run formatting, diff checks, focused ktests and the relevant real-device rNVPCe route.
 - [x] Run at least three release-mode repetitions for any point whose change is within normal run-to-run variance.

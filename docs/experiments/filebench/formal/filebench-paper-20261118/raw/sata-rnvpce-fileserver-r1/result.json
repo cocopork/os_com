@@ -1,0 +1,17 @@
+{
+  "case": "sata-rnvpce-fileserver-r1",
+  "device": "sata",
+  "mode": "rnvpce",
+  "workload": "fileserver",
+  "repeat": 1,
+  "threads": 16,
+  "nfiles": 10000,
+  "filesize_kib": 128,
+  "dataset_mib": 1250,
+  "dram_cache_mib": 64,
+  "nv_data_cache_mib": 64,
+  "operations": 420167,
+  "ops_s": 6998.139,
+  "mb_s": 263.0,
+  "latency_ms": 2.28
+}

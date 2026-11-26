@@ -213,8 +213,8 @@
 - Modify: `kernel/src/fs/fs_impls/ext4/fs.rs`
 - Modify: `kernel/src/fs/fs_impls/ext4/pipeline_profile.rs`
 - Modify: `kernel/src/fs/rnvpc/batch_metrics.rs`
-- Modify: experiment scripts under `docs/experiments/scripts/`
-- Create: a dated report under `docs/experiments/reports/`
+- Modify: experiment scripts under `docs/experiments/<test-type>/<formal-or-temporary>/<experiment>/scripts/`
+- Create: a dated report under `docs/experiments/validation/temporary/<experiment>/`
 - Test: `kernel/src/fs/fs_impls/ext4/nv_tests.rs`
 
 **Interfaces:**

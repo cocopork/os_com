@@ -1,0 +1,32 @@
+{
+  "case": "e2e-nvme-nvlog-cold-randread-threads-reconfigured-16-r2",
+  "device": "nvme",
+  "mode": "nvlog",
+  "workload": "cold-randread",
+  "axis": "threads-reconfigured",
+  "value": "16",
+  "bs_kib": 4,
+  "jobs": 16,
+  "repeat": 2,
+  "actual_mib": 2560.0,
+  "configured_dram_cache_mib": 128,
+  "configured_nv_data_cache_mib": 128,
+  "configured_total_data_cache_mib": 256,
+  "cache_control": "memcg-memory-high",
+  "cache_file_peak_bytes": 127668224,
+  "cache_anon_peak_bytes": 6205440,
+  "memory_high_mib": 136,
+  "memory_max_mib": 512,
+  "memory_events": {
+    "low": 0,
+    "high": 14082,
+    "max": 0,
+    "oom": 0,
+    "oom_kill": 0
+  },
+  "fio_mib_s": 443.13657569885254,
+  "including_sync_mib_s": null,
+  "iops": 113442.963476,
+  "mean_latency_us": 137.143050348,
+  "p99_latency_us": 214.016
+}

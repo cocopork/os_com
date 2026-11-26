@@ -37,7 +37,7 @@ Files: `kernel/src/fs/fs_impls/ext4/fs.rs`, `nv_tests.rs`, `test_utils.rs`, `ino
 
 ## Task 2: Build and workload evidence
 
-Files: existing fio harness and a new `docs/experiments/reports` validation report.
+Files: existing fio harness and `docs/experiments/validation/temporary/rnvpce-nojournal-20261018/`.
 
 - [x] Build release and run full kernel suite in the documented SMP=1 configuration; separately retain any SMP findings without calling failures passes.
 - [x] Use the authorized NVMe partition, 2GiB total and64MiB data limit, to verify 4KiB random and128KiB sequential writes, successful sync/unmount and e2fsck.

@@ -1,0 +1,17 @@
+{
+  "case": "e2e-nvme-ext4-append-write-bs-64k-r2",
+  "device": "nvme",
+  "mode": "ext4",
+  "workload": "append-write",
+  "axis": "bs",
+  "value": "64k",
+  "bs_kib": 64,
+  "jobs": 1,
+  "repeat": 2,
+  "actual_mib": 2048,
+  "fio_mib_s": 1460.7703275680542,
+  "including_sync_mib_s": 1204.7058823529412,
+  "iops": 23372.32525,
+  "mean_latency_us": 42.543525604,
+  "p99_latency_us": 1351.68
+}

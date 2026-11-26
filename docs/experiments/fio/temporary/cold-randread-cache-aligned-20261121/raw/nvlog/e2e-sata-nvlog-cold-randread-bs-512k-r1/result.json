@@ -1,0 +1,32 @@
+{
+  "case": "e2e-sata-nvlog-cold-randread-bs-512k-r1",
+  "device": "sata",
+  "mode": "nvlog",
+  "workload": "cold-randread",
+  "axis": "bs",
+  "value": "512k",
+  "bs_kib": 512,
+  "jobs": 1,
+  "repeat": 1,
+  "actual_mib": 2048,
+  "configured_dram_cache_mib": 128,
+  "configured_nv_data_cache_mib": 128,
+  "configured_total_data_cache_mib": 256,
+  "cache_control": "memcg-memory-high",
+  "cache_file_peak_bytes": 135127040,
+  "cache_anon_peak_bytes": 6017024,
+  "memory_high_mib": 136,
+  "memory_max_mib": 512,
+  "memory_events": {
+    "low": 0,
+    "high": 3920,
+    "max": 0,
+    "oom": 0,
+    "oom_kill": 0
+  },
+  "fio_mib_s": 227.45446395874023,
+  "including_sync_mib_s": null,
+  "iops": 454.908929,
+  "mean_latency_us": 2196.792149902,
+  "p99_latency_us": 3784.704
+}

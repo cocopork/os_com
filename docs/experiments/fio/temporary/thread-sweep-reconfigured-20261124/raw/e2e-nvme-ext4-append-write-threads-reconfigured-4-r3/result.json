@@ -1,0 +1,17 @@
+{
+  "case": "e2e-nvme-ext4-append-write-threads-reconfigured-4-r3",
+  "device": "nvme",
+  "mode": "ext4",
+  "workload": "append-write",
+  "axis": "threads-reconfigured",
+  "value": "4",
+  "bs_kib": 4,
+  "jobs": 4,
+  "repeat": 3,
+  "actual_mib": 4096.0,
+  "fio_mib_s": 316.9787950515747,
+  "including_sync_mib_s": 306.5868263473054,
+  "iops": 81146.571738,
+  "mean_latency_us": 48.90917676,
+  "p99_latency_us": 36.096
+}

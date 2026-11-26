@@ -139,8 +139,8 @@ Expected: all rNVPCe tests pass.
 ### Task 4: Build, Recovery, and Performance Validation
 
 **Files:**
-- Create: `docs/experiments/reports/SCALABLE-NVPAGE-POOL-2026-10-31.md`
-- Create or modify: task-specific scripts under `docs/experiments/scripts/`
+- Create: `docs/experiments/validation/temporary/scalable-nvpage-pool-20261031/README.md`
+- Create or modify: task-specific scripts under `docs/experiments/<test-type>/<formal-or-temporary>/<experiment>/scripts/`
 - Modify: `docs/superpowers/specs/2026-10-31-scalable-nvpage-pool-design.md` only for measured conclusions.
 
 **Interfaces:**

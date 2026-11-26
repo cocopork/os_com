@@ -1,0 +1,13 @@
+source,workload,jobs,fio_mib_s,samples
+asterinas_raw_device,append,4,382.13956928253174,3
+asterinas_raw_device,append,16,953.5704962412516,3
+asterinas_raw_device,append,32,1154.0964647928874,3
+asterinas_raw_device,overwrite,4,348.27278486887616,3
+asterinas_raw_device,overwrite,16,987.2100795110067,3
+asterinas_raw_device,overwrite,32,1193.537352879842,3
+historical_achilles,append,4,226.91075865427652,3
+historical_achilles,append,16,426.69863255818683,3
+historical_achilles,append,32,272.5589370727539,3
+historical_achilles,overwrite,4,770.8065903981527,3
+historical_achilles,overwrite,16,782.8225920995077,3
+historical_achilles,overwrite,32,782.3282725016276,3

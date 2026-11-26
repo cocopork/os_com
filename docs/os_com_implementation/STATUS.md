@@ -21,7 +21,7 @@ thread creation, with users0-31/flush60/completion61/virtio62/journal63, nice0.
 Actual entry CPUs verified; eight uninstrumented NVMe random4K/16-job runs
 finish256MiB at98.08-108.94MiB/s (median98.46), with no30+MiB/s sample.
 This is a test placement option, not a general scheduler or affinity fix.
-Evidence: [CPU isolation](test/aster-ext4-baseline-test/results/20261013-cpu-isolation/README.md).
+Evidence status: [archived temporary diagnostics](archive/experiments/2026-10-performance-diagnostics.md).
 
 Intermittent low bandwidth diagnosis (2026-10-13): uninstrumented repeats show
 108.94/36.06/34.83/98.84MiB/s. Slow serial diagnostics identify16-19ms waiting
@@ -30,7 +30,7 @@ stays0.08-0.10ms. Driver-thread scheduling is the leading explanation. A tempora
 nice=-1 control gives98.46-98.84MiB/s in four runs, but three restored-default runs
 also remain fast, so a permanent fix is not established. All probes and priority
 changes are removed; default kernel rebuilt. Evidence:
-[low bandwidth diagnosis](test/aster-ext4-baseline-test/results/20261013-lowbw-investigation/README.md).
+[archived temporary diagnostics](archive/experiments/2026-10-performance-diagnostics.md).
 
 Pending-index isolation (2026-10-13): completion pending lookup now uses64
 inode-hashed directory shards and per-slot generation/committed admission, without
@@ -40,14 +40,14 @@ acquisition drops6.46-9.36us to0.20us; leaf processing25.07-27.65us to19.02us.
 Uninstrumented busy samples109.40/32.61/33.73MiB/s, median33.73 vs90.14 before,
 do not establish an end-to-end improvement. Initial stale-directory race was
 fixed and covered by regression; those runs are excluded. Evidence:
-[pending index](test/aster-ext4-baseline-test/results/20261013-pending-index/README.md).
+[archived temporary diagnostics](archive/experiments/2026-10-performance-diagnostics.md).
 
 Leaf internal profile (2026-10-13): two KVM/NVMe random4K/16-job runs finish256MiB.
 Completion pending-mark lookup waits6.46-9.36us for `pool.state`, holds it only
 0.37-0.38us; the wait contributes26-34% of leaf processing. Exclusive admission
 is1.05-1.11us and two-buffer allocation0.38-0.44us per update. No mechanism change
 or throughput improvement is claimed. Evidence:
-[leaf internal breakdown](test/aster-ext4-baseline-test/results/20261013-leaf-detail/README.md).
+[archived temporary diagnostics](archive/experiments/2026-10-performance-diagnostics.md).
 
 Completed and tested (2026-10-13): completion uses leaf-level exclusion and an
 independent reservation guard, without inode publication. Eight targeted KVM
@@ -56,7 +56,7 @@ NVMe/16-job fio runs complete256 MiB. Busy median98.46MiB/s vs98.84 before is
 essentially unchanged. Inode publication waiting is eliminated, but leaf
 processing/reclamation still dominate; no end-to-end speedup is established.
 The new code remains uncommitted for review. Evidence:
-[leaf-level completion](test/aster-ext4-baseline-test/results/20261013-leaf-completion/README.md).
+[archived temporary diagnostics](archive/experiments/2026-10-performance-diagnostics.md).
 Current checkpoints: kernel `644fd298d`, workloads `3b48118ae`, docs `8de5530`.
 
 Repair workspace phase 1 (2026-10-13): bounded cleared-frame reuse, unindexed
@@ -66,7 +66,7 @@ Extent update drops from 289-302us to 71-119us/write; foreground publication bod
 from 484-500us to 172-292us. Uninstrumented busy samples 28.13/98.84/108.94MiB/s
 (median98.84) vs baseline76.42/82.58 (median79.50); variability remains, so 24.3%
 is a sample-median comparison, not a stable speedup claim. Phase 2 is not included.
-Evidence: [repair workspace](test/aster-ext4-baseline-test/results/20261013-repair-workspace/README.md).
+Evidence status: [archived temporary diagnostics](archive/experiments/2026-10-performance-diagnostics.md).
 
 Foreground publication profile (2026-10-13): two matching detailed NVMe
 random4K/16-job runs measure 484-500us/write inside publication, with extent
@@ -74,7 +74,7 @@ modification about 60%. Ordinary leaf rewrite's repair-image/mark creation and
 cleanup alone cost 50-51% of the body; user copying is 1.64-1.77us and SSD partial
 reads are zero. Completion publication wait remains 251-269us/group. Shared
 metadata lifecycle locks remain, but their exact contribution is not isolated.
-Evidence: [foreground profile](test/aster-ext4-baseline-test/results/20261013-foreground-publication-profile/README.md).
+Evidence status: [archived temporary diagnostics](archive/experiments/2026-10-performance-diagnostics.md).
 
 Migration profile follow-up (2026-10-13): two matching instrumented NVMe
 random4K/16-job runs show completion publication acquisition costs 247-250us/group
@@ -82,7 +82,7 @@ random4K/16-job runs show completion publication acquisition costs 247-250us/gro
 ledger work is 6-9%; its exclusive-entry wait is about 0.70us. The shared reservation
 metadata-index lock averages 19.4us across all roles; global SSD-credit release
 lock averages 0.14-0.21us. Evidence:
-[migration breakdown](test/aster-ext4-baseline-test/results/20261013-migration-breakdown/README.md).
+[archived temporary diagnostics](archive/experiments/2026-10-performance-diagnostics.md).
 
 Latest implementation: rNVPCe data completion now defers native EXT4 extent
 materialization to explicit filesystem metadata sync. NV extent records remain
@@ -91,7 +91,7 @@ fallocate, regular-file unlink and rename replacement are rejected on rNVPCe.
 Journal/nojournal KVM checkpoint/read tests and over-capacity fio pass. Three
 uninstrumented runs measure 33.68/98.46/89.82 MiB/s (median 89.82); variability
 prevents a stable speedup claim. Completion materialize/inner-wait counters are
-zero. Evidence: [deferred materialization](test/aster-ext4-baseline-test/results/20261012-deferred-materialize/README.md).
+zero. Evidence status: [archived temporary diagnostics](archive/experiments/2026-10-performance-diagnostics.md).
 
 Latest performance follow-up: uninstrumented fast NVMe random4K/16-job runs
 measure 71.31/76.42/76.65 MiB/s (median 76.42), all complete 256MiB.
@@ -99,7 +99,7 @@ Instrumented completion reclamation is 5.90 us/page on fast repeat and
 6.26 us/page on no-persist; materialization and reference publication now
 dominate. The first fast sample has an unreproduced SSD durability stall and
 is retained in the report. Evidence:
-[merged reclaim profile](test/aster-ext4-baseline-test/results/20261012-merged-reclaim-profile/README.md).
+[archived temporary diagnostics](archive/experiments/2026-10-performance-diagnostics.md).
 
 Latest implementation: allocator free slots/capacity/sequences now use a separate
 allocation lock. New rNVPCe completion uses one reclaim_after_ssd_publish call,
@@ -107,13 +107,13 @@ without pool control or legacy reference scans on success. Six targeted KVM
 tests and eight static checks pass. Two fast NVMe random4K/16-job smoke runs
 complete 256MiB at 29.80/94.81 MiB/s; large variability prevents a speedup claim.
 Counters remain disabled. Evidence:
-[allocation and combined reclaim](test/aster-ext4-baseline-test/results/20261012-allocation-reclaim/README.md).
+[archived temporary diagnostics](archive/experiments/2026-10-performance-diagnostics.md).
 
 Reclaim validation follow-up: keep full runtime validation before descriptor
 clear; finalization now checks the retained lease invariants with debug assertions
 and unconditionally clears reverse. Failure/retry and slot-reuse KVM tests pass;
 performance follow-up is linked above. Correctness evidence:
-[single validation](test/aster-ext4-baseline-test/results/20261012-reclaim-single-validation/README.md).
+[archived temporary diagnostics](archive/experiments/2026-10-performance-diagnostics.md).
 
 Current focus: performance experiments. Normal kernels exclude the durable-image
 allocation/copy code and reject `rnvpc_sim_mode=model`; use fast or
@@ -126,24 +126,24 @@ identity validation and reverse lookup use a single acquisition. Slot isolation
 and lifecycle/bounds KVM tests pass. NVMe random4K/16-job fio measures
 52.78 MiB/s (no-persist), 45.71 and 43.61 MiB/s (fast, last on final source).
 These are diagnostic samples, not an established speedup; counters are disabled.
-Evidence: [per-slot state and combined lookup](test/aster-ext4-baseline-test/results/20261012-per-slot-reverse/README.md).
+Evidence status: [archived temporary diagnostics](archive/experiments/2026-10-performance-diagnostics.md).
 
 Instrumented per-slot follow-up: completion service is 99.38 us/page (fast)
 and 91.56 us/page (no-persist). Reclamation dominates at 71.38%/65.91%;
 legacy reference checks and slot/capacity return still use pool control locking.
 Slot-lock acquisition inside reclamation is only 0.31%/0.38% of completion.
 One diagnostic sample per mode; not an isolated before/after optimization test.
-Evidence: [current completion profile](test/aster-ext4-baseline-test/results/20261012-per-slot-profile/README.md).
+Evidence status: [archived temporary diagnostics](archive/experiments/2026-10-performance-diagnostics.md).
 
 Historical narrow change (now superseded by combined reclaim): finish_after_ssd_publish no longer scanned the legacy
 reference table. Generation/lease/state checks and the shared free_data_page_if_seq
 check remain. The slot-lifecycle KVM test passes; performance has not been rerun.
-Evidence: [skip legacy finish check](test/aster-ext4-baseline-test/results/20261012-skip-legacy-reference-check/README.md).
+Evidence status: [archived temporary diagnostics](archive/experiments/2026-10-performance-diagnostics.md).
 
 Two directed KVM tests and eight static checks pass after backend-lock removal.
 Real NVMe random4K/16-job fio completes at 52.89 MiB/s (no-persist) and
 40.31 MiB/s (fast), one diagnostic sample per mode with counters disabled.
-Evidence: [backend without io_lock](test/aster-ext4-baseline-test/results/20261012-backend-no-io-lock/README.md).
+Evidence status: [archived temporary diagnostics](archive/experiments/2026-10-performance-diagnostics.md).
 
 | Repository | Branch / revision | Status |
 | --- | --- | --- |
@@ -160,14 +160,14 @@ pass. Four real NVMe random-4K/16-job fio points completed: busy bandwidth is
 38.04/33.68 MiB/s with simulated persistence disabled and 17.85/24.15 MiB/s in
 default fast mode. These overlap prior variability and do not establish a
 stable throughput improvement. Counters are disabled; final boot mode is fast.
-Evidence: [inode-local publication](test/aster-ext4-baseline-test/results/20261012-inode-publication/README.md).
+Evidence status: [archived temporary diagnostics](archive/experiments/2026-10-performance-diagnostics.md).
 
 Instrumented follow-up: completion service is 173.46 us/page in fast and
 106.01 us/page without simulated persistence. In the latter, reference
 publication/reservation is 40.56%, reclamation 46.66%, materialization 9.04%,
 and SSD durability 2.64%. One diagnostic sample per mode, not a stable speedup
 claim or an isolated lock-wait measurement.
-Evidence: [stage profile](test/aster-ext4-baseline-test/results/20261012-inode-publication-profile/README.md).
+Evidence status: [archived temporary diagnostics](archive/experiments/2026-10-performance-diagnostics.md).
 
 ## DRAM Persistence Ablation (2026-10-12)
 
@@ -179,7 +179,7 @@ versus 33.68/34.83 MiB/s in the ablation (alternating, two runs each).
 This identifies simulator overhead, not the hardware cost of clflush/sfence or
 an isolated measurement of io_lock contention. Both directed KVM tests and all
 four fio points passed. The final build parameters are restored to fast.
-Evidence: [persist ablation](test/aster-ext4-baseline-test/results/20261012-persist-ablation/README.md).
+Evidence status: [archived temporary diagnostics](archive/experiments/2026-10-performance-diagnostics.md).
 
 Instrumented follow-up: completion service falls from 157.85 to 116.18 us/page.
 With simulated persistence disabled, reclaim is 47.32%, reference publication
@@ -187,7 +187,7 @@ With simulated persistence disabled, reclaim is 47.32%, reference publication
 Descriptor clear falls from 52.12 to 9.92 us/page; legacy reference checks and
 slot return together cost 41.84 us/page. These intervals include control-lock
 waits, which are not yet measured separately from the work inside the lock.
-Evidence: [completion profile](test/aster-ext4-baseline-test/results/20261012-persist-completion-profile/README.md).
+Evidence status: [archived temporary diagnostics](archive/experiments/2026-10-performance-diagnostics.md).
 
 ## NVPool Object-State Sharding (2026-10-11)
 
@@ -201,7 +201,7 @@ throughput improves from 10.85 to 24.95/25.00 MiB/s. Instrumented mean reclaim
 lock acquisition falls from 33.225 to 0.246 us; per-page completion service falls
 from 379.77 to 158.15 us. Diagnostics are disabled and the final ordinary kernel
 was rebuilt and tested. No commit was created by this change.
-Evidence: [pool-shards report](test/aster-ext4-baseline-test/results/20261011-pool-shards-validation/README.md).
+Evidence status: [archived temporary diagnostics](archive/experiments/2026-10-performance-diagnostics.md).
 
 ## Foreground Checkpoint
 
@@ -291,7 +291,7 @@ one combined leaf update and one reservation-ledger refresh per group. Two focus
 KVM tests and eight IRQ-context checks pass. The instrumented NVMe random-4K/16-job
 comparison reports busy throughput 6.23 -> 10.41 MiB/s and amortized completion
 service 701.77 -> 379.77 microseconds/page; these are single-run results. See
-[`completion-leaf-batching-analysis.md`](test/aster-ext4-baseline-test/results/20261011_230050_aster-ext4-baseline/completion-leaf-batching-analysis.md).
+[archived temporary diagnostics](archive/experiments/2026-10-performance-diagnostics.md).
 Diagnostics-disabled repeat completes 256 MiB at 10.85 MiB/s (`20261011_230249`).
 
 - Implement rNVPCe persistent suffix deletion so truncate can atomically remove NV/SSD extent references and reclaim both SSD reservations and NV frames.

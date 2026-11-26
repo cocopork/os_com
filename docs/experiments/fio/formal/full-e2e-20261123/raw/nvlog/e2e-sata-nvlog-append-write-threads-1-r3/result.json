@@ -1,0 +1,32 @@
+{
+  "case": "e2e-sata-nvlog-append-write-threads-1-r3",
+  "device": "sata",
+  "mode": "nvlog",
+  "workload": "append-write",
+  "axis": "threads",
+  "value": "1",
+  "bs_kib": 4,
+  "jobs": 1,
+  "repeat": 3,
+  "actual_mib": 2048,
+  "configured_dram_cache_mib": 128,
+  "configured_nv_data_cache_mib": 128,
+  "configured_total_data_cache_mib": 256,
+  "cache_control": "memcg-memory-high",
+  "cache_file_peak_bytes": 131584000,
+  "cache_anon_peak_bytes": 5492736,
+  "memory_high_mib": 136,
+  "memory_max_mib": 512,
+  "memory_events": {
+    "low": 0,
+    "high": 10849,
+    "max": 0,
+    "oom": 0,
+    "oom_kill": 0
+  },
+  "fio_mib_s": 341.2764530181885,
+  "including_sync_mib_s": 289.6746817538897,
+  "iops": 87366.772205,
+  "mean_latency_us": 11.00255747,
+  "p99_latency_us": 45.312
+}

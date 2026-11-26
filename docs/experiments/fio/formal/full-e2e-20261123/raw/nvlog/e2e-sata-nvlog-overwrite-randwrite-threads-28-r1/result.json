@@ -1,0 +1,32 @@
+{
+  "case": "e2e-sata-nvlog-overwrite-randwrite-threads-28-r1",
+  "device": "sata",
+  "mode": "nvlog",
+  "workload": "overwrite-randwrite",
+  "axis": "threads",
+  "value": "28",
+  "bs_kib": 4,
+  "jobs": 28,
+  "repeat": 1,
+  "actual_mib": 2044,
+  "configured_dram_cache_mib": 128,
+  "configured_nv_data_cache_mib": 128,
+  "configured_total_data_cache_mib": 256,
+  "cache_control": "memcg-memory-high",
+  "cache_file_peak_bytes": 124416000,
+  "cache_anon_peak_bytes": 6631424,
+  "memory_high_mib": 136,
+  "memory_max_mib": 512,
+  "memory_events": {
+    "low": 0,
+    "high": 11931,
+    "max": 0,
+    "oom": 0,
+    "oom_kill": 0
+  },
+  "fio_mib_s": 251.87923526763916,
+  "including_sync_mib_s": 224.86248624862486,
+  "iops": 64481.084412,
+  "mean_latency_us": 394.08926937499996,
+  "p99_latency_us": 15269.888
+}

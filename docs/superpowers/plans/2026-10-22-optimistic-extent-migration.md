@@ -119,7 +119,7 @@
 ### Task 4: Verify Build, Recovery, Concurrency, And Performance
 
 **Files:**
-- Create: `docs/experiments/reports/OPTIMISTIC-EXTENT-MIGRATION-2026-10-22.md`
+- Create: `docs/experiments/validation/temporary/optimistic-extent-migration-20261022/README.md`
 - Modify: `docs/os_com_implementation/os_com_refactor_plan/016-extent-migration-lease/README.md`
 - Modify: `docs/os_com_implementation/os_com_refactor_plan/README.md`
 

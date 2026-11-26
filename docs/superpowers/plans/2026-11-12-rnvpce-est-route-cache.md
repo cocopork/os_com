@@ -64,7 +64,7 @@
 ### Task 3: Performance and Report
 
 **Files:**
-- Modify: `docs/experiments/reports/RNVPCE-AUTHORITY-HOTPATH-2026-11-11.md`
+- Modify: `docs/experiments/validation/temporary/rnvpce-authority-hotpath-20261111/README.md`
 
 - [x] Run 4/16/32-thread 4 KiB overwrite, three repetitions per point, on the existing fixed matrix.
 - [x] Compare write-plan tree-read counts and bandwidth against the retained pre-EST results.

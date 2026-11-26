@@ -1,0 +1,18 @@
+{
+  "case": "e2e-nvme-rnvpce-append-write-write-regression-128k-j1-r1",
+  "device": "nvme",
+  "mode": "rnvpce",
+  "workload": "append-write",
+  "axis": "write-regression",
+  "value": "128k-j1",
+  "bs_kib": 128,
+  "jobs": 1,
+  "repeat": 1,
+  "fio_fsync_blocks": 1,
+  "actual_mib": 2048.0,
+  "fio_mib_s": 2013.765977859497,
+  "including_sync_mib_s": 1393.1972789115646,
+  "iops": 16110.127827,
+  "mean_latency_us": 61.030630554000005,
+  "p99_latency_us": 577.536
+}

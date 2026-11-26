@@ -1,0 +1,17 @@
+{
+  "case": "e2e-sata-ext4-overwrite-randwrite-bs-128k-r3",
+  "device": "sata",
+  "mode": "ext4",
+  "workload": "overwrite-randwrite",
+  "axis": "bs",
+  "value": "128k",
+  "bs_kib": 128,
+  "jobs": 1,
+  "repeat": 3,
+  "actual_mib": 2048,
+  "fio_mib_s": 372.7702941894531,
+  "including_sync_mib_s": 350.6849315068493,
+  "iops": 2982.162359,
+  "mean_latency_us": 334.67677124,
+  "p99_latency_us": 9502.72
+}

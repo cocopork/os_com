@@ -1,0 +1,32 @@
+{
+  "case": "e2e-sata-nvlog-cold-randread-threads-reconfigured-28-r3",
+  "device": "sata",
+  "mode": "nvlog",
+  "workload": "cold-randread",
+  "axis": "threads-reconfigured",
+  "value": "28",
+  "bs_kib": 4,
+  "jobs": 28,
+  "repeat": 3,
+  "actual_mib": 2576.0,
+  "configured_dram_cache_mib": 128,
+  "configured_nv_data_cache_mib": 128,
+  "configured_total_data_cache_mib": 256,
+  "cache_control": "memcg-memory-high",
+  "cache_file_peak_bytes": 127000576,
+  "cache_anon_peak_bytes": 6627328,
+  "memory_high_mib": 136,
+  "memory_max_mib": 512,
+  "memory_events": {
+    "low": 0,
+    "high": 14837,
+    "max": 0,
+    "oom": 0,
+    "oom_kill": 0
+  },
+  "fio_mib_s": 235.42313957214355,
+  "including_sync_mib_s": null,
+  "iops": 60268.32389,
+  "mean_latency_us": 428.526686147,
+  "p99_latency_us": 970.752
+}

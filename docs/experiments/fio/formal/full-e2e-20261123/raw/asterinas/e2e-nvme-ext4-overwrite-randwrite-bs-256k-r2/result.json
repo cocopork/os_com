@@ -1,0 +1,17 @@
+{
+  "case": "e2e-nvme-ext4-overwrite-randwrite-bs-256k-r2",
+  "device": "nvme",
+  "mode": "ext4",
+  "workload": "overwrite-randwrite",
+  "axis": "bs",
+  "value": "256k",
+  "bs_kib": 256,
+  "jobs": 1,
+  "repeat": 2,
+  "actual_mib": 2048,
+  "fio_mib_s": 1535.2323837280273,
+  "including_sync_mib_s": 1256.441717791411,
+  "iops": 6140.929535,
+  "mean_latency_us": 162.43274499499998,
+  "p99_latency_us": 1613.824
+}

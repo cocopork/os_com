@@ -36,16 +36,16 @@
 ### Task 1: Deterministic mixed-I/O benchmark
 
 **Files:**
-- Create: `docs/experiments/scripts/mixed-sync-ratio-20261119/mixed_sync_bench.c`
-- Create: `docs/experiments/scripts/mixed-sync-ratio-20261119/Makefile`
-- Create: `docs/experiments/scripts/mixed-sync-ratio-20261119/test_mixed_sync_bench.py`
+- Create: `docs/experiments/mixed-sync/formal/mixed-sync-ratio-20261119/scripts/mixed_sync_bench.c`
+- Create: `docs/experiments/mixed-sync/formal/mixed-sync-ratio-20261119/scripts/Makefile`
+- Create: `docs/experiments/mixed-sync/formal/mixed-sync-ratio-20261119/scripts/test_mixed_sync_bench.py`
 
 **Interfaces:**
 - Consume CLI options `--directory`, `--threads`, `--file-bytes`, `--read-percent`, `--sync-percent`, `--seed`, `--warmup-seconds`, and `--runtime-seconds`.
 - Produce a single JSON object on stdout and a nonzero exit status on any thread, I/O, timing, or configuration error.
 
 - [x] Write host tests that compile the program and assert deterministic operation classes, nested sync selections, one file per thread, valid ratio rejection, and JSON schema.
-- [x] Run `python3 docs/experiments/scripts/mixed-sync-ratio-20261119/test_mixed_sync_bench.py` and verify the tests fail because the program is absent.
+- [x] Run `python3 docs/experiments/mixed-sync/formal/mixed-sync-ratio-20261119/scripts/test_mixed_sync_bench.py` and verify the tests fail because the program is absent.
 - [x] Implement counter-based decisions, pthread barriers, separate warm-up/measurement counters, `pread`/`pwrite`/post-write `fsync`, and bounded per-thread latency histograms.
 - [x] Add a deterministic `--self-test` mode so algorithm invariants can run without a mounted test filesystem.
 - [x] Run the focused test and verify all cases pass under the host and tools container compilers.
@@ -53,9 +53,9 @@
 ### Task 2: Matrix and guest execution
 
 **Files:**
-- Create: `docs/experiments/scripts/mixed-sync-ratio-20261119/matrix.py`
-- Create: `docs/experiments/scripts/mixed-sync-ratio-20261119/guest.sh`
-- Create: `docs/experiments/scripts/mixed-sync-ratio-20261119/test_matrix.py`
+- Create: `docs/experiments/mixed-sync/formal/mixed-sync-ratio-20261119/scripts/matrix.py`
+- Create: `docs/experiments/mixed-sync/formal/mixed-sync-ratio-20261119/scripts/guest.sh`
+- Create: `docs/experiments/mixed-sync/formal/mixed-sync-ratio-20261119/scripts/test_matrix.py`
 
 **Interfaces:**
 - Consume the benchmark binary plus a generated `case.cfg`.
@@ -70,9 +70,9 @@
 ### Task 3: Safe two-device runner and result validation
 
 **Files:**
-- Create: `docs/experiments/scripts/mixed-sync-ratio-20261119/run-sweep.sh`
-- Create: `docs/experiments/scripts/mixed-sync-ratio-20261119/parse_result.py`
-- Create: `docs/experiments/scripts/mixed-sync-ratio-20261119/test_parse_result.py`
+- Create: `docs/experiments/mixed-sync/formal/mixed-sync-ratio-20261119/scripts/run-sweep.sh`
+- Create: `docs/experiments/mixed-sync/formal/mixed-sync-ratio-20261119/scripts/parse_result.py`
+- Create: `docs/experiments/mixed-sync/formal/mixed-sync-ratio-20261119/scripts/test_parse_result.py`
 
 **Interfaces:**
 - Consume source ISO/initramfs images, explicit result root, optional exact `CASES`, and the Task 2 matrix.
@@ -88,10 +88,10 @@
 ### Task 4: Aggregation, plotting, and reproduction report
 
 **Files:**
-- Create: `docs/experiments/scripts/mixed-sync-ratio-20261119/summarize.py`
-- Create: `docs/experiments/scripts/mixed-sync-ratio-20261119/plot_results.py`
-- Create: `docs/experiments/scripts/mixed-sync-ratio-20261119/test_reporting.py`
-- Create: `docs/experiments/test_results/mixed-sync-ratio-20261119/README.md`
+- Create: `docs/experiments/mixed-sync/formal/mixed-sync-ratio-20261119/scripts/summarize.py`
+- Create: `docs/experiments/mixed-sync/formal/mixed-sync-ratio-20261119/scripts/plot_results.py`
+- Create: `docs/experiments/mixed-sync/formal/mixed-sync-ratio-20261119/scripts/test_reporting.py`
+- Create: `docs/experiments/mixed-sync/formal/mixed-sync-ratio-20261119/README.md`
 
 **Interfaces:**
 - Consume 432 validated result objects.
@@ -106,7 +106,7 @@
 ### Task 5: Build and experimental smoke validation
 
 **Files:**
-- Modify: `docs/experiments/test_results/mixed-sync-ratio-20261119/README.md`
+- Modify: `docs/experiments/mixed-sync/formal/mixed-sync-ratio-20261119/README.md`
 
 **Interfaces:**
 - Consume the completed Tasks 1--4 and the current release kernel image.

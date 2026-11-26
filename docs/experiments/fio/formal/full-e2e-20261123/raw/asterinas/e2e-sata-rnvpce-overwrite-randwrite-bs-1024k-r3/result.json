@@ -1,0 +1,18 @@
+{
+  "case": "e2e-sata-rnvpce-overwrite-randwrite-bs-1024k-r3",
+  "device": "sata",
+  "mode": "rnvpce",
+  "workload": "overwrite-randwrite",
+  "axis": "bs",
+  "value": "1024k",
+  "bs_kib": 1024,
+  "jobs": 1,
+  "repeat": 3,
+  "fio_fsync_blocks": 1,
+  "actual_mib": 2048.0,
+  "fio_mib_s": 435.2816152572632,
+  "including_sync_mib_s": 400.7827788649706,
+  "iops": 435.281615,
+  "mean_latency_us": 2294.725875977,
+  "p99_latency_us": 10682.368
+}

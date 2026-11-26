@@ -1,0 +1,32 @@
+{
+  "case": "e2e-nvme-nvlog-cold-randread-bs-64k-r2",
+  "device": "nvme",
+  "mode": "nvlog",
+  "workload": "cold-randread",
+  "axis": "bs",
+  "value": "64k",
+  "bs_kib": 64,
+  "jobs": 1,
+  "repeat": 2,
+  "actual_mib": 2048,
+  "configured_dram_cache_mib": 128,
+  "configured_nv_data_cache_mib": 128,
+  "configured_total_data_cache_mib": 256,
+  "cache_control": "memcg-memory-high",
+  "cache_file_peak_bytes": 134295552,
+  "cache_anon_peak_bytes": 5558272,
+  "memory_high_mib": 136,
+  "memory_max_mib": 512,
+  "memory_events": {
+    "low": 0,
+    "high": 10567,
+    "max": 0,
+    "oom": 0,
+    "oom_kill": 0
+  },
+  "fio_mib_s": 210.61291599273682,
+  "including_sync_mib_s": null,
+  "iops": 3369.806664,
+  "mean_latency_us": 295.67634906,
+  "p99_latency_us": 370.688
+}

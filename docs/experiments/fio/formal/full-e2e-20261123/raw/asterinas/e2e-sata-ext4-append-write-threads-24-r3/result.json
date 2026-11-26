@@ -1,0 +1,17 @@
+{
+  "case": "e2e-sata-ext4-append-write-threads-24-r3",
+  "device": "sata",
+  "mode": "ext4",
+  "workload": "append-write",
+  "axis": "threads",
+  "value": "24",
+  "bs_kib": 4,
+  "jobs": 24,
+  "repeat": 3,
+  "actual_mib": 2040,
+  "fio_mib_s": 324.7890462875366,
+  "including_sync_mib_s": 293.94812680115274,
+  "iops": 83145.995861,
+  "mean_latency_us": 271.908943469,
+  "p99_latency_us": 7241.728
+}

@@ -1,0 +1,18 @@
+{
+  "case": "e2e-sata-rnvpce-append-write-threads-reconfigured-4-r1",
+  "device": "sata",
+  "mode": "rnvpce",
+  "workload": "append-write",
+  "axis": "threads-reconfigured",
+  "value": "4",
+  "bs_kib": 4,
+  "jobs": 4,
+  "repeat": 1,
+  "fio_fsync_blocks": 1,
+  "actual_mib": 4096.0,
+  "fio_mib_s": 159.86261749267578,
+  "including_sync_mib_s": 155.15151515151516,
+  "iops": 40924.830224,
+  "mean_latency_us": 73.164378244,
+  "p99_latency_us": 98.816
+}

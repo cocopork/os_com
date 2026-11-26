@@ -17,7 +17,9 @@
 - Use per-inode indexes, per-page-slot transitions, worker-local queues, and allocation-domain grouping.
 - Never hold an XArray writer lock, page-slot lock, redirect lock, or allocation-domain lock across user copy, page copy, NVM persistence, SSD I/O, or sleep.
 - Preserve full-page overwrite without an SSD read and batch adjacent cold reads.
-- A clean NVPage is reclaimable only after SSD authority is durable; a dirty NVPage is never discarded.
+- A clean NVPage is reclaimable only after its SSD data and mapping are durable; a dirty NVPage is never discarded.
+- Every runtime-live NVPage has an exact PageCache slot; a normal PageCache miss resolves only SSD extent metadata.
+- Reclaim converts every claimed `CleanNv` page to `CleanDram` before detaching its redirect and freeing the NV range.
 - Add failing tests before each behavior change and commit each passing task independently.
 
 ### Task 1: Heterogeneous rNVPCe Page Slots
@@ -51,6 +53,8 @@
 - [x] Route rNVPCe reads through the page-slot index.
 - [x] Reuse PageCache batch BIO construction for contiguous SSD misses and readahead.
 - [x] Verify error/short-read cleanup removes only the exact loading owner.
+- [ ] Remove per-page NV authority lookup from the miss path; use NVPool-cached SSD extents and the SSD extent tree only.
+- [ ] Rebuild all NV-backed PageCache slots from persistent redirects before recovery exposes file I/O.
 - [x] Run focused read tests and commit.
 
 ### Task 3: Write Transitions And Persistent Publication
@@ -81,20 +85,21 @@
 - Test: `kernel/src/fs/rnvpc/rnvpce_integrity_tests.rs`
 
 **Interfaces:**
-- Produce `DirtyNv -> CleanNv` after durable SSD authority.
-- Produce hot `CleanNv -> CleanDram` and cold `CleanNv -> absent` reclaim paths.
+- Produce `DirtyNv -> CleanNv` after the SSD data and mapping are durable while retaining the NV redirect until reclaim.
+- Produce batched `CleanNv -> CleanDram` conversion before redirect detachment and NVPage release.
 
 - [x] Add tests proving completion retains a readable NVPage and dirty/in-flight pages cannot be reclaimed.
 - [x] Stop immediate completion-side slot release and publish `CleanNv` into the matching page slots.
 - [x] Implement worker/allocation-domain batched reclaim with exact compare-and-replace/remove.
 - [x] Keep foreground assistance as a pressure signal while the owning worker reclaims up to the normal batch budget, rather than one page per 4 KiB write.
+- [ ] Remove the cold `CleanNv -> absent` path; reserve DRAM capacity, evict older CleanDram pages if needed, and convert the entire claimed batch.
 - [x] Run reclaim, recovery, sync, and unmount tests; commit.
 
 ### Task 5: Recovery, Verification, And Performance
 
 **Files:**
 - Modify: `docs/os_com_implementation/rNVPC-rTIO/implementation.md`
-- Create: `docs/experiments/reports/RNVPCE-PAGECACHE-INTEGRATION-2026-11-18.md`
+- Create: `docs/experiments/validation/temporary/rnvpce-pagecache-integration-regression-20261118/README.md`
 
 - [ ] Verify recovery starts with empty PageCache and reconstructs authority only from persistent extent/redirect state.
 - [ ] Run formatting, normal compile, ktest compile, focused ktests, and crash/fault tests.

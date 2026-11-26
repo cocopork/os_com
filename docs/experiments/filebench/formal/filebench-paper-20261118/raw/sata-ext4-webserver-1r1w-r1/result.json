@@ -1,0 +1,17 @@
+{
+  "case": "sata-ext4-webserver-1r1w-r1",
+  "device": "sata",
+  "mode": "ext4",
+  "workload": "webserver-1r1w",
+  "repeat": 1,
+  "threads": 16,
+  "nfiles": 10000,
+  "filesize_kib": 128,
+  "dataset_mib": 1250,
+  "dram_cache_mib": 128,
+  "nv_data_cache_mib": 0,
+  "operations": 259288,
+  "ops_s": 4318.979,
+  "mb_s": 166.7,
+  "latency_ms": 3.697
+}

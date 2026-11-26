@@ -1,0 +1,66 @@
+[
+  {
+    "poll-shrink": 0,
+    "thread-id": 2406535,
+    "aio-max-batch": 0,
+    "poll-grow": 0,
+    "poll-max-ns": 32768,
+    "id": "iothread2"
+  },
+  {
+    "poll-shrink": 0,
+    "thread-id": 2406534,
+    "aio-max-batch": 0,
+    "poll-grow": 0,
+    "poll-max-ns": 32768,
+    "id": "iothread1"
+  },
+  {
+    "poll-shrink": 0,
+    "thread-id": 2406541,
+    "aio-max-batch": 0,
+    "poll-grow": 0,
+    "poll-max-ns": 32768,
+    "id": "iothread7"
+  },
+  {
+    "poll-shrink": 0,
+    "thread-id": 2406533,
+    "aio-max-batch": 0,
+    "poll-grow": 0,
+    "poll-max-ns": 32768,
+    "id": "iothread0"
+  },
+  {
+    "poll-shrink": 0,
+    "thread-id": 2406540,
+    "aio-max-batch": 0,
+    "poll-grow": 0,
+    "poll-max-ns": 32768,
+    "id": "iothread6"
+  },
+  {
+    "poll-shrink": 0,
+    "thread-id": 2406539,
+    "aio-max-batch": 0,
+    "poll-grow": 0,
+    "poll-max-ns": 32768,
+    "id": "iothread5"
+  },
+  {
+    "poll-shrink": 0,
+    "thread-id": 2406538,
+    "aio-max-batch": 0,
+    "poll-grow": 0,
+    "poll-max-ns": 32768,
+    "id": "iothread4"
+  },
+  {
+    "poll-shrink": 0,
+    "thread-id": 2406536,
+    "aio-max-batch": 0,
+    "poll-grow": 0,
+    "poll-max-ns": 32768,
+    "id": "iothread3"
+  }
+]

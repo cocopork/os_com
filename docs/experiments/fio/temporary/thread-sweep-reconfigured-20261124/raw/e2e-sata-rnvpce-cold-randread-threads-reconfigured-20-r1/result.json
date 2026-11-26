@@ -1,0 +1,17 @@
+{
+  "case": "e2e-sata-rnvpce-cold-randread-threads-reconfigured-20-r1",
+  "device": "sata",
+  "mode": "rnvpce",
+  "workload": "cold-randread",
+  "axis": "threads-reconfigured",
+  "value": "20",
+  "bs_kib": 4,
+  "jobs": 20,
+  "repeat": 1,
+  "actual_mib": 2560.0,
+  "fio_mib_s": 99.06737327575684,
+  "including_sync_mib_s": null,
+  "iops": 25361.24763,
+  "mean_latency_us": 737.7316021209999,
+  "p99_latency_us": 6586.368
+}

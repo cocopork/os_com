@@ -1,0 +1,17 @@
+{
+  "case": "e2e-sata-ext4-overwrite-randwrite-threads-24-r3",
+  "device": "sata",
+  "mode": "ext4",
+  "workload": "overwrite-randwrite",
+  "axis": "threads",
+  "value": "24",
+  "bs_kib": 4,
+  "jobs": 24,
+  "repeat": 3,
+  "actual_mib": 2040,
+  "fio_mib_s": 291.1789894104004,
+  "including_sync_mib_s": 268.42105263157896,
+  "iops": 74541.821296,
+  "mean_latency_us": 313.90965571199996,
+  "p99_latency_us": 1073.152
+}

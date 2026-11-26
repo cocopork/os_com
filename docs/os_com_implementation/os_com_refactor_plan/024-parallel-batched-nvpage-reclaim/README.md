@@ -79,5 +79,5 @@ redirect extent entry 的物理 NV 范围已经保证不跨 domain，因此发�
 24/32 线程的 258.82/268.20 MiB/s，分别提升 98.2%/62.1%，20 线程后的回收断崖已消除；但 32 线程
 仍只有本轮 4 线程的 75.2%，未达到“32 线程不低于 4 线程”的完整目标。插桩表明回收批次已经稳定在
 约 127 页，剩余差距主要对应容量等待和前台 persist/post-commit 随并发增加，而不是回收队列再次退化
-为逐页处理。完整数据见 `docs/experiments/reports/RNVPCE-PARALLEL-BATCHED-RECLAIM-2026-11-16.md`。
+为逐页处理。完整数据见 `docs/experiments/validation/temporary/rnvpce-parallel-batched-reclaim-20261116/README.md`。
 

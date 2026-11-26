@@ -1,0 +1,32 @@
+{
+  "case": "e2e-nvme-nvlog-append-write-threads-12-r3",
+  "device": "nvme",
+  "mode": "nvlog",
+  "workload": "append-write",
+  "axis": "threads",
+  "value": "12",
+  "bs_kib": 4,
+  "jobs": 12,
+  "repeat": 3,
+  "actual_mib": 2040,
+  "configured_dram_cache_mib": 128,
+  "configured_nv_data_cache_mib": 128,
+  "configured_total_data_cache_mib": 256,
+  "cache_control": "memcg-memory-high",
+  "cache_file_peak_bytes": 127639552,
+  "cache_anon_peak_bytes": 5918720,
+  "memory_high_mib": 136,
+  "memory_max_mib": 512,
+  "memory_events": {
+    "low": 0,
+    "high": 11108,
+    "max": 0,
+    "oom": 0,
+    "oom_kill": 0
+  },
+  "fio_mib_s": 873.2876710891724,
+  "including_sync_mib_s": 671.0526315789474,
+  "iops": 223561.643836,
+  "mean_latency_us": 50.39466952,
+  "p99_latency_us": 264.192
+}

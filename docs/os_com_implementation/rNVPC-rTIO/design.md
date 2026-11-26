@@ -27,12 +27,16 @@ rNVPCe uses PageCache as its volatile hot-data index. A page slot may reference 
 ```text
 PageCache hit -> CleanDram: read DRAM
               -> DirtyNv/CleanNv: pin and read NVPage
-PageCache miss -> persistent extent + redirect lookup
-               -> NV authoritative: install an NV slot and read NVPage
-               -> SSD authoritative: batch read into clean DRAM pages
+PageCache miss -> lookup NVPool-cached SSD extent metadata
+               -> miss: traverse the SSD extent tree and cache its metadata
+               -> batch read SSD blocks into clean DRAM pages
 ```
 
-Concurrent misses for one page share one page-local loading owner. Adjacent SSD misses use batched BIO and readahead rather than per-page submission and wait. A clean DRAM or clean NV hit does not inspect the extent tree. PageCache and its file data are discarded after a crash; persistent extent/redirect state alone reconstructs authority.
+Every live NVPage has a `DirtyNv` or `CleanNv` PageCache slot while the filesystem is running. A PageCache miss therefore means
+the page is SSD-authoritative; it does not trigger an NV redirect lookup. Concurrent misses for one page share one page-local loading
+owner. Adjacent SSD misses use batched BIO and readahead rather than per-page submission and wait. A clean DRAM or clean NV hit does
+not inspect the extent tree. PageCache and its file data are discarded after a crash; recovery rebuilds NV-backed slots from persistent
+redirect state before serving file I/O.
 
 ## Write Flow
 
@@ -167,8 +171,8 @@ persist SSD allocation ownership and data (JBD2 or nojournal durability boundary
   -> release the leaf guard; repeat for the remaining leaves
   -> mark each new block's credit consumed and refresh the inode ledger once
      under the reservation record's own modification guard
-  -> clear the persistent redirect and transient migration state
-  -> publish SSD authority and change the matching PageCache slot DirtyNv -> CleanNv
+  -> clear transient migration state but retain the persistent NV redirect
+  -> change the matching PageCache slot DirtyNv -> CleanNv
   -> retain the clean NVPage until later cache/capacity reclaim
   -> yield before the next bounded completion group
 ```
@@ -176,20 +180,21 @@ persist SSD allocation ownership and data (JBD2 or nojournal durability boundary
 The transient migration target and phase live in the existing persistent NVPage descriptor; there is no separate migration log, anchor, or manifest. They let retry and recovery distinguish an unplaced page from a page that already owns a migration-time SSD allocation. An I/O failure keeps that durable target, returns the exact page generation to `NvDirty`, and retries without allocating another block. After SSD publication, a one-way descriptor phase ensures that the live EXT4 reservation counter is released exactly once. The per-inode persistent reservation record is a conservative ledger: failure to refresh it may temporarily over-reserve only in the persistent image, while runtime admission uses the exact atomic counter and recovery recomputes the ledger from the forward graph.
 
 ```text
-NvDirty -> Claimed -> InFlight -> IoComplete -> SSD authority durable -> CleanNv
+NvDirty -> Claimed -> InFlight -> IoComplete -> SSD copy durable -> CleanNv
                          \-- I/O failure --------------------------> NvDirty/requeue
 ```
 
 Submission and device completion are not reclaim boundaries. Until the SSD allocation and replacement extent reference are durable, the NV extent remains the selected mapping and the NVPage remains pinned.
 
-After durable SSD publication, completion consumes the migration lease but does
-not normally free the data slot. A later bounded reclaim batch handles clean
-NVPages. A hot clean NVPage is copied to a clean DRAM page and atomically replaced
-in PageCache; a cold clean NVPage is compare-and-removed. Only after old readers
-have drained does reclaim clear the descriptor and return capacity. Dirty,
-in-flight, or stale page slots are skipped. Reclaim queues and slot free operations
-are partitioned by worker and allocation domain; notifications occur after locks
-are released and are aggregated per batch.
+After the SSD copy and its mapping are durable, completion consumes the migration
+lease and publishes `CleanNv`, but retains the persistent NV redirect and data
+slot. A later bounded reclaim batch reserves DRAM capacity, copies every claimed
+clean NVPage outside index locks, and replaces the batch with `CleanDram` slots
+under one inode-local PageCache writer acquisition. It then detaches the persistent
+NV redirects, waits for old readers to drain, clears the descriptors, and returns
+the NV range. Dirty, in-flight, or stale page slots are skipped. Reclaim queues and
+slot free operations are partitioned by worker and allocation domain; notifications
+occur after locks are released and are aggregated per batch.
 
 Each mapped NVPage has one compact DRAM reverse locator identifying its current leaf extent slot. Forward extent publication and reverse-index installation occur under the same extent/page mutation exclusion, so an extent must never expose an NVPage while that page has an empty reverse entry. An empty reverse entry is therefore sufficient proof that no extent references the page; once completion and lifecycle conditions also permit reclamation, rTIO need not rescan the inode extent tree. The reverse index is an acceleration and safety structure for the running instance, not persistent metadata, and recovery rebuilds it from the persistent extent trees before migration or reclamation is enabled.
 
@@ -292,6 +297,7 @@ whole-leaf crash-atomicity guarantee.
 - DRAM is never the sole recovery copy.
 - NV data validity precedes persistent reference publication.
 - PageCache is the first lookup for rNVPCe buffered reads and writes and may reference clean DRAM, dirty NV, or clean NV data.
+- Every runtime-live NVPage has an exact PageCache slot; only clean DRAM slots may be independently evicted.
 - PageCache is volatile acceleration; persistent extent and redirect state remain the only crash-recovery authority.
 - Existing NVPages are overwritten in place; newly allocated NVPages are fully initialized before publication.
 - Foreground mutation of a mapped NVPage excludes same-page rTIO writeback.
@@ -299,6 +305,7 @@ whole-leaf crash-atomicity guarantee.
 - Candidate discovery uses inode-owner worker queues and never walks inode extent trees or a global candidate queue.
 - New NV mappings reserve SSD capacity without choosing SSD positions; only rTIO assigns concrete blocks.
 - End-I/O callbacks never mutate persistent filesystem metadata or reclaim NVPages.
+- NVPage reclaim copies the claimed clean batch into DRAM, replaces its PageCache slots, detaches persistent redirects, and only then frees the NV range.
 - No ordinary lock is held across asynchronous BIO execution.
 - A split freezes only its moved interval; rTIO cannot migrate or reclaim that interval until forward repair and reverse-index correction both complete.
 - Recovery rebuilds and validates reverse locators before enabling rTIO or runtime reclamation.

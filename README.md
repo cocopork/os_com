@@ -11,7 +11,7 @@
 ## 研究设计与恢复进展
 
 - [设计与实现计划](docs/os_com_implementation/README.md)：与代码共用本仓库和远端。
-- [实验报告与复现脚本](docs/experiments/reports/README.md)：当前 rebuild 的测试结论和可复现实验入口。
+- [实验报告与复现脚本](docs/experiments/README.md)：当前 rebuild 的测试结论和可复现实验入口。
 - [代码恢复证据](docs/recovery/)：来源清单、恢复审查和持久化接线记录。
 - [工作区合并说明](docs/recovery/REPOSITORY-CONSOLIDATION-2026-10-18.md)：目录迁移与历史归档位置。
 

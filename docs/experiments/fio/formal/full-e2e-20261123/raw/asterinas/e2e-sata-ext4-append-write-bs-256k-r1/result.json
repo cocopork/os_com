@@ -1,0 +1,17 @@
+{
+  "case": "e2e-sata-ext4-append-write-bs-256k-r1",
+  "device": "sata",
+  "mode": "ext4",
+  "workload": "append-write",
+  "axis": "bs",
+  "value": "256k",
+  "bs_kib": 256,
+  "jobs": 1,
+  "repeat": 1,
+  "actual_mib": 2048,
+  "fio_mib_s": 364.4128112792969,
+  "including_sync_mib_s": 343.0485762144054,
+  "iops": 1457.651246,
+  "mean_latency_us": 685.5121728519999,
+  "p99_latency_us": 9109.504
+}

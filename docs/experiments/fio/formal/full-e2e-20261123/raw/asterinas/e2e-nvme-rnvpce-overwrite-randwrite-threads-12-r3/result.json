@@ -1,0 +1,17 @@
+{
+  "case": "e2e-nvme-rnvpce-overwrite-randwrite-threads-12-r3",
+  "device": "nvme",
+  "mode": "rnvpce",
+  "workload": "overwrite-randwrite",
+  "axis": "threads",
+  "value": "12",
+  "bs_kib": 4,
+  "jobs": 12,
+  "repeat": 3,
+  "actual_mib": 2040,
+  "fio_mib_s": 800.9422845840454,
+  "including_sync_mib_s": 691.5254237288135,
+  "iops": 205041.224971,
+  "mean_latency_us": 52.998286889,
+  "p99_latency_us": 152.576
+}

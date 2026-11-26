@@ -194,8 +194,8 @@
 
 **Files:**
 - Modify: `kernel/src/fs/fs_impls/ext4/pipeline_profile.rs`
-- Create: `docs/experiments/scripts/scalable-rnvpce-allocation-20261030/`
-- Create: `docs/experiments/reports/SCALABLE-RNVPCE-ALLOCATION-2026-10-30.md`
+- Create: `docs/experiments/validation/temporary/scalable-rnvpce-allocation-20261030/scripts/`
+- Create: `docs/experiments/validation/temporary/scalable-rnvpce-allocation-20261030/README.md`
 
 **Interfaces:**
 - Consumes: Tasks 1-4 complete implementation.

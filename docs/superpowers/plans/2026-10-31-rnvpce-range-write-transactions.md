@@ -192,8 +192,8 @@ git commit -m "Track rNVPCe data slots by range"
 - Modify: `kernel/src/fs/rnvpc/redirect_index.rs`
 - Modify: `kernel/src/fs/rnvpc/write_transaction.rs`
 - Modify: `kernel/src/fs/rnvpc/rnvpce_integrity_tests.rs`
-- Create: `docs/experiments/reports/RNVPCE-RANGE-WRITE-TRANSACTIONS-2026-10-31.md`
-- Create: `docs/experiments/scripts/rnvpce-range-write-20261031/`
+- Create: `docs/experiments/validation/temporary/rnvpce-range-write-20261031/README.md`
+- Create: `docs/experiments/validation/temporary/rnvpce-range-write-20261031/scripts/`
 
 **Interfaces:**
 - Consumes: Tasks 1--3 range transaction and range-owner APIs.
@@ -247,7 +247,7 @@ git add kernel/src/fs/rnvpc/index.rs kernel/src/fs/rnvpc/descriptor.rs \
   kernel/src/fs/rnvpc/frame/object_table.rs kernel/src/fs/rnvpc/frame/redirect.rs kernel/src/fs/rnvpc/persist.rs \
   kernel/src/fs/fs_impls/ext4/inode/mod.rs \
   kernel/src/fs/rnvpc/rnvpce_integrity_tests.rs \
-  docs/experiments/reports/RNVPCE-RANGE-WRITE-TRANSACTIONS-2026-10-31.md \
-  docs/experiments/scripts/rnvpce-range-write-20261031
+  docs/experiments/validation/temporary/rnvpce-range-write-20261031/README.md \
+  docs/experiments/validation/temporary/rnvpce-range-write-20261031/scripts
 git commit -m "Validate rNVPCe range write transactions"
 ```

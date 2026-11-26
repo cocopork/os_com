@@ -1,0 +1,17 @@
+{
+  "case": "e2e-sata-rnvpce-cold-randread-threads-1-r3",
+  "device": "sata",
+  "mode": "rnvpce",
+  "workload": "cold-randread",
+  "axis": "threads",
+  "value": "1",
+  "bs_kib": 4,
+  "jobs": 1,
+  "repeat": 3,
+  "actual_mib": 2048,
+  "fio_mib_s": 24.800493240356445,
+  "including_sync_mib_s": null,
+  "iops": 6348.926483,
+  "mean_latency_us": 157.15788188,
+  "p99_latency_us": 259.072
+}

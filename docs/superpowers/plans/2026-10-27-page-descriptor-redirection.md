@@ -437,8 +437,8 @@ descriptors with `ssd_target == 0`; normal foreground writes cannot create one.
 - Modify: `kernel/src/fs/rnvpc/batch_metrics.rs`
 - Modify: `kernel/src/fs/fs_impls/ext4/mod.rs`
 - Modify: `kernel/src/fs/fs_impls/ext4/migration.rs`
-- Modify: `docs/experiments/scripts/` scripts selected from the existing rNVPCe pipeline harness
-- Create: `docs/experiments/reports/PAGE-DESCRIPTOR-REDIRECTION-2026-10-27.md`
+- Modify: `docs/experiments/<test-type>/<formal-or-temporary>/<experiment>/scripts/` scripts selected from the existing rNVPCe pipeline harness
+- Create: `docs/experiments/validation/temporary/page-descriptor-redirection-20261027/README.md`
 
 **Interfaces:**
 - Consumes: final redirect write/claim/completion paths.
@@ -481,6 +481,6 @@ descriptors with `ssd_target == 0`; normal foreground writes cannot create one.
 - [ ] **Step 7: Commit**
 
   ```bash
-  git add kernel/src/fs/rnvpc/batch_metrics.rs kernel/src/fs/fs_impls/ext4 docs/experiments/scripts docs/experiments/reports/PAGE-DESCRIPTOR-REDIRECTION-2026-10-27.md
+  git add kernel/src/fs/rnvpc/batch_metrics.rs kernel/src/fs/fs_impls/ext4 docs/experiments/validation/temporary/page-descriptor-redirection-20261027
   git commit -m "test(rnvpce): validate page descriptor redirection"
   ```

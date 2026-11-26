@@ -1,0 +1,13 @@
+{
+  "case": "nvme-ext4-fileserver-r1",
+  "device": "nvme",
+  "mode": "ext4",
+  "workload": "fileserver",
+  "repeat": 1,
+  "threads": 16,
+  "nfiles": 10000,
+  "filesize_kib": 128,
+  "dataset_mib": 1250,
+  "dram_cache_mib": 128,
+  "nv_data_cache_mib": 0
+}

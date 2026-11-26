@@ -1,0 +1,4 @@
+1bd2c5c83d93d700b78244c4bec80b5729c5e600b5bd791bfa2e3b0ed89e428a  docs/experiments/mixed-sync/formal/mixed-sync-ratio-20261119/nvlog-results.csv
+6951dd3ae10540bf9d3303a4eb8142601906526eefb5b19a73cb1964d23947fc  docs/experiments/mixed-sync/formal/mixed-sync-ratio-20261119/results.csv
+493e9bab99b750d4538734c5d8db6a8568ca3e014e7eb43638f1416c08dab5a0  docs/experiments/mixed-sync/formal/mixed-sync-ratio-20261119/aggregate.csv
+71540befc03c0fc16775f7d7ae2c38ba2500801fe49aee79d5d5edf82a3290db  docs/experiments/mixed-sync/formal/mixed-sync-ratio-20261119/plotting-source.csv

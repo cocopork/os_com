@@ -1,0 +1,17 @@
+{
+  "case": "e2e-nvme-rnvpce-cold-randread-bs-256k-r1",
+  "device": "nvme",
+  "mode": "rnvpce",
+  "workload": "cold-randread",
+  "axis": "bs",
+  "value": "256k",
+  "bs_kib": 256,
+  "jobs": 1,
+  "repeat": 1,
+  "actual_mib": 2048,
+  "fio_mib_s": 103.89610385894775,
+  "including_sync_mib_s": null,
+  "iops": 415.584416,
+  "mean_latency_us": 2405.4530950930002,
+  "p99_latency_us": 5931.008
+}

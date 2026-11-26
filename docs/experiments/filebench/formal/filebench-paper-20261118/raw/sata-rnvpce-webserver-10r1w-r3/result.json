@@ -1,0 +1,17 @@
+{
+  "case": "sata-rnvpce-webserver-10r1w-r3",
+  "device": "sata",
+  "mode": "rnvpce",
+  "workload": "webserver-10r1w",
+  "repeat": 3,
+  "threads": 16,
+  "nfiles": 10000,
+  "filesize_kib": 128,
+  "dataset_mib": 1250,
+  "dram_cache_mib": 64,
+  "nv_data_cache_mib": 64,
+  "operations": 1074225,
+  "ops_s": 17457.402,
+  "mb_s": 2071.5,
+  "latency_ms": 0.913
+}

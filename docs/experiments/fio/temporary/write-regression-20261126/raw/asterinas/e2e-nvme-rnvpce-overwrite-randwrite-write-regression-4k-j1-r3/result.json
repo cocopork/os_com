@@ -1,0 +1,18 @@
+{
+  "case": "e2e-nvme-rnvpce-overwrite-randwrite-write-regression-4k-j1-r3",
+  "device": "nvme",
+  "mode": "rnvpce",
+  "workload": "overwrite-randwrite",
+  "axis": "write-regression",
+  "value": "4k-j1",
+  "bs_kib": 4,
+  "jobs": 1,
+  "repeat": 3,
+  "fio_fsync_blocks": 1,
+  "actual_mib": 2048.0,
+  "fio_mib_s": 317.8150215148926,
+  "including_sync_mib_s": 299.8535871156662,
+  "iops": 81360.645562,
+  "mean_latency_us": 11.012892477,
+  "p99_latency_us": 14.656
+}

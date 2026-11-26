@@ -439,7 +439,8 @@ Evidence: `test/aster-ext4-baseline-test/results/20261012-inode-publication/`.
   throughput runs. IRQ and host CPU affinity are outside this experiment.
 - Eight complete NVMe/random4K/16-job runs show98.08-108.94MiB/s, median98.46,
   with no30+MiB/s sample. This is a bounded mitigation result, not proof of
-  universal scheduler correctness. Evidence: [CPU isolation](../test/aster-ext4-baseline-test/results/20261013-cpu-isolation/README.md).
+  universal scheduler correctness. Evidence status:
+  [archived temporary diagnostics](../archive/experiments/2026-10-performance-diagnostics.md).
 
 ### Completion leaf batching (2026-10-11)
 

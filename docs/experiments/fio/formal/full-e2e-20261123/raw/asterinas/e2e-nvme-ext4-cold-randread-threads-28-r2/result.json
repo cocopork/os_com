@@ -1,0 +1,17 @@
+{
+  "case": "e2e-nvme-ext4-cold-randread-threads-28-r2",
+  "device": "nvme",
+  "mode": "ext4",
+  "workload": "cold-randread",
+  "axis": "threads",
+  "value": "28",
+  "bs_kib": 4,
+  "jobs": 28,
+  "repeat": 2,
+  "actual_mib": 2044,
+  "fio_mib_s": 233.28007221221924,
+  "including_sync_mib_s": null,
+  "iops": 59719.698699,
+  "mean_latency_us": 459.126491943,
+  "p99_latency_us": 2179.072
+}

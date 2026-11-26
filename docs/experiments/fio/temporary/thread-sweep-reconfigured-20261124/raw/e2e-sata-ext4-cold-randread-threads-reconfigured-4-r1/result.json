@@ -1,0 +1,17 @@
+{
+  "case": "e2e-sata-ext4-cold-randread-threads-reconfigured-4-r1",
+  "device": "sata",
+  "mode": "ext4",
+  "workload": "cold-randread",
+  "axis": "threads-reconfigured",
+  "value": "4",
+  "bs_kib": 4,
+  "jobs": 4,
+  "repeat": 1,
+  "actual_mib": 2560.0,
+  "fio_mib_s": 63.399291038513184,
+  "including_sync_mib_s": null,
+  "iops": 16230.218678,
+  "mean_latency_us": 206.12881977199999,
+  "p99_latency_us": 321.536
+}

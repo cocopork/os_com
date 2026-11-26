@@ -1,0 +1,29 @@
+[
+  {
+    "case": "raw-nvme-randwrite-32q-8w-poll-j28",
+    "repeat": 1,
+    "io_bytes": 2143289344,
+    "fio_mib_s": 162.4542989730835,
+    "iops": 41588.300747,
+    "mean_latency_us": 636.433425802,
+    "p99_latency_us": 1695.744
+  },
+  {
+    "case": "raw-nvme-randwrite-32q-8w-poll-j28",
+    "repeat": 2,
+    "io_bytes": 2143289344,
+    "fio_mib_s": 155.02464866638184,
+    "iops": 39686.310201,
+    "mean_latency_us": 668.885672492,
+    "p99_latency_us": 1597.44
+  },
+  {
+    "case": "raw-nvme-randwrite-32q-8w-poll-j28",
+    "repeat": 3,
+    "io_bytes": 2143289344,
+    "fio_mib_s": 151.60955333709717,
+    "iops": 38812.045691,
+    "mean_latency_us": 661.8146418099999,
+    "p99_latency_us": 1613.824
+  }
+]

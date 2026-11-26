@@ -17,7 +17,7 @@
 - Candidate claim is DRAM-only; do not persist a per-page `NvWriteback` transition.
 - No partition, inode, allocator, or baseline-generation lock may cross an I/O or wait boundary.
 - The migration critical path must not route an inode extent tree or use reverse lookup.
-- Existing unrelated changes in `docs/experiments/reports/NVPAGE-PARALLEL-RECLAIM-2026-10-28.md` must remain untouched and must not be included in feature commits.
+- Existing unrelated changes in `docs/experiments/validation/temporary/nvpage-parallel-reclaim-20261028/README.md` must remain untouched and must not be included in feature commits.
 - Use “index partition”, “dirty migration extent”, and “contiguous page range”; remove `shard` terminology from touched APIs and documents.
 
 ## Review Focus
@@ -40,7 +40,7 @@
 - Modify EXT4 allocator files located during Task 4: constrained allocation from an already owned block group and deferred wakeup.
 - Modify `kernel/src/fs/fs_impls/ext4/inode/mod.rs`: prefix/overlap/suffix foreground write loop.
 - Modify rNVPCe and EXT4 ktests in `kernel/src/fs/rnvpc/` and `kernel/src/fs/fs_impls/ext4/`.
-- Add the final performance results to a new report under `docs/experiments/reports/`; keep raw data untracked under the experiment workspace.
+- Add the final performance results to a new report under `docs/experiments/validation/temporary/<experiment>/`; keep raw data untracked under the experiment workspace.
 
 ### Task 1: Lock the 128-Page Extent Semantics with Failing Tests
 
@@ -176,7 +176,7 @@
 
 **Files:**
 - Modify: rNVPCe batch/latency metrics files found by `rg -n "nv_candidate_select|nv_flush_total" kernel/src`
-- Create: `docs/experiments/reports/DIRTY-MIGRATION-EXTENTS-2026-10-29.md`
+- Create: `docs/experiments/validation/temporary/dirty-migration-extents-20261029/README.md`
 
 - [ ] Add counters for ready-queue pop, local rebuild, logical lease, physical-slot lease, baseline batch claim, group defer, target allocation, BIO submit, completion publication, and reclaim.
 - [ ] Run `cargo osdk check --ktests --package aster-kernel`.

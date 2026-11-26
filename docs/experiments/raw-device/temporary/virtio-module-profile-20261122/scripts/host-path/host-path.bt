@@ -1,0 +1,159 @@
+#!/usr/bin/env bpftrace
+
+BEGIN
+{
+    printf("PROFILE_CONFIG qemu_pid=%d target_fd=%d target_dev=%d\n", $1, $2, $3);
+    @iothread[$4] = 1;
+    @iothread[$5] = 1;
+    @iothread[$6] = 1;
+    @iothread[$7] = 1;
+    @iothread[$8] = 1;
+    @iothread[$9] = 1;
+    @iothread[$10] = 1;
+    @iothread[$11] = 1;
+}
+
+uprobe:QEMU_BINARY:virtio_blk_handle_vq
+/pid == $1/
+{
+    @vq_started[tid] = nsecs;
+    @vq_handle_count = count();
+}
+
+uretprobe:QEMU_BINARY:virtio_blk_handle_vq
+/pid == $1/
+{
+    delete(@vq_started[tid]);
+}
+
+uprobe:QEMU_BINARY:virtio_blk_handle_request
+/pid == $1/
+{
+    if (@vq_started[tid]) {
+        $delta = nsecs - @vq_started[tid];
+        @vq_to_request_us = hist($delta / 1000);
+        @vq_to_request_sum_us = sum($delta / 1000);
+        @vq_to_request_count = count();
+    }
+    @request_started[arg0] = nsecs;
+    @request_handle_count = count();
+}
+
+uprobe:QEMU_BINARY:virtio_blk_rw_complete
+/pid == $1/
+{
+    if (@request_started[arg0]) {
+        $delta = nsecs - @request_started[arg0];
+        @handle_to_rw_complete_us = hist($delta / 1000);
+        @handle_to_rw_complete_sum_us = sum($delta / 1000);
+        @handle_to_rw_complete_count = count();
+        @rw_completed[arg0] = nsecs;
+    }
+}
+
+uprobe:QEMU_BINARY:virtio_blk_req_complete
+/pid == $1/
+{
+    @request_complete_count = count();
+    if (@rw_completed[arg0]) {
+        $delta = nsecs - @rw_completed[arg0];
+        @rw_to_request_complete_us = hist($delta / 1000);
+        @rw_to_request_complete_sum_us = sum($delta / 1000);
+        @rw_to_request_complete_count = count();
+        @request_completed[tid] = nsecs;
+        delete(@request_started[arg0]);
+        delete(@rw_completed[arg0]);
+    }
+}
+
+uprobe:QEMU_BINARY:virtio_notify_irqfd_deferred_fn
+/pid == $1/
+{
+    @deferred_irq_count = count();
+    if (@request_completed[tid]) {
+        $delta = nsecs - @request_completed[tid];
+        @request_to_irq_us = hist($delta / 1000);
+        @request_to_irq_sum_us = sum($delta / 1000);
+        @request_to_irq_count = count();
+        delete(@request_completed[tid]);
+    }
+}
+
+tracepoint:syscalls:sys_enter_pwrite64
+/pid == $1 && args.fd == $2/
+{
+    @syscall_started[tid] = nsecs;
+    @pwrite64_count = count();
+}
+
+tracepoint:block:block_rq_issue
+/args.dev == $3 && @syscall_started[tid]/
+{
+    $delta = nsecs - @syscall_started[tid];
+    @kernel_submit_us = hist($delta / 1000);
+    @kernel_submit_sum_us = sum($delta / 1000);
+    @kernel_submit_count = count();
+    @issue_started[args.sector] = nsecs;
+    @issue_owner[args.sector] = tid;
+}
+
+tracepoint:block:block_rq_complete
+/args.dev == $3 && @issue_started[args.sector]/
+{
+    $delta = nsecs - @issue_started[args.sector];
+    @device_service_us = hist($delta / 1000);
+    @device_service_sum_us = sum($delta / 1000);
+    @device_service_count = count();
+    $owner = @issue_owner[args.sector];
+    @device_completed[$owner] = nsecs;
+    delete(@issue_started[args.sector]);
+    delete(@issue_owner[args.sector]);
+}
+
+tracepoint:syscalls:sys_exit_pwrite64
+/pid == $1 && @syscall_started[tid]/
+{
+    $delta = nsecs - @syscall_started[tid];
+    @pwrite64_total_us = hist($delta / 1000);
+    @pwrite64_total_sum_us = sum($delta / 1000);
+    @pwrite64_total_count = count();
+    if (@device_completed[tid]) {
+        $post = nsecs - @device_completed[tid];
+        @kernel_complete_us = hist($post / 1000);
+        @kernel_complete_sum_us = sum($post / 1000);
+        @kernel_complete_count = count();
+        delete(@device_completed[tid]);
+    }
+    delete(@syscall_started[tid]);
+}
+
+tracepoint:sched:sched_wakeup
+/@iothread[args.pid]/
+{
+    @iothread_wakeup[args.pid] = nsecs;
+    @iothread_wakeup_count = count();
+}
+
+tracepoint:sched:sched_switch
+/@iothread[args.next_pid] && @iothread_wakeup[args.next_pid]/
+{
+    $delta = nsecs - @iothread_wakeup[args.next_pid];
+    @iothread_schedule_us = hist($delta / 1000);
+    @iothread_schedule_sum_us = sum($delta / 1000);
+    @iothread_schedule_count = count();
+    delete(@iothread_wakeup[args.next_pid]);
+}
+
+END
+{
+    clear(@vq_started);
+    clear(@request_started);
+    clear(@rw_completed);
+    clear(@request_completed);
+    clear(@syscall_started);
+    clear(@issue_started);
+    clear(@issue_owner);
+    clear(@device_completed);
+    clear(@iothread);
+    clear(@iothread_wakeup);
+}

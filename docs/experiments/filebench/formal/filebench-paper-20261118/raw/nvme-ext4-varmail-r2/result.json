@@ -1,0 +1,17 @@
+{
+  "case": "nvme-ext4-varmail-r2",
+  "device": "nvme",
+  "mode": "ext4",
+  "workload": "varmail",
+  "repeat": 2,
+  "threads": 16,
+  "nfiles": 10000,
+  "filesize_kib": 128,
+  "dataset_mib": 1250,
+  "dram_cache_mib": 128,
+  "nv_data_cache_mib": 0,
+  "operations": 441758,
+  "ops_s": 7271.663,
+  "mb_s": 827.3,
+  "latency_ms": 2.189
+}

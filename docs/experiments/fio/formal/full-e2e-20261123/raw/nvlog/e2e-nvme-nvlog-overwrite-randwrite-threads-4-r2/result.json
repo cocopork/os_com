@@ -1,0 +1,32 @@
+{
+  "case": "e2e-nvme-nvlog-overwrite-randwrite-threads-4-r2",
+  "device": "nvme",
+  "mode": "nvlog",
+  "workload": "overwrite-randwrite",
+  "axis": "threads",
+  "value": "4",
+  "bs_kib": 4,
+  "jobs": 4,
+  "repeat": 2,
+  "actual_mib": 2048,
+  "configured_dram_cache_mib": 128,
+  "configured_nv_data_cache_mib": 128,
+  "configured_total_data_cache_mib": 256,
+  "cache_control": "memcg-memory-high",
+  "cache_file_peak_bytes": 127131648,
+  "cache_anon_peak_bytes": 5689344,
+  "memory_high_mib": 136,
+  "memory_max_mib": 512,
+  "memory_events": {
+    "low": 0,
+    "high": 11161,
+    "max": 0,
+    "oom": 0,
+    "oom_kill": 0
+  },
+  "fio_mib_s": 484.04632472991943,
+  "including_sync_mib_s": 401.56862745098044,
+  "iops": 123915.859135,
+  "mean_latency_us": 31.28104344,
+  "p99_latency_us": 140.288
+}

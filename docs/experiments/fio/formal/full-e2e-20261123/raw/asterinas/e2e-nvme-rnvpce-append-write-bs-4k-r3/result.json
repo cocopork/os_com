@@ -1,0 +1,18 @@
+{
+  "case": "e2e-nvme-rnvpce-append-write-bs-4k-r3",
+  "device": "nvme",
+  "mode": "rnvpce",
+  "workload": "append-write",
+  "axis": "bs",
+  "value": "4k",
+  "bs_kib": 4,
+  "jobs": 1,
+  "repeat": 3,
+  "fio_fsync_blocks": 1,
+  "actual_mib": 2048.0,
+  "fio_mib_s": 201.2183132171631,
+  "including_sync_mib_s": 194.49192782526117,
+  "iops": 51511.888387,
+  "mean_latency_us": 18.320419818999998,
+  "p99_latency_us": 31.36
+}

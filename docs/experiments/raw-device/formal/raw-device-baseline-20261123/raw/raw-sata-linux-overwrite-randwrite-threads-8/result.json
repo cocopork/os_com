@@ -1,0 +1,50 @@
+[
+  {
+    "case": "raw-sata-linux-overwrite-randwrite-threads-8",
+    "device": "sata",
+    "system": "linux",
+    "workload": "overwrite-randwrite",
+    "axis": "threads",
+    "bs_kib": 4,
+    "jobs": 8,
+    "repeat": 1,
+    "actual_mib": 2048,
+    "virtqueues": 1,
+    "fio_mib_s": 226.12343978881836,
+    "iops": 57887.600751,
+    "mean_latency_us": 135.481329065,
+    "p99_latency_us": 244.736
+  },
+  {
+    "case": "raw-sata-linux-overwrite-randwrite-threads-8",
+    "device": "sata",
+    "system": "linux",
+    "workload": "overwrite-randwrite",
+    "axis": "threads",
+    "bs_kib": 4,
+    "jobs": 8,
+    "repeat": 2,
+    "actual_mib": 2048,
+    "virtqueues": 1,
+    "fio_mib_s": 228.21484279632568,
+    "iops": 58422.999777,
+    "mean_latency_us": 136.030291687,
+    "p99_latency_us": 246.784
+  },
+  {
+    "case": "raw-sata-linux-overwrite-randwrite-threads-8",
+    "device": "sata",
+    "system": "linux",
+    "workload": "overwrite-randwrite",
+    "axis": "threads",
+    "bs_kib": 4,
+    "jobs": 8,
+    "repeat": 3,
+    "actual_mib": 2048,
+    "virtqueues": 1,
+    "fio_mib_s": 229.26228523254395,
+    "iops": 58691.145192,
+    "mean_latency_us": 134.938362186,
+    "p99_latency_us": 244.736
+  }
+]

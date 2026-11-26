@@ -1,0 +1,17 @@
+{
+  "case": "e2e-nvme-ext4-cold-randread-bs-1024k-r3",
+  "device": "nvme",
+  "mode": "ext4",
+  "workload": "cold-randread",
+  "axis": "bs",
+  "value": "1024k",
+  "bs_kib": 1024,
+  "jobs": 1,
+  "repeat": 3,
+  "actual_mib": 2048,
+  "fio_mib_s": 111.63196277618408,
+  "including_sync_mib_s": null,
+  "iops": 111.631963,
+  "mean_latency_us": 8956.621965332,
+  "p99_latency_us": 223346.688
+}

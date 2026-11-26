@@ -10,21 +10,24 @@ It replaces the former direct extent/redirect lookup on every read with a
 per-inode sparse page-slot index that can reference clean DRAM, dirty NV, or clean
 NV data. Persistent extent/redirect metadata remains authoritative; PageCache is
 discarded on recovery. Completion publishes `CleanNv` rather than immediately
-freeing the page, and later worker/allocation-domain batches will copy hot clean
-pages to DRAM or evict cold clean pages.
+freeing the page. Every live NVPage retains an exact PageCache slot. Later
+worker/allocation-domain batches copy clean NVPages to DRAM, replace the slots
+with `CleanDram`, detach their redirects, and then free the NV range.
 
 The implementation must not add a global hot-path map or lock. Index updates are
 per inode, transitions are per page slot, and allocation/reclaim remains
 partitioned. No such lock may span user copy, 4 KiB copy, NVM persistence, SSD
 I/O, or sleep.
 
-As of 2026-11-18, the active branch implements the per-inode XArray, page-local
+As of 2026-11-21, the active branch implements the per-inode XArray, page-local
 miss ownership, 32-page SSD read windows, batched DirtyNv publication, the
 `IoComplete -> Clean` authority boundary, delayed worker-local reclaim, and one
-per-inode batched compare-and-replace/remove operation. An accessed CleanNv page
-is copied to a CleanDram page before its NV range is freed; an unaccessed page is
-evicted without a DRAM copy. The inode-cache read lock is used only to clone an
-`Arc<Inode>` and is dropped before copying or freeing.
+per-inode batched compare-and-replace/remove operation. The remaining read-path
+change removes per-page NV authority lookup from PageCache misses: a miss resolves
+only SSD extent metadata, reads SSD blocks, and publishes `CleanDram`. Reclaim is
+being tightened so every claimed CleanNv batch is copied to DRAM before its NV
+range is freed. The inode-cache read lock is used only to clone an `Arc<Inode>`
+and is dropped before copying or freeing.
 
 Direct `CleanNv -> DirtyNv` reuse remains a follow-up. A write that encounters a
 clean retained entry currently requests worker progress, lets the worker retire
@@ -100,7 +103,9 @@ in native EXT4, commits through JBD2 or nojournal metadata sync, performs the
 durability boundary, changes each persistent extent from its exact NV reference
 to SSD and consumes reservation credit once. Under plan 025 it then publishes
 the matching PageCache slot as `CleanNv`; later cache/capacity reclaim releases
-that NV generation.
+that NV generation. The revised target moves final NV redirect detachment into
+the reclaim transaction, after the batch has been copied to `CleanDram`; this
+current completion behavior must be changed with the remaining plan 025 work.
 Failed I/O retains the durable target and NV mapping for retry.
 
 Fresh production and ktest-configuration compilation pass, as does the 7-case

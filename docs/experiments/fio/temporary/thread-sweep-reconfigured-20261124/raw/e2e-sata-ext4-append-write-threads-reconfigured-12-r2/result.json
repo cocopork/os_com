@@ -1,0 +1,17 @@
+{
+  "case": "e2e-sata-ext4-append-write-threads-reconfigured-12-r2",
+  "device": "sata",
+  "mode": "ext4",
+  "workload": "append-write",
+  "axis": "threads-reconfigured",
+  "value": "12",
+  "bs_kib": 4,
+  "jobs": 12,
+  "repeat": 2,
+  "actual_mib": 12288.0,
+  "fio_mib_s": 226.63641834259033,
+  "including_sync_mib_s": 224.43835616438355,
+  "iops": 58018.923256,
+  "mean_latency_us": 203.16068470899998,
+  "p99_latency_us": 4014.08
+}

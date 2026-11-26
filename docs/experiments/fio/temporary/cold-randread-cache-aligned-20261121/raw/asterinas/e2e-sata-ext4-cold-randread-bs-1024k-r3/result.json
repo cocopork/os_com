@@ -1,0 +1,17 @@
+{
+  "case": "e2e-sata-ext4-cold-randread-bs-1024k-r3",
+  "device": "sata",
+  "mode": "ext4",
+  "workload": "cold-randread",
+  "axis": "bs",
+  "value": "1024k",
+  "bs_kib": 1024,
+  "jobs": 1,
+  "repeat": 3,
+  "actual_mib": 2048,
+  "fio_mib_s": 88.50092887878418,
+  "including_sync_mib_s": null,
+  "iops": 88.500929,
+  "mean_latency_us": 11297.412893555,
+  "p99_latency_us": 166723.584
+}

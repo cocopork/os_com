@@ -52,7 +52,7 @@
 ### Task 3: Verification and Performance
 
 **Files:**
-- Create: `docs/experiments/reports/RNVPCE-OWNER-SCHEDULING-2026-11-14.md`
+- Create: `docs/experiments/validation/temporary/<experiment>/RNVPCE-OWNER-SCHEDULING-2026-11-14.md`
 
 - [x] Run formatting, normal and ktest compile checks, and focused QEMU ktests.
 - [x] Run release 4/16/32-thread 4 KiB random-overwrite A/B tests on `/dev/nvme1n1p2`.

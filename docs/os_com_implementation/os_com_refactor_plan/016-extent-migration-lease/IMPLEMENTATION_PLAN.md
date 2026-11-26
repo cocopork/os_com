@@ -86,7 +86,7 @@
 
 **Files:**
 - Modify: `docs/os_com_implementation/os_com_refactor_plan/016-extent-migration-lease/README.md`
-- Create: `docs/experiments/reports/EXTENT-MIGRATION-LEASE-2026-10-22.md`
+- Create: `docs/experiments/validation/temporary/extent-migration-lease-20261022/README.md`
 
 **Interfaces:**
 - Consumes: Tasks 1-3 implementation and existing latency probes.

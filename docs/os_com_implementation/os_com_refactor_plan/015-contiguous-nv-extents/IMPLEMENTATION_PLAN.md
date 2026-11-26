@@ -37,4 +37,4 @@
 - [x] 运行生产与 ktest 配置编译、相关 rNVPCe ktests和崩溃恢复测试。
 - [x] 记录 4 KiB randwrite、128 KiB write 的 fio 结果。
 - [x] 检查连续写只生成一个 NV entry，completion 缺页不发布且完整范围一次切换。
-- [x] 将结果写入 `docs/experiments/reports/`；原始数据保持在未跟踪目录。
+- [x] 将结果写入 `docs/experiments/validation/temporary/<experiment>/`；原始数据保持在未跟踪目录。

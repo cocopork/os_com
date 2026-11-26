@@ -1,0 +1,29 @@
+[
+  {
+    "case": "raw-nvme-randwrite-8q-direct-j32",
+    "repeat": 1,
+    "io_bytes": 2147483648,
+    "fio_mib_s": 415.66876316070557,
+    "iops": 106411.203572,
+    "mean_latency_us": 253.05165219699998,
+    "p99_latency_us": 684.032
+  },
+  {
+    "case": "raw-nvme-randwrite-8q-direct-j32",
+    "repeat": 2,
+    "io_bytes": 2147483648,
+    "fio_mib_s": 192.17415714263916,
+    "iops": 49196.584405,
+    "mean_latency_us": 621.6858318440001,
+    "p99_latency_us": 1433.6
+  },
+  {
+    "case": "raw-nvme-randwrite-8q-direct-j32",
+    "repeat": 3,
+    "io_bytes": 2147483648,
+    "fio_mib_s": 195.98086071014404,
+    "iops": 50171.100478,
+    "mean_latency_us": 610.3908375509999,
+    "p99_latency_us": 1417.216
+  }
+]

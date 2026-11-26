@@ -1,0 +1,9 @@
+{
+  "case": "linux-ext4-overwrite-randwrite-4k-j1-r2",
+  "system": "linux-ext4",
+  "fio_mib_s": 306.12854957580566,
+  "including_sync_mib_s": 292.57142857142856,
+  "iops": 78368.908819,
+  "mean_latency_us": 12.174561384,
+  "p99_latency_us": 73.216
+}

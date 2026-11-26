@@ -1,0 +1,17 @@
+{
+  "case": "e2e-sata-rnvpce-cold-randread-bs-256k-r1",
+  "device": "sata",
+  "mode": "rnvpce",
+  "workload": "cold-randread",
+  "axis": "bs",
+  "value": "256k",
+  "bs_kib": 256,
+  "jobs": 1,
+  "repeat": 1,
+  "actual_mib": 2048,
+  "fio_mib_s": 121.05449771881104,
+  "including_sync_mib_s": null,
+  "iops": 484.217993,
+  "mean_latency_us": 2064.404562988,
+  "p99_latency_us": 6389.76
+}

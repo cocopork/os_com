@@ -1,0 +1,16 @@
+nvme ext4   fileserver           15096.158 ops/s    768.500 MB/s
+nvme ext4   varmail               7124.960 ops/s    807.500 MB/s
+nvme ext4   webserver-10r1w      35266.936 ops/s   5056.500 MB/s
+nvme ext4   webserver-1r1w       16976.166 ops/s    970.500 MB/s
+nvme rnvpce fileserver           14278.688 ops/s    760.000 MB/s
+nvme rnvpce varmail               5606.846 ops/s    800.300 MB/s
+nvme rnvpce webserver-10r1w      35415.420 ops/s   5076.000 MB/s
+nvme rnvpce webserver-1r1w       14193.356 ops/s    758.800 MB/s
+sata ext4   fileserver            5566.728 ops/s    184.500 MB/s
+sata ext4   varmail               3745.195 ops/s    286.000 MB/s
+sata ext4   webserver-10r1w      12314.568 ops/s   1366.000 MB/s
+sata ext4   webserver-1r1w        3963.527 ops/s    150.700 MB/s
+sata rnvpce fileserver            6998.139 ops/s    263.000 MB/s
+sata rnvpce varmail               3494.295 ops/s    352.800 MB/s
+sata rnvpce webserver-10r1w      17590.444 ops/s   2079.500 MB/s
+sata rnvpce webserver-1r1w        5948.589 ops/s    243.800 MB/s

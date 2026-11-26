@@ -1,0 +1,18 @@
+{
+  "case": "e2e-nvme-ext4-append-write-write-regression-128k-j1-r3",
+  "device": "nvme",
+  "mode": "ext4",
+  "workload": "append-write",
+  "axis": "write-regression",
+  "value": "128k-j1",
+  "bs_kib": 128,
+  "jobs": 1,
+  "repeat": 3,
+  "fio_fsync_blocks": 0,
+  "actual_mib": 2048.0,
+  "fio_mib_s": 1499.2679347991943,
+  "including_sync_mib_s": 1280.0,
+  "iops": 11994.143485,
+  "mean_latency_us": 83.12636334199999,
+  "p99_latency_us": 2473.984
+}

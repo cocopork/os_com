@@ -120,7 +120,7 @@
 
 **Files:**
 - Modify: `docs/os_com_implementation/os_com_refactor_plan/022-inode-owned-rtio-flushers/README.md`
-- Create: `docs/experiments/reports/RNVPCE-WORKER-LOCAL-BATCHING-2026-11-15.md`
+- Create: `docs/experiments/validation/temporary/rnvpce-worker-local-batching-20261115/README.md`
 
 **Interfaces:**
 - Consumes: completed Tasks 1-3 and the existing overwrite sweep harness.

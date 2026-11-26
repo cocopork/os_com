@@ -399,4 +399,4 @@ both sides of the redirect header commit boundary. Five 1-job runs on the real
 NVMe device increased 4 KiB sequential overwrite from 183.69 MiB/s to a
 630.80 MiB/s mean, while random overwrite remained near baseline at
 189.22 MiB/s. Full evidence is recorded in
-`docs/experiments/reports/RNVPCE-OPEN-REDIRECT-EXTENTS-2026-11-09.md`.
+`docs/experiments/validation/temporary/rnvpce-open-redirect-extents-20261109/README.md`.

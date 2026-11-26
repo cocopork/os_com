@@ -3,7 +3,7 @@
 Date: 2026-10-31
 
 Status: Implemented and validated on 2026-10-31. See
-`docs/experiments/reports/SCALABLE-NVPAGE-POOL-2026-10-31.md`.
+`docs/experiments/validation/temporary/scalable-nvpage-pool-20261031/README.md`.
 
 ## Intent
 

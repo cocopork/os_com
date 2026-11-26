@@ -17,7 +17,8 @@ baseline64). Keep nice0, `rtio_cpu_trace` off, and latency counters off for
 throughput runs. Diagnostic latency runs must use the same CPU isolation.
 This standing performance policy does not enable isolation in small-vCPU ktests.
 Do not compare historical unisolated runs as a controlled before/after pair.
-See [CPU placement and results](aster-ext4-baseline-test/results/20261013-cpu-isolation/README.md).
+See the retained conclusion in `STATUS.md`; the raw run is covered by the
+[archived temporary-diagnostics boundary](../archive/experiments/2026-10-performance-diagnostics.md).
 
 Run host entry points on a KVM-capable host with Docker access. The harnesses enter their own privileged container and pass through the selected block device; do not run guest scripts directly. Use one build at a time. A baseline rerun may use `--skip-build` only when its build stamp confirms that both the kernel tree and installed guest script are unchanged.
 

@@ -85,7 +85,7 @@
 ### Task 4: Verification And Performance Matrix
 
 **Files:**
-- Create: `docs/experiments/reports/RNVPCE-PARALLEL-BATCHED-RECLAIM-2026-11-16.md`
+- Create: `docs/experiments/validation/temporary/rnvpce-parallel-batched-reclaim-20261116/README.md`
 - Modify: `docs/os_com_implementation/os_com_refactor_plan/024-parallel-batched-nvpage-reclaim/README.md`
 
 **Interfaces:**
